@@ -1,4 +1,4 @@
-//! Correct a completed data build using an indexed, publication-fenced head.
+//! Correct a completed data build using an exact catalog and index head.
 //! Only additive position deletes and unrelated physical changes are accepted.
 
 use crate::{BuiltData, DeleteReadLimits, Policy, ReadLimits, WorkerOutput, stage_delete_files};
@@ -20,11 +20,12 @@ pub struct CatchUpRejected(pub &'static str);
 
 const MAX_ANCESTRY_SNAPSHOTS: usize = 256;
 
-/// The coordinator supplies live counts at this same head before acquiring its
-/// durable fence. The worker owns no catalog handle and cannot publish.
-/// Accepted mappings are staged in bounded batches as they are checked. The
-/// destination must remain Building until this function succeeds; a later
-/// validation or I/O failure can leave a partial delta that must be discarded.
+/// The coordinator supplies a row-index view and live counts captured at the
+/// same head. The worker owns no catalog handle and cannot publish. Accepted
+/// mappings are emitted in bounded batches as they are checked. A caller may
+/// stage those batches into a fenced Building operation, or validate them in a
+/// detached preparation and stream `WorkerOutput::index_deltas` only after an
+/// exact activation check.
 #[allow(clippy::too_many_arguments)]
 pub async fn catch_up(
     table: &Table,

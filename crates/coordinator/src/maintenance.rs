@@ -2,7 +2,10 @@ pub(crate) mod artifacts;
 mod builds;
 mod concurrent;
 pub use builds::{BuildRegistration, active_build_protection, discard_abandoned_builds};
-pub use concurrent::{ReadyCompaction, RunningCompaction};
+pub use concurrent::{
+    PreparationWait, PreparedCompaction, ReadyCompaction, RetiringCompactionPreparation,
+    RunningCompaction, RunningCompactionPreparation,
+};
 mod garbage;
 pub use garbage::{GarbagePolicy, GarbageProtection, GarbageReport};
 use std::collections::{BTreeSet, HashMap};
@@ -83,7 +86,8 @@ struct RewriteCommit {
     deltas_staged: bool,
     worker_ms: f64,
     prepare_started: std::time::Instant,
-    // These phases partition prepare_ms; strict work has no catch-up phase.
+    // Preflight and plan sealing partition prepare_ms. A speculative catch-up
+    // can be completed before activation and is reported independently.
     prepare_preflight_ms: f64,
     catch_up_ms: f64,
     plan_seal_started: std::time::Instant,

@@ -9,9 +9,9 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use flow_coordinator::{
-    CollapseLimits, DeleteRepairCursor, Epoch, Priority, ReadyCompaction, ReplanRequired,
-    RunningCompaction, Scheduler, SourceHealth, SourceLedger, TableMaintenance, TablePublisher,
-    WalPressure, collapse_epoch,
+    CollapseLimits, DeleteRepairCursor, Epoch, PreparationWait, PreparedCompaction, Priority,
+    ReadyCompaction, ReplanRequired, RunningCompaction, RunningCompactionPreparation, Scheduler,
+    SourceHealth, SourceLedger, TableMaintenance, TablePublisher, WalPressure, collapse_epoch,
 };
 use flow_ingress_journal::{Journal, JournalReader};
 use flow_model::{OperationId, PgLsn, SourceId, SourceTransaction, TableId, TableSchema};
@@ -374,7 +374,16 @@ impl PublishRuntime {
         let mut build_active = HashSet::new();
         let mut builds = FuturesUnordered::<BoxFuture<'static, BuildCompletion>>::new();
         let mut ready_builds = BTreeMap::<TableId, CompletedBuild>::new();
+        let mut preparations = FuturesUnordered::<BoxFuture<'static, PreparationCompletion>>::new();
+        let mut retirements = FuturesUnordered::<BoxFuture<'static, RetirementCompletion>>::new();
+        let mut ready_preparations = BTreeMap::<TableId, CompletedPreparation>::new();
         let mut waiting_for_build = HashSet::new();
+        // Timed-out workers retain durable ownership and resource accounting,
+        // but are no longer candidates that may pause foreground publication.
+        let mut retiring_builds = HashSet::new();
+        // Preparation reads a frozen index snapshot. Hold only this table's
+        // next CDC epoch until that candidate activates or is retired.
+        let mut activation_pending = HashSet::new();
         let mut fenced_fallback = HashSet::new();
         let mut health = tokio::time::interval(Duration::from_secs(5));
         health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -388,9 +397,11 @@ impl PublishRuntime {
         tokio::pin!(shutdown);
         observation.write(config, ledger, capture_goal, true)?;
         loop {
-            let available = running.len() + builds.len() < config.limits.table_workers;
+            let available = running.len() + builds.len() + preparations.len() + retirements.len()
+                < config.limits.table_workers;
             let deadline = if !idle_work.is_empty()
                 || ready_builds.keys().any(|id| !busy.contains(id))
+                || ready_preparations.keys().any(|id| !busy.contains(id))
             {
                 Instant::now()
             } else {
@@ -400,7 +411,11 @@ impl PublishRuntime {
                     .chain(
                         maintenance_due
                             .iter()
-                            .filter(|(id, _)| !busy.contains(*id) && !build_active.contains(*id))
+                            .filter(|(id, _)| {
+                                !busy.contains(*id)
+                                    && !build_active.contains(*id)
+                                    && !retiring_builds.contains(*id)
+                            })
                             .map(|(_, due)| *due),
                     )
                     .min()
@@ -451,6 +466,37 @@ impl PublishRuntime {
                             }));
                             maintenance_due.remove(&id);
                         }
+                        TableOutcome::Preparation(preparation) => {
+                            ensure!(reserved_build && transactions.is_empty(), "invalid background preparation handoff");
+                            ensure!(
+                                activation_pending.insert(id),
+                                "duplicate compaction preparation handoff"
+                            );
+                            scheduler.stall(id, true);
+                            metrics::counter!(
+                                "flow_compaction_preparations_total",
+                                "table_id" => id.0.to_string(),
+                                "result" => "started"
+                            ).increment(1);
+                            preparations.push(Box::pin(async move {
+                                let StartedPreparation {
+                                    running,
+                                    path,
+                                    started,
+                                    activation_stall_started,
+                                } = *preparation;
+                                let remaining = PREPARATION_STALL_LIMIT
+                                    .saturating_sub(activation_stall_started.elapsed());
+                                PreparationCompletion {
+                                    id,
+                                    path,
+                                    started,
+                                    activation_stall_started,
+                                    result: running.wait_for(remaining).await,
+                                }
+                            }));
+                            maintenance_due.remove(&id);
+                        }
                         TableOutcome::Deferred => {
                             ensure!(!reserved_build, "build reservation deferred behind itself");
                             pending.restore(id, transactions, &mut scheduler, profiles[&id]);
@@ -461,9 +507,24 @@ impl PublishRuntime {
                                     "hard pressure paused publication until the local build completes");
                             }
                         }
+                        TableOutcome::CandidateInvalidated => {
+                            ensure!(reserved_build && transactions.is_empty(), "invalid candidate retirement");
+                            build_active.remove(&id);
+                            activation_pending.remove(&id);
+                            let hard_pressure = waiting_for_build.remove(&id);
+                            scheduler.stall(id, false);
+                            if hard_pressure {
+                                fenced_fallback.insert(id);
+                            }
+                            maintenance_due.insert(id, Instant::now());
+                        }
                         TableOutcome::Complete { snapshot, maintenance_pending } => {
                             let completion_started = Instant::now();
-                            if reserved_build { build_active.remove(&id); }
+                            if reserved_build {
+                                build_active.remove(&id);
+                                activation_pending.remove(&id);
+                                waiting_for_build.remove(&id);
+                            }
                             scheduler.record_completion(id, elapsed);
                             for batch in transactions.chunks(ledger.batch_capacity()) {
                                 let ends = batch.iter().map(|transaction| transaction.end_lsn).collect::<Vec<_>>();
@@ -515,15 +576,124 @@ impl PublishRuntime {
                             // wait() joins the actual worker before releasing ownership.
                             std::fs::remove_dir_all(path)?;
                             build_active.remove(&id);
-                            waiting_for_build.remove(&id);
+                            let hard_pressure = waiting_for_build.remove(&id);
                             scheduler.stall(id, busy.contains(&id));
                             if !retry_table_work(&error) { return Err(error); }
                             tracing::warn!(event = "compaction_build_discarded", table = ?id, %error,
-                                "local build invalidated; scheduling fenced maintenance");
-                            fenced_fallback.insert(id);
+                                hard_pressure, "local build invalidated; scheduling maintenance");
+                            if hard_pressure {
+                                fenced_fallback.insert(id);
+                            }
                             maintenance_due.insert(id, Instant::now());
                         }
                     }
+                }
+                Some(completion) = preparations.next(), if !preparations.is_empty() => {
+                    let PreparationCompletion {
+                        id,
+                        path,
+                        started,
+                        activation_stall_started,
+                        result,
+                    } = completion;
+                    match result {
+                        Ok(PreparationWait::Ready(prepared)) => {
+                            metrics::counter!(
+                                "flow_compaction_preparations_total",
+                                "table_id" => id.0.to_string(),
+                                "result" => "ready"
+                            ).increment(1);
+                            ready_preparations.insert(id, CompletedPreparation {
+                                prepared: *prepared,
+                                path,
+                                started,
+                                activation_stall_started,
+                            });
+                        }
+                        Ok(PreparationWait::Deadline(retiring)) => {
+                            let operation_id = retiring.operation_id().clone();
+                            let stall = activation_stall_started.elapsed();
+                            metrics::counter!(
+                                "flow_compaction_preparations_total",
+                                "table_id" => id.0.to_string(),
+                                "result" => "deadline"
+                            ).increment(1);
+                            metrics::histogram!(
+                                "flow_compaction_publication_stall_seconds",
+                                "table_id" => id.0.to_string()
+                            ).record(stall.as_secs_f64());
+                            tracing::warn!(
+                                event = "compaction_preparation_deadline",
+                                operation_id = %operation_id.0,
+                                table = ?id,
+                                publication_stall_ms = stall.as_secs_f64() * 1000.0,
+                                "resuming table publication while the preparation worker retires"
+                            );
+                            activation_pending.remove(&id);
+                            build_active.remove(&id);
+                            retiring_builds.insert(id);
+                            waiting_for_build.remove(&id);
+                            scheduler.stall(id, busy.contains(&id));
+                            retirements.push(Box::pin(async move {
+                                RetirementCompletion {
+                                    id,
+                                    path,
+                                    result: retiring.wait().await,
+                                }
+                            }));
+                        }
+                        Err(error) => {
+                            // wait() joins the actual worker before releasing BUILD.
+                            std::fs::remove_dir_all(path)?;
+                            build_active.remove(&id);
+                            activation_pending.remove(&id);
+                            let hard_pressure = waiting_for_build.remove(&id);
+                            scheduler.stall(id, busy.contains(&id));
+                            if !retry_table_work(&error) { return Err(error); }
+                            metrics::counter!(
+                                "flow_compaction_preparations_total",
+                                "table_id" => id.0.to_string(),
+                                "result" => "invalidated"
+                            ).increment(1);
+                            metrics::histogram!(
+                                "flow_compaction_publication_stall_seconds",
+                                "table_id" => id.0.to_string()
+                            ).record(activation_stall_started.elapsed().as_secs_f64());
+                            tracing::warn!(
+                                event = "compaction_preparation_discarded",
+                                table = ?id,
+                                hard_pressure,
+                                %error,
+                                "background compaction preparation invalidated; scheduling maintenance"
+                            );
+                            if hard_pressure {
+                                fenced_fallback.insert(id);
+                            }
+                            maintenance_due.insert(id, Instant::now());
+                        }
+                    }
+                }
+                Some(completion) = retirements.next(), if !retirements.is_empty() => {
+                    let RetirementCompletion { id, path, result } = completion;
+                    std::fs::remove_dir_all(path)?;
+                    retiring_builds.remove(&id);
+                    let hard_pressure = waiting_for_build.remove(&id);
+                    scheduler.stall(id, busy.contains(&id));
+                    if let Err(error) = result {
+                        if !retry_table_work(&error) {
+                            return Err(error);
+                        }
+                        tracing::info!(
+                            event = "compaction_preparation_retirement_error",
+                            table = ?id,
+                            error = ?error,
+                            "retired invalidated background preparation"
+                        );
+                    }
+                    if hard_pressure {
+                        fenced_fallback.insert(id);
+                    }
+                    maintenance_due.insert(id, Instant::now());
                 }
                 Some(result) = health_checks.next(), if !health_checks.is_empty() => {
                     health_client = result?;
@@ -533,20 +703,52 @@ impl PublishRuntime {
                     checkpoint_at = Instant::now();
                 }
                 _ = tokio::time::sleep_until(deadline.into()), if available => {
-                    while running.len() + builds.len() < config.limits.table_workers {
+                    while running.len() + builds.len() + preparations.len() + retirements.len()
+                        < config.limits.table_workers
+                    {
                         let now = Instant::now();
-                        let completed = ready_builds.keys().find(|id| !busy.contains(*id)).copied();
+                        let prepared = ready_preparations
+                            .keys()
+                            .find(|id| !busy.contains(*id))
+                            .copied();
+                        let built = ready_builds
+                            .keys()
+                            .find(|id| !busy.contains(*id))
+                            .copied();
                         let overdue = maintenance_due.iter()
-                            .filter(|(id, due)| **due <= now && !busy.contains(*id) && !build_active.contains(*id))
+                            .filter(|(id, due)| {
+                                **due <= now
+                                    && !busy.contains(*id)
+                                    && !build_active.contains(*id)
+                                    && !retiring_builds.contains(*id)
+                            })
                             .min_by_key(|(_, due)| **due)
                             .map(|(id, _)| *id);
-                        let (id, idle) = if let Some(id) = completed.or(overdue) {
-                            (id, true)
+                        let (id, idle, candidate) = if let Some(id) = prepared {
+                            (
+                                id,
+                                true,
+                                Some(CompactionCandidate::Prepared(
+                                    ready_preparations.remove(&id).expect("selected preparation"),
+                                )),
+                            )
+                        } else if let Some(id) = built {
+                            (
+                                id,
+                                true,
+                                Some(CompactionCandidate::Built(
+                                    ready_builds.remove(&id).expect("selected build"),
+                                )),
+                            )
                         } else if let Some(id) = scheduler.take_ready(now) {
                             idle_work.retain(|queued| *queued != id);
-                            (id, false)
+                            (id, false, None)
+                        } else if let Some(id) = overdue {
+                            (id, true, None)
                         } else if let Some(id) = idle_work.pop_front() {
-                            if build_active.contains(&id) { continue; }
+                            if build_active.contains(&id) || retiring_builds.contains(&id) {
+                                continue;
+                            }
                             if ledger.watermarks().journal_durable_lsn < capture_goal
                                 || ledger.pending_count() != pending.loaded.len()
                             {
@@ -556,7 +758,7 @@ impl PublishRuntime {
                             if pending.tables.get(&id).is_some_and(|queue| !queue.is_empty()) {
                                 continue;
                             }
-                            (id, true)
+                            (id, true, None)
                         } else {
                             break;
                         };
@@ -568,21 +770,24 @@ impl PublishRuntime {
                             maintenance_due.remove(&id);
                             idle_work.retain(|queued| *queued != id);
                         }
-                        let candidate = ready_builds.remove(&id);
                         let build_admission = if candidate.is_some() {
-                            waiting_for_build.remove(&id);
+                            if candidate.as_ref().is_some_and(CompactionCandidate::is_prepared) {
+                                waiting_for_build.remove(&id);
+                            }
                             BuildAdmission::Fenced
                         } else if !background_builds || fenced_fallback.remove(&id) {
                             BuildAdmission::Fenced
-                        } else if idle && build_active.is_empty() {
+                        } else if idle && build_active.is_empty() && retiring_builds.is_empty() {
                             build_active.insert(id);
                             BuildAdmission::Start
                         } else {
                             BuildAdmission::Wait
                         };
+                        let lane_acquired_at = Instant::now();
                         let options = WorkOptions {
                             build_active: candidate.is_none() && build_active.contains(&id) && build_admission != BuildAdmission::Start,
                             build_admission,
+                            actor_acquired_at: lane_acquired_at,
                         };
                         let transactions = if idle { Vec::new() } else { pending.take_epoch(id) };
                         if transactions.is_empty() && !idle {
@@ -592,14 +797,14 @@ impl PublishRuntime {
                             schedule_transactions(id, queue, &mut scheduler, profiles[&id]);
                             scheduler.stall(id, true);
                         }
-                        let lane_acquired_at = Instant::now();
                         busy.insert(id);
                         scheduler.stall(id, true);
-                        let finalization_lane = candidate.as_ref().map(|candidate| {
-                            FinalizationLane {
-                                operation_id: candidate.ready.operation_id().clone(),
+                        let finalization_lane = candidate.as_ref().and_then(|candidate| {
+                            candidate.activation_stall_started().map(|stall_started| FinalizationLane {
+                                operation_id: candidate.operation_id().clone(),
                                 acquired_at: lane_acquired_at,
-                            }
+                                publication_stall_started: stall_started,
+                            })
                         });
                         let schema = schemas[&id].clone();
                         let table = tables[&id].clone();
@@ -637,6 +842,7 @@ impl PublishRuntime {
                         for id in tables.keys() {
                             if !busy.contains(id)
                                 && !build_active.contains(id)
+                                && !retiring_builds.contains(id)
                                 && pending.tables.get(id).is_none_or(VecDeque::is_empty)
                                 && !idle_work.contains(id)
                             {
@@ -652,7 +858,11 @@ impl PublishRuntime {
                 &profiles,
                 config.limits.pending_transactions,
             )?;
-            for id in busy.iter().chain(&waiting_for_build) {
+            for id in busy
+                .iter()
+                .chain(&waiting_for_build)
+                .chain(&activation_pending)
+            {
                 scheduler.stall(*id, true);
             }
         }
@@ -966,6 +1176,8 @@ impl PendingWork {
 // the next available worker; running table operations are never preempted.
 const OPTIONAL_MAINTENANCE_DELAY: Duration = Duration::from_secs(1);
 const BUILD_MAX_AGE: Duration = Duration::from_secs(30);
+// Leave enough of the realtime budget for atomic activation and ledger ACK.
+const PREPARATION_STALL_LIMIT: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BuildAdmission {
@@ -978,6 +1190,7 @@ enum BuildAdmission {
 struct WorkOptions {
     build_active: bool,
     build_admission: BuildAdmission,
+    actor_acquired_at: Instant,
 }
 
 struct StartedBuild {
@@ -999,12 +1212,81 @@ struct BuildCompletion {
     result: Result<ReadyCompaction>,
 }
 
+struct StartedPreparation {
+    running: RunningCompactionPreparation,
+    path: PathBuf,
+    started: Instant,
+    activation_stall_started: Instant,
+}
+
+struct CompletedPreparation {
+    prepared: PreparedCompaction,
+    path: PathBuf,
+    started: Instant,
+    activation_stall_started: Instant,
+}
+
+struct PreparationCompletion {
+    id: TableId,
+    path: PathBuf,
+    started: Instant,
+    activation_stall_started: Instant,
+    result: Result<PreparationWait>,
+}
+
+struct RetirementCompletion {
+    id: TableId,
+    path: PathBuf,
+    result: Result<()>,
+}
+
+enum CompactionCandidate {
+    Built(CompletedBuild),
+    Prepared(CompletedPreparation),
+}
+
+impl CompactionCandidate {
+    fn path(&self) -> &PathBuf {
+        match self {
+            Self::Built(candidate) => &candidate.path,
+            Self::Prepared(candidate) => &candidate.path,
+        }
+    }
+
+    fn operation_id(&self) -> &OperationId {
+        match self {
+            Self::Built(candidate) => candidate.ready.operation_id(),
+            Self::Prepared(candidate) => candidate.prepared.operation_id(),
+        }
+    }
+
+    fn is_prepared(&self) -> bool {
+        matches!(self, Self::Prepared(_))
+    }
+
+    fn activation_stall_started(&self) -> Option<Instant> {
+        match self {
+            Self::Built(_) => None,
+            Self::Prepared(candidate) => Some(candidate.activation_stall_started),
+        }
+    }
+
+    async fn discard(self) -> Result<()> {
+        match self {
+            Self::Built(candidate) => candidate.ready.discard().await,
+            Self::Prepared(candidate) => candidate.prepared.discard().await,
+        }
+    }
+}
+
 enum TableOutcome {
     Complete {
         snapshot: Option<i64>,
         maintenance_pending: bool,
     },
     Build(Box<StartedBuild>),
+    Preparation(Box<StartedPreparation>),
+    CandidateInvalidated,
     Deferred,
 }
 
@@ -1032,21 +1314,30 @@ struct TableCompletion {
 struct FinalizationLane {
     operation_id: OperationId,
     acquired_at: Instant,
+    publication_stall_started: Instant,
 }
 
 impl FinalizationLane {
     fn record_release(self, table_id: TableId, released_at: Instant) -> Duration {
         let held = released_at.saturating_duration_since(self.acquired_at);
+        let publication_stall =
+            released_at.saturating_duration_since(self.publication_stall_started);
         metrics::histogram!(
             "flow_compaction_finalization_actor_lane_hold_seconds",
             "table_id" => table_id.0.to_string()
         )
         .record(held.as_secs_f64());
+        metrics::histogram!(
+            "flow_compaction_publication_stall_seconds",
+            "table_id" => table_id.0.to_string()
+        )
+        .record(publication_stall.as_secs_f64());
         tracing::info!(
             event = "compaction_finalization_actor_lane_released",
             operation_id = %self.operation_id.0,
             table_id = table_id.0,
             lane_hold_ms = held.as_secs_f64() * 1000.0,
+            publication_stall_ms = publication_stall.as_secs_f64() * 1000.0,
             "completed compaction finalization released the table actor lane"
         );
         held
@@ -1063,6 +1354,27 @@ fn retry_table_work(error: &anyhow::Error) -> bool {
                     | flow_compactor::Error::DependencyBudget
             )
         )
+}
+
+fn candidate_invalidation_reason(error: &anyhow::Error) -> &'static str {
+    if error
+        .downcast_ref::<flow_state_store::Error>()
+        .is_some_and(|error| matches!(error, flow_state_store::Error::ExactStateMismatch { .. }))
+    {
+        "index_head"
+    } else if error
+        .downcast_ref::<flow_state_store::Error>()
+        .is_some_and(|error| matches!(error, flow_state_store::Error::SnapshotMismatch { .. }))
+    {
+        "snapshot"
+    } else if error
+        .downcast_ref::<flow_compactor::CatchUpRejected>()
+        .is_some()
+    {
+        "catch_up"
+    } else {
+        "catalog_or_schema"
+    }
 }
 
 #[derive(Clone)]
@@ -1216,16 +1528,26 @@ impl TableWork {
         schema: TableSchema,
         transactions: Vec<SourceTransaction>,
         options: WorkOptions,
-        mut candidate: Option<CompletedBuild>,
+        mut candidate: Option<CompactionCandidate>,
         finalization_lane: Option<FinalizationLane>,
     ) -> Result<TableCompletion> {
         let started = Instant::now();
         let mut attempt = 0u32;
         let mut repair_cursor = DeleteRepairCursor::default();
-        let scratch_path = candidate.as_ref().map(|build| build.path.clone());
+        let scratch_path = candidate.as_ref().map(|candidate| candidate.path().clone());
         let reserved_build =
             candidate.is_some() || options.build_admission == BuildAdmission::Start;
         let result = loop {
+            let candidate_context = candidate.as_ref().map(|candidate| {
+                (
+                    if candidate.is_prepared() {
+                        "activation"
+                    } else {
+                        "preparation"
+                    },
+                    candidate.operation_id().clone(),
+                )
+            });
             match self
                 .clone()
                 .run_once(
@@ -1238,6 +1560,57 @@ impl TableWork {
                 )
                 .await
             {
+                Err(error) if candidate_context.is_some() && retry_table_work(&error) => {
+                    let (stage, operation_id) =
+                        candidate_context.expect("checked candidate context");
+                    if self.store.operation(&operation_id)?.is_some() {
+                        let delay = crate::retry::delay(attempt);
+                        metrics::counter!("flow_table_retries_total", "table_id" => schema.table_id.0.to_string()).increment(1);
+                        tracing::warn!(
+                            table = ?schema.table_id,
+                            operation_id = %operation_id.0,
+                            attempt,
+                            delay_ms = delay.as_millis(),
+                            error = ?error,
+                            "durable compaction activation interrupted; recovering before releasing the table lane"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    let reason = candidate_invalidation_reason(&error);
+                    metrics::counter!(
+                        "flow_compaction_candidate_invalidations_total",
+                        "table_id" => schema.table_id.0.to_string(),
+                        "stage" => stage,
+                        "reason" => reason
+                    )
+                    .increment(1);
+                    if stage == "activation" {
+                        metrics::counter!(
+                            "flow_compaction_activations_total",
+                            "table_id" => schema.table_id.0.to_string(),
+                            "result" => "invalidated"
+                        )
+                        .increment(1);
+                    }
+                    tracing::warn!(
+                        event = "compaction_candidate_invalidated",
+                        table = ?schema.table_id,
+                        stage,
+                        reason,
+                        error = ?error,
+                        "retired stale compaction candidate before rescheduling"
+                    );
+                    break Ok(TableCompletion {
+                        id: schema.table_id,
+                        transactions,
+                        outcome: TableOutcome::CandidateInvalidated,
+                        elapsed: started.elapsed(),
+                        reserved_build,
+                        finalization_lane,
+                    });
+                }
                 Err(error) if retry_table_work(&error) => {
                     let delay = crate::retry::delay(attempt);
                     metrics::counter!("flow_table_retries_total", "table_id" => schema.table_id.0.to_string()).increment(1);
@@ -1258,12 +1631,15 @@ impl TableWork {
                 }
             }
         };
-        // A candidate's worker has already joined. If table refresh failed
-        // before the finalizer took it, retire its independent BUILD record.
+        let preparation_handoff = result
+            .as_ref()
+            .is_ok_and(|completion| matches!(completion.outcome, TableOutcome::Preparation(_)));
+        // A candidate's workers have already joined. If table refresh failed
+        // before ownership was transferred, retire its independent BUILD record.
         if let Some(candidate) = candidate {
-            candidate.ready.discard().await?;
+            candidate.discard().await?;
         }
-        if let Some(path) = scratch_path {
+        if !preparation_handoff && let Some(path) = scratch_path {
             std::fs::remove_dir_all(path)?;
         }
         result
@@ -1275,7 +1651,7 @@ impl TableWork {
         schema: TableSchema,
         transactions: Vec<SourceTransaction>,
         options: WorkOptions,
-        candidate: &mut Option<CompletedBuild>,
+        candidate: &mut Option<CompactionCandidate>,
         repair_cursor: &mut DeleteRepairCursor,
     ) -> Result<TableOutcome> {
         let id = schema.table_id;
@@ -1359,23 +1735,62 @@ impl TableWork {
             .await??;
         }
         if let Some(candidate) = candidate.take() {
-            if candidate.started.elapsed() > BUILD_MAX_AGE {
-                candidate.ready.discard().await?;
-                return Err(ReplanRequired.into());
+            match candidate {
+                CompactionCandidate::Built(candidate) => {
+                    if candidate.started.elapsed() > BUILD_MAX_AGE {
+                        candidate.ready.discard().await?;
+                        return Err(ReplanRequired.into());
+                    }
+                    let running = self
+                        .maintenance
+                        .start_compaction_preparation(&current, &schema, candidate.ready)
+                        .await;
+                    let handoff_elapsed = options.actor_acquired_at.elapsed();
+                    metrics::histogram!(
+                        "flow_compaction_preparation_handoff_actor_lane_hold_seconds",
+                        "table_id" => id.0.to_string()
+                    )
+                    .record(handoff_elapsed.as_secs_f64());
+                    tracing::info!(
+                        event = "compaction_preparation_handoff_actor_lane_released",
+                        table_id = id.0,
+                        lane_hold_ms = handoff_elapsed.as_secs_f64() * 1000.0,
+                        "handed compaction preparation to the background"
+                    );
+                    let running = running?;
+                    return Ok(TableOutcome::Preparation(Box::new(StartedPreparation {
+                        running,
+                        path: candidate.path,
+                        started: candidate.started,
+                        activation_stall_started: options.actor_acquired_at,
+                    })));
+                }
+                CompactionCandidate::Prepared(candidate) => {
+                    if candidate.started.elapsed() > BUILD_MAX_AGE {
+                        candidate.prepared.discard().await?;
+                        return Err(ReplanRequired.into());
+                    }
+                    let snapshot = self
+                        .maintenance
+                        .activate_compaction(&current, &schema, candidate.prepared)
+                        .await?;
+                    metrics::counter!(
+                        "flow_compaction_activations_total",
+                        "table_id" => id.0.to_string(),
+                        "result" => if snapshot.is_some() { "committed" } else { "no_change" }
+                    )
+                    .increment(1);
+                    if snapshot.is_some() {
+                        metrics::histogram!("flow_compaction_seconds", "table_id" => id.0.to_string(), "kind" => "data")
+                            .record(candidate.started.elapsed().as_secs_f64());
+                        metrics::counter!("flow_compactions_total", "table_id" => id.0.to_string(), "kind" => "data").increment(1);
+                    }
+                    return Ok(TableOutcome::Complete {
+                        snapshot,
+                        maintenance_pending: true,
+                    });
+                }
             }
-            let snapshot = self
-                .maintenance
-                .finish_compaction(&current, &schema, candidate.ready)
-                .await?;
-            if snapshot.is_some() {
-                metrics::histogram!("flow_compaction_seconds", "table_id" => id.0.to_string(), "kind" => "data")
-                    .record(candidate.started.elapsed().as_secs_f64());
-                metrics::counter!("flow_compactions_total", "table_id" => id.0.to_string(), "kind" => "data").increment(1);
-            }
-            return Ok(TableOutcome::Complete {
-                snapshot,
-                maintenance_pending: true,
-            });
         }
         let (current, maintenance_pending) = match self
             .maintain(
@@ -1631,6 +2046,7 @@ mod finalization_lane_tests {
         let lane = FinalizationLane {
             operation_id: OperationId("rewrite-observability-test".into()),
             acquired_at,
+            publication_stall_started: acquired_at,
         };
 
         let held = tracing::subscriber::with_default(subscriber, || {

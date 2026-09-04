@@ -1,9 +1,9 @@
 # Local concurrent data compaction
 
-Status: core integration and the seven-phase live concurrency/deadline gate pass.
-Release workload qualification is pending. This addresses measured data-rewrite
-occupancy of the table lane. It introduces no distributed workers, HA, global
-compaction service or sort/Z-order requirement.
+Status: core integration and the live concurrency/deadline gates pass. The
+release31 maintenance matrix is the baseline; workload qualification of this
+new split prepare/activate path is pending. It introduces no distributed workers,
+HA, global compaction service or sort/Z-order requirement.
 
 The existing strict rewrite remains the fallback. Optional data builds can run
 while the table continues publishing CDC. Delete-only, manifest and retention
@@ -23,9 +23,11 @@ work retain their existing paths.
 3. Build selected live data and the complete original-to-replacement row mapping
    against S. Payloads, delete staging and mappings remain bounded or disk-backed.
    The worker cannot commit a catalog change or modify the live row index.
-4. Once the worker finishes, finalize only at an idle table boundary. Reconcile
-   external maintenance and acquire an exact current indexed head H. Require S
-   ancestry, unchanged selected data identities and unchanged original delete
+4. Once the worker finishes, use a short idle table boundary to hand preparation
+   to the background. The daemon pauses admission of the next same-table CDC
+   epoch while that task loads catalog head H and captures one immutable index
+   snapshot, including the full table state and exact live-file counts. Require
+   S ancestry, unchanged selected data identities and unchanged original delete
    inputs; additive late position deletes and unrelated appends are permitted.
 5. Without an effective late position delete, retain an output row's index delta
    only if its old location still equals the current mapping. With such a delete,
@@ -33,17 +35,24 @@ work retain their existing paths.
    selected inputs. Translate the deletion to the
    new output position and omit that stale index delta. Row-version comparison
    alone is insufficient because delete/reinsert can reset a row version.
-   Stage accepted mappings directly into the fenced Building operation in bounded
-   batches. A later failure leaves unpublished partial work for discard; a new H
-   requires a fresh operation. Finalization does not rescan accepted mappings.
+   Retain accepted mappings in the candidate's disk-backed scratch state. This
+   detached phase creates no main-store operation or catalog commit. A failure
+   discards the whole candidate; a new H requires fresh preparation.
 6. Rebuild residual deletes for unselected surviving data using original sequence
    applicability, and add the translated output masks. New data uses S's data
-   sequence; delete outputs use the maximum removed delete sequence. Persist this
-   exact corrected plan and filtered deltas as ordinary Prepared work at H before
-   POST. Existing exact-head catalog validation and ambiguous-outcome recovery
-   apply. Never redo catch-up after an unknown commit outcome.
+   sequence; delete outputs use the maximum removed delete sequence. Reacquire
+   the table actor and require the catalog identity, location, snapshot, schema
+   and spec plus the complete index `TableState` to equal captured H. Atomically
+   install Building and its artifact reservation, stage the filtered deltas in
+   bounded batches, and seal ordinary Prepared work before POST. Existing
+   ambiguous-outcome recovery applies. Never redo catch-up after an unknown
+   commit outcome.
 7. Remove BUILD only after Prepared is durable, or after a failed/cancelled worker
-   has actually finished. Dropping a blocking-task handle is not proof of join.
+   has actually finished. A 750 ms end-to-end preparation budget releases the
+   same-table CDC gate; a timed-out blocking worker retains BUILD, scratch and a
+   worker slot while it joins and retires asynchronously. It no longer counts as
+   a viable candidate for foreground pressure decisions. Dropping a blocking-task
+   handle is not proof of join.
    Shutdown retains BUILD; startup discards abandoned BUILD records before actors
    resume, leaving registered artifacts for existing protected GC and grace. Startup
    also removes abandoned UUID scratch stores after durable operation recovery.
@@ -51,22 +60,22 @@ work retain their existing paths.
 The daemon admits one local build globally within the configured table worker
 budget, keeping its reservation through finalization. With only one table worker,
 it uses the strict path. Library callers must serialize one build per table.
-A completed candidate receives a table boundary to finalize. Hard reader pressure
-may defer queued CDC while a candidate finishes, releasing the actor so finalization
-cannot deadlock. Invalidated or expired work returns to the strict bounded path;
-publication never bypasses hard debt. The worker wait requests cancellation after
-30 seconds and still joins the actual worker before releasing ownership; this is
-not a hard deadline for an in-flight I/O call. Catch-up accepts at most 256
+A completed build receives a short table boundary for background handoff, then a
+prepared candidate receives the next boundary for activation. Prepared work is
+preferred over a new CDC epoch; build handoff is preferred next so sustained CDC
+cannot starve maintenance. Invalidated work returns to scheduling, while hard
+reader pressure can select the strict bounded fallback. Publication never bypasses
+hard debt. The build wait requests cancellation after 30 seconds and still joins
+the actual worker before releasing ownership. Catch-up accepts at most 256
 intervening snapshots and applies the configured delete-input file, byte and row
 limits before staging. The Parquet read/write admission limits also apply.
 
 Catch-up also caps each mapping batch by the existing row limit and the smaller
 writer batch/row-group byte budget. It charges decoded keys, locations, paths
 and partition bytes; one decoded lookahead and storage buffers remain outside
-that payload count. One scoped thread can stage a batch while the caller checks
-the next at H. It does not change authoritative row mappings. The scope always
-joins staging before returning an error or allowing Building cleanup; this adds
-no detached work or new recovery state.
+that payload count. Detached preparation reads and filters the scratch mapping
+at H without changing authoritative row mappings. Activation later streams that
+same filtered mapping through the existing durable staging and recovery path.
 
 Blocking maintenance workers share one lazily started, process-lifetime I/O
 runtime with one driver thread. Row processing stays on the existing blocking

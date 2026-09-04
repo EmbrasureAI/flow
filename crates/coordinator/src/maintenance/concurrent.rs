@@ -95,6 +95,148 @@ impl ReadyCompaction {
     }
 }
 
+struct PreparedData {
+    output: flow_compactor::WorkerOutput,
+    head: Table,
+    indexed: TableState,
+    build_base: CommitBase,
+    catch_up_ms: f64,
+}
+
+/// Catch-up running against one immutable catalog and row-index head. It owns no
+/// table publication fence and cannot submit a catalog commit.
+#[must_use = "join preparation before releasing its scratch directory"]
+pub struct RunningCompactionPreparation {
+    worker: tokio::task::JoinHandle<Result<PreparedData>>,
+    ownership: BuildRegistration,
+    started: Instant,
+    worker_ms: f64,
+}
+
+/// Result of waiting for detached catch-up without sacrificing its ownership
+/// barrier when the caller's publication-stall budget expires.
+pub enum PreparationWait {
+    Ready(Box<PreparedCompaction>),
+    Deadline(RetiringCompactionPreparation),
+}
+
+/// A timed-out preparation whose blocking worker still owns scratch artifacts.
+/// CDC may resume while this handle joins and retires that work in the background.
+#[must_use = "join the worker before releasing its scratch directory"]
+pub struct RetiringCompactionPreparation {
+    worker: tokio::task::JoinHandle<Result<PreparedData>>,
+    ownership: BuildRegistration,
+    started: Instant,
+}
+
+impl RetiringCompactionPreparation {
+    pub fn operation_id(&self) -> &OperationId {
+        self.ownership.operation_id()
+    }
+
+    pub async fn wait(self) -> Result<()> {
+        let joined = self.worker.await;
+        self.ownership.release_after_join().await?;
+        tracing::info!(
+            event = "compaction_preparation_retired",
+            operation_id = %self.ownership.operation_id().0,
+            elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+            "joined timed-out compaction preparation and released build ownership"
+        );
+        match joined {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(replan_error(error)),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl RunningCompactionPreparation {
+    pub async fn wait(self) -> Result<PreparedCompaction> {
+        match self.wait_for(MAX_BUILD_TIME).await? {
+            PreparationWait::Ready(prepared) => Ok(*prepared),
+            PreparationWait::Deadline(retiring) => {
+                retiring.wait().await?;
+                Err(ReplanRequired.into())
+            }
+        }
+    }
+
+    /// Wait only through the caller's stall budget. On expiry the returned
+    /// retirement handle keeps BUILD ownership until the blocking worker joins.
+    pub async fn wait_for(mut self, deadline: Duration) -> Result<PreparationWait> {
+        if deadline.is_zero() {
+            return Ok(PreparationWait::Deadline(RetiringCompactionPreparation {
+                worker: self.worker,
+                ownership: self.ownership,
+                started: self.started,
+            }));
+        }
+        let outcome = match tokio::time::timeout(deadline, &mut self.worker).await {
+            Ok(outcome) => outcome
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
+            Err(_) => {
+                return Ok(PreparationWait::Deadline(RetiringCompactionPreparation {
+                    worker: self.worker,
+                    ownership: self.ownership,
+                    started: self.started,
+                }));
+            }
+        };
+        match outcome {
+            Ok(prepared) => {
+                tracing::info!(
+                    event = "compaction_preparation_ready",
+                    operation_id = %self.ownership.operation_id().0,
+                    head_snapshot_id = prepared.head.metadata().current_snapshot_id(),
+                    materialized_lsn = %prepared.indexed.materialized_lsn,
+                    elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+                    catch_up_ms = prepared.catch_up_ms,
+                    "compaction catch-up prepared outside the table actor lane"
+                );
+                Ok(PreparationWait::Ready(Box::new(PreparedCompaction {
+                    output: prepared.output,
+                    ownership: self.ownership,
+                    head: prepared.head,
+                    indexed: prepared.indexed,
+                    build_base: prepared.build_base,
+                    worker_ms: self.worker_ms,
+                    catch_up_ms: prepared.catch_up_ms,
+                })))
+            }
+            Err(error) => {
+                self.ownership.release_after_join().await?;
+                Err(replan_error(error))
+            }
+        }
+    }
+}
+
+/// A fully checked rewrite candidate anchored to an exact catalog and row-index
+/// head. Activation must install the ordinary durable fence against that same
+/// `TableState` before importing any mapping.
+#[must_use = "activate or discard the prepared compaction"]
+pub struct PreparedCompaction {
+    output: flow_compactor::WorkerOutput,
+    ownership: BuildRegistration,
+    head: Table,
+    indexed: TableState,
+    build_base: CommitBase,
+    worker_ms: f64,
+    catch_up_ms: f64,
+}
+
+impl PreparedCompaction {
+    pub fn operation_id(&self) -> &OperationId {
+        self.ownership.operation_id()
+    }
+
+    pub async fn discard(self) -> Result<()> {
+        self.ownership.release_after_join().await
+    }
+}
+
 impl TableMaintenance {
     /// Plan at an indexed head and return only after the worker has acquired its
     /// frozen index read view. Subsequent CDC may then advance the table.
@@ -194,17 +336,124 @@ impl TableMaintenance {
         }
     }
 
-    /// Finish only an already joined worker while the owning table actor is
-    /// idle. Catch-up uses the ordinary durable fence and exact-head recovery.
+    /// Compatibility path for serialized library callers. The daemon uses the
+    /// split prepare/activate API so catch-up does not occupy its table lane.
     pub async fn finish_compaction(
         &self,
         table: &Table,
         schema: &TableSchema,
         ready: ReadyCompaction,
     ) -> Result<Option<i64>> {
-        let ownership = ready.ownership.clone();
+        let prepared = self
+            .start_compaction_preparation(table, schema, ready)
+            .await?
+            .wait()
+            .await?;
+        self.activate_compaction(table, schema, prepared).await
+    }
+
+    /// Capture an exact unfenced index head, then run all late-delete and mapping
+    /// checks on its immutable RocksDB snapshot. No main-store operation exists
+    /// and no catalog commit is possible until `activate_compaction` succeeds.
+    pub async fn start_compaction_preparation(
+        &self,
+        table: &Table,
+        schema: &TableSchema,
+        ready: ReadyCompaction,
+    ) -> Result<RunningCompactionPreparation> {
+        let identifier = table.identifier().clone();
+        let catalog = self.catalog.clone();
+        let store = self.store.clone();
+        let worker_schema = schema.clone();
+        let base = ready.base;
+        let built = ready.built;
+        let build_indexed = ready.indexed;
+        let policy = self.policy.clone();
+        let limits = self.read_limits.clone();
+        let cache = self.cache.clone();
+        let ownership = ready.ownership;
+        let worker_ownership = ownership.clone();
+        let mut writer = self.writer.clone();
+        writer.artifact_tracker = Some(worker_ownership.writer());
+        let started = Instant::now();
+        let worker = tokio::spawn(async move {
+            let head = catalog.load_table(&identifier).await?;
+            base.validate(&head).map_err(|_| ReplanRequired)?;
+            worker_ownership
+                .validate_table(&head, worker_schema.table_id)
+                .map_err(|_| ReplanRequired)?;
+            ensure!(
+                worker_schema.table_id == built.table_id()
+                    && worker_schema.version == build_indexed.schema_version
+                    && crate::same_iceberg_schema(
+                        head.metadata().current_schema(),
+                        &iceberg_schema(&worker_schema)?
+                    ),
+                ReplanRequired
+            );
+            let table_id = worker_schema.table_id;
+            let snapshot_id = head.metadata().current_snapshot_id();
+            let files = built.plan().input_files.iter().cloned().collect::<Vec<_>>();
+            let worker_table = head.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                let index = store.index_snapshot(&table_id, snapshot_id)?;
+                let indexed = index.table_state().clone();
+                ensure!(
+                    indexed.schema_version == worker_schema.version
+                        && indexed.materialized_lsn >= build_indexed.materialized_lsn,
+                    ReplanRequired
+                );
+                let counts = files
+                    .iter()
+                    .cloned()
+                    .zip(index.file_live_row_counts(&files)?)
+                    .collect::<BTreeMap<_, _>>();
+                let catch_up_started = Instant::now();
+                let output = super::worker_runtime()?.block_on(flow_compactor::catch_up(
+                    &worker_table,
+                    &worker_schema,
+                    &base,
+                    built,
+                    &index,
+                    &counts,
+                    &policy,
+                    writer,
+                    &limits,
+                    &cache,
+                    |_| Ok(()),
+                ))?;
+                Ok(PreparedData {
+                    output,
+                    head: worker_table,
+                    indexed,
+                    build_base: base,
+                    catch_up_ms: catch_up_started.elapsed().as_secs_f64() * 1000.0,
+                })
+            })
+            .await??;
+            Ok(prepared)
+        });
+        Ok(RunningCompactionPreparation {
+            worker,
+            ownership,
+            started,
+            worker_ms: ready.worker_ms,
+        })
+    }
+
+    /// Atomically admit an already prepared candidate at its exact captured
+    /// catalog/index head, then use the ordinary recoverable publication path.
+    pub async fn activate_compaction(
+        &self,
+        table: &Table,
+        schema: &TableSchema,
+        prepared: PreparedCompaction,
+    ) -> Result<Option<i64>> {
+        let ownership = prepared.ownership.clone();
         let id = ownership.operation_id().clone();
-        let result = self.finish_compaction_inner(table, schema, ready).await;
+        let result = self
+            .activate_compaction_inner(table, schema, prepared)
+            .await;
         // No catalog POST exists before Prepared. Discarding Building here is
         // therefore safe; all later phases retain the existing recovery proof.
         let store = self.store.clone();
@@ -232,114 +481,66 @@ impl TableMaintenance {
         result.map_err(replan_error)
     }
 
-    async fn finish_compaction_inner(
+    async fn activate_compaction_inner(
         &self,
         table: &Table,
         schema: &TableSchema,
-        ready: ReadyCompaction,
+        prepared: PreparedCompaction,
     ) -> Result<Option<i64>> {
         let prepare_started = Instant::now();
         let head = self.catalog.load_table(table.identifier()).await?;
-        ready.base.validate(&head).map_err(|_| ReplanRequired)?;
+        let anchor = CommitBase::new(&prepared.head);
+        anchor.validate(&head).map_err(|_| ReplanRequired)?;
         ensure!(
-            schema.table_id == ready.built.table_id()
-                && schema.version == ready.indexed.schema_version,
+            head.metadata().location() == prepared.head.metadata().location()
+                && head.metadata().current_snapshot_id() == anchor.snapshot_id
+                && head.metadata().current_schema_id() == anchor.schema_id
+                && head.metadata().default_partition_spec_id() == anchor.spec_id
+                && schema.table_id == prepared.output.table_id()
+                && schema.version == prepared.indexed.schema_version,
             ReplanRequired
         );
         let table_id = schema.table_id;
-        let snapshot = head.metadata().current_snapshot_id();
-        let files = ready
-            .built
-            .plan()
-            .input_files
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let store = self.store.clone();
-        let (indexed, counts) = blocking(move || {
-            let indexed = store.table_state(&table_id)?;
-            let counts = store.file_live_row_counts(&table_id, snapshot, &files)?;
-            Ok((
-                indexed,
-                files.into_iter().zip(counts).collect::<BTreeMap<_, _>>(),
-            ))
-        })
-        .await?;
-        ensure!(
-            indexed.materialized_lsn >= ready.indexed.materialized_lsn
-                && indexed.schema_version == schema.version,
-            ReplanRequired
-        );
         let operation = PreparedOperation {
-            id: ready.ownership.operation_id().clone(),
+            id: prepared.ownership.operation_id().clone(),
             table_id,
             kind: OperationKind::Rewrite,
-            base_snapshot_id: indexed.snapshot_id,
-            last_lsn: indexed.materialized_lsn,
+            base_snapshot_id: prepared.indexed.snapshot_id,
+            last_lsn: prepared.indexed.materialized_lsn,
             schema_version: schema.version,
             artifacts: Vec::new(),
             payload: Vec::new(),
         };
-        let ownership = ready.ownership.writer();
+        let ownership = prepared.ownership.writer();
         let reservation = ownership.record().await?;
         let store = self.store.clone();
+        let expected = prepared.indexed.clone();
         blocking(move || {
-            Ok(store
-                .begin_prepare_with_record(operation, Some((&reservation.0, &reservation.1)))?)
+            Ok(store.begin_prepare_exact(
+                operation,
+                &expected,
+                Some((&reservation.0, &reservation.1)),
+            )?)
         })
         .await?;
-        let output_sequence = ready.base.sequence_number;
-        let build_snapshot_id = ready.base.snapshot_id;
-        let worker_table = head.clone();
-        let worker_schema = schema.clone();
-        let store = self.store.clone();
-        let policy = self.policy.clone();
-        let limits = self.read_limits.clone();
-        let cache = self.cache.clone();
-        let mut writer = self.writer.clone();
-        writer.artifact_tracker = Some(ownership.clone());
-        let operation_id = ready.built.operation_id().clone();
-        let catch_up_started = Instant::now();
-        let output = tokio::task::spawn_blocking(move || {
-            super::worker_runtime()?.block_on(flow_compactor::catch_up(
-                &worker_table,
-                &worker_schema,
-                &ready.base,
-                ready.built,
-                &store,
-                &counts,
-                &policy,
-                writer,
-                &limits,
-                &cache,
-                |deltas| {
-                    store.stage_deltas(&operation_id, deltas)?;
-                    Ok(())
-                },
-            ))
-        })
-        .await??;
         let plan_seal_started = Instant::now();
         self.publish_rewrite(
             &head,
             schema,
-            output,
+            prepared.output,
             RewriteCommit {
                 base: CommitBase::new(&head),
                 ownership,
-                output_data_sequence: Some(output_sequence),
-                build_snapshot_id,
-                deltas_staged: true,
-                worker_ms: ready.worker_ms,
+                output_data_sequence: Some(prepared.build_base.sequence_number),
+                build_snapshot_id: prepared.build_base.snapshot_id,
+                deltas_staged: false,
+                worker_ms: prepared.worker_ms,
                 prepare_started,
-                prepare_preflight_ms: catch_up_started
+                prepare_preflight_ms: plan_seal_started
                     .duration_since(prepare_started)
                     .as_secs_f64()
                     * 1000.0,
-                catch_up_ms: plan_seal_started
-                    .duration_since(catch_up_started)
-                    .as_secs_f64()
-                    * 1000.0,
+                catch_up_ms: prepared.catch_up_ms,
                 plan_seal_started,
             },
         )
@@ -351,7 +552,10 @@ fn replan_error(error: anyhow::Error) -> anyhow::Error {
     if error.is::<CatchUpRejected>()
         || matches!(
             error.downcast_ref::<flow_state_store::Error>(),
-            Some(flow_state_store::Error::SnapshotMismatch { .. })
+            Some(
+                flow_state_store::Error::SnapshotMismatch { .. }
+                    | flow_state_store::Error::ExactStateMismatch { .. }
+            )
         )
     {
         error.context(ReplanRequired)

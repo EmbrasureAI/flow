@@ -12,8 +12,9 @@ pub use publication::{
 mod maintenance;
 pub use maintenance::{
     BuildRegistration, DeleteRepairCursor, DeleteRewritePolicy, GarbagePolicy, GarbageProtection,
-    GarbageReport, Inventory, ReadyCompaction, RunningCompaction, TableMaintenance,
-    active_build_protection, discard_abandoned_builds,
+    GarbageReport, Inventory, PreparationWait, PreparedCompaction, ReadyCompaction,
+    RetiringCompactionPreparation, RunningCompaction, RunningCompactionPreparation,
+    TableMaintenance, active_build_protection, discard_abandoned_builds,
 };
 
 mod schema;

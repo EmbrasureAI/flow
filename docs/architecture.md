@@ -64,14 +64,16 @@ Workers receive a base snapshot and exact data/delete inputs, scan in bounded ba
 Data compaction selects a bounded data-file group without pulling every shared-delete target into it. The worker reads the applicable delete files once, filters each record using its original sequence and target identity, and stages a sorted, deduplicated set on disk. Selected data rows consume their positions; residual delete files preserve effective positions for unselected survivors. Data and residual replacements publish in one exact-base `replace` snapshot. Only selected data rows receive new index locations, so a minor L0 rewrite can leave an existing L1/L2 base physically unchanged.
 
 Optional data builds use a frozen RocksDB read view and durable BUILD ownership
-without holding the table's publication fence. At an idle table boundary, the
-coordinator validates snapshot ancestry and physical inputs, translates late
-position deletes to output positions, then seals the corrected plan as ordinary
-Prepared work. The daemon admits one such build within its existing worker
-budget and retains the strict path for invalidation or hard-pressure fallback.
-BUILD protects files and required history until the worker joins or ownership
-moves to Prepared. See [local compaction](local-compaction.md) for the proof,
-bounds and actual-file/service tests.
+without holding the table's publication fence. After build completion, a detached
+task captures exact catalog/index head H, validates ancestry and physical inputs,
+and translates late position deletes to output positions. The daemon briefly
+gates the next same-table epoch, then activates only if catalog identity/location
+and the complete `TableState` still equal H. Activation atomically installs the
+ordinary Building fence before staging and sealing Prepared. The preparation
+gate expires after 750 ms; its worker keeps BUILD and scratch while retiring in
+the background, without continuing to pause CDC. BUILD protects files and
+required history until the worker joins or ownership moves to Prepared. See
+[local compaction](local-compaction.md) for the proof, bounds and tests.
 
 Deletion density comes from live-row counts at the exact indexed snapshot. Low-density delete fanout triggers a separate bounded delete-only rewrite with no row-index deltas. Total delete-file count also contributes to debt, including dangling files; a fully dangling singleton can be removed with no output. The data-rewrite planner separately bounds delete inputs to 32 files, 32 MiB and one million positions by default. Exceeding a work budget preserves backpressure. File grouping respects the current unpartitioned spec. Z-order-aware compaction, distributed compaction protocols, HA and global autocompaction remain outside early scope; external compactor reconciliation remains required.
 

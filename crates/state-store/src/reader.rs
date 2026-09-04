@@ -1,8 +1,8 @@
 //! Current and snapshot index reads for bounded compaction workers.
 
 use crate::{
-    Error, PK, REVERSE, Result, StateStore, TABLES, TableState, decode, file_prefix, pk_key,
-    prefix_end,
+    Error, FILE_COUNTS, PK, REVERSE, Result, StateStore, TABLES, TableState, decode,
+    decode_file_count, file_prefix, pk_key, prefix_end,
 };
 use flow_model::{FileId, PrimaryKey, RowLocation, TableId};
 use rocksdb::{DB, Direction, IteratorMode, ReadOptions, SnapshotWithThreadMode};
@@ -41,6 +41,24 @@ impl IndexSnapshot<'_> {
     /// advance these without changing the catalog snapshot ID.
     pub fn table_state(&self) -> &TableState {
         &self.state
+    }
+
+    /// Exact live-row counts in input order at the captured table version.
+    pub fn file_live_row_counts(&self, files: &[FileId]) -> Result<Vec<u64>> {
+        let cf = self
+            .db
+            .cf_handle(FILE_COUNTS)
+            .expect("opened column family");
+        files
+            .iter()
+            .map(|file| {
+                self.snapshot
+                    .get_cf(&cf, file_prefix(&self.table, file))?
+                    .map(|bytes| decode_file_count(&bytes))
+                    .transpose()
+                    .map(|count| count.unwrap_or(0))
+            })
+            .collect()
     }
 }
 

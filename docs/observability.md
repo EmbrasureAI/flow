@@ -39,6 +39,10 @@ No separate export task is created.
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
 | `flow_compaction_finalization_actor_lane_hold_seconds` | Completed data-build finalization from actual table-lane reservation through cleanup and lane release |
+| `flow_compaction_preparation_handoff_actor_lane_hold_seconds` | Actor time used to validate and hand a completed build to detached preparation; separate from finalization |
+| `flow_compaction_publication_stall_seconds` | Same-table publication gate from preparation handoff through activation, invalidation or the 750 ms deadline |
+| `flow_compaction_preparations_total`, `flow_compaction_activations_total` | Detached preparation and exact activation outcomes, with fixed result labels |
+| `flow_compaction_candidate_invalidations_total` | Candidates retired before publication, labelled by preparation/activation stage and bounded reason |
 | `flow_external_reconciliations_total` | External snapshots successfully verified and durably applied to the row index, labelled by table and bounded reconciliation kind |
 | `flow_artifact_{files,bytes}_written_total` | Successfully finished data/delete artifacts, including attempts later invalidated |
 | `flow_garbage_delete_requests_total` | Conservative deletion requests against registered obsolete artifacts |
@@ -68,10 +72,11 @@ contribute successful-page observations.
 
 Preparation and application timings are nested diagnostics, not independent
 latency components to sum indiscriminately. `compaction_completed` retains its
-aggregate worker/preparation/publication fields and partitions preparation into
-preflight, catch-up and plan/seal. Catch-up includes direct staging of accepted
-index deltas; older builds staged them in plan/seal, so compare aggregate
-preparation when assessing that change. Strict rewrites report zero catch-up time.
+aggregate worker/preparation/publication fields. For concurrent builds, catch-up
+runs in detached preparation and is reported alongside activation diagnostics;
+it is not a serial component of the later coordinator interval. Accepted mappings
+remain in scratch during catch-up and enter the main store only after exact
+activation. Strict rewrites report zero catch-up time.
 `compaction_catch_up_completed` reports one successful inner catch-up pass with
 its operation, table, build snapshot and fenced head. Its exclusive fields sum
 to `inner_elapsed_ms`: `validation_setup_ms`, `late_delete_scan_stage_ms`,
@@ -140,6 +145,13 @@ publish/application intervals. Join the operation ID to
 `compaction_finalization_actor_lane_released`, whose `lane_hold_ms` begins at the
 daemon's busy-lane reservation and ends immediately after release. It includes
 task dispatch, retries, coordinator work, candidate cleanup and scratch removal.
+Its `publication_stall_ms` begins at the earlier preparation handoff and includes
+detached catch-up plus finalization. Deadline and failed-preparation stalls are
+reported by `compaction_preparation_deadline` or
+`compaction_preparation_discarded`; a timed-out worker can continue retiring after
+same-table CDC resumes. The handoff lane has its own event and histogram so it
+does not dilute finalization samples. Candidate invalidation events include stage,
+bounded reason and the complete error chain.
 `delete_rewrite_completed` similarly
 records admitted rows, scanned rows and produced file/row/byte totals with its
 operation and catalog snapshot. These file sizes exclude metadata artifacts and

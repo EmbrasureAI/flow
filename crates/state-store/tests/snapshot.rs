@@ -55,6 +55,89 @@ fn file_rows(index: &impl RowIndex, file: &str) -> Vec<(u64, PrimaryKey)> {
         .unwrap()
 }
 
+fn seed_table(store: &StateStore) -> TableState {
+    let initial = operation("seed", None, 10, 1);
+    store
+        .prepare(
+            initial.clone(),
+            [IndexDelta {
+                key: key(1),
+                expected: None,
+                replacement: Some(location("a", 0, 10)),
+            }],
+        )
+        .unwrap();
+    store.mark_committed(&initial.id, 100, 1).unwrap();
+    store.apply_committed(&initial.id).unwrap();
+    store.table_state(&TABLE).unwrap()
+}
+
+#[test]
+fn exact_prepare_fences_the_admitted_table_state_with_its_source_record() {
+    let directory = TempDir::new().unwrap();
+    let store = open(directory.path());
+    let expected = seed_table(&store);
+    let mut rewrite = operation("rewrite", Some(100), 10, 1);
+    rewrite.kind = OperationKind::Rewrite;
+
+    store
+        .begin_prepare_exact(
+            rewrite.clone(),
+            &expected,
+            Some((b"owned/rewrite", b"reservation")),
+        )
+        .unwrap();
+
+    let mut fenced = expected;
+    fenced.pending_operation = Some(rewrite.id.clone());
+    assert_eq!(store.table_state(&TABLE).unwrap(), fenced);
+    let record = store.operation(&rewrite.id).unwrap().unwrap();
+    assert_eq!(record.operation, rewrite);
+    assert_eq!(record.phase, flow_state_store::OperationPhase::Building);
+    assert_eq!(
+        store
+            .source_transaction(b"owned/rewrite")
+            .unwrap()
+            .as_deref(),
+        Some(b"reservation".as_slice())
+    );
+}
+
+#[test]
+fn exact_prepare_rejects_a_noop_lsn_advance_without_partial_writes() {
+    let directory = TempDir::new().unwrap();
+    let store = open(directory.path());
+    let expected = seed_table(&store);
+    let expected_rows = store.lookup_many(&TABLE, &[key(1)]).unwrap();
+    store.complete_noop(&TABLE, PgLsn(20), 1).unwrap();
+    let current = store.table_state(&TABLE).unwrap();
+    assert_eq!(current.snapshot_id, expected.snapshot_id);
+    assert_ne!(current.materialized_lsn, expected.materialized_lsn);
+
+    let mut rewrite = operation("stale-rewrite", Some(100), 10, 1);
+    rewrite.kind = OperationKind::Rewrite;
+    assert!(matches!(
+        store.begin_prepare_exact(
+            rewrite.clone(),
+            &expected,
+            Some((b"owned/stale", b"reservation")),
+        ),
+        Err(Error::ExactStateMismatch { table }) if table == TABLE
+    ));
+
+    assert_eq!(store.table_state(&TABLE).unwrap(), current);
+    assert!(store.operation(&rewrite.id).unwrap().is_none());
+    assert!(store.source_transaction(b"owned/stale").unwrap().is_none());
+    assert_eq!(store.lookup_many(&TABLE, &[key(1)]).unwrap(), expected_rows);
+    assert_eq!(file_rows(&store, "a"), [(0, key(1))]);
+    assert_eq!(
+        store
+            .file_live_row_counts(&TABLE, Some(100), &[FileId("a".into())])
+            .unwrap(),
+        [1]
+    );
+}
+
 #[test]
 fn snapshot_reads_survive_partial_cdc_apply_and_capture_noop_watermarks() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -96,6 +179,14 @@ fn snapshot_reads_survive_partial_cdc_apply_and_capture_noop_watermarks() {
                 pending_operation: None,
             }
         );
+        assert_eq!(
+            snapshot
+                .file_live_row_counts(
+                    &[FileId("a".into()), FileId("b".into()), FileId("a".into()),]
+                )
+                .unwrap(),
+            [3, 0, 3]
+        );
         let old_file = FileId("a".into());
         let mut reverse = assert_send(snapshot.file_rows(&TABLE, &old_file));
         assert_eq!(reverse.next().unwrap().unwrap(), (0, key(1)));
@@ -134,6 +225,25 @@ fn snapshot_reads_survive_partial_cdc_apply_and_capture_noop_watermarks() {
         assert!(!store.apply_committed_batch(&next.id).unwrap().complete);
         assert_eq!(file_rows(&store, "a"), [(2, key(3))]);
         assert!(matches!(
+            store.file_live_row_counts(
+                &TABLE,
+                Some(100),
+                &[FileId("a".into()), FileId("b".into())]
+            ),
+            Err(Error::SnapshotMismatch {
+                table: TABLE,
+                expected: Some(100),
+                actual: Some(100),
+                pending: Some(id),
+            }) if id == next.id
+        ));
+        assert_eq!(
+            snapshot
+                .file_live_row_counts(&[FileId("a".into()), FileId("b".into())])
+                .unwrap(),
+            [3, 0]
+        );
+        assert!(matches!(
             store.index_snapshot(&TABLE, Some(100)),
             Err(Error::SnapshotMismatch { pending: Some(id), .. }) if id == next.id
         ));
@@ -168,9 +278,21 @@ fn snapshot_reads_survive_partial_cdc_apply_and_capture_noop_watermarks() {
             file_rows(&snapshot, "a"),
             [(0, key(1)), (1, key(2)), (2, key(3))]
         );
+        assert_eq!(
+            snapshot
+                .file_live_row_counts(&[FileId("a".into()), FileId("b".into())])
+                .unwrap(),
+            [3, 0]
+        );
         let current = store.index_snapshot(&TABLE, Some(200)).unwrap();
         assert!(file_rows(&current, "a").is_empty());
         assert_eq!(file_rows(&current, "b"), [(0, key(1)), (1, key(4))]);
+        assert_eq!(
+            current
+                .file_live_row_counts(&[FileId("a".into()), FileId("b".into())])
+                .unwrap(),
+            [0, 2]
+        );
 
         store.complete_noop(&TABLE, PgLsn(30), 3).unwrap();
         let after_noop = store.index_snapshot(&TABLE, Some(200)).unwrap();
@@ -179,6 +301,18 @@ fn snapshot_reads_survive_partial_cdc_apply_and_capture_noop_watermarks() {
         assert_eq!(current.table_state().schema_version, 2);
         assert_eq!(after_noop.table_state().materialized_lsn, PgLsn(30));
         assert_eq!(after_noop.table_state().schema_version, 3);
+        assert_eq!(
+            snapshot
+                .file_live_row_counts(&[FileId("a".into()), FileId("b".into())])
+                .unwrap(),
+            [3, 0]
+        );
+        assert_eq!(
+            after_noop
+                .file_live_row_counts(&[FileId("a".into()), FileId("b".into())])
+                .unwrap(),
+            [0, 2]
+        );
         final_state = after_noop.table_state().clone();
         final_rows = after_noop
             .lookup_many(&TABLE, &[key(1), key(2), key(3), key(4)])

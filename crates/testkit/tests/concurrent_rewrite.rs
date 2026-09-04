@@ -3,8 +3,8 @@ mod fixture;
 use fixture::{Fixture, options, row, sorted};
 use flow_compactor::Policy;
 use flow_coordinator::{
-    DeleteRewritePolicy, ReadyCompaction, TableMaintenance, TablePublisher,
-    resolve_catalog_operation,
+    DeleteRewritePolicy, PreparationWait, ReadyCompaction, TableMaintenance, TablePublisher,
+    active_build_protection, resolve_catalog_operation,
 };
 use flow_iceberg_ext::{CommitBase, ManifestCache, RewriteFilesAction, SnapshotView};
 use flow_materializer::{DataWriter, WriterConfig};
@@ -12,6 +12,7 @@ use flow_model::{OperationId, PgLsn, Row, SourceId, Value};
 use flow_state_store::{Change, OperationKind, OperationPhase, PreparedOperation, StateStore};
 use flow_testkit::scan;
 use iceberg::{Catalog, spec::DataContentType, table::Table};
+use std::time::Duration;
 
 fn compaction_policy() -> Policy {
     Policy {
@@ -389,13 +390,263 @@ async fn catch_up_merges_overlapping_residuals_and_masks_into_bounded_cohorts() 
 async fn concurrent_build_catches_up_updates_deletes_key_moves_and_identical_reinsert() {
     let mut f = Fixture::new().await;
     let (ready, base, late) = build_with_late_changes(&mut f).await;
-    maintenance(&f)
-        .finish_compaction(&late, &f.schema, ready)
+    let maintenance = maintenance(&f);
+    let prepared = maintenance
+        .start_compaction_preparation(&late, &f.schema, ready)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(f.index.pending_operations().unwrap().is_empty());
+    maintenance
+        .activate_compaction(&late, &f.schema, prepared)
         .await
         .unwrap()
         .unwrap();
     let committed = f.catalog.load_table(late.identifier()).await.unwrap();
     verify(&f, &base, &late, &committed, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn noop_watermark_after_detached_preparation_replans_without_partial_publication() {
+    let mut f = Fixture::new().await;
+    cdc(&mut f, 90, vec![(16, Change::Insert(row(16)))]).await;
+    let head = f.head.clone();
+    let snapshot = head.metadata().current_snapshot_id();
+    let snapshot_count = head.metadata().snapshots().len();
+    let rows = sorted(scan(&head, &f.schema).await.unwrap());
+    let maintenance = maintenance(&f);
+    let ready = maintenance
+        .start_compaction(&head, &f.schema, f.scratch("noop-race-build"))
+        .await
+        .unwrap()
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let preparing = maintenance
+        .start_compaction_preparation(&head, &f.schema, ready)
+        .await
+        .unwrap();
+    let prepared = preparing.wait().await.unwrap();
+
+    // The completed preparation is anchored to the unfenced row index at LSN
+    // 90. Advancing only its source watermark must invalidate activation even
+    // though the catalog snapshot and all physical rows remain unchanged.
+    f.index
+        .complete_noop(&f.schema.table_id, PgLsn(100), f.schema.version)
+        .unwrap();
+    let operation = prepared.operation_id().clone();
+    let rejected = maintenance
+        .activate_compaction(&head, &f.schema, prepared)
+        .await
+        .unwrap_err();
+    assert!(
+        rejected.is::<flow_coordinator::ReplanRequired>(),
+        "{rejected:#}"
+    );
+
+    let unchanged = f.catalog.load_table(head.identifier()).await.unwrap();
+    assert_eq!(unchanged.metadata().current_snapshot_id(), snapshot);
+    assert_eq!(unchanged.metadata().snapshots().len(), snapshot_count);
+    assert_eq!(sorted(scan(&unchanged, &f.schema).await.unwrap()), rows);
+    let state = f.index.table_state(&f.schema.table_id).unwrap();
+    assert_eq!(state.snapshot_id, snapshot);
+    assert_eq!(state.materialized_lsn, PgLsn(100));
+    assert!(state.pending_operation.is_none());
+    assert!(f.index.operation(&operation).unwrap().is_none());
+    assert!(
+        f.index
+            .source_transactions_after(b"active-build/", None)
+            .next()
+            .is_none()
+    );
+
+    // A following CDC transaction proves that cleanup released the table.
+    cdc(&mut f, 110, vec![(10, Change::Update(updated(10)))]).await;
+    let after = sorted(scan(&f.head, &f.schema).await.unwrap());
+    assert!(after.contains(&updated(10)));
+    assert!(!after.contains(&row(10)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_cdc_after_detached_preparation_replans_without_leaking_publication_state() {
+    let mut f = Fixture::new().await;
+    cdc(&mut f, 90, vec![(16, Change::Insert(row(16)))]).await;
+    let base = f.head.clone();
+    let maintenance = maintenance(&f);
+    let ready = maintenance
+        .start_compaction(&base, &f.schema, f.scratch("cdc-race-build"))
+        .await
+        .unwrap()
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let prepared = maintenance
+        .start_compaction_preparation(&base, &f.schema, ready)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let operation = prepared.operation_id().clone();
+
+    // Preparation is complete but still owns no publication fence, so a real
+    // catalog and index advance must remain available to CDC.
+    cdc(
+        &mut f,
+        100,
+        vec![(10, Change::Update(updated(10))), (13, Change::Delete)],
+    )
+    .await;
+    let advanced = f.head.clone();
+    let advanced_state = f.index.table_state(&f.schema.table_id).unwrap();
+    let advanced_rows = sorted(scan(&advanced, &f.schema).await.unwrap());
+
+    let rejected = maintenance
+        .activate_compaction(&advanced, &f.schema, prepared)
+        .await
+        .unwrap_err();
+    assert!(
+        rejected.is::<flow_coordinator::ReplanRequired>(),
+        "{rejected:#}"
+    );
+
+    let unchanged = f.catalog.load_table(advanced.identifier()).await.unwrap();
+    assert_eq!(
+        unchanged.metadata().current_snapshot_id(),
+        advanced.metadata().current_snapshot_id()
+    );
+    assert_eq!(
+        f.index.table_state(&f.schema.table_id).unwrap(),
+        advanced_state
+    );
+    assert_eq!(
+        sorted(scan(&unchanged, &f.schema).await.unwrap()),
+        advanced_rows
+    );
+    assert!(f.index.operation(&operation).unwrap().is_none());
+    assert!(
+        f.index
+            .source_transactions_after(b"active-build/", None)
+            .next()
+            .is_none()
+    );
+
+    // A later source transaction proves the failed activation released every
+    // fence and marker needed by the ingest path.
+    cdc(&mut f, 110, vec![(14, Change::Update(updated(14)))]).await;
+    assert_eq!(
+        f.index
+            .table_state(&f.schema.table_id)
+            .unwrap()
+            .materialized_lsn,
+        PgLsn(110)
+    );
+    assert!(sorted(scan(&f.head, &f.schema).await.unwrap()).contains(&updated(14)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preparation_deadline_allows_cdc_before_join_and_retires_scratch_ownership() {
+    let mut f = Fixture::new().await;
+    cdc(&mut f, 90, vec![(16, Change::Insert(row(16)))]).await;
+    let base = f.head.clone();
+    let maintenance = maintenance(&f);
+    let scratch_name = "deadline-preparation-build";
+    let scratch_path = f.temp.path().join(scratch_name);
+    let scratch = f.scratch(scratch_name);
+    let scratch_lock = scratch.clone();
+    let ready = maintenance
+        .start_compaction(&base, &f.schema, scratch)
+        .await
+        .unwrap()
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+
+    // Give background preparation a real catalog and index advance to catch up.
+    cdc(&mut f, 100, vec![(10, Change::Update(updated(10)))]).await;
+    let late = f.head.clone();
+
+    // Hold the scratch writer after the data build so the background catch-up
+    // cannot finish before the zero-duration deadline is observed.
+    let (entered_lock, lock_entered) = std::sync::mpsc::channel();
+    let (release_lock, lock_released) = std::sync::mpsc::channel();
+    let table_id = f.schema.table_id;
+    let held_location = f.locations[0].clone();
+    let holding_lock = tokio::task::spawn_blocking(move || {
+        scratch_lock.put_position_deletes(
+            "deadline-test-lock",
+            &table_id,
+            std::iter::once_with(move || {
+                let _ = entered_lock.send(());
+                let _ = lock_released.recv();
+                held_location
+            }),
+        )
+    });
+    tokio::task::spawn_blocking(move || lock_entered.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    let preparing = maintenance
+        .start_compaction_preparation(&late, &f.schema, ready)
+        .await
+        .unwrap();
+    let retiring = match preparing.wait_for(Duration::ZERO).await.unwrap() {
+        PreparationWait::Deadline(retiring) => retiring,
+        PreparationWait::Ready(prepared) => {
+            let _ = release_lock.send(());
+            holding_lock.await.unwrap().unwrap();
+            prepared.discard().await.unwrap();
+            panic!("zero preparation budget unexpectedly completed the blocking worker")
+        }
+    };
+    let operation = retiring.operation_id().clone();
+
+    cdc(&mut f, 110, vec![(14, Change::Delete)]).await;
+    let advanced = f.head.clone();
+    let advanced_state = f.index.table_state(&f.schema.table_id).unwrap();
+    let advanced_rows = sorted(scan(&advanced, &f.schema).await.unwrap());
+    assert!(
+        active_build_protection(&f.index, &f.head, f.schema.table_id)
+            .unwrap()
+            .operations
+            .contains(&operation),
+        "retirement must retain build ownership until its worker is joined"
+    );
+
+    release_lock.send(()).unwrap();
+    holding_lock.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), retiring.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let unchanged = f.catalog.load_table(advanced.identifier()).await.unwrap();
+    assert_eq!(
+        unchanged.metadata().current_snapshot_id(),
+        advanced.metadata().current_snapshot_id()
+    );
+    assert_eq!(
+        f.index.table_state(&f.schema.table_id).unwrap(),
+        advanced_state
+    );
+    assert_eq!(
+        sorted(scan(&unchanged, &f.schema).await.unwrap()),
+        advanced_rows
+    );
+    assert!(f.index.operation(&operation).unwrap().is_none());
+    assert!(
+        f.index
+            .source_transactions_after(b"active-build/", None)
+            .next()
+            .is_none()
+    );
+    std::fs::remove_dir_all(&scratch_path).unwrap();
+    assert!(!scratch_path.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

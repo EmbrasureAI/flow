@@ -23,6 +23,10 @@ pub struct WorkerOutput {
     pub(crate) table_id: TableId,
 }
 impl WorkerOutput {
+    pub fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
     pub fn index_deltas(
         &self,
     ) -> flow_state_store::Result<impl Iterator<Item = flow_state_store::Result<IndexDelta>> + '_>

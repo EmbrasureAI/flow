@@ -153,6 +153,10 @@ impl BuildRegistration {
         self.writer.clone()
     }
 
+    pub(crate) fn validate_table(&self, table: &Table, table_id: TableId) -> Result<()> {
+        self.record.validate_table(table, table_id)
+    }
+
     pub(crate) fn writer(&self) -> Arc<WriterRegistration> {
         self.writer.clone()
     }

@@ -66,6 +66,8 @@ pub enum Error {
         actual: Option<i64>,
         pending: Option<OperationId>,
     },
+    #[error("table state changed before exact prepare for table {table:?}")]
+    ExactStateMismatch { table: TableId },
     #[error("state mutex poisoned; restart and recover before publishing")]
     Poisoned,
 }
@@ -409,6 +411,58 @@ impl StateStore {
         operation: PreparedOperation,
         source_record: Option<(&[u8], &[u8])>,
     ) -> Result<()> {
+        self.begin_prepare_checked(operation, source_record, |state, operation| {
+            if state.pending_operation.is_some() || state.snapshot_id != operation.base_snapshot_id
+            {
+                return Err(Error::InvalidState(
+                    "table is fenced or base snapshot does not match index".into(),
+                ));
+            }
+            if operation.last_lsn < state.materialized_lsn {
+                return Err(Error::InvalidState(
+                    "operation would regress materialized LSN".into(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    /// Atomically fence the exact table version admitted by a background build.
+    pub fn begin_prepare_exact(
+        &self,
+        operation: PreparedOperation,
+        expected: &TableState,
+        source_record: Option<(&[u8], &[u8])>,
+    ) -> Result<()> {
+        self.begin_prepare_checked(operation, source_record, |state, operation| {
+            if expected.pending_operation.is_some() {
+                return Err(Error::InvalidState(
+                    "exact prepare requires an unfenced expected table state".into(),
+                ));
+            }
+            if operation.base_snapshot_id != expected.snapshot_id
+                || operation.last_lsn != expected.materialized_lsn
+                || operation.schema_version != expected.schema_version
+            {
+                return Err(Error::InvalidState(
+                    "operation does not match the expected table state".into(),
+                ));
+            }
+            if state != expected {
+                return Err(Error::ExactStateMismatch {
+                    table: operation.table_id,
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn begin_prepare_checked(
+        &self,
+        operation: PreparedOperation,
+        source_record: Option<(&[u8], &[u8])>,
+        validate: impl FnOnce(&TableState, &PreparedOperation) -> Result<()>,
+    ) -> Result<()> {
         let _guard = self.lock()?;
         if self.operation(&operation.id)?.is_some() {
             return Err(Error::InvalidState(
@@ -416,16 +470,7 @@ impl StateStore {
             ));
         }
         let mut state = self.table_state(&operation.table_id)?;
-        if state.pending_operation.is_some() || state.snapshot_id != operation.base_snapshot_id {
-            return Err(Error::InvalidState(
-                "table is fenced or base snapshot does not match index".into(),
-            ));
-        }
-        if operation.last_lsn < state.materialized_lsn {
-            return Err(Error::InvalidState(
-                "operation would regress materialized LSN".into(),
-            ));
-        }
+        validate(&state, &operation)?;
         state.pending_operation = Some(operation.id.clone());
         let record = OperationRecord {
             operation,
@@ -1030,39 +1075,8 @@ impl StateStore {
         expected_snapshot: Option<i64>,
         files: &[FileId],
     ) -> Result<Vec<u64>> {
-        let snapshot = {
-            let _guard = self.lock()?;
-            self.0.db.snapshot()
-        };
-        let tables_cf = self.0.db.cf_handle(TABLES).expect("opened column family");
-        let state: TableState = snapshot
-            .get_cf(&tables_cf, table.0.to_be_bytes())?
-            .map(|bytes| decode(&bytes))
-            .transpose()?
-            .unwrap_or_default();
-        if state.pending_operation.is_some() || state.snapshot_id != expected_snapshot {
-            return Err(Error::SnapshotMismatch {
-                table: *table,
-                expected: expected_snapshot,
-                actual: state.snapshot_id,
-                pending: state.pending_operation,
-            });
-        }
-        let counts_cf = self
-            .0
-            .db
-            .cf_handle(FILE_COUNTS)
-            .expect("opened column family");
-        files
-            .iter()
-            .map(|file| {
-                snapshot
-                    .get_cf(&counts_cf, file_prefix(table, file))?
-                    .map(|bytes| decode_file_count(&bytes))
-                    .transpose()
-                    .map(|count| count.unwrap_or(0))
-            })
-            .collect()
+        self.index_snapshot(table, expected_snapshot)?
+            .file_live_row_counts(files)
     }
 
     /// Source-wide transaction ledger payloads. One key per transaction, never
