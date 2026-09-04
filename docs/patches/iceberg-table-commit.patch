@@ -1,0 +1,116 @@
+--- a/src/catalog/mod.rs
++++ b/src/catalog/mod.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -343,11 +344,11 @@
+ 
+ /// TableCommit represents the commit of a table in the catalog.
+ ///
+-/// The builder is marked as private since it's dangerous and error-prone to construct
+-/// [`TableCommit`] directly.
+-/// Users are supposed to use [`crate::transaction::Transaction`] to update table.
++/// Prefer [`crate::transaction::Transaction`] for supported operations. Extensions
++/// constructing commits directly must supply the validation requirements needed
++/// to protect their updates against concurrent catalog changes.
+ #[derive(Debug, TypedBuilder)]
+-#[builder(build_method(vis = "pub(crate)"))]
++#[builder(build_method(vis = "pub"))]
+ pub struct TableCommit {
+     /// The table ident.
+     ident: TableIdent,
+--- a/src/spec/table_metadata.rs
++++ b/src/spec/table_metadata.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -330,6 +331,16 @@
+             self.snapshot_by_id(r.snapshot_id)
+                 .unwrap_or_else(|| panic!("Snapshot id of ref {ref_name} doesn't exist"))
+         })
++    }
++
++    /// Get a snapshot reference, including its retention policy.
++    pub fn snapshot_reference(&self, ref_name: &str) -> Option<&SnapshotReference> {
++        self.refs.get(ref_name)
++    }
++
++    /// Iterate snapshot references, including their retention policies.
++    pub fn snapshot_references(&self) -> impl Iterator<Item = (&str, &SnapshotReference)> {
++        self.refs.iter().map(|(name, reference)| (name.as_str(), reference))
+     }
+ 
+     /// Return all sort orders.
+--- a/src/transaction/expire_snapshots.rs
++++ b/src/transaction/expire_snapshots.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -55,6 +56,8 @@
+     explicit_ids_to_remove: Vec<i64>,
+     older_than_ms: Option<i64>,
+     retain_last: Option<usize>,
++    protected_ids: HashSet<i64>,
++    protected_since_ms: Option<i64>,
+ }
+ 
+ impl ExpireSnapshotsAction {
+@@ -63,6 +66,8 @@
+             explicit_ids_to_remove: vec![],
+             older_than_ms: None,
+             retain_last: None,
++            protected_ids: HashSet::new(),
++            protected_since_ms: None,
+         }
+     }
+ 
+@@ -98,6 +103,22 @@
+         self
+     }
+ 
++    /// Protect snapshots used by an in-progress operation or checkpoint. These
++    /// protections take precedence over explicit and age-based expiration, and
++    /// keep references whose heads are protected from aging out.
++    pub fn protect_snapshots(mut self, snapshot_ids: impl IntoIterator<Item = i64>) -> Self {
++        self.protected_ids.extend(snapshot_ids);
++        self
++    }
++
++    /// Preserve a minimum reader window across every branch. Evaluated against
++    /// the refreshed metadata on every attempt, even when a branch has a shorter
++    /// configured retention window.
++    pub fn protect_newer_than_ms(mut self, timestamp_ms: i64) -> Self {
++        self.protected_since_ms = Some(timestamp_ms);
++        self
++    }
++
+     /// Resolves the snapshots and refs to remove, following Java `RemoveSnapshots.internalApply`.
+     fn plan(&self, table: &Table, properties: &TableProperties) -> Result<ExpirePlan> {
+         // Matches Java `RemoveSnapshots.retainLast`, which requires at least one snapshot.
+@@ -125,6 +146,7 @@
+         let mut retained_refs: Vec<&SnapshotReference> = vec![];
+         for (ref_name, snapshot_ref) in &metadata.refs {
+             if ref_name == MAIN_BRANCH
++                || self.protected_ids.contains(&snapshot_ref.snapshot_id)
+                 || !Self::ref_aged_out(metadata, snapshot_ref, now, properties.max_ref_age_ms)
+             {
+                 retained_refs.push(snapshot_ref);
+@@ -207,7 +229,11 @@
+             }
+         }
+ 
+-        let mut ids_to_remove: Vec<i64> = expiring_ids.into_iter().collect();
++        let mut ids_to_remove: Vec<i64> = expiring_ids.into_iter().filter(|id| {
++            !self.protected_ids.contains(id)
++                && !self.protected_since_ms.is_some_and(|cutoff| metadata.snapshot_by_id(*id)
++                    .is_some_and(|snapshot| snapshot.timestamp_ms() >= cutoff))
++        }).collect();
+         ids_to_remove.sort_unstable();
+         removed_ref_names.sort();
+         Ok(ExpirePlan {

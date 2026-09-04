@@ -1,0 +1,28 @@
+--- a/src/writer/file_writer/parquet_writer.rs
++++ b/src/writer/file_writer/parquet_writer.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -342,6 +343,20 @@
+ }
+ 
+ impl ParquetWriter {
++    /// Flush the current row group without closing the file.
++    ///
++    /// Callers can enforce logical input byte limits before appending another
++    /// batch, independently of Parquet's estimated encoded-size threshold.
++    pub async fn flush_row_group(&mut self) -> Result<()> {
++        if let Some(writer) = &mut self.inner_writer {
++            writer.flush().await.map_err(|err| {
++                Error::new(ErrorKind::Unexpected, "Failed to flush parquet row group.")
++                    .with_source(err)
++            })?;
++        }
++        Ok(())
++    }
++
+     /// Converts parquet files to data files
+     #[allow(dead_code)]
+     pub(crate) async fn parquet_files_to_data_files(

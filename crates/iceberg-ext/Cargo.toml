@@ -1,0 +1,19 @@
+[package]
+name = "flow-iceberg-ext"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iceberg.workspace = true
+futures.workspace = true
+uuid.workspace = true
+serde.workspace = true
+moka = { version = "0.12", features = ["future"] }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

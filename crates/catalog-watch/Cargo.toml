@@ -1,0 +1,17 @@
+[package]
+name = "flow-catalog-watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flow-model.workspace = true
+flow-state-store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

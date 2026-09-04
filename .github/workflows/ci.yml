@@ -1,0 +1,30 @@
+name: Rust
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
+      - run: cargo test --locked --workspace --all-targets
+      - run: python3 -m unittest discover -s tests/production -p test_cost_report.py -v
+      - run: python3 -m unittest discover -s tests/production -p test_benchmark_store.py -v
+      - run: cargo run --locked -p flow-daemon -- --config examples/flow.toml check
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.94.0 check --locked --workspace --all-targets

@@ -1,0 +1,173 @@
+# Local concurrent data compaction
+
+Status: core integration and the seven-phase live concurrency/deadline gate pass.
+Release workload qualification is pending. This addresses measured data-rewrite
+occupancy of the table lane. It introduces no distributed workers, HA, global
+compaction service or sort/Z-order requirement.
+
+The existing strict rewrite remains the fallback. Optional data builds can run
+while the table continues publishing CDC. Delete-only, manifest and retention
+work retain their existing paths.
+
+## Durable and public boundaries
+
+1. While the table actor is idle, choose bounded inputs at indexed snapshot S.
+   Persist artifact reservations and a nonfencing BUILD record before launching
+   the worker or issuing any PUT. BUILD protects the operation's files and S's
+   descendant history. It is separate
+   from the normal Building/Prepared operation that fences a table.
+2. The blocking worker captures an immutable RocksDB read view and its complete
+   table state at S, then acknowledges capture before the actor resumes CDC.
+   The read view stays scoped to that worker; no self-referential storage or
+   unsafe code is needed.
+3. Build selected live data and the complete original-to-replacement row mapping
+   against S. Payloads, delete staging and mappings remain bounded or disk-backed.
+   The worker cannot commit a catalog change or modify the live row index.
+4. Once the worker finishes, finalize only at an idle table boundary. Reconcile
+   external maintenance and acquire an exact current indexed head H. Require S
+   ancestry, unchanged selected data identities and unchanged original delete
+   inputs; additive late position deletes and unrelated appends are permitted.
+5. Without an effective late position delete, retain an output row's index delta
+   only if its old location still equals the current mapping. With such a delete,
+   require either no current key or a newer source-LSN mapping outside the
+   selected inputs. Translate the deletion to the
+   new output position and omit that stale index delta. Row-version comparison
+   alone is insufficient because delete/reinsert can reset a row version.
+   Stage accepted mappings directly into the fenced Building operation in bounded
+   batches. A later failure leaves unpublished partial work for discard; a new H
+   requires a fresh operation. Finalization does not rescan accepted mappings.
+6. Rebuild residual deletes for unselected surviving data using original sequence
+   applicability, and add the translated output masks. New data uses S's data
+   sequence; delete outputs use the maximum removed delete sequence. Persist this
+   exact corrected plan and filtered deltas as ordinary Prepared work at H before
+   POST. Existing exact-head catalog validation and ambiguous-outcome recovery
+   apply. Never redo catch-up after an unknown commit outcome.
+7. Remove BUILD only after Prepared is durable, or after a failed/cancelled worker
+   has actually finished. Dropping a blocking-task handle is not proof of join.
+   Shutdown retains BUILD; startup discards abandoned BUILD records before actors
+   resume, leaving registered artifacts for existing protected GC and grace. Startup
+   also removes abandoned UUID scratch stores after durable operation recovery.
+
+The daemon admits one local build globally within the configured table worker
+budget, keeping its reservation through finalization. With only one table worker,
+it uses the strict path. Library callers must serialize one build per table.
+A completed candidate receives a table boundary to finalize. Hard reader pressure
+may defer queued CDC while a candidate finishes, releasing the actor so finalization
+cannot deadlock. Invalidated or expired work returns to the strict bounded path;
+publication never bypasses hard debt. The worker wait requests cancellation after
+30 seconds and still joins the actual worker before releasing ownership; this is
+not a hard deadline for an in-flight I/O call. Catch-up accepts at most 256
+intervening snapshots and applies the configured delete-input file, byte and row
+limits before staging. The Parquet read/write admission limits also apply.
+
+Catch-up also caps each mapping batch by the existing row limit and the smaller
+writer batch/row-group byte budget. It charges decoded keys, locations, paths
+and partition bytes; one decoded lookahead and storage buffers remain outside
+that payload count. One scoped thread can stage a batch while the caller checks
+the next at H. It does not change authoritative row mappings. The scope always
+joins staging before returning an error or allowing Building cleanup; this adds
+no detached work or new recovery state.
+
+Blocking maintenance workers share one lazily started, process-lifetime I/O
+runtime with one driver thread. Row processing stays on the existing blocking
+workers. This lifetime matches
+[OpenDAL 0.57's global HTTP client](https://github.com/apache/opendal/blob/1e0fc73190afb7e221c7badda7ef43fe40592940/core/core/src/raw/http_util/client.rs#L50-L103):
+[reqwest 0.13.4](https://github.com/seanmonstar/reqwest/blob/11489b34eda6d32b15ad4033e62beba2ee401350/src/async_impl/client.rs#L940)
+uses [Hyper's Tokio executor](https://github.com/hyperium/hyper-util/blob/b23a13e2b7ee73e15ba008cd9b19dcd2d3861957/src/rt/tokio.rs#L105-L116),
+which starts pooled connection tasks on the runtime handling the request.
+Temporary worker runtimes could drop those tasks while another worker reused
+the connection. The shared driver keeps worker-created connections and retry
+timers alive between jobs and after main-runtime shutdown. Connections opened on
+the main runtime can still require normal retry when that runtime stops. None of
+this retires BUILD or substitutes for an actual worker join; bounded process
+shutdown and restart recovery remain unchanged. The actual pooled-HTTP regression
+holds a request across the first worker's completion and parent shutdown, then
+releases the response and joins the surviving worker. It fails with the former
+temporary-runtime helper and passes with the shared driver.
+
+## Bounded delete dependencies
+
+The planner tries feasible subsets without increasing data or delete read budgets.
+Position-delete files carry exact full-path bounds, and a data rewrite emits at
+most eight ordered residual ranges. This avoids charging a single broad residual
+to every older data file when narrower metadata can exclude it.
+
+When no useful data group fits, a repair pass reads one individually admissible
+shared delete file and counts its effective positions using disk-backed staging.
+It can isolate one blocked target into at most three ordered ranges. Publication
+requires that target's complete prospective delete-file, byte and row charges to
+fit the existing limits. An unhelpful pass publishes nothing. A caller-owned
+cursor remembers checked inputs across retries at the same table UUID and head;
+new heads reset it, and I/O errors do not consume a candidate. Exhaustion waits
+for changed catalog state or external maintenance without rereading failed inputs.
+Ordinary delete consolidation also rejects output that would make a currently
+admissible data target exceed those limits, preserving progress across restart.
+
+## Validation
+
+The real RocksDB, Parquet/Avro and Iceberg-reader integration gates cover:
+
+- A captured index view remains at S through concurrent partial and completed H
+  application, including reverse mappings and key moves.
+- Actual Parquet/Avro and Iceberg scans verify late update, delete, key move,
+  delete/reinsert, unaffected rows, sequence filtering and retained historical rows.
+- Replaced selected data files or original delete files cancel safely, including
+  delete consolidation that leaves every data-file identity unchanged.
+  Successful commit response loss, restart and index loss recover the exact
+  corrected Prepared plan. A failure after the first accepted batch leaves
+  Building work unpublished; reopen, discard and a newer-H source delete verify
+  that a fresh rewrite cannot reuse the partial mapping or resurrect that row.
+  A held real staging write verifies that the next lookup can run concurrently
+  and that its failure cannot return before staging joins. Wide-key admission
+  verifies byte splits and oversized lookahead against reopened scratch data.
+- BUILD protects GC/history, survives index generation replacement, and becomes
+  collectible only after join/promotion or startup abandonment and the normal grace.
+- Delete dependency repair covers alternate targets from one staged input,
+  alternate inputs, exhaustion without repeated object reads, lost-response
+  recovery and subsequent bounded data compaction. Ordinary consolidation
+  preserves dependency locality before and after index reopen.
+
+[Concurrent-compaction-04](../target/production-concurrent-compaction-04/report.json)
+passed the same seven phases on release16 after one-pass staging and independent
+worker runtimes. Cancellation requested at 30.003 seconds retained ownership
+until actual join at build age 33.021 seconds. SIGTERM exited 0 in 1.030 seconds
+with I/O held; restart restored exact 36,089 orders and 17 accounts and retained
+both historical row streams. No worker panics were logged. The
+[validation report](validation.md) records the binary digest and final watermarks.
+
+The historical [concurrent-compaction-03](../target/production-concurrent-compaction-03/report.json)
+passed seven phases on release14
+`b8f430122b6b02d3a2e6c4fedd107bf1a28557790be3793537f6237869d5f2bf`.
+Cancellation was requested at 30.003 seconds with durable BUILD ownership
+verified. The read remained held for 32.991 seconds after observation; actual
+worker join and retirement occurred at build age 37.038 seconds, after release. Scratch stayed
+until join, the cancelled operation never published, and the same daemon resumed
+CDC and ACK with exact current and historical rows. The later SIGTERM exited
+successfully in 11 ms; restart reclaimed the abandoned BUILD and scratch and recovered
+36,089 orders and 17 accounts. Initial history retained 36,096 rows; deadline
+build history retained 36,093. Final status was stopped with zero pending work and
+received/journal/materialized watermarks equal at `7/F4478BE8`. The five transport
+errors were deliberately held GETs; there were no catalog errors.
+
+The historical [concurrent-compaction-02](../target/production-concurrent-compaction-02/report.json)
+passed all six live phases on immutable release12
+`0ebc7471c1edd8f792fcec846e37bcac17b6ba2158b8984161964059290cb6f5`.
+An actual S3 GET remained held while CRUD and ACK progressed; the result contained
+eight translated delete masks and preserved exact current and historical rows.
+Default hard debt paused publication and ACK while capture continued. SIGTERM
+exited successfully in 11 ms with the read held. Restart retired the abandoned
+BUILD, removed its scratch directory and recovered exact 36,091 orders and 17
+accounts. The sole transport error was the deliberately canceled held GET;
+no catalog errors occurred. The earlier debug01 report remains retained.
+
+The failed bounded rates must be re-run before a performance claim. Retain the
+original failures and the separate 24-hour qualification requirement.
+
+Iceberg's [scan-planning rules](https://iceberg.apache.org/spec/#scan-planning)
+apply position deletes when the data sequence is at most the delete sequence and
+the physical path/position matches. Retaining an old data sequence alone cannot
+retarget position deletes after a rewrite. The translated masks and exact current
+head are this protocol's additional proof. Apache's
+[rewrite API](https://iceberg.apache.org/javadoc/1.4.3/org/apache/iceberg/RewriteFiles.html)
+supports explicit data sequences and validates that replaced inputs remain live;
+this service must additionally preserve its physical-row index and late changes.

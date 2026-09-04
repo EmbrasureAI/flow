@@ -1,0 +1,22 @@
+[package]
+name = "flow-materializer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flow-model.workspace = true
+flow-iceberg-ext.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+iceberg.workspace = true
+parquet.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

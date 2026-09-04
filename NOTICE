@@ -1,0 +1,15 @@
+Embrasure Flow
+
+This product includes Apache Iceberg Rust.
+Copyright 2023-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+
+Iceberg Rust and its REST catalog contain local modifications described in
+vendor/iceberg/LOCAL_CHANGES.md and vendor/iceberg-catalog-rest/LOCAL_CHANGES.md.
+
+The binary distribution includes third-party license and copyright notices
+under /usr/share/licenses/embrasure-flow. Its index.json identifies the locked
+Rust dependencies and the included native-library notices. Debian package
+copyright and license texts remain under /usr/share/doc in the container.

@@ -1,0 +1,28 @@
+[package]
+name = "flow-compactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flow-model.workspace = true
+flow-state-store.workspace = true
+flow-materializer.workspace = true
+flow-iceberg-ext.workspace = true
+iceberg.workspace = true
+parquet.workspace = true
+arrow-array.workspace = true
+bytes.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
