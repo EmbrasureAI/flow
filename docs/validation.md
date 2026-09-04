@@ -6,6 +6,16 @@ Validation follows the complete path from PostgreSQL commit through durable capt
 
 Run `cargo test --locked --workspace --all-targets`, `cargo fmt --all --check`, and `cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings`. Project integration tests use real RocksDB databases, journal segments, Parquet and Avro files, the stock Iceberg Rust reader, scripted wire peers and child-process exits. Vendored Apache source may emit existing upstream warnings. A test count is not an acceptance contract; use the complete gate against the exact revision being released.
 
+The release30 candidate removes owned path and partition allocation while
+checking current physical rows during index apply. Its
+[full Rust gate](../target/release30-validation/) passes 129 active tests across
+40 test binaries, strict Clippy, formatting, the release build and Rust 1.94;
+one existing test remains ignored. A private codec test proves that the borrowed
+view has the exact `RowLocation` bincode shape and rejects truncated or invalid
+UTF-8 values. The [actual-RocksDB comparison](../target/apply-borrow-profile-29/assessment.md)
+passes all twelve accepted/obsolete, checkpoint and reopen cases with unchanged
+durable bytes.
+
 Release29 adds bounded current-epoch memory collapse with complete disk replay on
 capacity exhaustion. Its [full Rust gate](../target/release29-validation-02/report.json)
 passes 128 active tests, strict Clippy, formatting, the release build and Rust 1.94;

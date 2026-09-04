@@ -82,6 +82,14 @@ compaction work prevent treating either overall result as an isolated buffer
 comparison. Retained arrival and phase records guide the next change; thresholds
 and the bounded-v2 measurement protocol stay fixed.
 
+The first focused index-apply change removes duplicate owned decoding of current
+file paths and partitions without changing the durable representation. Its
+[twelve-sample actual-RocksDB comparison](../target/apply-borrow-profile-29/assessment.md)
+passes exact forward/reverse/count/checkpoint/reopen checks. Median apply time
+improves 1.92% with one file and 3.64% with 256 files; obsolete apply improves
+4.35% and 4.79%. The full release gate passes 129 active tests. This is retained
+as a bounded improvement and does not qualify the failed service control.
+
 No sustained 50k, 100-table or 24-hour qualification is claimed. The separate
 [WAL check](../target/production-wal-overhead-01/assessment.md) and
 [pinned reader diagnostic](../target/production-reader-diagnostics-27-01/assessment.md)
@@ -91,7 +99,7 @@ by bounded-v2; final local watermarks must not be relabeled as that measurement.
 
 ## Remaining sequence
 
-1. Resolve the measured service critical path using release29's retained arrival, publication and compaction records. The buffer is exercised in every runtime epoch and reduces collapse work, but the service still misses the source, catalog and reader gates. Separate source-admission stalls from table-lane occupancy and physical maintenance amplification before selecting the next focused change. The rejected [atomic-flush experiment](../target/atomic-flush-profile-28/assessment.md) remains rejected. Preserve physical-head validation, journal replay, exact Prepared ownership and existing workload thresholds; speculative next-epoch reservation remains deferred.
+1. Resolve the measured service critical path using release29's retained arrival, publication and compaction records. The buffer is exercised in every runtime epoch and reduces collapse work, but the service still misses the source, catalog and reader gates. The borrowed index view removes one measured allocation source but its isolated 1.92–3.64% apply improvement is too small to assume service qualification. Continue separating source-admission stalls, table-lane occupancy and physical maintenance amplification before the next focused change. The rejected [atomic-flush experiment](../target/atomic-flush-profile-28/assessment.md) remains rejected. Preserve physical-head validation, journal replay, exact Prepared ownership and existing workload thresholds; speculative next-epoch reservation remains deferred.
 2. Repeat the measured workloads after a supported optimization, preserving the local build/catch-up protocol, measurement protocol and resource budgets. Once the 50k and 100-table cases meet their gates, extend the same artifact to the remaining workload dimensions.
 3. Use the validated disk-backed harness for subsequent workloads and retain its measurement protocol. The seven-phase composite-key and capture-quota service gate passes on release23, including crash/rebuild, acknowledgement fencing and same-slot recovery. Preserve existing format compatibility; the rejected dictionary experiment does not require a new format-upgrade campaign.
 4. Extend source-version, reader-version and storage/catalog coverage beyond the recorded gates. Real-source tests cover PostgreSQL 14.24, 15.19, 16.15, 17.11 and 18.6; reader results apply to the exact versions in validation. Extend failure and retention checks to deployment conditions.

@@ -119,6 +119,49 @@ pub struct IndexDelta {
     pub replacement: Option<RowLocation>,
 }
 
+// This mirrors RowLocation's durable bincode shape while borrowing its variable-size
+// fields from a pinned RocksDB value. `matches` exhaustively destructures RowLocation so
+// adding a field cannot silently weaken the apply compare-and-swap check.
+#[derive(Debug, Serialize, Deserialize)]
+struct BorrowedFileId<'a>(#[serde(borrow)] &'a str);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BorrowedRowLocation<'a> {
+    #[serde(borrow)]
+    data_file_id: BorrowedFileId<'a>,
+    row_position: u64,
+    data_sequence_number: i64,
+    spec_id: i32,
+    #[serde(borrow)]
+    partition: &'a [u8],
+    source_commit_lsn: PgLsn,
+    row_version: u64,
+    row_fingerprint: [u8; 16],
+}
+
+impl BorrowedRowLocation<'_> {
+    fn matches(&self, expected: &RowLocation) -> bool {
+        let RowLocation {
+            data_file_id,
+            row_position,
+            data_sequence_number,
+            spec_id,
+            partition,
+            source_commit_lsn,
+            row_version,
+            row_fingerprint,
+        } = expected;
+        self.data_file_id.0 == data_file_id.0
+            && self.row_position == *row_position
+            && self.data_sequence_number == *data_sequence_number
+            && self.spec_id == *spec_id
+            && self.partition == partition
+            && self.source_commit_lsn == *source_commit_lsn
+            && self.row_version == *row_version
+            && self.row_fingerprint == *row_fingerprint
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationPhase {
     Building,
@@ -775,12 +818,16 @@ impl StateStore {
                 });
                 (owner, targets.next().expect("one target per replacement"))
             });
-            let current = current?.map(|value| decode(&value)).transpose()?;
-            if current != delta.expected {
+            let current = current?;
+            let current = current
+                .as_deref()
+                .map(decode_borrowed_row_location)
+                .transpose()?;
+            if !matches_expected(current.as_ref(), delta.expected.as_ref()) {
                 // Never overwrite an ingestion version from after the worker's
                 // read. Catalog validation is still mandatory before this point.
                 if record.operation.kind == OperationKind::Rewrite
-                    && is_obsolete(&current, &delta.expected)
+                    && is_obsolete(current.as_ref(), delta.expected.as_ref())
                 {
                     obsolete += 1;
                     continue;
@@ -1319,6 +1366,9 @@ fn durable_write() -> WriteOptions {
 fn decode<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
     Ok(bincode::deserialize(value)?)
 }
+fn decode_borrowed_row_location(value: &[u8]) -> Result<BorrowedRowLocation<'_>> {
+    Ok(bincode::deserialize(value)?)
+}
 fn decode_file_count(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes.try_into().map_err(|_| {
         Error::RecoveryRequired("invalid per-file live-row count; rebuild the index".into())
@@ -1368,7 +1418,17 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     }
     None
 }
-fn is_obsolete(current: &Option<RowLocation>, expected: &Option<RowLocation>) -> bool {
+fn matches_expected(
+    current: Option<&BorrowedRowLocation<'_>>,
+    expected: Option<&RowLocation>,
+) -> bool {
+    match (current, expected) {
+        (None, None) => true,
+        (Some(current), Some(expected)) => current.matches(expected),
+        _ => false,
+    }
+}
+fn is_obsolete(current: Option<&BorrowedRowLocation<'_>>, expected: Option<&RowLocation>) -> bool {
     match (current, expected) {
         // Absence alone is not a durable proof of a newer source delete.
         (None, Some(_)) => false,
@@ -1377,5 +1437,53 @@ fn is_obsolete(current: &Option<RowLocation>, expected: &Option<RowLocation>) ->
                 && current.row_version > expected.row_version
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_row_location_preserves_codec_and_malformed_boundaries() {
+        let location = RowLocation {
+            data_file_id: FileId("s3://bucket/δ\0/data.parquet".into()),
+            row_position: u64::MAX - 1,
+            data_sequence_number: -7,
+            spec_id: -3,
+            partition: vec![0, 255, 1, 128],
+            source_commit_lsn: PgLsn(u64::MAX - 2),
+            row_version: u64::MAX - 3,
+            row_fingerprint: [0xa5; 16],
+        };
+        let encoded = bincode::serialize(&location).unwrap();
+        let borrowed = decode_borrowed_row_location(&encoded).unwrap();
+        assert!(borrowed.matches(&location));
+        assert_eq!(bincode::serialize(&borrowed).unwrap(), encoded);
+
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(&[0xde, 0xad]);
+        assert_eq!(
+            bincode::deserialize::<RowLocation>(&trailing).unwrap(),
+            location
+        );
+        assert!(
+            decode_borrowed_row_location(&trailing)
+                .unwrap()
+                .matches(&location)
+        );
+
+        let mut invalid_utf8 = encoded.clone();
+        let path_start = invalid_utf8
+            .windows(b"s3://".len())
+            .position(|bytes| bytes == b"s3://")
+            .unwrap();
+        invalid_utf8[path_start] = 0xff;
+        assert!(bincode::deserialize::<RowLocation>(&invalid_utf8).is_err());
+        assert!(decode_borrowed_row_location(&invalid_utf8).is_err());
+
+        let truncated = &encoded[..encoded.len() - 1];
+        assert!(bincode::deserialize::<RowLocation>(truncated).is_err());
+        assert!(decode_borrowed_row_location(truncated).is_err());
     }
 }

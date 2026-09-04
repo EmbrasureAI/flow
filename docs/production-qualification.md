@@ -1148,8 +1148,8 @@ cause. Catalog p95/p99 are 6.750/7.222 seconds, final drain is 5.906 seconds and
 reader slowdown is 2.271×. These fail the original gates. Final server-side
 PostgreSQL acknowledgement remains unmeasured.
 
-All 156 runtime epochs use the memory path. Accepted retention is 1.945–24.339MiB,
-with a23.876 MiB median and no fallback. Measured-window collapse occupancy falls
+All 156 runtime epochs use the memory path. Accepted retention is 1.945–24.339 MiB,
+with a 23.876 MiB median and no fallback. Measured-window collapse occupancy falls
 from 12.537 seconds in release28 to 6.369 seconds in release29. This confirms the
 buffer is active and reducing its intended work, but does not explain or erase
 the end-to-end failure.
@@ -1164,3 +1164,27 @@ path is the next focused target: its process-lifetime nested time increases for
 both ingestion and rewrites while lock wait remains below 1 ms. This is a measured
 location for further work, not proof that CPU, RocksDB I/O or allocation is the
 cause. One postfinal build remains incomplete and excluded from committed totals.
+
+## Borrowed index-row comparison
+
+The first release30 candidate changes only the current-row decode inside
+`StateStore::apply_batch`. A private serde view borrows the file path and
+partition from the pinned RocksDB value, compares every `RowLocation` field and
+then leaves reverse ownership, file counts, cursor updates and the durable write
+batch on the existing owned delta. Codec tests require byte-for-byte
+reserialization and matching trailing, truncated and invalid UTF-8 behavior.
+
+The [finite comparison](../target/apply-borrow-profile-29/assessment.md) runs
+twelve serial actual-RocksDB samples across one-file and 256-file layouts. Each
+sample applies 98,304 accepted replacements and 24,576 obsolete rewrite rows in
+1,024-row batches, then verifies every forward row, reverse owner and file count
+through checkpoint restore and controlled reopen. Median total apply time changes
+from 204.644 to 200.717 ms (-1.92%) with one file and 381.530 to 367.624 ms
+(-3.64%) with 256 files. Obsolete apply improves 4.35% and 4.79%. SST byte counts
+and control revisions are identical within each layout.
+
+The candidate passes formatting, 129 active workspace tests across 40 binaries,
+strict Clippy, the release build and Rust 1.94. The change is retained as a small
+allocation reduction. It does not explain release29's full service regression or
+qualify source admission, catalog latency, reader slowdown or final PostgreSQL
+acknowledgement.
