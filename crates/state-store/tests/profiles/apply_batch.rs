@@ -18,53 +18,75 @@ const SETUP_BATCH_ROWS: usize = 1_024;
 
 #[derive(Clone, Copy)]
 enum Scenario {
-    Mixed,
-    Wide,
+    Compaction,
+    MixedUpdateDelete,
+    WideCompaction,
 }
 
 impl Scenario {
     fn configured() -> Self {
         match std::env::var("FLOW_STATE_APPLY_PROFILE_SCENARIO")
-            .unwrap_or_else(|_| "mixed".into())
+            .unwrap_or_else(|_| "compaction".into())
             .as_str()
         {
-            "mixed" => Self::Mixed,
-            "wide" => Self::Wide,
-            value => panic!("FLOW_STATE_APPLY_PROFILE_SCENARIO must be mixed or wide, got {value}"),
+            "compaction" => Self::Compaction,
+            "mixed_update_delete" => Self::MixedUpdateDelete,
+            "wide_compaction" => Self::WideCompaction,
+            value => panic!(
+                "FLOW_STATE_APPLY_PROFILE_SCENARIO must be compaction, mixed_update_delete, or wide_compaction, got {value}"
+            ),
         }
     }
 
     fn name(self) -> &'static str {
         match self {
-            Self::Mixed => "mixed",
-            Self::Wide => "wide",
+            Self::Compaction => "compaction",
+            Self::MixedUpdateDelete => "mixed_update_delete",
+            Self::WideCompaction => "wide_compaction",
         }
+    }
+
+    fn is_wide(self) -> bool {
+        matches!(self, Self::WideCompaction)
+    }
+
+    fn is_delete(self, row: u64) -> bool {
+        matches!(self, Self::MixedUpdateDelete) && row.is_multiple_of(10)
+    }
+
+    fn rewrite_lsn(self) -> PgLsn {
+        if matches!(self, Self::MixedUpdateDelete) {
+            REWRITE_LSN
+        } else {
+            SEED_LSN
+        }
+    }
+
+    fn logical_generation(self) -> u64 {
+        u64::from(matches!(self, Self::MixedUpdateDelete))
+    }
+
+    fn lookup_chunk_rows(self) -> u64 {
+        if self.is_wide() { 256 } else { 4_096 }
     }
 
     fn key(self, row: u64) -> PrimaryKey {
-        match self {
-            Self::Mixed => PrimaryKey(row.to_be_bytes().to_vec()),
-            Self::Wide => {
-                let len = 1024 + bounded_hash(row, 3_073);
-                let mut key = patterned_bytes(len, row ^ 0x7a5b_d911);
-                key[..size_of::<u64>()].copy_from_slice(&row.to_be_bytes());
-                PrimaryKey(key)
-            }
+        if self.is_wide() {
+            let len = 1024 + bounded_hash(row, 3_073);
+            let mut key = patterned_bytes(len, row ^ 0x7a5b_d911);
+            key[..size_of::<u64>()].copy_from_slice(&row.to_be_bytes());
+            PrimaryKey(key)
+        } else {
+            PrimaryKey(row.to_be_bytes().to_vec())
         }
     }
 
-    fn partition(self, row: u64, generation: u64) -> Vec<u8> {
-        match self {
-            Self::Mixed => format!(
-                "tenant={:04}/day={:02}/generation={generation}",
-                row % 1_009,
-                row % 31
-            )
-            .into_bytes(),
-            Self::Wide => {
-                let len = 1024 + bounded_hash(row.rotate_left(19) ^ generation, 3_073);
-                patterned_bytes(len, row ^ generation.rotate_left(7))
-            }
+    fn partition(self, file: u64) -> Vec<u8> {
+        if self.is_wide() {
+            let len = 1024 + bounded_hash(file.rotate_left(19), 3_073);
+            patterned_bytes(len, file ^ 0x4d2a_91b7)
+        } else {
+            format!("tenant={:04}/day={:02}", file % 1_009, file % 31).into_bytes()
         }
     }
 
@@ -72,7 +94,7 @@ impl Scenario {
         let mut path = format!(
             "s3://warehouse/flow-profile/events/data/tenant=production/day=2026-09-04/{generation}-{file:06}-"
         );
-        if matches!(self, Self::Wide) {
+        if self.is_wide() {
             let target = 1024 + bounded_hash(file.wrapping_mul(0x9e37_79b9), 3_073);
             path.extend(std::iter::repeat_n('x', target.saturating_sub(path.len())));
         } else {
@@ -112,10 +134,6 @@ impl ProfileConfig {
             ..StateStoreOptions::default()
         }
     }
-
-    fn inferred_batches(self) -> u64 {
-        self.rows.div_ceil(self.batch_rows as u64)
-    }
 }
 
 fn configured_u64(name: &str, default: u64) -> u64 {
@@ -151,23 +169,52 @@ fn fingerprint(row: u64, generation: u64) -> [u8; 16] {
     fingerprint
 }
 
+#[derive(Clone, Copy)]
+enum PhysicalGeneration {
+    Old,
+    New,
+}
+
+impl PhysicalGeneration {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Old => "old",
+            Self::New => "new",
+        }
+    }
+}
+
 fn location(
     config: ProfileConfig,
-    generation: &'static str,
+    generation: PhysicalGeneration,
     row: u64,
     sequence: i64,
-    lsn: PgLsn,
 ) -> RowLocation {
-    let generation_number = u64::from(generation == "new");
+    let file = row % config.files;
+    let ordinal = row / config.files;
+    let logical_generation = match generation {
+        PhysicalGeneration::Old => 0,
+        PhysicalGeneration::New => config.scenario.logical_generation(),
+    };
+    let lsn = if logical_generation == 0 {
+        SEED_LSN
+    } else {
+        REWRITE_LSN
+    };
     RowLocation {
-        data_file_id: config.scenario.file(generation, row % config.files),
-        row_position: row / config.files,
+        data_file_id: config.scenario.file(generation.name(), file),
+        row_position: ordinal
+            .checked_mul(2)
+            .and_then(|position| {
+                position.checked_add(u64::from(matches!(generation, PhysicalGeneration::Old)))
+            })
+            .expect("profile row position fits u64"),
         data_sequence_number: sequence,
         spec_id: 0,
-        partition: config.scenario.partition(row, generation_number),
+        partition: config.scenario.partition(file),
         source_commit_lsn: lsn,
         row_version: lsn.0,
-        row_fingerprint: fingerprint(row, generation_number),
+        row_fingerprint: fingerprint(row, logical_generation),
     }
 }
 
@@ -193,17 +240,27 @@ fn seed_delta(config: ProfileConfig, row: u64) -> IndexDelta {
     IndexDelta {
         key: config.scenario.key(row),
         expected: None,
-        replacement: Some(location(config, "old", row, -1, SEED_LSN)),
+        replacement: Some(location(config, PhysicalGeneration::Old, row, -1)),
     }
 }
 
 fn rewrite_delta(config: ProfileConfig, row: u64) -> IndexDelta {
     IndexDelta {
         key: config.scenario.key(row),
-        expected: Some(location(config, "old", row, SEED_SEQUENCE, SEED_LSN)),
-        replacement: (!row.is_multiple_of(10))
-            .then(|| location(config, "new", row, -1, REWRITE_LSN)),
+        expected: Some(location(
+            config,
+            PhysicalGeneration::Old,
+            row,
+            SEED_SEQUENCE,
+        )),
+        replacement: (!config.scenario.is_delete(row))
+            .then(|| location(config, PhysicalGeneration::New, row, -1)),
     }
+}
+
+fn file_major_rows(config: ProfileConfig) -> impl Iterator<Item = u64> {
+    let step = usize::try_from(config.files).expect("file count fits usize");
+    (0..config.files).flat_map(move |file| (file..config.rows).step_by(step))
 }
 
 fn initialize(root: &Path) -> (ControlStore, StateStore, PathBuf, PathBuf) {
@@ -238,7 +295,7 @@ fn seed(store: &StateStore, config: ProfileConfig) {
     store
         .prepare(
             seed.clone(),
-            (0..config.rows).map(|row| seed_delta(config, row)),
+            file_major_rows(config).map(|row| seed_delta(config, row)),
         )
         .unwrap();
     store
@@ -252,11 +309,16 @@ fn seed(store: &StateStore, config: ProfileConfig) {
 }
 
 fn prepare_rewrite(store: &StateStore, config: ProfileConfig, id: &str) -> OperationId {
-    let rewrite = operation(id, OperationKind::Rewrite, Some(SEED_SNAPSHOT), REWRITE_LSN);
+    let rewrite = operation(
+        id,
+        OperationKind::Rewrite,
+        Some(SEED_SNAPSHOT),
+        config.scenario.rewrite_lsn(),
+    );
     store
         .prepare(
             rewrite.clone(),
-            (0..config.rows).map(|row| rewrite_delta(config, row)),
+            file_major_rows(config).map(|row| rewrite_delta(config, row)),
         )
         .unwrap();
     store
@@ -265,10 +327,10 @@ fn prepare_rewrite(store: &StateStore, config: ProfileConfig, id: &str) -> Opera
     rewrite.id
 }
 
-fn expected_table_state() -> TableState {
+fn expected_table_state(config: ProfileConfig) -> TableState {
     TableState {
         snapshot_id: Some(REWRITE_SNAPSHOT),
-        materialized_lsn: REWRITE_LSN,
+        materialized_lsn: config.scenario.rewrite_lsn(),
         schema_version: 3,
         pending_operation: None,
     }
@@ -302,10 +364,13 @@ fn verify_exact(
     id: &OperationId,
     config: ProfileConfig,
 ) {
-    assert_eq!(store.table_state(&TABLE).unwrap(), expected_table_state());
+    assert_eq!(
+        store.table_state(&TABLE).unwrap(),
+        expected_table_state(config)
+    );
     assert_eq!(
         control.table_state(&TABLE).unwrap().unwrap(),
-        expected_table_state()
+        expected_table_state(config)
     );
     assert!(control.pending_operations().unwrap().is_empty());
 
@@ -317,17 +382,16 @@ fn verify_exact(
     assert_eq!(record.delta_count, config.rows);
     assert_eq!(record.applied_count, config.rows);
 
-    const LOOKUP_ROWS: u64 = 4_096;
     let mut start = 0;
     while start < config.rows {
-        let end = config.rows.min(start + LOOKUP_ROWS);
+        let end = config.rows.min(start + config.scenario.lookup_chunk_rows());
         let keys = (start..end)
             .map(|row| config.scenario.key(row))
             .collect::<Vec<_>>();
         let actual = store.lookup_many(&TABLE, &keys).unwrap();
         for (row, actual) in (start..end).zip(actual) {
-            let expected = (!row.is_multiple_of(10))
-                .then(|| location(config, "new", row, REWRITE_SEQUENCE, REWRITE_LSN));
+            let expected = (!config.scenario.is_delete(row))
+                .then(|| location(config, PhysicalGeneration::New, row, REWRITE_SEQUENCE));
             assert_eq!(actual, expected, "forward row {row}");
         }
         start = end;
@@ -351,7 +415,7 @@ fn verify_exact(
     assert!(actual_counts[..file_count].iter().all(|count| *count == 0));
     let mut expected_counts = vec![0_u64; file_count];
     for row in 0..config.rows {
-        if !row.is_multiple_of(10) {
+        if !config.scenario.is_delete(row) {
             expected_counts[(row % config.files) as usize] += 1;
         }
     }
@@ -364,11 +428,12 @@ fn verify_exact(
         let mut actual = store.file_rows(&TABLE, file);
         for row in (file_index as u64..config.rows)
             .step_by(file_count)
-            .filter(|row| !row.is_multiple_of(10))
+            .filter(|row| !config.scenario.is_delete(*row))
         {
+            let expected = location(config, PhysicalGeneration::New, row, REWRITE_SEQUENCE);
             assert_eq!(
                 actual.next().unwrap().unwrap(),
-                (row / config.files, config.scenario.key(row)),
+                (expected.row_position, config.scenario.key(row)),
                 "reverse row {row}"
             );
         }
@@ -379,7 +444,7 @@ fn verify_exact(
 #[derive(Default)]
 struct DiskUsage {
     total: u64,
-    wal: u64,
+    wal_footprint: u64,
 }
 
 fn disk_usage(path: &Path) -> std::io::Result<DiskUsage> {
@@ -397,7 +462,7 @@ fn disk_usage(path: &Path) -> std::io::Result<DiskUsage> {
                     .extension()
                     .is_some_and(|extension| extension == "log")
                 {
-                    usage.wal += bytes;
+                    usage.wal_footprint += bytes;
                 }
             }
         }
@@ -417,6 +482,57 @@ fn signed_byte_delta(after: u64, before: u64) -> i64 {
     }
 }
 
+struct ApplyObservation {
+    result: ApplyResult,
+    cursor_rows: Vec<u64>,
+    batch_call_ms: Vec<f64>,
+}
+
+impl ApplyObservation {
+    fn total_ms(&self) -> f64 {
+        self.batch_call_ms.iter().sum()
+    }
+
+    fn percentile_ms(&self, percentile: usize) -> f64 {
+        let mut samples = self.batch_call_ms.clone();
+        samples.sort_by(f64::total_cmp);
+        let index = (samples.len() * percentile).div_ceil(100).saturating_sub(1);
+        samples[index]
+    }
+}
+
+fn observe_apply(store: &StateStore, id: &OperationId) -> ApplyObservation {
+    let mut result = ApplyResult {
+        applied_rows: 0,
+        obsolete_rows: 0,
+        complete: false,
+    };
+    let mut cursor = store.operation(id).unwrap().unwrap().applied_count;
+    let mut cursor_rows = Vec::new();
+    let mut batch_call_ms = Vec::new();
+    while !result.complete {
+        let batch_started = Instant::now();
+        let batch = store.apply_batch(id, false).unwrap();
+        batch_call_ms.push(batch_started.elapsed().as_secs_f64() * 1_000.0);
+        let next_cursor = store.operation(id).unwrap().unwrap().applied_count;
+        let advanced = next_cursor
+            .checked_sub(cursor)
+            .expect("apply cursor only advances");
+        assert_ne!(advanced, 0, "an incomplete apply must advance its cursor");
+        assert_eq!(advanced, batch.applied_rows + batch.obsolete_rows);
+        cursor_rows.push(advanced);
+        cursor = next_cursor;
+        result.applied_rows += batch.applied_rows;
+        result.obsolete_rows += batch.obsolete_rows;
+        result.complete = batch.complete;
+    }
+    ApplyObservation {
+        result,
+        cursor_rows,
+        batch_call_ms,
+    }
+}
+
 #[test]
 #[ignore = "manual profile; configure with FLOW_STATE_APPLY_PROFILE_* variables"]
 fn profiles_controlled_apply_batches() {
@@ -433,9 +549,8 @@ fn profiles_controlled_apply_batches() {
     let index_usage_pre_apply = disk_usage(&index_path).unwrap();
     let control_usage_pre_apply = disk_usage(&control_path).unwrap();
 
-    let apply_started = Instant::now();
-    let result = store.apply_committed(&id).unwrap();
-    let apply_ms = apply_started.elapsed().as_secs_f64() * 1_000.0;
+    let observation = observe_apply(&store, &id);
+    let result = observation.result;
     assert_eq!(result.applied_rows, config.rows);
     assert_eq!(result.obsolete_rows, 0);
     assert!(result.complete);
@@ -452,69 +567,84 @@ fn profiles_controlled_apply_batches() {
 
     let index_usage_after_reopen = disk_usage(&index_path).unwrap();
     let control_usage_after_reopen = disk_usage(&control_path).unwrap();
-    let deletes = config.rows.div_ceil(10);
+    let deletes = if matches!(config.scenario, Scenario::MixedUpdateDelete) {
+        config.rows.div_ceil(10)
+    } else {
+        0
+    };
     eprintln!(
         "state_store_apply_profile {}",
         serde_json::to_string(&json!({
             "kind": "summary",
             "version": 1,
             "controlled_store": true,
-            "scenario": config.scenario.name(),
-            "rows": config.rows,
-            "replacement_rows": config.rows - deletes,
-            "delete_rows": deletes,
-            "file_count": config.files,
-            "setup_batch_row_ceiling": SETUP_BATCH_ROWS,
-            "batch_row_ceiling": config.batch_rows,
-            "apply_batches": config.inferred_batches(),
-            "apply_batch_count_source": "fixed_row_ceiling",
-            "per_batch_bytes_reported": false,
-            "per_batch_timing_reported": false,
-            "apply_total_ms": apply_ms,
-            "applied_rows": result.applied_rows,
-            "obsolete_rows": result.obsolete_rows,
-            "validation_after_apply": true,
-            "validation_after_reopen": true,
-            "index_db_bytes_pre_apply": index_usage_pre_apply.total,
-            "index_wal_bytes_pre_apply": index_usage_pre_apply.wal,
-            "control_db_bytes_pre_apply": control_usage_pre_apply.total,
-            "control_wal_bytes_pre_apply": control_usage_pre_apply.wal,
-            "index_db_bytes_after_apply": index_usage_after_apply.total,
-            "index_wal_bytes_after_apply": index_usage_after_apply.wal,
-            "control_db_bytes_after_apply": control_usage_after_apply.total,
-            "control_wal_bytes_after_apply": control_usage_after_apply.wal,
-            "index_db_bytes_apply_delta": signed_byte_delta(index_usage_after_apply.total, index_usage_pre_apply.total),
-            "index_wal_bytes_apply_delta": signed_byte_delta(index_usage_after_apply.wal, index_usage_pre_apply.wal),
-            "control_db_bytes_apply_delta": signed_byte_delta(control_usage_after_apply.total, control_usage_pre_apply.total),
-            "control_wal_bytes_apply_delta": signed_byte_delta(control_usage_after_apply.wal, control_usage_pre_apply.wal),
-            "index_db_bytes_after_reopen": index_usage_after_reopen.total,
-            "index_wal_bytes_after_reopen": index_usage_after_reopen.wal,
-            "control_db_bytes_after_reopen": control_usage_after_reopen.total,
-            "control_wal_bytes_after_reopen": control_usage_after_reopen.wal,
-            "interruption_coverage": "separate_controlled_reopen_test",
+            "config": {
+                "scenario": config.scenario.name(),
+                "rows": config.rows,
+                "replacement_rows": config.rows - deletes,
+                "delete_rows": deletes,
+                "file_count": config.files,
+                "setup_batch_row_ceiling": SETUP_BATCH_ROWS,
+                "batch_row_ceiling": config.batch_rows,
+            },
+            "apply": {
+                "batches": observation.cursor_rows.len(),
+                "batch_count_source": "observed_cursor_advances",
+                "batch_cursor_rows": observation.cursor_rows,
+                "batch_call_p50_ms": observation.percentile_ms(50),
+                "batch_call_p95_ms": observation.percentile_ms(95),
+                "batch_call_p99_ms": observation.percentile_ms(99),
+                "batch_call_max_ms": observation.percentile_ms(100),
+                "total_ms": observation.total_ms(),
+                "timing_scope": "end_to_end_apply_batch_calls",
+                "phase_split_reported": false,
+                "serialized_write_batch_bytes_reported": false,
+                "applied_rows": result.applied_rows,
+                "obsolete_rows": result.obsolete_rows,
+            },
+            "validation": { "after_apply": true, "after_reopen": true },
+            "storage": {
+                "index_db_bytes_pre_apply": index_usage_pre_apply.total,
+                "index_wal_footprint_bytes_pre_apply": index_usage_pre_apply.wal_footprint,
+                "control_db_bytes_pre_apply": control_usage_pre_apply.total,
+                "control_wal_footprint_bytes_pre_apply": control_usage_pre_apply.wal_footprint,
+                "index_db_bytes_after_apply": index_usage_after_apply.total,
+                "index_wal_footprint_bytes_after_apply": index_usage_after_apply.wal_footprint,
+                "control_db_bytes_after_apply": control_usage_after_apply.total,
+                "control_wal_footprint_bytes_after_apply": control_usage_after_apply.wal_footprint,
+                "index_db_bytes_apply_delta": signed_byte_delta(index_usage_after_apply.total, index_usage_pre_apply.total),
+                "index_wal_footprint_bytes_apply_delta": signed_byte_delta(index_usage_after_apply.wal_footprint, index_usage_pre_apply.wal_footprint),
+                "control_db_bytes_apply_delta": signed_byte_delta(control_usage_after_apply.total, control_usage_pre_apply.total),
+                "control_wal_footprint_bytes_apply_delta": signed_byte_delta(control_usage_after_apply.wal_footprint, control_usage_pre_apply.wal_footprint),
+                "index_db_bytes_after_reopen": index_usage_after_reopen.total,
+                "index_wal_footprint_bytes_after_reopen": index_usage_after_reopen.wal_footprint,
+                "control_db_bytes_after_reopen": control_usage_after_reopen.total,
+                "control_wal_footprint_bytes_after_reopen": control_usage_after_reopen.wal_footprint,
+            },
+            "reopen_coverage": "separate_clean_reopen_test",
         }))
         .unwrap()
     );
 }
 
 #[test]
-fn controlled_reopen_resumes_at_an_atomic_batch_cursor() {
+fn clean_reopen_resumes_at_an_atomic_batch_cursor() {
     let config = ProfileConfig {
         rows: 257,
         files: 17,
         batch_rows: 64,
-        scenario: Scenario::Mixed,
+        scenario: Scenario::Compaction,
     };
     let root = TempDir::new().unwrap();
     let (control, store, control_path, index_path) = initialize(root.path());
     seed(&store, config);
-    let id = prepare_rewrite(&store, config, "interrupted-rewrite");
+    let id = prepare_rewrite(&store, config, "reopened-rewrite");
     drop(store);
     drop(control);
 
     let (control, store) = reopen(&control_path, &index_path, config);
     verify_pre_apply(&store, &control, &id, config);
-    let first = store.apply_committed_batch(&id).unwrap();
+    let first = store.apply_batch(&id, false).unwrap();
     assert_eq!(first.applied_rows, config.batch_rows as u64);
     assert_eq!(first.obsolete_rows, 0);
     assert!(!first.complete);
@@ -535,9 +665,9 @@ fn controlled_reopen_resumes_at_an_atomic_batch_cursor() {
     drop(control);
 
     let (control, store) = reopen(&control_path, &index_path, config);
-    let interrupted = store.operation(&id).unwrap().unwrap();
-    assert_eq!(interrupted.phase, OperationPhase::Committed);
-    assert_eq!(interrupted.applied_count, config.batch_rows as u64);
+    let reopened = store.operation(&id).unwrap().unwrap();
+    assert_eq!(reopened.phase, OperationPhase::Committed);
+    assert_eq!(reopened.applied_count, config.batch_rows as u64);
     let resumed = store.apply_committed(&id).unwrap();
     assert_eq!(resumed.applied_rows, config.rows - config.batch_rows as u64);
     assert!(resumed.complete);
@@ -550,15 +680,15 @@ fn controlled_reopen_resumes_at_an_atomic_batch_cursor() {
     eprintln!(
         "state_store_apply_profile {}",
         serde_json::to_string(&json!({
-            "kind": "controlled_reopen_resume",
+            "kind": "clean_reopen_resume",
             "version": 1,
             "rows": config.rows,
             "setup_batch_row_ceiling": SETUP_BATCH_ROWS,
             "batch_row_ceiling": config.batch_rows,
-            "interrupted_after_rows": config.batch_rows,
+            "reopened_after_rows": config.batch_rows,
             "validation_after_resume": true,
             "validation_after_second_reopen": true,
-            "boundary": "durable_batch_then_clean_process-equivalent_close",
+            "boundary": "wal_backed_intermediate_batch_then_clean_close",
             "arbitrary_process_kill_covered": false,
         }))
         .unwrap()
