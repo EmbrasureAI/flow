@@ -575,22 +575,22 @@ fn profiles_controlled_apply_batches() {
     let id = prepare_rewrite(&store, config, "profile-rewrite");
     drop(store);
     drop(control);
+    let index_usage_pre_apply = disk_usage(&index_path).unwrap();
+    let control_usage_pre_apply = disk_usage(&control_path).unwrap();
 
     let (control, store) = reopen(&control_path, &index_path, config);
     verify_pre_apply(&store, &control, &id, config);
-    let index_usage_pre_apply = disk_usage(&index_path).unwrap();
-    let control_usage_pre_apply = disk_usage(&control_path).unwrap();
 
     let observation = observe_apply(&store, &id);
     let result = observation.result;
     assert_eq!(result.applied_rows, config.rows);
     assert_eq!(result.obsolete_rows, 0);
     assert!(result.complete);
-    let index_usage_after_apply = disk_usage(&index_path).unwrap();
-    let control_usage_after_apply = disk_usage(&control_path).unwrap();
     verify_exact(&store, &control, &id, config);
     drop(store);
     drop(control);
+    let index_usage_after_apply = disk_usage(&index_path).unwrap();
+    let control_usage_after_apply = disk_usage(&control_path).unwrap();
 
     let (control, store) = reopen(&control_path, &index_path, config);
     verify_exact(&store, &control, &id, config);
@@ -647,6 +647,7 @@ fn profiles_controlled_apply_batches() {
                 "obsolete_rows": result.obsolete_rows,
             },
             "validation": { "after_apply": true, "after_reopen": true },
+            "storage_measurement": "directory bytes after clean database close; WAL fields are file footprints",
             "storage": {
                 "index_db_bytes_pre_apply": index_usage_pre_apply.total,
                 "index_wal_footprint_bytes_pre_apply": index_usage_pre_apply.wal_footprint,
