@@ -9,9 +9,40 @@ import tempfile
 import unittest
 
 from benchmark_store import BenchmarkStore, DenseKeys, PAGE_ROWS, lsn_key, lsn_text, zipf_sample
+from reconciliation import scan_reconciliation_events
 
 
 class BenchmarkStorageTest(unittest.TestCase):
+    def test_reconciliation_cursor_requires_exact_complete_event(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "daemon.log"
+            expected = {(42, 101)}
+            records = [
+                {"fields": {"event": "table_published", "table_id": 42, "snapshot_id": 101}},
+                {"fields": {"event": "external_snapshot_reconciled", "table_id": 42,
+                            "snapshot_id": 100, "sequence_number": 9,
+                            "reconciliation_kind": "data-rewrite"}},
+            ]
+            partial = {"fields": {"event": "external_snapshot_reconciled", "table_id": 42,
+                                  "snapshot_id": 101, "sequence_number": 10,
+                                  "reconciliation_kind": "data-rewrite"}}
+            log.write_bytes(("not-json\nnull\n" + "\n".join(map(json.dumps, records)) + "\n" +
+                             json.dumps(partial)).encode())
+
+            offset, acknowledged = scan_reconciliation_events(log, 0, expected)
+            self.assertEqual(acknowledged, {})
+            self.assertLess(offset, log.stat().st_size)
+
+            with log.open("ab") as output:
+                output.write(b"\n")
+            offset, acknowledged = scan_reconciliation_events(log, offset, expected)
+            self.assertEqual(acknowledged, {(42, 101): {
+                "table_id": 42, "snapshot_id": 101, "sequence_number": 10,
+                "reconciliation_kind": "data-rewrite",
+            }})
+            final_offset, acknowledged = scan_reconciliation_events(log, offset, expected)
+            self.assertEqual((final_offset, acknowledged), (offset, {}))
+
     def test_disk_key_slots_preserve_selection_and_swap_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             for distribution in ("uniform", "hot", "zipf"):

@@ -31,10 +31,11 @@ After collecting reports, remove only this disposable project with the same Comp
 
 ## Run a measured workload
 
-Build optimized binaries before collecting results:
+Freeze optimized binaries and their build manifest before collecting results:
 
 ```sh
-cargo build --release --locked -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
+python3 tests/production/freeze_build.py \
+  --output target/qualification-binaries/release-001
 export AWS_ACCESS_KEY_ID=demo-access
 export AWS_SECRET_ACCESS_KEY=demo-secret-key
 export AWS_REGION=us-east-1
@@ -42,13 +43,14 @@ export FLOW_POSTGRES_URL='postgres://flow:local-test-password@127.0.0.1:55432/fl
 uv run tests/production/benchmark.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/release/embrasure-flow \
-  --compactor-binary target/release/examples/local_compactor \
+  --binary target/qualification-binaries/release-001/embrasure-flow \
+  --build-manifest target/qualification-binaries/release-001/build-manifest.json \
+  --compactor-binary target/qualification-binaries/release-001/local_compactor \
   --artifacts target/production-1000-001 \
   --rate 1000 --duration 60 --warmup 10
 ```
 
-The endpoints are examples; configure the actual disposable deployment. Leave PostgreSQL durability enabled: `fsync`, `full_page_writes`, and synchronous commit. The older correctness-only [local Compose fixture](../local/README.md) disables these settings and must not be used unchanged for performance qualification. Do not compare release and debug builds as performance results. Every artifact directory must be new. The harness retains logs and durable state and stops only processes it started; it does not delete service data or replication slots.
+The endpoints are examples; configure the actual disposable deployment. Leave PostgreSQL durability enabled: `fsync`, `full_page_writes`, and synchronous commit. The older correctness-only [local Compose fixture](../local/README.md) disables these settings and must not be used unchanged for performance qualification. Do not compare release and profiling builds as equivalent results. Every artifact directory must be new. Directory names are labels, not run identity. Each report embeds the build manifest and records its hash, source commit/tree/dirty-diff digest, exact binary hashes by process role, build-time Rust toolchain/profile/target/features/environment, harness/config hashes, run-time toolchain, machine capacity, and compactor topology. The harness rejects a binary that does not match the manifest and rechecks each executable immediately before spawning it. The harness retains logs and durable state and stops only processes it started; it does not delete service data or replication slots.
 
 The default workload seeds 100,000 rows in one table, then uses four connections and 100 mutations per transaction: 70 updates, 20 inserts, and 10 deletes. Each transaction includes one immutable negative-key visibility probe among its 20 inserts, so probes are counted in the requested mutation rate. Writers have disjoint key ownership to avoid artificial row-lock contention. Updates and deletes assert the actual affected row counts. The complete final `(id, version, md5(payload))` stream must match PostgreSQL in sorted order, including probes.
 
@@ -84,10 +86,37 @@ Start at 1,000 mutations/s, then increase to 10,000 and 50,000. The spec's basel
 python3 tests/production/matrix.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
+  --binary target/qualification-binaries/release-001/embrasure-flow \
+  --build-manifest target/qualification-binaries/release-001/build-manifest.json \
+  --compactor-binary target/qualification-binaries/release-001/local_compactor \
   --artifacts target/production-matrix-01
 ```
 
 Use repeated `--case` options to select a subset and `--duration`/`--warmup` to change timing. Each case has its own report; `matrix.json` records every exit code and failure. The 16 KiB and hundred-table cases start with 10,000 rows per table to bound the fixture's data volume; other cases start with 100,000 rows per table. The separate compactor runs every ten seconds in its case. This bounded matrix is a regression and capacity probe, not the specification's 24-hour qualification.
+
+Before changing maintenance architecture, run the controlled A/B/C/D comparison at 1,000 and 10,000 mutations/s:
+
+```sh
+python3 tests/production/maintenance_matrix.py \
+  --catalog-uri http://127.0.0.1:58181 \
+  --s3-endpoint http://127.0.0.1:59000 \
+  --binary target/qualification-binaries/release-001/embrasure-flow \
+  --build-manifest target/qualification-binaries/release-001/build-manifest.json \
+  --reader-baseline-compactor target/qualification-binaries/release-001/local_compactor \
+  --artifacts target/production-maintenance-matrix-01
+```
+
+The four modes are a finite diagnostic control, delete-file consolidation without data rewrites, bounded L0-to-L1 binpacking, and the current all-level rewrite policy. The wrapper holds manifest rewriting off equally across the cases. The first two modes explicitly raise L0 debt limits above the bounded run envelope; the first three raise only the independent stable-small-file limits, leaving C's real L0 limits active. The disabled mode also raises delete-debt limits and removes the daemon compactor role. These settings isolate maintenance costs and must not be used as production defaults. Each result retains catalog latency, drain throughput, planned versus recorded arrivals, file and delete counts/bytes/rows, average data-file size, delete ratios, and the same-final-state reader result.
+
+The default matrix admits at most 16,384 files and 512 MiB to its final external rewrite, with a separate 900-second deadline. The wrapper rejects a custom duration whose conservative file bound exceeds that cap; increase `--baseline-max-input-files` explicitly when extending the run. These larger limits apply only after measured ingestion has stopped and are recorded in every report. Baseline readiness polls catalog heads and reads manifests initially, after a non-fixture head change, and once after the compactor stops, avoiding repeated full inventory scans while thousands of small files are present.
+
+For CPU and allocation capture, freeze a separate profiling build. It inherits release optimization and adds debug information plus forced frame pointers:
+
+```sh
+python3 tests/production/freeze_build.py \
+  --profile profiling \
+  --output target/qualification-binaries/profiling-001
+```
 
 Zipf selection follows the [finite rank probability law](https://commons.apache.org/proper/commons-statistics/commons-statistics-distribution/apidocs/org/apache/commons/statistics/distribution/ZipfDistribution.html), with weights `r**(-s)` for ranks `1..N`. The default exponent 0.99 matches [YCSB's default skew](https://github.com/brianfrankcooper/YCSB/blob/master/core/src/main/java/site/ycsb/generator/ZipfianGenerator.java). Draws are successive and without replacement within a transaction, so updates and deletes use distinct keys. Ranks refer to each writer/table's current active-key vector: deletes swap the last key into the removed position, and new keys append. Popularity therefore follows those changing ranks. Writers retain their existing disjoint ownership, and probes remain immutable.
 
@@ -97,7 +126,7 @@ Default payloads are distinct per row and generation, generated from repeated MD
 
 ## Measurement contract
 
-Transactions arrive on a predetermined open-loop schedule. Each writer owns every fourth arrival by default and does not shift future arrivals when PostgreSQL is slow. An arrival more than 250 ms late is rejected and counted in `missed_scheduled_arrivals`; no silent catch-up loop turns a saturation test into a lower-rate success. `source_commit_window_mutations_per_second` counts actual PostgreSQL commit responses inside the measurement window, independently of the scheduled cohort; it is a source input rate, not proof of Iceberg's capacity. `catalog_completion_delay_after_measurement_seconds` reports the tail after the measurement window, and `measured_cohort_catalog_mutations_per_second_including_drain` divides the measured cohort's mutations by the window plus that tail. The latter two fields are null if timing observations are incomplete. Late source completions and the scheduled-cohort rate are reported separately. Warmup transactions are excluded from latency percentiles.
+Transactions arrive on a predetermined open-loop schedule. Each writer owns every fourth arrival by default and does not shift future arrivals when PostgreSQL is slow. An arrival more than 250 ms late is rejected and counted in `missed_scheduled_arrivals`; no silent catch-up loop turns a saturation test into a lower-rate success. The legacy top-level `scheduled_transactions`, `committed_transactions`, and `missed_scheduled_arrivals` fields describe recorded measured-window arrivals only. `arrival_cohorts` distinguishes nominally planned, recorded, committed, missed, and unrecorded counts for warmup, the measured window, and the complete run. Qualification uses the measured cohort; warmup misses remain visible. `source_commit_window_mutations_per_second` counts actual PostgreSQL commit responses inside the measurement window, independently of the scheduled cohort; it is a source input rate, not proof of Iceberg's capacity. `catalog_completion_delay_after_measurement_seconds` reports the tail after the measurement window, and `measured_cohort_catalog_mutations_per_second_including_drain` divides the measured cohort's mutations by the window plus that tail. The latter two fields are null if timing observations are incomplete. Late source completions and the scheduled-cohort rate are reported separately. Warmup transactions are excluded from latency percentiles.
 
 The daemon emits structured events at durable journal append and after the catalog acknowledges a table publication. XID joins the source commit to its journal record; table OID and the closed interval of source end LSNs join it to the containing Iceberg publication. Each benchmark transaction affects exactly one target table. Negative-key probes survive subsequent mutations, so every committed transaction can be observed independently by DuckDB. The harness polls fresh catalog metadata and queries the exact returned Iceberg metadata location, rather than substituting direct Parquet reads.
 
@@ -132,9 +161,9 @@ python3 -m unittest discover -s tests/production -p test_benchmark_store.py -v
 
 Each run saves `report.json`, transaction timing records, reader samples, periodic source watermark and retained-WAL samples, the exact post-drain PostgreSQL acknowledgement, per-process RSS/CPU readings, initial-copy logs and metrics, daemon logs, compactor logs, and local state. A resource summary records sampled reader-debt peaks and process counters through drain. Counters include warmup and drain; one-second sampling can miss brief peaks. Initial COPY metrics are archived before the daemon replaces its process metrics. Final inventory includes live data/delete files, manifests, retained snapshots, and compaction counts. Source/target hashes are for diagnosis; matching ordered row streams is the correctness assertion. `ps` CPU values are OS-reported process utilization samples, not a precise per-phase CPU accounting model.
 
-The initial reader baseline and final reader timings use different data populations. To compare the **same final dataset**, add `--reader-baseline-compactor target/release/examples/local_compactor`. After the workload drains and its scan is recorded, the harness starts that external process if one is not already running and waits for a complete rewrite without positional deletes (or an already compacted single file). It pins the compacted metadata, verifies the full source/target rows, and stops its owned daemon and compactor before measuring. Shared services remain running.
+The initial reader baseline and final reader timings use different data populations. To compare the **same final dataset**, pass the frozen `local_compactor` beside the required `build-manifest.json`, for example `--reader-baseline-compactor target/qualification-binaries/release31/local_compactor`. After the workload drains and its scan is recorded, the harness cleanly stops any workload compactor, starts the selected baseline compactor, and waits for an external rewrite without positional deletes or an already compact one-file table. It pins that snapshot and stops the compactor, then keeps the daemon alive until an exact table-and-snapshot event confirms durable row-index reconciliation for each newly external head. Already compact heads are reported separately. Full source/target verification follows before the daemon stops and the pinned reader layouts are measured. Shared services remain running.
 
-The shared [reader comparison](reader_compare.py) explicitly warms both pinned layouts twice, then measures twenty scans per layout in alternating original/compacted and compacted/original pairs. Before those scans, the report saves a `verified_reader_baseline` checkpoint with exact compacted metadata locations, full-row counts and hashes, stopped-process IDs and exit codes, and the joined-worker panic check. A reader failure therefore preserves verified inputs for a separate repeat. Completed comparisons also retain every warmup and measured sample and the ratio of the two median scan times. Every query checks matching aggregates. The 1.25 ratio limit is unchanged. This fixture has an explicit 512 MiB compressed-input and 256-file maintenance limit and fails if the configured workload exceeds it.
+The shared [reader comparison](reader_compare.py) explicitly warms both pinned layouts twice, then measures twenty scans per layout in alternating original/compacted and compacted/original pairs. Before those scans, the report saves a `verified_reader_baseline` checkpoint with exact compacted metadata locations, full-row counts and hashes, stopped-process IDs and exit codes, and the joined-worker panic check. A reader failure therefore preserves verified inputs for a separate repeat. Completed comparisons also retain every warmup and measured sample and the ratio of the two median scan times. Every query checks matching aggregates. The 1.25 ratio limit is unchanged. The fixture defaults to explicit 512 MiB compressed-input and 256-file maintenance limits and fails when the selected recorded budgets are exceeded.
 
 New local runs and standalone comparisons explicitly enable stock DuckDB
 `httpfs_connection_caching=true`. The `reader_settings` field records its actual

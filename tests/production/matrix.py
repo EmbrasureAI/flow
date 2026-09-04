@@ -32,22 +32,27 @@ def main():
     parser.add_argument("--catalog-uri", required=True)
     parser.add_argument("--s3-endpoint", required=True)
     parser.add_argument("--binary", type=Path, default=Path("target/release/embrasure-flow"))
-    parser.add_argument("--compactor-binary", type=Path, default=Path("target/release/examples/local_compactor"))
+    parser.add_argument("--build-manifest", type=Path, required=True)
+    parser.add_argument("--compactor-binary", type=Path)
     parser.add_argument("--reader-baseline-compactor", type=Path)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=60)
     parser.add_argument("--warmup", type=float, default=10)
     parser.add_argument("--case", choices=CASES, action="append")
     args = parser.parse_args()
+    selected = args.case or list(CASES)
     if not args.postgres_url or args.duration <= 0 or args.warmup < 0:
         parser.error("provide PostgreSQL URL, positive duration and nonnegative warmup")
+    if "external-compactor-1k" in selected and args.compactor_binary is None:
+        parser.error("--compactor-binary is required for external-compactor-1k")
     args.artifacts.mkdir(parents=True, exist_ok=False)
     results = []
-    for name in args.case or CASES:
+    for name in selected:
         directory = args.artifacts / name
         command = ["uv", "run", str(Path(__file__).with_name("benchmark.py")),
                    "--postgres-url", args.postgres_url, "--catalog-uri", args.catalog_uri,
                    "--s3-endpoint", args.s3_endpoint, "--binary", str(args.binary),
+                   "--build-manifest", str(args.build_manifest),
                    "--artifacts", str(directory), "--duration", str(args.duration),
                    "--warmup", str(args.warmup), *CASES[name]]
         if name == "external-compactor-1k":

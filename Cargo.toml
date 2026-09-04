@@ -60,5 +60,10 @@ dbg_macro = "deny"
 lto = "thin"
 codegen-units = 1
 
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+
 [profile.dev]
 debug = 1

@@ -31,6 +31,8 @@ from psycopg import sql
 
 from reader_compare import compare_snapshots
 from benchmark_store import BenchmarkStore, DenseKeys, LATENCIES, PAGE_ROWS, QUEUE_ITEMS, bounded_lines, zipf_sample
+from provenance import load_build_manifest, machine_identity, repository_identity, sha256_file, verified_binary
+from reconciliation import scan_reconciliation_events
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
 from run import Run, dump, lsn  # noqa: E402
@@ -38,8 +40,6 @@ from run import Run, dump, lsn  # noqa: E402
 
 def micros():
     return time.time_ns() // 1000
-
-
 
 
 class Benchmark(Run):
@@ -59,6 +59,9 @@ class Benchmark(Run):
         self.writer_connections = [None] * self.args.writers
         self.writer_lock = threading.Lock()
         self.compactor = self.compactor_log = None
+        self.compactor_binary = self.compactor_log_path = None
+        self.compactor_generation = 0
+        self.daemon_stops = []
         text = f'''state_dir = {json.dumps(str(self.directory / 'state'))}
 [source]
 connection_env = "FLOW_LOCAL_POSTGRES_URL"
@@ -73,7 +76,29 @@ warehouse = {json.dumps(self.args.warehouse)}
 "s3.endpoint" = {json.dumps(self.args.s3_endpoint)}
 "s3.region" = {json.dumps(os.environ.get('AWS_REGION', 'us-east-1'))}
 "s3.path-style-access" = "true"
-[limits]
+'''
+        text += f'''[compaction]
+data_rewrite_scope = {json.dumps({'current': 'all', 'l0-only': 'l0-only', 'delete-only': 'disabled', 'disabled': 'disabled'}[self.args.maintenance_mode])}
+'''
+        if self.args.maintenance_mode in ("disabled", "delete-only"):
+            text += '''l0_soft_files = 1000000
+l0_hard_files = 2000000
+l0_soft_bytes = 1152921504606846976
+l0_hard_bytes = 2305843009213693952
+oldest_l0_soft_ms = 2305843009213693952
+oldest_l0_hard_ms = 4611686018427387904
+'''
+        if self.args.maintenance_mode in ("disabled", "delete-only", "l0-only"):
+            text += '''stable_small_soft_files = 1000000
+stable_small_hard_files = 2000000
+'''
+        if self.args.maintenance_mode == "disabled":
+            text += '''delete_files_soft = 1000000
+delete_files_hard = 2000000
+deleted_rows_percent = 100
+'''
+        text += f'''[limits]
+manifest_max_count = {self.args.manifest_max_count}
 batch_rows = {self.args.batch_rows}
 chunk_bytes = 1048576
 batch_bytes = 8388608
@@ -105,6 +130,53 @@ columns = [
         self.environment = os.environ | {"FLOW_LOCAL_POSTGRES_URL": self.args.postgres_url, "RUST_LOG": "info"}
         self.store = BenchmarkStore(self.directory / "evidence.sqlite3")
 
+    def verify_runtime_inputs(self):
+        daemon = verified_binary(self.build_manifest, "daemon", self.args.binary)
+        config_sha256 = sha256_file(self.config)
+        expected = self.report["artifact_identity"]["config"]["sha256"]
+        if config_sha256 != expected:
+            raise RuntimeError(
+                f"runtime config changed during the run: expected {expected}, got {config_sha256}"
+            )
+        return {"daemon": daemon, "config_sha256": config_sha256}
+
+    def command(self, command):
+        result = super().command(command)
+        if command == "run" and self.args.maintenance_mode == "disabled":
+            result += ["--roles", "ingest,coordinator"]
+        return result
+
+    def start(self):
+        self.verify_runtime_inputs()
+        super().start()
+
+    def stop(self, crash=False):
+        if self.process is None:
+            return None
+        process = self.process
+        forced_kill = False
+        if process.poll() is None:
+            process.send_signal(signal.SIGKILL if crash else signal.SIGINT)
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                forced_kill = True
+                process.kill()
+                process.wait(timeout=10)
+        self.process = None
+        self.log.close()
+        record = {
+            "pid": process.pid,
+            "returncode": process.returncode,
+            "crash_requested": crash,
+            "forced_kill": forced_kill,
+            "generation": self.generation,
+        }
+        self.daemon_stops.append(record)
+        self.report["daemon_stops"] = self.daemon_stops
+        self.verify_runtime_inputs()
+        return record
+
     def seed(self):
         self.pg.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(self.name)))
         for name in self.names:
@@ -120,9 +192,11 @@ columns = [
         return {"rows_per_table": self.args.initial_rows, "tables": self.args.tables}
 
     def initialize(self):
+        self.verify_runtime_inputs()
         with (self.directory / "init.log").open("wb") as log:
             subprocess.run(self.command("init"), env=self.environment, stdout=log,
                            stderr=subprocess.STDOUT, check=True, timeout=self.args.timeout)
+        self.verify_runtime_inputs()
         metrics = self.directory / "state" / "metrics.prom"
         if metrics.exists():
             (self.directory / "init-metrics.prom").write_bytes(metrics.read_bytes())
@@ -174,28 +248,56 @@ columns = [
                     self.report["worker_panics"] = [{"log": path.name, "line": number, "message": line.rstrip()}]
                     raise AssertionError(f"worker panic logged in {path.name}:{number}")
 
-    def start_compactor(self, binary=None):
+    def start_compactor(self, binary=None, *, max_input_files=None, max_input_bytes=None):
         binary = binary or self.args.compactor_binary
-        if binary and self.compactor is None:
-            self.compactor_log = (self.directory / "compactor.log").open("wb")
-            self.compactor = subprocess.Popen([str(binary.resolve()), "--config", str(self.config),
-                                              "--interval-ms", str(self.args.compactor_interval_ms)], env=self.environment,
-                                             stdout=self.compactor_log, stderr=subprocess.STDOUT)
+        if binary is None:
+            return
+        binary = binary.resolve()
+        if self.compactor is not None:
+            if binary != self.compactor_binary:
+                raise RuntimeError(f"compactor already running from {self.compactor_binary}")
+            return
+        verified_binary(self.build_manifest, "external_compactor", binary)
+        self.verify_runtime_inputs()
+        self.compactor_generation += 1
+        self.compactor_log_path = self.directory / f"compactor-{self.compactor_generation}.log"
+        self.compactor_log = self.compactor_log_path.open("wb")
+        try:
+            command = [str(binary), "--config", str(self.config),
+                       "--interval-ms", str(self.args.compactor_interval_ms)]
+            if max_input_files is not None:
+                command += ["--max-input-files", str(max_input_files)]
+            if max_input_bytes is not None:
+                command += ["--max-input-bytes", str(max_input_bytes)]
+            self.compactor = subprocess.Popen(command,
+                                              env=self.environment, stdout=self.compactor_log,
+                                              stderr=subprocess.STDOUT)
+            self.compactor_binary = binary
+        except BaseException:
+            self.compactor_log.close()
+            self.compactor_log = self.compactor_log_path = None
+            raise
 
     def stop_compactor(self):
         if self.compactor is None:
             return None
         process = self.compactor
+        binary = self.compactor_binary
+        log_path = self.compactor_log_path
+        forced_kill = False
         if process.poll() is None:
             process.send_signal(signal.SIGINT)
             try:
                 process.wait(timeout=15)
             except subprocess.TimeoutExpired:
+                forced_kill = True
                 process.kill()
                 process.wait(timeout=10)
         self.compactor = None
         self.compactor_log.close()
-        return {"pid": process.pid, "returncode": process.returncode}
+        self.compactor_log = self.compactor_binary = self.compactor_log_path = None
+        return {"pid": process.pid, "returncode": process.returncode,
+                "binary": str(binary), "log": log_path.name, "forced_kill": forced_kill}
 
     def alive(self):
         super().alive()
@@ -348,6 +450,17 @@ columns = [
     def workload(self):
         args = self.args
         scheduled = math.floor((args.duration + args.warmup) * args.rate / args.transaction_rows)
+        interval = args.transaction_rows / args.rate
+        warmup_scheduled = min(scheduled, math.ceil(args.warmup / interval))
+        while warmup_scheduled and (warmup_scheduled - 1) * interval >= args.warmup:
+            warmup_scheduled -= 1
+        while warmup_scheduled < scheduled and warmup_scheduled * interval < args.warmup:
+            warmup_scheduled += 1
+        self.planned_arrivals = {
+            "warmup": warmup_scheduled,
+            "measured": scheduled - warmup_scheduled,
+            "all": scheduled,
+        }
         self.key_pools = [{} for _ in range(args.writers)]
         threads = []
         finished = False
@@ -443,11 +556,19 @@ columns = [
         """, (self.measured_end_us,)).fetchone()
         missing = {name: summary[name] for name in ("source_commit", "journal", "catalog", "reader") if summary[name]}
         totals = {name: summary[name] for name in ("mutations", "insert_rows", "update_rows", "delete_rows")}
+        cohorts = db.execute("""
+            SELECT count(*) AS scheduled, count(commit_response_at_micros) AS committed,
+                coalesce(sum(missed_arrival=1),0) AS missed,
+                coalesce(sum(measured=0),0) AS warmup_scheduled,
+                coalesce(sum(measured=0 AND commit_response_at_micros IS NOT NULL),0) AS warmup_committed,
+                coalesce(sum(measured=0 AND missed_arrival=1),0) AS warmup_missed
+            FROM transactions
+        """).fetchone()
         window_rows = db.execute("SELECT coalesce(sum(mutations),0) FROM transactions "
                                  "WHERE commit_response_at_micros>=? AND commit_response_at_micros<?",
                                  (self.measured_start_us, self.measured_end_us)).fetchone()[0]
         percentiles = {name: self.store.distribution(name) for name in LATENCIES}
-        requested = self.store.distribution("scheduled_to_reader", summary["scheduled"])
+        requested = self.store.distribution("scheduled_to_reader", self.planned_arrivals["measured"])
         unobserved = db.execute("SELECT count(*) FROM transactions WHERE marker IS NOT NULL "
                                 "AND reader_observed_at_micros IS NULL").fetchone()[0]
         observations_complete = (bool(summary["completed"]) and not missing and not unobserved and
@@ -457,8 +578,19 @@ columns = [
             catalog_end = max(self.measured_end_us, summary["catalog_end"])
             catalog_delay = (catalog_end - self.measured_end_us) / 1e6
             catalog_rate = totals["mutations"] / ((catalog_end - self.measured_start_us) / 1e6)
+        def cohort(name, recorded, committed, missed):
+            planned = self.planned_arrivals[name]
+            return {"planned": planned, "recorded": recorded, "committed": committed,
+                    "missed": missed, "unrecorded": planned - recorded}
+
         return {"scheduled_transactions": summary["scheduled"], "committed_transactions": summary["completed"],
                 "missed_scheduled_arrivals": summary["missed"], "missing_observations": missing, "affected_rows": totals,
+                "arrival_cohorts": {
+                    "measured": cohort("measured", summary["scheduled"], summary["completed"], summary["missed"]),
+                    "warmup": cohort("warmup", cohorts["warmup_scheduled"], cohorts["warmup_committed"],
+                                     cohorts["warmup_missed"]),
+                    "all": cohort("all", cohorts["scheduled"], cohorts["committed"], cohorts["missed"]),
+                },
                 "unobserved_committed_transactions_including_warmup": unobserved,
                 "requested_mutations_per_second": self.args.rate,
                 "source_commit_window_mutations_per_second": window_rows / self.args.duration,
@@ -473,7 +605,11 @@ columns = [
                 "scheduled_to_reader_including_failures": requested,
                 "writer_timing": self.store.writer_timing_summary(),
                 "all_committed_transactions_observed": observations_complete,
-                "target_arrival_rate_sustained": summary["missed"] == 0 and window_rows / self.args.duration >= self.args.rate * .95}
+                "target_arrival_rate_sustained": (
+                    summary["scheduled"] == self.planned_arrivals["measured"]
+                    and summary["missed"] == 0
+                    and window_rows / self.args.duration >= self.args.rate * .95
+                )}
 
     def avro(self, path):
         # Inventory polling must not retain all historical manifests in Run's cache.
@@ -490,12 +626,14 @@ columns = [
             spool.seek(0)
             yield from fastavro.reader(spool)
 
-    def inventory(self):
+    def inventory(self, pinned_tables=None):
         result = {}
         for name in self.names:
-            metadata = self.table(name)["metadata"]
+            table = self.table(name) if pinned_tables is None else pinned_tables[name]
+            metadata = table["metadata"]
             current = next(snap for snap in metadata["snapshots"] if snap["snapshot-id"] == metadata["current-snapshot-id"])
-            counts = {"manifests": 0, "data_files": 0, "delete_files": 0, "data_bytes": 0}
+            counts = {"manifests": 0, "data_files": 0, "delete_files": 0,
+                      "data_bytes": 0, "delete_bytes": 0, "data_rows": 0, "delete_rows": 0}
             for manifest in self.avro(current["manifest-list"]):
                 counts["manifests"] += 1
                 for entry in self.avro(manifest["manifest_path"]):
@@ -505,9 +643,18 @@ columns = [
                     if file["content"] == 0:
                         counts["data_files"] += 1
                         counts["data_bytes"] += file["file_size_in_bytes"]
+                        counts["data_rows"] += file["record_count"]
                     elif file["content"] == 1:
                         counts["delete_files"] += 1
-            result[name] = {**counts, "snapshots": len(metadata["snapshots"]),
+                        counts["delete_bytes"] += file["file_size_in_bytes"]
+                        counts["delete_rows"] += file["record_count"]
+            result[name] = {
+                            **counts,
+                            "average_data_file_bytes": counts["data_bytes"] / counts["data_files"] if counts["data_files"] else None,
+                            "delete_files_per_data_file": counts["delete_files"] / counts["data_files"] if counts["data_files"] else None,
+                            "delete_rows_per_data_row": counts["delete_rows"] / counts["data_rows"] if counts["data_rows"] else None,
+                            "current_snapshot_id": metadata["current-snapshot-id"],
+                            "snapshots": len(metadata["snapshots"]),
                             "current_external_compaction": "local-test.compaction-id" in current["summary"],
                             "compaction_commits": sum(snap["summary"].get("streaming.operation") == "compact" or
                                                       "local-test.compaction-id" in snap["summary"] for snap in metadata["snapshots"])}
@@ -589,32 +736,117 @@ columns = [
         return self.until("PostgreSQL did not acknowledge the exact materialized prefix", aligned)
 
     def compacted_reader_baseline(self, previous):
-        self.start_compactor(self.args.reader_baseline_compactor)
+        workload_compactor = self.stop_compactor()
+        assert workload_compactor is None or (
+            not workload_compactor["forced_kill"] and workload_compactor["returncode"] == 0
+        ), "workload compactor did not stop gracefully at the reader-baseline boundary"
+        initial_inventory = self.inventory()
+        ready_tables = {
+            name for name, item in initial_inventory.items()
+            if item["delete_files"] == 0 and item["data_files"] == 1
+        }
+        checked_snapshots = {
+            name: item["current_snapshot_id"] for name, item in initial_inventory.items()
+        }
+        self.start_compactor(
+            self.args.reader_baseline_compactor,
+            max_input_files=self.args.reader_baseline_max_input_files,
+            max_input_bytes=self.args.reader_baseline_max_input_bytes,
+        )
+
         def ready():
-            inventory = self.inventory()
-            return inventory if all(item["delete_files"] == 0 and (item["data_files"] == 1 or item["current_external_compaction"])
-                                    for item in inventory.values()) else None
-        inventory = self.until("final-state compactor did not produce a compacted baseline", ready)
+            changed_without_external_marker = False
+            for name in self.names:
+                if name in ready_tables:
+                    continue
+                table = self.table(name)
+                metadata = table["metadata"]
+                snapshot_id = metadata["current-snapshot-id"]
+                snapshot = next(item for item in metadata["snapshots"]
+                                if item["snapshot-id"] == snapshot_id)
+                if "local-test.compaction-id" in snapshot["summary"]:
+                    ready_tables.add(name)
+                elif checked_snapshots.get(name) != snapshot_id:
+                    checked_snapshots[name] = snapshot_id
+                    changed_without_external_marker = True
+            # A daemon rewrite can win the race and leave an already compact
+            # layout without the fixture marker. Inspect manifests only when a
+            # catalog head changes, rather than on every readiness poll.
+            if changed_without_external_marker:
+                for name, item in self.inventory().items():
+                    if item["delete_files"] == 0 and item["data_files"] == 1:
+                        ready_tables.add(name)
+            return True if len(ready_tables) == len(self.names) else None
+
+        self.until(
+            "final-state compactor did not produce a compacted external snapshot", ready,
+            timeout=self.args.reader_baseline_timeout)
+        stopped_compactor = self.stop_compactor()
+        assert stopped_compactor is not None and not stopped_compactor["forced_kill"] \
+            and stopped_compactor["returncode"] == 0, \
+            "reader-baseline compactor did not stop gracefully"
         compacted = {name: self.table(name) for name in self.names}
+        inventory = self.inventory(compacted)
+        assert all(
+            item["delete_files"] == 0
+            and (item["data_files"] == 1 or item["current_external_compaction"])
+            for item in inventory.values()
+        ), "final reader baseline is not compacted"
+
+        expected = {}
+        not_required = {}
+        for name in self.names:
+            metadata = compacted[name]["metadata"]
+            snapshot_id = int(metadata["current-snapshot-id"])
+            snapshot = next(item for item in metadata["snapshots"]
+                            if item["snapshot-id"] == snapshot_id)
+            identity = (int(self.oids[name]), snapshot_id)
+            if "local-test.compaction-id" in snapshot["summary"]:
+                expected[identity] = name
+            else:
+                not_required[name] = {"table_id": identity[0], "snapshot_id": identity[1],
+                                      "reason": "already_compact"}
+        acknowledged = {}
+        cursor = 0
+        daemon_log = self.directory / f"daemon-{self.generation}.log"
+
+        def reconciled():
+            nonlocal cursor
+            cursor, observed = scan_reconciliation_events(daemon_log, cursor, expected)
+            acknowledged.update(observed)
+            if acknowledged.keys() != expected.keys():
+                return None
+            return {name: acknowledged[identity] for identity, name in expected.items()}
+
+        reconciliation = (self.until(
+            "daemon did not durably reconcile every compacted external snapshot", reconciled,
+            timeout=self.args.reader_baseline_timeout)
+            if expected else {})
         verified = self.verify(compacted)
         self.alive()
-        stopped_compactor = self.stop_compactor()
-        daemon = self.process
-        self.stop()
+        daemon_stop = self.stop()
+        assert daemon_stop is not None and not daemon_stop["forced_kill"] \
+            and daemon_stop["returncode"] == 0, "daemon did not stop gracefully"
         baseline = {"inventory": inventory, "same_final_rows": verified,
                     "metadata_locations": {name: compacted[name]["metadata-location"] for name in self.names},
-                    "quiescence": {"daemon": {"pid": daemon.pid, "returncode": daemon.returncode},
+                    "external_reconciliation": {
+                        "event": "external_snapshot_reconciled",
+                        "acknowledged_after_durable_index_apply": reconciliation,
+                        "reconciliation_not_required": not_required,
+                    },
+                    "quiescence": {"daemon": daemon_stop,
+                                   "workload_compactor": workload_compactor,
                                    "compactor": stopped_compactor}}
         self.report["verified_reader_baseline"] = baseline
         self.check_worker_panics()
         dump(self.directory / "report.json", self.report)
-        assert stopped_compactor["returncode"] == 0, "reader-baseline compactor did not stop gracefully"
         comparison = compare_snapshots(
             self.duck,
             {name: previous[name]["metadata_location"] for name in self.names},
             baseline["metadata_locations"],
         )
-        return {"inventory": inventory, "same_final_rows": verified, **comparison,
+        return {"inventory": inventory, "same_final_rows": verified,
+                "external_reconciliation": baseline["external_reconciliation"], **comparison,
                 "quiescence": baseline["quiescence"]}
 
     def execute(self):
@@ -632,15 +864,71 @@ columns = [
             "scope": "bounded Python collections and engine-managed spill budgets, not an RSS guarantee for native libraries or catalog metadata",
             "comparison": "writer timing instrumentation changes producer and recorder overhead and requires a fresh v3 matched control; previous reports are unchanged",
         }
+        root = Path(__file__).resolve().parents[2]
+        self.build_manifest = load_build_manifest(args.build_manifest)
+        daemon_binary = verified_binary(self.build_manifest, "daemon", args.binary)
+        workload_compactor = (verified_binary(self.build_manifest, "external_compactor", args.compactor_binary)
+                              if args.compactor_binary else None)
+        baseline_compactor = (verified_binary(self.build_manifest, "external_compactor", args.reader_baseline_compactor)
+                              if args.reader_baseline_compactor else None)
+        repository = repository_identity()
+        self.report["artifact_identity"] = {
+            "schema": 2,
+            "repository": repository,
+            "build_manifest": self.build_manifest,
+            "harness_sha256": {
+                str(path.relative_to(root)): sha256_file(path)
+                for path in (Path(__file__).resolve(), root / "tests/production/benchmark_store.py",
+                             root / "tests/production/reader_compare.py",
+                             root / "tests/production/provenance.py",
+                             root / "tests/production/reconciliation.py",
+                             root / "tests/local/run.py")
+            },
+            "binaries": {
+                "daemon": daemon_binary,
+                "external_during_workload": workload_compactor,
+                "same_final_state_external": baseline_compactor,
+            },
+            "rustc_observed_at_run": subprocess.check_output(["rustc", "-Vv"], text=True).strip(),
+            "config": {"path": str(self.config), "sha256": sha256_file(self.config)},
+            "machine": machine_identity(),
+            "compaction": {
+                "daemon_during_workload": args.maintenance_mode != "disabled",
+                "external_during_workload": bool(args.compactor_binary),
+                "same_final_state_external": bool(args.reader_baseline_compactor),
+                "interval_ms": args.compactor_interval_ms,
+                "same_final_state_budget": {
+                    "max_input_files": args.reader_baseline_max_input_files,
+                    "max_input_bytes": args.reader_baseline_max_input_bytes,
+                    "timeout_seconds": args.reader_baseline_timeout,
+                } if args.reader_baseline_compactor else None,
+            },
+        }
         self.report.update(profile=args.profile, seed=args.seed, initial_rows_per_table=args.initial_rows,
                            tables=args.tables, payload_bytes=args.row_bytes, warmup_seconds=args.warmup,
                            measured_seconds=args.duration, transaction_rows=args.transaction_rows, writers=args.writers,
                            key_distribution=args.key_distribution, reader_poll_seconds=args.reader_poll_seconds,
                            batch_rows=args.batch_rows, pending_transactions=args.pending_transactions,
+                           maintenance_mode=args.maintenance_mode,
+                           manifest_max_count=args.manifest_max_count,
                            payload=("distinct MD5 blocks per row and generation; hex text (4 bits per byte), PostgreSQL generation CPU included"
                                     if args.payload_entropy == "high" else "distinct-per-row repeated MD5 text; compressible, not random-byte throughput"),
-                           compactor="external background process" if args.compactor_binary else "daemon background role",
+                           compactor=("external background process" if args.compactor_binary else
+                                      "daemon background role" if args.maintenance_mode != "disabled" else "disabled"),
                            build=str(args.binary.resolve()), platform=subprocess.check_output(["uname", "-a"], text=True).strip())
+        self.report["maintenance_policy_contract"] = {
+            "mode": args.maintenance_mode,
+            "daemon_compactor_enabled": args.maintenance_mode != "disabled",
+            "data_rewrite_scope": {
+                "current": "all", "l0-only": "l0-only",
+                "delete-only": "disabled", "disabled": "disabled",
+            }[args.maintenance_mode],
+            "delete_rewrites_enabled": args.maintenance_mode != "disabled",
+            "data_debt_bounds_relaxed_for_finite_diagnostic": args.maintenance_mode in ("disabled", "delete-only"),
+            "stable_small_file_bounds_relaxed_for_finite_diagnostic": args.maintenance_mode != "current",
+            "delete_debt_bounds_relaxed_for_finite_diagnostic": args.maintenance_mode == "disabled",
+            "manifest_max_count": args.manifest_max_count,
+        }
         if args.key_distribution == "zipf":
             self.report["key_distribution_contract"] = {
                 "sampler": "finite-zipf-bucket-rejection-v1", "exponent": args.zipf_exponent,
@@ -677,8 +965,16 @@ columns = [
                                   if phase["name"] == "same-final-state-compacted-reader")
                 self.report["reader_scan_qualified"] = comparison["reader_scan_qualified"]
                 self.report["performance_qualified"] &= self.report["reader_scan_qualified"]
-            self.stop()
-            self.stop_compactor()
+            workload_compactor_stop = self.stop_compactor()
+            if workload_compactor_stop is not None:
+                assert not workload_compactor_stop["forced_kill"] \
+                    and workload_compactor_stop["returncode"] == 0, \
+                    "workload compactor did not stop gracefully"
+                self.report["workload_compactor_shutdown"] = workload_compactor_stop
+            daemon_stop = self.stop()
+            if daemon_stop is not None:
+                assert not daemon_stop["forced_kill"] and daemon_stop["returncode"] == 0, \
+                    "daemon did not stop gracefully"
             self.check_worker_panics()
             self.report["passed"] = self.report["correctness_passed"] and self.report["performance_qualified"]
             if not self.report["passed"]:
@@ -687,8 +983,8 @@ columns = [
             self.report.update(failure=str(error), traceback=traceback.format_exc())
             raise
         finally:
-            self.stop()
             self.stop_compactor()
+            self.stop()
             self.report["state_bytes"] = {name: sum(path.stat().st_size for path in (self.directory / "state" / name).rglob("*") if path.is_file())
                                           for name in ("index", "journal", "spool")}
             try:
@@ -709,9 +1005,16 @@ def main():
     parser.add_argument("--s3-endpoint", required=True)
     parser.add_argument("--warehouse", default="s3://warehouse/")
     parser.add_argument("--binary", type=Path, default=Path("target/release/embrasure-flow"))
+    parser.add_argument("--build-manifest", type=Path, required=True)
     parser.add_argument("--compactor-binary", type=Path)
     parser.add_argument("--reader-baseline-compactor", type=Path)
+    parser.add_argument("--reader-baseline-max-input-files", type=int, default=256)
+    parser.add_argument("--reader-baseline-max-input-bytes", type=int, default=512 << 20)
+    parser.add_argument("--reader-baseline-timeout", type=float, default=180)
     parser.add_argument("--compactor-interval-ms", type=int, default=3000)
+    parser.add_argument("--maintenance-mode", choices=("disabled", "delete-only", "l0-only", "current"),
+                        default="current")
+    parser.add_argument("--manifest-max-count", type=int, default=64)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--duration", type=float, default=60)
@@ -745,8 +1048,12 @@ def main():
         parser.error("initial rows per writer must exceed transaction rows")
     if args.duration * args.rate < args.transaction_rows:
         parser.error("measurement window must schedule at least one complete transaction")
-    if args.pending_transactions <= 0:
-        parser.error("pending transactions must be positive")
+    if (args.pending_transactions <= 0 or args.manifest_max_count < 2
+            or args.reader_baseline_max_input_files <= 0
+            or args.reader_baseline_max_input_bytes <= 0
+            or args.reader_baseline_timeout <= 0):
+        parser.error("pending transactions, reader-baseline budgets and timeouts must be positive; "
+                     "manifest max count must be at least two")
     if args.key_distribution == "zipf" and (not math.isfinite(args.zipf_exponent) or not 0 < args.zipf_exponent <= 2):
         parser.error("Zipf exponent must be finite and greater than zero, at most two")
     Benchmark(args).execute()
