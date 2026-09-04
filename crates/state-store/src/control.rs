@@ -11,7 +11,8 @@
 
 use crate::{
     Error, OPERATIONS, OperationPhase, OperationRecord, RawEntry, Result, SOURCE, StateBatch,
-    StateStore, StateStoreOptions, TABLES, TableState, decode, durable_write, prefix_end,
+    StateStore, StateStoreOptions, TABLES, TableState, WriteObservation, decode, durable_write,
+    prefix_end,
 };
 use flow_model::{OperationId, TableId};
 use rocksdb::{DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions};
@@ -189,7 +190,11 @@ impl ControlStore {
         Ok(active.revision)
     }
 
-    pub(crate) fn commit_index(&self, index: &StateStore, batch: &mut StateBatch) -> Result<()> {
+    pub(crate) fn commit_index(
+        &self,
+        index: &StateStore,
+        batch: &mut StateBatch,
+    ) -> Result<WriteObservation> {
         let _guard = self.lock()?;
         let result = (|| {
             index.ensure_writable()?;
@@ -204,6 +209,7 @@ impl ControlStore {
             active.revision = next_revision(active.revision)?;
             batch.index.put(REVISION, active.revision.to_be_bytes());
             batch.control.put(ACTIVE, bincode::serialize(&active)?);
+            let observation = WriteObservation::capture(&batch.index);
             index
                 .0
                 .db
@@ -212,7 +218,7 @@ impl ControlStore {
                 .db
                 .write_opt(std::mem::take(&mut batch.control), &durable_write())?;
             index.0.revision.store(active.revision, Ordering::Release);
-            Ok(())
+            Ok(observation)
         })();
         // SOURCE ledger writes can bypass the row mutex. Fence a failed two-DB
         // transition before releasing this lock to any subsequent durable write.

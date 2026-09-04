@@ -34,7 +34,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -85,8 +85,11 @@ pub type RawEntry = (Box<[u8]>, Box<[u8]>);
 pub struct StateStoreOptions {
     pub block_cache_bytes: usize,
     pub write_buffer_bytes: usize,
-    /// Maximum index mutations in one durable batch.
+    /// Maximum prepared deltas staged or advanced by one index write.
     pub apply_batch_rows: usize,
+    /// Maximum prepared deltas decoded and looked up together while building an
+    /// atomic apply batch.
+    pub apply_lookup_rows: usize,
 }
 impl Default for StateStoreOptions {
     fn default() -> Self {
@@ -94,6 +97,7 @@ impl Default for StateStoreOptions {
             block_cache_bytes: 128 << 20,
             write_buffer_bytes: 16 << 20,
             apply_batch_rows: 1024,
+            apply_lookup_rows: 1024,
         }
     }
 }
@@ -203,10 +207,61 @@ pub struct ApplyResult {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ApplyBatchStats {
+    cursor_rows: u64,
+    write_batch_bytes: usize,
+    write_batch_operations: usize,
+    reverse_owner_reads: usize,
+    decode: Duration,
+    pk_lookup: Duration,
+    reverse_lookup: Duration,
+    mutation_build: Duration,
+    file_count: Duration,
+    write: Duration,
+    lock_wait: Duration,
+    lock_hold: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApplyBatchOutcome {
+    result: ApplyResult,
+    stats: ApplyBatchStats,
+}
+
+impl ApplyBatchOutcome {
+    fn into_result(self) -> ApplyResult {
+        let _ = self.stats;
+        self.result
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WriteObservation {
+    bytes: usize,
+    operations: usize,
+}
+
+impl WriteObservation {
+    fn capture(batch: &WriteBatch) -> Self {
+        Self {
+            bytes: batch.size_in_bytes(),
+            operations: batch.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileCountShadow {
+    initial: u64,
+    current: u64,
+}
+
 struct Inner {
     db: DB,
     writer: Mutex<()>,
     batch_rows: usize,
+    lookup_rows: usize,
     control: Option<ControlStore>,
     revision: AtomicU64,
     failed: AtomicBool,
@@ -236,6 +291,7 @@ impl StateStore {
         authority_import: bool,
     ) -> Result<Self> {
         if config.apply_batch_rows == 0
+            || config.apply_lookup_rows == 0
             || config.write_buffer_bytes == 0
             || config.block_cache_bytes == 0
         {
@@ -307,6 +363,7 @@ impl StateStore {
             db,
             writer: Mutex::new(()),
             batch_rows: config.apply_batch_rows,
+            lookup_rows: config.apply_lookup_rows,
             control,
             revision: AtomicU64::new(revision),
             failed: AtomicBool::new(false),
@@ -763,21 +820,28 @@ impl StateStore {
     /// Apply one bounded, durable atomic batch. Useful for cooperative recovery and fault
     /// injection. No new publication may start until `complete` is true.
     pub fn apply_committed_batch(&self, id: &OperationId) -> Result<ApplyResult> {
-        self.apply_batch(id, true)
+        Ok(self.apply_batch(id, true)?.into_result())
     }
 
-    fn apply_batch(&self, id: &OperationId, sync_progress: bool) -> Result<ApplyResult> {
+    fn apply_batch(&self, id: &OperationId, sync_progress: bool) -> Result<ApplyBatchOutcome> {
         let lock_started = Instant::now();
-        let _guard = self.lock()?;
-        let lock_wait = lock_started.elapsed();
+        let guard = self.lock()?;
+        let lock_held = Instant::now();
+        let mut stats = ApplyBatchStats {
+            lock_wait: lock_started.elapsed(),
+            ..ApplyBatchStats::default()
+        };
         let prepare_started = Instant::now();
         let mut record = self.require_operation(id)?;
         if record.phase == OperationPhase::Applied {
-            return Ok(ApplyResult {
+            let result = ApplyResult {
                 applied_rows: 0,
                 obsolete_rows: 0,
                 complete: true,
-            });
+            };
+            stats.lock_hold = lock_held.elapsed();
+            drop(guard);
+            return Ok(ApplyBatchOutcome { result, stats });
         }
         if record.phase != OperationPhase::Committed {
             return Err(Error::InvalidState(
@@ -805,175 +869,215 @@ impl StateStore {
         let mut batch = StateBatch::default();
         let mut applied = 0;
         let mut obsolete = 0;
-        let mut file_counts = BTreeMap::<FileId, i64>::new();
+        let mut file_counts = BTreeMap::<FileId, FileCountShadow>::new();
+        let start = record.applied_count;
         let end = record.delta_count.min(
             record
                 .applied_count
                 .saturating_add(self.0.batch_rows as u64),
         );
-        let cf = self.0.db.cf_handle(DELTAS).expect("opened column family");
-        let mut expected = delta_key(id, record.applied_count);
-        let ordinal_start = expected.len() - size_of::<u64>();
-        let mut options = ReadOptions::default();
-        options.fill_cache(false);
-        options.set_iterate_upper_bound(delta_key(id, end));
-        let mut records = self.0.db.raw_iterator_cf_opt(&cf, options);
-        records.seek(&expected);
-        let mut deltas = Vec::<IndexDelta>::with_capacity((end - record.applied_count) as usize);
-        for offset in record.applied_count..end {
-            let Some((key, value)) = records.item() else {
-                records.status()?;
-                return Err(Error::InvalidState("prepared delta is missing".into()));
-            };
-            expected[ordinal_start..].copy_from_slice(&offset.to_be_bytes());
-            if key != expected {
-                return Err(Error::InvalidState(
-                    "prepared delta ordinal is missing".into(),
-                ));
-            }
-            deltas.push(decode(value)?);
-            if offset + 1 < end {
-                records.next();
-            }
-        }
-        records.status()?;
-        drop(records);
-        // Staging guarantees unique keys and replacement positions. Under the
-        // existing apply lock, every check observes the same pre-batch index.
+        stats.cursor_rows = end - start;
+        let delta_cf = self.0.db.cf_handle(DELTAS).expect("opened column family");
         let pk_cf = self.0.db.cf_handle(PK).expect("opened column family");
         let reverse_cf = self.0.db.cf_handle(REVERSE).expect("opened column family");
-        let keys: Vec<_> = deltas
-            .iter()
-            .map(|delta| pk_key(&record.operation.table_id, &delta.key))
-            .collect();
-        let targets: Vec<_> = deltas
-            .iter()
-            .filter_map(|delta| delta.replacement.as_ref())
-            .map(|location| reverse_key(&record.operation.table_id, location))
-            .collect();
-        let current = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), false);
-        let mut owners = (!self.reverse_targets_are_fresh(&reverse_cf, &targets)).then(|| {
-            self.0
-                .db
-                .batched_multi_get_cf(&reverse_cf, targets.iter(), false)
-                .into_iter()
-        });
-        let mut targets = targets.into_iter();
-        let mut encoded = Vec::new();
-        for ((mut delta, current), key) in deltas.into_iter().zip(current).zip(keys) {
-            let target = delta.replacement.as_ref().map(|_| {
-                let owner = owners.as_mut().map(|owners| {
-                    owners
-                        .next()
-                        .expect("one reverse-owner result per replacement")
-                });
-                (owner, targets.next().expect("one target per replacement"))
-            });
-            let current = current?;
-            let current = current
-                .as_deref()
-                .map(decode_borrowed_row_location)
-                .transpose()?;
-            if !matches_expected(current.as_ref(), delta.expected.as_ref()) {
-                // Never overwrite an ingestion version from after the worker's
-                // read. Catalog validation is still mandatory before this point.
-                if record.operation.kind == OperationKind::Rewrite
-                    && is_obsolete(current.as_ref(), delta.expected.as_ref())
-                {
-                    obsolete += 1;
-                    continue;
-                }
-                return Err(Error::IndexConflict {
-                    table: record.operation.table_id,
-                    key: delta.key,
-                });
-            }
-            if let Some(replacement) = &mut delta.replacement
-                && replacement.data_sequence_number == -1
-            {
-                replacement.data_sequence_number = record.sequence_number.ok_or_else(|| {
-                    Error::InvalidState("committed sequence number is missing".into())
-                })?;
-            }
-            // Obsolete rewrite rows must skip their owner check as well as the
-            // write, even if their planned position now belongs to another key.
-            if let Some(old) = &delta.expected {
-                batch.delete_cf(&reverse_cf, reverse_key(&record.operation.table_id, old));
-            }
-            match (&delta.replacement, target) {
-                (Some(new), Some((owner, target))) => {
-                    let owner: Option<PrimaryKey> = owner
-                        .transpose()?
-                        .flatten()
-                        .map(|value| decode(&value))
-                        .transpose()?;
-                    if owner.as_ref().is_some_and(|owner| owner != &delta.key) {
-                        return Err(Error::InvalidState(
-                            "two live keys claim the same physical row".into(),
-                        ));
-                    }
-                    // WriteBatch copies bytes, so one buffer serves every row
-                    // without repeated allocation or column-family lookups.
-                    encoded.clear();
-                    bincode::serialize_into(&mut encoded, new)?;
-                    batch.put_cf(&pk_cf, key, &encoded);
-                    encoded.clear();
-                    bincode::serialize_into(&mut encoded, &delta.key)?;
-                    batch.put_cf(&reverse_cf, target, &encoded);
-                }
-                (None, None) => batch.delete_cf(&pk_cf, key),
-                _ => unreachable!("one reverse-owner result per replacement"),
-            }
-            let old = delta.expected.as_ref().map(|row| &row.data_file_id);
-            let new = delta.replacement.as_ref().map(|row| &row.data_file_id);
-            if old != new {
-                for (file, change) in old
-                    .into_iter()
-                    .map(|file| (file, -1))
-                    .chain(new.into_iter().map(|file| (file, 1)))
-                {
-                    // Most rows share a file. Clone its path only once per batch.
-                    if let Some(count) = file_counts.get_mut(file) {
-                        *count = count.checked_add(change).ok_or_else(|| {
-                            Error::InvalidState(
-                                "file count delta exceeds the bounded apply batch".into(),
-                            )
-                        })?;
-                    } else {
-                        file_counts.insert(file.clone(), change);
-                    }
-                }
-            }
-            applied += 1;
-        }
         let counts_cf = self
             .0
             .db
             .cf_handle(FILE_COUNTS)
             .expect("opened column family");
-        for (file, change) in file_counts {
-            if change == 0 {
+        let mut expected = delta_key(id, start);
+        let ordinal_start = expected.len() - size_of::<u64>();
+        let mut options = ReadOptions::default();
+        options.fill_cache(false);
+        options.set_iterate_upper_bound(delta_key(id, end));
+        let mut records = self.0.db.raw_iterator_cf_opt(&delta_cf, options);
+        records.seek(&expected);
+        let mut cursor = start;
+        while cursor < end {
+            let chunk_end = end.min(cursor.saturating_add(self.0.lookup_rows as u64));
+            let decode_started = Instant::now();
+            let mut deltas = Vec::<IndexDelta>::with_capacity((chunk_end - cursor) as usize);
+            for offset in cursor..chunk_end {
+                let Some((key, value)) = records.item() else {
+                    records.status()?;
+                    return Err(Error::InvalidState("prepared delta is missing".into()));
+                };
+                expected[ordinal_start..].copy_from_slice(&offset.to_be_bytes());
+                if key != expected {
+                    return Err(Error::InvalidState(
+                        "prepared delta ordinal is missing".into(),
+                    ));
+                }
+                deltas.push(decode(value)?);
+                if offset + 1 < end {
+                    records.next();
+                }
+            }
+            stats.decode += decode_started.elapsed();
+
+            let pk_lookup_started = Instant::now();
+            let keys: Vec<_> = deltas
+                .iter()
+                .map(|delta| pk_key(&record.operation.table_id, &delta.key))
+                .collect();
+            let current = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), false);
+            stats.pk_lookup += pk_lookup_started.elapsed();
+
+            let reverse_lookup_started = Instant::now();
+            let targets: Vec<_> = deltas
+                .iter()
+                .filter_map(|delta| delta.replacement.as_ref())
+                .map(|location| reverse_key(&record.operation.table_id, location))
+                .collect();
+            let mut owners = (!self.reverse_targets_are_fresh(&reverse_cf, &targets)).then(|| {
+                stats.reverse_owner_reads += targets.len();
+                self.0
+                    .db
+                    .batched_multi_get_cf(&reverse_cf, targets.iter(), false)
+                    .into_iter()
+            });
+            stats.reverse_lookup += reverse_lookup_started.elapsed();
+
+            let mutation_started = Instant::now();
+            let mut targets = targets.into_iter();
+            let mut encoded = Vec::new();
+            let mut chunk_file_counts = BTreeMap::<FileId, i64>::new();
+            for ((mut delta, current), key) in deltas.into_iter().zip(current).zip(keys) {
+                let target = delta.replacement.as_ref().map(|_| {
+                    let owner = owners.as_mut().map(|owners| {
+                        owners
+                            .next()
+                            .expect("one reverse-owner result per replacement")
+                    });
+                    (owner, targets.next().expect("one target per replacement"))
+                });
+                let current = current?;
+                let current = current
+                    .as_deref()
+                    .map(decode_borrowed_row_location)
+                    .transpose()?;
+                if !matches_expected(current.as_ref(), delta.expected.as_ref()) {
+                    // Never overwrite an ingestion version from after the worker's
+                    // read. Catalog validation is still mandatory before this point.
+                    if record.operation.kind == OperationKind::Rewrite
+                        && is_obsolete(current.as_ref(), delta.expected.as_ref())
+                    {
+                        obsolete += 1;
+                        continue;
+                    }
+                    return Err(Error::IndexConflict {
+                        table: record.operation.table_id,
+                        key: delta.key,
+                    });
+                }
+                if let Some(replacement) = &mut delta.replacement
+                    && replacement.data_sequence_number == -1
+                {
+                    replacement.data_sequence_number = record.sequence_number.ok_or_else(|| {
+                        Error::InvalidState("committed sequence number is missing".into())
+                    })?;
+                }
+                // Every owner lookup observes the committed index from before this
+                // outer batch. A delete in an earlier lookup chunk cannot free a
+                // physical row for a later chunk in the same atomic commit.
+                if let Some(old) = &delta.expected {
+                    batch.delete_cf(&reverse_cf, reverse_key(&record.operation.table_id, old));
+                }
+                match (&delta.replacement, target) {
+                    (Some(new), Some((owner, target))) => {
+                        let owner: Option<PrimaryKey> = owner
+                            .transpose()?
+                            .flatten()
+                            .map(|value| decode(&value))
+                            .transpose()?;
+                        if owner.as_ref().is_some_and(|owner| owner != &delta.key) {
+                            return Err(Error::InvalidState(
+                                "two live keys claim the same physical row".into(),
+                            ));
+                        }
+                        // WriteBatch copies bytes, so one buffer serves every row
+                        // without repeated allocation or column-family lookups.
+                        encoded.clear();
+                        bincode::serialize_into(&mut encoded, new)?;
+                        batch.put_cf(&pk_cf, key, &encoded);
+                        encoded.clear();
+                        bincode::serialize_into(&mut encoded, &delta.key)?;
+                        batch.put_cf(&reverse_cf, target, &encoded);
+                    }
+                    (None, None) => batch.delete_cf(&pk_cf, key),
+                    _ => unreachable!("one reverse-owner result per replacement"),
+                }
+                let old = delta.expected.as_ref().map(|row| &row.data_file_id);
+                let new = delta.replacement.as_ref().map(|row| &row.data_file_id);
+                if old != new {
+                    for (file, change) in old
+                        .into_iter()
+                        .map(|file| (file, -1))
+                        .chain(new.into_iter().map(|file| (file, 1)))
+                    {
+                        if let Some(count) = chunk_file_counts.get_mut(file) {
+                            *count = count.checked_add(change).ok_or_else(|| {
+                                Error::InvalidState(
+                                    "file count delta exceeds the bounded lookup chunk".into(),
+                                )
+                            })?;
+                        } else {
+                            chunk_file_counts.insert(file.clone(), change);
+                        }
+                    }
+                }
+                applied += 1;
+            }
+            stats.mutation_build += mutation_started.elapsed();
+
+            let file_count_started = Instant::now();
+            for (file, change) in chunk_file_counts {
+                if change == 0 {
+                    continue;
+                }
+                let previous = if let Some(count) = file_counts.get(&file) {
+                    count.current
+                } else {
+                    let key = file_prefix(&record.operation.table_id, &file);
+                    self.0
+                        .db
+                        .get_cf(&counts_cf, key)?
+                        .map(|bytes| decode_file_count(&bytes))
+                        .transpose()?
+                        .unwrap_or(0)
+                };
+                let current = previous.checked_add_signed(change).ok_or_else(|| {
+                    Error::RecoveryRequired(
+                        "per-file live-row count overflow or underflow; rebuild the index".into(),
+                    )
+                })?;
+                file_counts
+                    .entry(file)
+                    .and_modify(|count| count.current = current)
+                    .or_insert(FileCountShadow {
+                        initial: previous,
+                        current,
+                    });
+            }
+            stats.file_count += file_count_started.elapsed();
+            cursor = chunk_end;
+        }
+        records.status()?;
+        drop(records);
+
+        let file_count_started = Instant::now();
+        for (file, count) in file_counts {
+            if count.current == count.initial {
                 continue;
             }
             let key = file_prefix(&record.operation.table_id, &file);
-            let previous = self
-                .0
-                .db
-                .get_cf(&counts_cf, &key)?
-                .map(|bytes| decode_file_count(&bytes))
-                .transpose()?
-                .unwrap_or(0);
-            let count = previous.checked_add_signed(change).ok_or_else(|| {
-                Error::RecoveryRequired(
-                    "per-file live-row count overflow or underflow; rebuild the index".into(),
-                )
-            })?;
-            if count == 0 {
+            if count.current == 0 {
                 batch.delete_cf(&counts_cf, key);
             } else {
-                batch.put_cf(&counts_cf, key, count.to_be_bytes());
+                batch.put_cf(&counts_cf, key, count.current.to_be_bytes());
             }
         }
+        stats.file_count += file_count_started.elapsed();
         record.applied_count = end;
         let complete = end == record.delta_count;
         if complete {
@@ -991,24 +1095,24 @@ impl StateStore {
         }
         self.put(&mut batch, OPERATIONS, id.0.as_bytes(), &record)?;
         let prepare = prepare_started.elapsed();
-        metrics::histogram!("flow_state_apply_batch_seconds", "role" => role, "kind" => kind, "phase" => "lock_wait")
-            .record(lock_wait.as_secs_f64());
-        metrics::histogram!("flow_state_apply_batch_seconds", "role" => role, "kind" => kind, "phase" => "prepare")
-            .record(prepare.as_secs_f64());
-        let commit_started = Instant::now();
-        let result = if complete || sync_progress {
-            self.write(batch)
+        let write_started = Instant::now();
+        let observation = if complete || sync_progress {
+            self.write_observed(batch)
         } else {
-            self.write_staged(batch)
-        };
-        metrics::histogram!("flow_state_apply_batch_seconds", "role" => role, "kind" => kind, "phase" => "commit")
-            .record(commit_started.elapsed().as_secs_f64());
-        result?;
-        Ok(ApplyResult {
+            self.write_staged_observed(batch)
+        }?;
+        stats.write = write_started.elapsed();
+        stats.write_batch_bytes = observation.bytes;
+        stats.write_batch_operations = observation.operations;
+        let result = ApplyResult {
             applied_rows: applied,
             obsolete_rows: obsolete,
             complete,
-        })
+        };
+        stats.lock_hold = lock_held.elapsed();
+        drop(guard);
+        record_apply_batch_metrics(role, kind, prepare, &stats);
+        Ok(ApplyBatchOutcome { result, stats })
     }
 
     /// Each progress cursor is atomic with its index changes. The final batch
@@ -1022,7 +1126,7 @@ impl StateStore {
             complete: false,
         };
         while !total.complete {
-            let result = self.apply_batch(id, false)?;
+            let result = self.apply_batch(id, false)?.into_result();
             total.applied_rows += result.applied_rows;
             total.obsolete_rows += result.obsolete_rows;
             total.complete = result.complete;
@@ -1295,11 +1399,16 @@ impl StateStore {
         );
         Ok(())
     }
-    fn write(&self, mut batch: StateBatch) -> Result<()> {
+    fn write(&self, batch: StateBatch) -> Result<()> {
+        self.write_observed(batch).map(|_| ())
+    }
+    fn write_observed(&self, mut batch: StateBatch) -> Result<WriteObservation> {
         if let Some(control) = &self.0.control {
             control.commit_index(self, &mut batch)
         } else {
-            Ok(self.0.db.write_opt(batch.index, &durable_write())?)
+            let observation = WriteObservation::capture(&batch.index);
+            self.0.db.write_opt(batch.index, &durable_write())?;
+            Ok(observation)
         }
     }
     /// Derived state uses the WAL without forcing a disk flush per chunk.
@@ -1307,7 +1416,12 @@ impl StateStore {
     /// revision. Controlled index writes remain unsynced and require revision
     /// validation on reopen, with rebuild on mismatch. Never disable the WAL here.
     fn write_staged(&self, batch: StateBatch) -> Result<()> {
-        Ok(self.0.db.write_opt(batch.index, &WriteOptions::default())?)
+        self.write_staged_observed(batch).map(|_| ())
+    }
+    fn write_staged_observed(&self, batch: StateBatch) -> Result<WriteObservation> {
+        let observation = WriteObservation::capture(&batch.index);
+        self.0.db.write_opt(batch.index, &WriteOptions::default())?;
+        Ok(observation)
     }
 
     fn scan(&self, cf: &str, prefix: Vec<u8>) -> impl Iterator<Item = Result<RawEntry>> + '_ {
@@ -1358,6 +1472,40 @@ impl StateStore {
             prefix,
             &end,
         );
+    }
+}
+
+fn record_apply_batch_metrics(
+    role: &'static str,
+    kind: &'static str,
+    prepare: Duration,
+    stats: &ApplyBatchStats,
+) {
+    for (phase, duration) in [
+        ("lock_wait", stats.lock_wait),
+        ("prepare", prepare),
+        ("decode", stats.decode),
+        ("pk_lookup", stats.pk_lookup),
+        ("reverse_lookup", stats.reverse_lookup),
+        ("mutation_build", stats.mutation_build),
+        ("file_count", stats.file_count),
+        ("commit", stats.write),
+        ("lock_hold", stats.lock_hold),
+    ] {
+        metrics::histogram!("flow_state_apply_batch_seconds", "role" => role, "kind" => kind, "phase" => phase)
+            .record(duration.as_secs_f64());
+    }
+    for (measurement, value) in [
+        ("cursor_rows", stats.cursor_rows),
+        ("write_batch_bytes", stats.write_batch_bytes as u64),
+        (
+            "write_batch_operations",
+            stats.write_batch_operations as u64,
+        ),
+        ("reverse_owner_reads", stats.reverse_owner_reads as u64),
+    ] {
+        metrics::histogram!("flow_state_apply_batch_size", "role" => role, "kind" => kind, "measurement" => measurement)
+            .record(value as f64);
     }
 }
 

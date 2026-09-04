@@ -3,7 +3,7 @@ use serde_json::json;
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 
@@ -109,6 +109,7 @@ struct ProfileConfig {
     rows: u64,
     files: u64,
     batch_rows: usize,
+    lookup_rows: usize,
     scenario: Scenario,
 }
 
@@ -117,13 +118,16 @@ impl ProfileConfig {
         let rows = configured_u64("FLOW_STATE_APPLY_PROFILE_ROWS", 100_000);
         let files = configured_u64("FLOW_STATE_APPLY_PROFILE_FILES", 256);
         let batch_rows = configured_usize("FLOW_STATE_APPLY_PROFILE_BATCH_ROWS", 1_024);
+        let lookup_rows = configured_usize("FLOW_STATE_APPLY_PROFILE_LOOKUP_ROWS", 1_024);
         assert!(rows >= 2, "profile needs at least two rows");
         assert_ne!(files, 0, "profile needs at least one file");
         assert_ne!(batch_rows, 0, "batch row ceiling must be positive");
+        assert_ne!(lookup_rows, 0, "lookup row ceiling must be positive");
         Self {
             rows,
             files,
             batch_rows,
+            lookup_rows,
             scenario: Scenario::configured(),
         }
     }
@@ -131,6 +135,7 @@ impl ProfileConfig {
     fn apply_options(self) -> StateStoreOptions {
         StateStoreOptions {
             apply_batch_rows: self.batch_rows,
+            apply_lookup_rows: self.lookup_rows,
             ..StateStoreOptions::default()
         }
     }
@@ -272,6 +277,7 @@ fn initialize(root: &Path) -> (ControlStore, StateStore, PathBuf, PathBuf) {
             &index_path,
             StateStoreOptions {
                 apply_batch_rows: SETUP_BATCH_ROWS,
+                apply_lookup_rows: SETUP_BATCH_ROWS,
                 ..StateStoreOptions::default()
             },
         )
@@ -484,7 +490,7 @@ fn signed_byte_delta(after: u64, before: u64) -> i64 {
 
 struct ApplyObservation {
     result: ApplyResult,
-    cursor_rows: Vec<u64>,
+    batches: Vec<ApplyBatchStats>,
     batch_call_ms: Vec<f64>,
 }
 
@@ -493,12 +499,36 @@ impl ApplyObservation {
         self.batch_call_ms.iter().sum()
     }
 
-    fn percentile_ms(&self, percentile: usize) -> f64 {
-        let mut samples = self.batch_call_ms.clone();
-        samples.sort_by(f64::total_cmp);
-        let index = (samples.len() * percentile).div_ceil(100).saturating_sub(1);
-        samples[index]
+    fn batch_call_distribution(&self) -> serde_json::Value {
+        distribution(self.batch_call_ms.clone())
     }
+}
+
+fn distribution(mut samples: Vec<f64>) -> serde_json::Value {
+    assert!(!samples.is_empty(), "profile distribution needs a sample");
+    samples.sort_by(f64::total_cmp);
+    let percentile = |value: usize| {
+        let index = (samples.len() * value).div_ceil(100).saturating_sub(1);
+        samples[index]
+    };
+    json!({
+        "p50": percentile(50),
+        "p95": percentile(95),
+        "p99": percentile(99),
+        "max": percentile(100),
+    })
+}
+
+fn duration_distribution(
+    batches: &[ApplyBatchStats],
+    field: impl Fn(&ApplyBatchStats) -> Duration,
+) -> serde_json::Value {
+    distribution(
+        batches
+            .iter()
+            .map(|batch| field(batch).as_secs_f64() * 1_000.0)
+            .collect(),
+    )
 }
 
 fn observe_apply(store: &StateStore, id: &OperationId) -> ApplyObservation {
@@ -508,19 +538,21 @@ fn observe_apply(store: &StateStore, id: &OperationId) -> ApplyObservation {
         complete: false,
     };
     let mut cursor = store.operation(id).unwrap().unwrap().applied_count;
-    let mut cursor_rows = Vec::new();
+    let mut batches = Vec::new();
     let mut batch_call_ms = Vec::new();
     while !result.complete {
         let batch_started = Instant::now();
-        let batch = store.apply_batch(id, false).unwrap();
+        let outcome = store.apply_batch(id, false).unwrap();
         batch_call_ms.push(batch_started.elapsed().as_secs_f64() * 1_000.0);
+        let batch = outcome.result;
         let next_cursor = store.operation(id).unwrap().unwrap().applied_count;
         let advanced = next_cursor
             .checked_sub(cursor)
             .expect("apply cursor only advances");
         assert_ne!(advanced, 0, "an incomplete apply must advance its cursor");
         assert_eq!(advanced, batch.applied_rows + batch.obsolete_rows);
-        cursor_rows.push(advanced);
+        assert_eq!(advanced, outcome.stats.cursor_rows);
+        batches.push(outcome.stats);
         cursor = next_cursor;
         result.applied_rows += batch.applied_rows;
         result.obsolete_rows += batch.obsolete_rows;
@@ -528,7 +560,7 @@ fn observe_apply(store: &StateStore, id: &OperationId) -> ApplyObservation {
     }
     ApplyObservation {
         result,
-        cursor_rows,
+        batches,
         batch_call_ms,
     }
 }
@@ -576,7 +608,7 @@ fn profiles_controlled_apply_batches() {
         "state_store_apply_profile {}",
         serde_json::to_string(&json!({
             "kind": "summary",
-            "version": 1,
+            "version": 2,
             "controlled_store": true,
             "config": {
                 "scenario": config.scenario.name(),
@@ -586,19 +618,31 @@ fn profiles_controlled_apply_batches() {
                 "file_count": config.files,
                 "setup_batch_row_ceiling": SETUP_BATCH_ROWS,
                 "batch_row_ceiling": config.batch_rows,
+                "lookup_row_ceiling": config.lookup_rows,
+                "write_batch_byte_ceiling": serde_json::Value::Null,
             },
             "apply": {
-                "batches": observation.cursor_rows.len(),
+                "batches": observation.batches.len(),
                 "batch_count_source": "observed_cursor_advances",
-                "batch_cursor_rows": observation.cursor_rows,
-                "batch_call_p50_ms": observation.percentile_ms(50),
-                "batch_call_p95_ms": observation.percentile_ms(95),
-                "batch_call_p99_ms": observation.percentile_ms(99),
-                "batch_call_max_ms": observation.percentile_ms(100),
+                "batch_cursor_rows": observation.batches.iter().map(|batch| batch.cursor_rows).collect::<Vec<_>>(),
+                "batch_serialized_write_bytes": observation.batches.iter().map(|batch| batch.write_batch_bytes).collect::<Vec<_>>(),
+                "batch_write_operations": observation.batches.iter().map(|batch| batch.write_batch_operations).collect::<Vec<_>>(),
+                "batch_reverse_owner_reads": observation.batches.iter().map(|batch| batch.reverse_owner_reads).collect::<Vec<_>>(),
+                "batch_call_ms": observation.batch_call_distribution(),
+                "phase_ms": {
+                    "decode": duration_distribution(&observation.batches, |batch| batch.decode),
+                    "pk_lookup": duration_distribution(&observation.batches, |batch| batch.pk_lookup),
+                    "reverse_lookup": duration_distribution(&observation.batches, |batch| batch.reverse_lookup),
+                    "mutation_build": duration_distribution(&observation.batches, |batch| batch.mutation_build),
+                    "file_count": duration_distribution(&observation.batches, |batch| batch.file_count),
+                    "write": duration_distribution(&observation.batches, |batch| batch.write),
+                    "lock_wait": duration_distribution(&observation.batches, |batch| batch.lock_wait),
+                    "lock_hold": duration_distribution(&observation.batches, |batch| batch.lock_hold),
+                },
                 "total_ms": observation.total_ms(),
                 "timing_scope": "end_to_end_apply_batch_calls",
-                "phase_split_reported": false,
-                "serialized_write_batch_bytes_reported": false,
+                "write_batch_observation": "serialized index WriteBatch as submitted; controlled durable batches include the revision mutation",
+                "limit_note": "row ceilings only; no serialized 8 MiB WriteBatch cap is enforced",
                 "applied_rows": result.applied_rows,
                 "obsolete_rows": result.obsolete_rows,
             },
@@ -633,6 +677,7 @@ fn clean_reopen_resumes_at_an_atomic_batch_cursor() {
         rows: 257,
         files: 17,
         batch_rows: 64,
+        lookup_rows: 11,
         scenario: Scenario::Compaction,
     };
     let root = TempDir::new().unwrap();
@@ -645,6 +690,10 @@ fn clean_reopen_resumes_at_an_atomic_batch_cursor() {
     let (control, store) = reopen(&control_path, &index_path, config);
     verify_pre_apply(&store, &control, &id, config);
     let first = store.apply_batch(&id, false).unwrap();
+    assert_eq!(first.stats.cursor_rows, config.batch_rows as u64);
+    assert!(first.stats.write_batch_bytes > 0);
+    assert!(first.stats.write_batch_operations > 0);
+    let first = first.result;
     assert_eq!(first.applied_rows, config.batch_rows as u64);
     assert_eq!(first.obsolete_rows, 0);
     assert!(!first.complete);
@@ -681,10 +730,11 @@ fn clean_reopen_resumes_at_an_atomic_batch_cursor() {
         "state_store_apply_profile {}",
         serde_json::to_string(&json!({
             "kind": "clean_reopen_resume",
-            "version": 1,
+            "version": 2,
             "rows": config.rows,
             "setup_batch_row_ceiling": SETUP_BATCH_ROWS,
             "batch_row_ceiling": config.batch_rows,
+            "lookup_row_ceiling": config.lookup_rows,
             "reopened_after_rows": config.batch_rows,
             "validation_after_resume": true,
             "validation_after_second_reopen": true,

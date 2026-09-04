@@ -6,10 +6,19 @@ use flow_state_store::{
 use tempfile::TempDir;
 
 fn open(path: &std::path::Path) -> StateStore {
+    open_with_apply_limits(path, 2, StateStoreOptions::default().apply_lookup_rows)
+}
+
+fn open_with_apply_limits(
+    path: &std::path::Path,
+    batch_rows: usize,
+    lookup_rows: usize,
+) -> StateStore {
     StateStore::open(
         path,
         StateStoreOptions {
-            apply_batch_rows: 2,
+            apply_batch_rows: batch_rows,
+            apply_lookup_rows: lookup_rows,
             ..Default::default()
         },
     )
@@ -273,6 +282,138 @@ fn index_conflict_never_partially_applies_a_batch() {
             assert_eq!(state.pending_operation.as_ref(), Some(&id));
         }
     }
+}
+
+#[test]
+fn lookup_chunks_advance_one_atomic_apply_cursor() {
+    let temp = TempDir::new().unwrap();
+    let store = open_with_apply_limits(temp.path(), 5, 2);
+    let id = OperationId("chunked-insert".into());
+    store
+        .prepare(
+            operation(&id.0, None, 10),
+            (0..5).map(|row| insert(row, "a", row.into())),
+        )
+        .unwrap();
+    store.mark_committed(&id, 1, 1).unwrap();
+
+    let result = store.apply_committed_batch(&id).unwrap();
+    assert_eq!(result.applied_rows, 5);
+    assert!(result.complete);
+    assert_eq!(store.operation(&id).unwrap().unwrap().applied_count, 5);
+    assert_eq!(file_counts(&store, 1, &["a"]), [5]);
+}
+
+#[test]
+fn later_lookup_chunk_owner_conflict_rolls_back_the_commit_group() {
+    let temp = TempDir::new().unwrap();
+    let store = open_with_apply_limits(temp.path(), 2, 1);
+    let table = TableId(7);
+    let seed = OperationId("owner-seed".into());
+    store
+        .prepare(operation(&seed.0, None, 10), [insert(1, "a", 0)])
+        .unwrap();
+    store.mark_committed(&seed, 1, 1).unwrap();
+    store.apply_committed(&seed).unwrap();
+    let original = store.lookup(&table, &PrimaryKey(vec![1])).unwrap().unwrap();
+
+    let id = OperationId("owner-conflict".into());
+    store
+        .prepare(
+            operation(&id.0, Some(1), 20),
+            [
+                IndexDelta {
+                    key: PrimaryKey(vec![1]),
+                    expected: Some(original.clone()),
+                    replacement: Some(location("b", 0, 20)),
+                },
+                insert(2, "a", 0),
+            ],
+        )
+        .unwrap();
+    store.mark_committed(&id, 2, 2).unwrap();
+
+    assert!(matches!(
+        store.apply_committed_batch(&id),
+        Err(flow_state_store::Error::InvalidState(message))
+            if message == "two live keys claim the same physical row"
+    ));
+    assert_eq!(
+        store.lookup(&table, &PrimaryKey(vec![1])).unwrap(),
+        Some(original)
+    );
+    assert_eq!(store.lookup(&table, &PrimaryKey(vec![2])).unwrap(), None);
+    assert_eq!(store.file_rows(&table, &FileId("a".into())).count(), 1);
+    assert_eq!(store.file_rows(&table, &FileId("b".into())).count(), 0);
+    assert_eq!(store.operation(&id).unwrap().unwrap().applied_count, 0);
+}
+
+#[test]
+fn file_count_underflow_is_checked_at_each_lookup_chunk_boundary() {
+    let temp = TempDir::new().unwrap();
+    let table = TableId(7);
+    let seed = OperationId("count-boundary-seed".into());
+    let (first, second) = {
+        let store = open_with_apply_limits(temp.path(), 3, 2);
+        store
+            .prepare(
+                operation(&seed.0, None, 10),
+                [insert(1, "a", 0), insert(2, "a", 1)],
+            )
+            .unwrap();
+        store.mark_committed(&seed, 1, 1).unwrap();
+        store.apply_committed(&seed).unwrap();
+        (
+            store.lookup(&table, &PrimaryKey(vec![1])).unwrap(),
+            store.lookup(&table, &PrimaryKey(vec![2])).unwrap(),
+        )
+    };
+    let options = rocksdb::Options::default();
+    let families = rocksdb::DB::list_cf(&options, temp.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&options, temp.path(), families).unwrap();
+    let counts = db.cf_handle("file_live_rows").unwrap();
+    let (key, _) = db
+        .iterator_cf(&counts, rocksdb::IteratorMode::Start)
+        .next()
+        .unwrap()
+        .unwrap();
+    db.put_cf(&counts, key, 1_u64.to_be_bytes()).unwrap();
+    drop(counts);
+    drop(db);
+
+    let store = open_with_apply_limits(temp.path(), 3, 2);
+    let id = OperationId("count-boundary".into());
+    store
+        .prepare(
+            operation(&id.0, Some(1), 20),
+            [
+                IndexDelta {
+                    key: PrimaryKey(vec![1]),
+                    expected: first.clone(),
+                    replacement: None,
+                },
+                IndexDelta {
+                    key: PrimaryKey(vec![2]),
+                    expected: second.clone(),
+                    replacement: None,
+                },
+                insert(3, "a", 2),
+            ],
+        )
+        .unwrap();
+    store.mark_committed(&id, 2, 2).unwrap();
+
+    // The full group nets -1 and would hide the corrupted count. Its first
+    // two-row lookup chunk nets -2, so the shadow count detects the underflow.
+    assert!(matches!(
+        store.apply_committed_batch(&id),
+        Err(flow_state_store::Error::RecoveryRequired(_))
+    ));
+    assert_eq!(store.lookup(&table, &PrimaryKey(vec![1])).unwrap(), first);
+    assert_eq!(store.lookup(&table, &PrimaryKey(vec![2])).unwrap(), second);
+    assert_eq!(store.lookup(&table, &PrimaryKey(vec![3])).unwrap(), None);
+    assert_eq!(store.file_rows(&table, &FileId("a".into())).count(), 2);
+    assert_eq!(store.operation(&id).unwrap().unwrap().applied_count, 0);
 }
 
 #[test]

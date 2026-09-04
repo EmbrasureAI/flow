@@ -32,7 +32,8 @@ No separate export task is created.
 | `flow_ingest_prepare_seconds` | Successful ingest artifact and delta preparation through durable Prepared, before catalog resolution |
 | `flow_table_local_phase_seconds` | Successful epoch collapse, or dispatcher completion through ledger updates, index cleanup, ACK feedback and observation export |
 | `flow_maintenance_phase_seconds` | Fixed preparation phases (`preflight`, `catch_up`, `plan_seal`) and recovery phases (`catalog_resolve`, `mark_apply`) |
-| `flow_state_apply_batch_seconds` | State-store lock wait, batch preparation and commit call; fixed operation-kind and controlled/standalone labels |
+| `flow_state_apply_batch_seconds` | State-store aggregate lock wait, preparation, commit and lock hold, plus decode, PK lookup, reverse lookup, mutation-build and file-count components; fixed operation-kind and controlled/standalone labels |
+| `flow_state_apply_batch_size` | Apply cursor rows, serialized index `WriteBatch` bytes, submitted update-record count and reverse-owner reads; fixed measurement, operation-kind and controlled/standalone labels |
 | `flow_state_stage_batch_seconds` | Delta-batch construction, duplicate lookup and staged write; fixed operation-kind and controlled/standalone labels |
 | `flow_state_collapse_batch_seconds` | Disk-collapse batch setup, fold, prior spool reads, index lookup, binding and staged write; fixed phase and controlled/standalone labels |
 | `flow_table_*` | L0 count/bytes/age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
