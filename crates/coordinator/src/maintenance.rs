@@ -7,7 +7,7 @@ mod garbage;
 pub use garbage::{GarbagePolicy, GarbageProtection, GarbageReport};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail, ensure};
 use flow_compactor::{Debt, DeleteDependency, FileCandidate, Level, Policy};
@@ -30,7 +30,7 @@ mod manifests;
 mod recovery;
 use levels::file_level;
 pub(crate) use recovery::resolve_maintenance_catalog_operation;
-use recovery::resolve_maintenance_operation;
+use recovery::{MaintenanceResolution, resolve_maintenance_operation};
 
 /// OpenDAL shares its HTTP pool across the process. Connection tasks started by
 /// one worker must remain driven after that worker finishes or its caller shuts
@@ -94,6 +94,158 @@ struct ReconcileRecovery {
     table_uuid: uuid::Uuid,
     snapshot_id: i64,
     sequence_number: i64,
+}
+
+struct RecoveryDiagnostics {
+    started: Instant,
+    record_found: bool,
+    table_id: u32,
+    kind: &'static str,
+    phase_before: Option<OperationPhase>,
+    total_delta_rows: u64,
+    apply_start_cursor: u64,
+    durable_lookup_phase: Duration,
+    durable_lookup_call: Duration,
+    catalog_resolution_path: &'static str,
+    catalog_resolution_phase: Duration,
+    catalog_update_call: Option<Duration>,
+    catalog_already_committed: bool,
+    mark_committed_required: bool,
+    mark_committed_phase: Duration,
+    mark_committed_call: Duration,
+    state_apply_phase: Duration,
+    state_apply_call: Duration,
+    discard_before_replan_phase: Duration,
+    discard_uncommitted_call: Duration,
+    catalog_resolve_boundary: Duration,
+    mark_apply_boundary: Duration,
+    completed_apply: bool,
+    snapshot_id: Option<i64>,
+    applied_rows: u64,
+    obsolete_rows: u64,
+}
+
+impl RecoveryDiagnostics {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            record_found: false,
+            table_id: 0,
+            kind: "unknown",
+            phase_before: None,
+            total_delta_rows: 0,
+            apply_start_cursor: 0,
+            durable_lookup_phase: Duration::ZERO,
+            durable_lookup_call: Duration::ZERO,
+            catalog_resolution_path: "not_started",
+            catalog_resolution_phase: Duration::ZERO,
+            catalog_update_call: None,
+            catalog_already_committed: false,
+            mark_committed_required: false,
+            mark_committed_phase: Duration::ZERO,
+            mark_committed_call: Duration::ZERO,
+            state_apply_phase: Duration::ZERO,
+            state_apply_call: Duration::ZERO,
+            discard_before_replan_phase: Duration::ZERO,
+            discard_uncommitted_call: Duration::ZERO,
+            catalog_resolve_boundary: Duration::ZERO,
+            mark_apply_boundary: Duration::ZERO,
+            completed_apply: false,
+            snapshot_id: None,
+            applied_rows: 0,
+            obsolete_rows: 0,
+        }
+    }
+
+    fn emit(
+        &self,
+        event_name: &'static str,
+        operation_id: &OperationId,
+        outcome: &'static str,
+        error: Option<&anyhow::Error>,
+    ) {
+        let total = self.started.elapsed();
+        let catalog_resolution_other = self
+            .catalog_resolution_phase
+            .saturating_sub(self.catalog_update_call.unwrap_or_default());
+        let mark_committed_other = self
+            .mark_committed_phase
+            .saturating_sub(self.mark_committed_call);
+        let state_apply_other = self.state_apply_phase.saturating_sub(self.state_apply_call);
+        let discard_before_replan_other = self
+            .discard_before_replan_phase
+            .saturating_sub(self.discard_uncommitted_call);
+        let recovery_other = total
+            .saturating_sub(self.durable_lookup_phase)
+            .saturating_sub(self.catalog_resolution_phase)
+            .saturating_sub(self.mark_committed_phase)
+            .saturating_sub(self.state_apply_phase)
+            .saturating_sub(self.discard_before_replan_phase);
+        let error = error.map(ToString::to_string).unwrap_or_default();
+        tracing::info!(
+            event = event_name,
+            operation_id = %operation_id.0,
+            outcome,
+            error,
+            record_found = self.record_found,
+            table_id = self.table_id,
+            kind = self.kind,
+            phase_before = ?self.phase_before,
+            snapshot_known = self.snapshot_id.is_some(),
+            snapshot_id = self.snapshot_id.unwrap_or_default(),
+            total_delta_rows = self.total_delta_rows,
+            apply_start_cursor = self.apply_start_cursor,
+            applied_rows_this_call = self.applied_rows,
+            obsolete_rows_this_call = self.obsolete_rows,
+            catalog_resolve_ms = self.catalog_resolve_boundary.as_secs_f64() * 1000.0,
+            mark_apply_ms = self.mark_apply_boundary.as_secs_f64() * 1000.0,
+            durable_lookup_phase_ms = self.durable_lookup_phase.as_secs_f64() * 1000.0,
+            durable_lookup_call_ms = self.durable_lookup_call.as_secs_f64() * 1000.0,
+            durable_lookup_other_ms = self
+                .durable_lookup_phase
+                .saturating_sub(self.durable_lookup_call)
+                .as_secs_f64()
+                * 1000.0,
+            catalog_resolution_path = self.catalog_resolution_path,
+            catalog_resolution_phase_ms = self.catalog_resolution_phase.as_secs_f64() * 1000.0,
+            catalog_update_attempted = self.catalog_update_call.is_some(),
+            catalog_update_call_ms = self.catalog_update_call.unwrap_or_default().as_secs_f64()
+                * 1000.0,
+            catalog_already_committed = self.catalog_already_committed,
+            catalog_resolution_other_ms = catalog_resolution_other.as_secs_f64() * 1000.0,
+            mark_committed_required = self.mark_committed_required,
+            mark_committed_phase_ms = self.mark_committed_phase.as_secs_f64() * 1000.0,
+            mark_committed_call_ms = self.mark_committed_call.as_secs_f64() * 1000.0,
+            mark_committed_other_ms = mark_committed_other.as_secs_f64() * 1000.0,
+            state_apply_phase_ms = self.state_apply_phase.as_secs_f64() * 1000.0,
+            state_apply_call_ms = self.state_apply_call.as_secs_f64() * 1000.0,
+            state_apply_other_ms = state_apply_other.as_secs_f64() * 1000.0,
+            discard_before_replan_phase_ms = self.discard_before_replan_phase.as_secs_f64()
+                * 1000.0,
+            discard_uncommitted_call_ms = self.discard_uncommitted_call.as_secs_f64() * 1000.0,
+            discard_before_replan_other_ms = discard_before_replan_other.as_secs_f64() * 1000.0,
+            recovery_other_ms = recovery_other.as_secs_f64() * 1000.0,
+            recovery_total_ms = total.as_secs_f64() * 1000.0,
+            "maintenance recovery phase diagnostics"
+        );
+    }
+
+    fn emit_result(&self, operation_id: &OperationId, result: &Result<Option<i64>>) {
+        let outcome = match result {
+            Ok(_) => "success",
+            Err(error) if error.downcast_ref::<ReplanRequired>().is_some() => "replan",
+            Err(_) => "error",
+        };
+        self.emit(
+            "maintenance_recovery_terminal",
+            operation_id,
+            outcome,
+            result.as_ref().err(),
+        );
+        if self.completed_apply && result.is_ok() {
+            self.emit("maintenance_recovered", operation_id, "success", None);
+        }
+    }
 }
 
 /// Uses the same durable table fence as ingestion. Work may run concurrently,
@@ -603,10 +755,20 @@ impl TableMaintenance {
         }
         let publish_started = std::time::Instant::now();
         let snapshot = self.recover(head, &id).await?;
+        let recovered_at = std::time::Instant::now();
+        let publish_and_apply_ms =
+            recovered_at.duration_since(publish_started).as_secs_f64() * 1000.0;
+        let coordinator_prepare_publish_ms = recovered_at
+            .duration_since(context.prepare_started)
+            .as_secs_f64()
+            * 1000.0;
+        let coordinator_prepare_publish_other_ms =
+            (coordinator_prepare_publish_ms - prepare_ms - publish_and_apply_ms).max(0.0);
         tracing::info!(
             event = "compaction_completed",
             table_id = table_id.0,
             operation_id = %id.0,
+            candidate_kind = "data_rewrite",
             snapshot_id = snapshot,
             output_level = level,
             output_data_files,
@@ -620,7 +782,9 @@ impl TableMaintenance {
             prepare_preflight_ms = context.prepare_preflight_ms,
             catch_up_ms = context.catch_up_ms,
             plan_seal_ms,
-            publish_and_apply_ms = publish_started.elapsed().as_secs_f64() * 1000.0,
+            publish_and_apply_ms,
+            coordinator_prepare_publish_ms,
+            coordinator_prepare_publish_other_ms,
             "table rewrite completed"
         );
         Ok(snapshot)
@@ -637,13 +801,39 @@ impl TableMaintenance {
     }
 
     pub async fn recover(&self, table: &Table, id: &OperationId) -> Result<Option<i64>> {
-        let resolve_started = std::time::Instant::now();
+        let mut diagnostics = RecoveryDiagnostics::new();
+        let result = self
+            .recover_with_diagnostics(table, id, &mut diagnostics)
+            .await;
+        diagnostics.emit_result(id, &result);
+        result
+    }
+
+    async fn recover_with_diagnostics(
+        &self,
+        table: &Table,
+        id: &OperationId,
+        diagnostics: &mut RecoveryDiagnostics,
+    ) -> Result<Option<i64>> {
+        let lookup_started = Instant::now();
         let store = self.store.clone();
         let operation_id = id.clone();
-        let record = blocking(move || Ok(store.operation(&operation_id)?))
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("unknown maintenance operation"))?;
-        let kind = match record.operation.kind {
+        let lookup = blocking(move || {
+            let call_started = Instant::now();
+            let result = store.operation(&operation_id);
+            Ok((result, call_started.elapsed()))
+        })
+        .await;
+        diagnostics.durable_lookup_phase = lookup_started.elapsed();
+        let (record, lookup_call) = lookup?;
+        diagnostics.durable_lookup_call = lookup_call;
+        let record = record?.ok_or_else(|| anyhow::anyhow!("unknown maintenance operation"))?;
+        diagnostics.record_found = true;
+        diagnostics.table_id = record.operation.table_id.0;
+        diagnostics.phase_before = Some(record.phase);
+        diagnostics.total_delta_rows = record.delta_count;
+        diagnostics.apply_start_cursor = record.applied_count;
+        diagnostics.kind = match record.operation.kind {
             OperationKind::Rewrite => "rewrite",
             OperationKind::Reconcile => "reconcile",
             OperationKind::ManifestRewrite => "manifest_rewrite",
@@ -653,77 +843,108 @@ impl TableMaintenance {
             bail!("incomplete rewrite build must be discarded and replanned");
         }
         if record.phase == OperationPhase::Applied {
+            diagnostics.catalog_resolution_path = "already_applied";
+            diagnostics.catalog_already_committed = true;
+            diagnostics.snapshot_id = record.snapshot_id;
             return Ok(record.snapshot_id);
         }
-        let outcome = resolve_maintenance_operation(
+
+        let tracker = Some(artifacts::MetadataRegistration::live(
+            self.store.clone(),
+            table,
+            record.operation.table_id,
+            record.operation.id.clone(),
+        )?);
+        let catalog_resolution_started = Instant::now();
+        let resolution_attempt = resolve_maintenance_operation(
             &record,
             self.catalog.as_ref(),
             table,
             self.cache.clone(),
-            Some(artifacts::MetadataRegistration::live(
-                self.store.clone(),
-                table,
-                record.operation.table_id,
-                record.operation.id.clone(),
-            )?),
+            tracker,
         )
-        .await?;
-        let resolved_at = std::time::Instant::now();
+        .await;
+        diagnostics.catalog_resolution_phase = catalog_resolution_started.elapsed();
+        diagnostics.catalog_update_call = resolution_attempt.catalog_update_elapsed;
+        diagnostics.catalog_resolution_path = "error";
+        let resolved_at = Instant::now();
+        diagnostics.catalog_resolve_boundary = resolved_at.duration_since(diagnostics.started);
+        let MaintenanceResolution {
+            outcome,
+            path,
+            catalog_already_committed,
+        } = resolution_attempt.result?;
+        diagnostics.catalog_resolution_path = path;
+        diagnostics.catalog_already_committed = catalog_already_committed;
+
         let Some((snapshot, sequence)) = outcome else {
+            let discard_started = Instant::now();
             let store = self.store.clone();
             let id = id.clone();
-            blocking(move || {
-                store.discard_uncommitted(&id)?;
-                Ok(())
+            let discard = blocking(move || {
+                let call_started = Instant::now();
+                let result = store.discard_uncommitted(&id);
+                Ok((result, call_started.elapsed()))
             })
-            .await?;
+            .await;
+            diagnostics.discard_before_replan_phase = discard_started.elapsed();
+            let (discard, discard_call) = discard?;
+            diagnostics.discard_uncommitted_call = discard_call;
+            discard?;
             return Err(ReplanRequired.into());
         };
-        if record.phase == OperationPhase::Prepared {
+        diagnostics.snapshot_id = Some(snapshot);
+
+        diagnostics.mark_committed_required = record.phase == OperationPhase::Prepared;
+        if diagnostics.mark_committed_required {
+            let mark_committed_started = Instant::now();
             let store = self.store.clone();
             let id = id.clone();
-            blocking(move || {
-                store.mark_committed(&id, snapshot, sequence)?;
-                Ok(())
+            let mark_committed = blocking(move || {
+                let call_started = Instant::now();
+                let result = store.mark_committed(&id, snapshot, sequence);
+                Ok((result, call_started.elapsed()))
             })
-            .await?;
+            .await;
+            diagnostics.mark_committed_phase = mark_committed_started.elapsed();
+            let (mark_committed, mark_committed_call) = mark_committed?;
+            diagnostics.mark_committed_call = mark_committed_call;
+            mark_committed?;
         }
+
+        let state_apply_started = Instant::now();
         let store = self.store.clone();
         let id = id.clone();
-        let (snapshot, applied) = blocking(move || {
-            let applied = store.apply_committed(&id)?;
-            Ok((
-                store.operation(&id)?.and_then(|record| record.snapshot_id),
-                applied,
-            ))
+        let state_apply = blocking(move || {
+            let call_started = Instant::now();
+            let applied = store.apply_committed(&id);
+            let call_elapsed = call_started.elapsed();
+            let result = applied.and_then(|applied| {
+                Ok((
+                    store.operation(&id)?.and_then(|record| record.snapshot_id),
+                    applied,
+                ))
+            });
+            Ok((result, call_elapsed))
         })
-        .await?;
-        // Resolution includes the durable operation lookup. Local commit
-        // marking and index application begin only after the catalog outcome.
-        let catalog_resolve_ms = resolved_at.duration_since(resolve_started).as_secs_f64() * 1000.0;
-        let mark_apply_ms = resolved_at.elapsed().as_secs_f64() * 1000.0;
-        for (phase, elapsed_ms) in [
-            ("catalog_resolve", catalog_resolve_ms),
-            ("mark_apply", mark_apply_ms),
+        .await;
+        diagnostics.state_apply_phase = state_apply_started.elapsed();
+        let (state_apply, state_apply_call) = state_apply?;
+        diagnostics.state_apply_call = state_apply_call;
+        let (snapshot, applied) = state_apply?;
+        diagnostics.snapshot_id = snapshot;
+        diagnostics.applied_rows = applied.applied_rows;
+        diagnostics.obsolete_rows = applied.obsolete_rows;
+        diagnostics.mark_apply_boundary = Instant::now().duration_since(resolved_at);
+        diagnostics.completed_apply = true;
+
+        for (phase, elapsed) in [
+            ("catalog_resolve", diagnostics.catalog_resolve_boundary),
+            ("mark_apply", diagnostics.mark_apply_boundary),
         ] {
             metrics::histogram!("flow_maintenance_phase_seconds", "table_id" => record.operation.table_id.0.to_string(), "phase" => phase)
-                .record(elapsed_ms / 1000.0);
+                .record(elapsed.as_secs_f64());
         }
-        tracing::info!(
-            event = "maintenance_recovered",
-            operation_id = %record.operation.id.0,
-            table_id = record.operation.table_id.0,
-            kind,
-            snapshot_id = snapshot,
-            phase_before = ?record.phase,
-            total_delta_rows = record.delta_count,
-            apply_start_cursor = record.applied_count,
-            applied_rows_this_call = applied.applied_rows,
-            obsolete_rows_this_call = applied.obsolete_rows,
-            catalog_resolve_ms,
-            mark_apply_ms,
-            "maintenance catalog outcome and index application completed"
-        );
         Ok(snapshot)
     }
 
@@ -969,6 +1190,12 @@ impl TableMaintenance {
             let scratch = scratch.clone();
             let sequence = target.sequence_number();
             let keyless = schema.primary_key.is_empty();
+            let reconciliation_kind = match classification {
+                Classification::MetadataOnly => "metadata-only",
+                Classification::VerifyDeleteRewrite => "delete-rewrite",
+                Classification::ReconcileDataRewrite => "data-rewrite",
+                Classification::ServiceOperation | Classification::Pause(_) => unreachable!(),
+            };
             blocking(move || {
                 if classification == Classification::ReconcileDataRewrite {
                     let rows = scratch.prepared_deltas(&operation_id)?.map(|delta| {
@@ -1023,6 +1250,20 @@ impl TableMaintenance {
                 Ok(())
             })
             .await?;
+            metrics::counter!(
+                "flow_external_reconciliations_total",
+                "table_id" => table_id.0.to_string(),
+                "kind" => reconciliation_kind
+            )
+            .increment(1);
+            tracing::info!(
+                event = "external_snapshot_reconciled",
+                table_id = table_id.0,
+                snapshot_id = id,
+                sequence_number = sequence,
+                reconciliation_kind,
+                "external snapshot verified and durably applied to the row index"
+            );
             before = after;
         }
         Ok(head.metadata().current_snapshot_id())
@@ -1225,6 +1466,100 @@ fn index_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TraceWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_diagnostics_identify_every_terminal_outcome() {
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = trace.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || TraceWriter(output.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut success = RecoveryDiagnostics::new();
+            success.record_found = true;
+            success.table_id = 7;
+            success.kind = "rewrite";
+            success.phase_before = Some(OperationPhase::Prepared);
+            success.catalog_resolution_path = "catalog_updated";
+            success.catalog_update_call = Some(Duration::from_millis(2));
+            success.mark_committed_required = true;
+            success.mark_committed_phase = Duration::from_millis(3);
+            success.mark_committed_call = Duration::from_millis(2);
+            success.completed_apply = true;
+            success.emit_result(&OperationId("terminal-success".into()), &Ok(Some(101)));
+
+            let mut replan = RecoveryDiagnostics::new();
+            replan.record_found = true;
+            replan.table_id = 7;
+            replan.kind = "rewrite";
+            replan.discard_before_replan_phase = Duration::from_millis(4);
+            replan.discard_uncommitted_call = Duration::from_millis(3);
+            let result: Result<Option<i64>> = Err(ReplanRequired.into());
+            replan.emit_result(&OperationId("terminal-replan".into()), &result);
+
+            let failure: Result<Option<i64>> = Err(anyhow::anyhow!("catalog unavailable"));
+            RecoveryDiagnostics::new().emit_result(&OperationId("terminal-error".into()), &failure);
+        });
+
+        let trace = String::from_utf8(trace.lock().unwrap().clone()).unwrap();
+        let terminal = |operation: &str| {
+            trace
+                .lines()
+                .filter(|line| {
+                    line.contains("event=\"maintenance_recovery_terminal\"")
+                        && line.contains(operation)
+                })
+                .collect::<Vec<_>>()
+        };
+        let success = terminal("operation_id=terminal-success");
+        let replan = terminal("operation_id=terminal-replan");
+        let error = terminal("operation_id=terminal-error");
+        assert_eq!(success.len(), 1, "{trace}");
+        assert_eq!(replan.len(), 1, "{trace}");
+        assert_eq!(error.len(), 1, "{trace}");
+        assert!(
+            success[0].contains("outcome=\"success\"")
+                && success[0].contains("catalog_update_attempted=true")
+                && success[0].contains("mark_committed_call_ms="),
+            "{trace}"
+        );
+        assert!(
+            replan[0].contains("outcome=\"replan\"")
+                && replan[0].contains("discard_before_replan_phase_ms=")
+                && replan[0].contains("discard_uncommitted_call_ms="),
+            "{trace}"
+        );
+        assert!(
+            error[0].contains("outcome=\"error\"")
+                && error[0].contains("error=\"catalog unavailable\""),
+            "{trace}"
+        );
+        assert_eq!(
+            trace
+                .lines()
+                .filter(|line| line.contains("event=\"maintenance_recovered\""))
+                .count(),
+            1,
+            "{trace}"
+        );
+    }
 
     #[test]
     fn pooled_http_survives_worker_completion_and_parent_runtime_shutdown() -> Result<()> {

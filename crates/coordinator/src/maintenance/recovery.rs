@@ -7,7 +7,34 @@ use flow_iceberg_ext::{
 use flow_model::OperationId;
 use flow_state_store::{OperationKind, OperationPhase, OperationRecord};
 use iceberg::{Catalog, table::Table};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+#[derive(Debug)]
+pub(super) struct MaintenanceResolution {
+    pub outcome: Option<(i64, i64)>,
+    pub path: &'static str,
+    pub catalog_already_committed: bool,
+}
+
+impl MaintenanceResolution {
+    fn new(
+        outcome: Option<(i64, i64)>,
+        path: &'static str,
+        catalog_already_committed: bool,
+    ) -> Self {
+        Self {
+            outcome,
+            path,
+            catalog_already_committed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct MaintenanceResolutionAttempt {
+    pub result: Result<MaintenanceResolution>,
+    pub catalog_update_elapsed: Option<Duration>,
+}
 
 enum RewritePlan {
     Data(RewriteRecovery),
@@ -29,9 +56,14 @@ impl RewritePlan {
         id: &OperationId,
         cache: ManifestCache,
         tracker: Option<Arc<dyn ArtifactTracker>>,
+        elapsed: &mut Option<Duration>,
     ) -> Result<flow_iceberg_ext::CommitResult> {
         match self {
-            Self::Manifests(plan) => Ok(plan.commit(catalog, head).await?),
+            Self::Manifests(plan) => {
+                let attempt = plan.commit_with_diagnostics(catalog, head).await;
+                *elapsed = attempt.catalog_update_elapsed;
+                Ok(attempt.result?)
+            }
             Self::Data(plan) => {
                 let files = read_artifact_plan(head.file_io(), &plan.manifest_list).await?;
                 let rewrites_data = !plan.removed_data.is_empty();
@@ -58,7 +90,9 @@ impl RewritePlan {
                         "data rewrite output contains deletes"
                     );
                 }
-                Ok(action.commit(catalog, head).await?)
+                let attempt = action.commit_with_diagnostics(catalog, head).await;
+                *elapsed = attempt.catalog_update_elapsed;
+                Ok(attempt.result?)
             }
         }
     }
@@ -73,7 +107,12 @@ pub(crate) async fn resolve_maintenance_catalog_operation(
     table: &Table,
     tracker: Option<Arc<dyn ArtifactTracker>>,
 ) -> Result<Option<(i64, i64)>> {
-    resolve_maintenance_operation(record, catalog, table, ManifestCache::default(), tracker).await
+    Ok(
+        resolve_maintenance_operation(record, catalog, table, ManifestCache::default(), tracker)
+            .await
+            .result?
+            .outcome,
+    )
 }
 
 pub(super) async fn resolve_maintenance_operation(
@@ -82,7 +121,31 @@ pub(super) async fn resolve_maintenance_operation(
     table: &Table,
     cache: ManifestCache,
     tracker: Option<Arc<dyn ArtifactTracker>>,
-) -> Result<Option<(i64, i64)>> {
+) -> MaintenanceResolutionAttempt {
+    let mut catalog_update_elapsed = None;
+    let result = resolve_maintenance_operation_inner(
+        record,
+        catalog,
+        table,
+        cache,
+        tracker,
+        &mut catalog_update_elapsed,
+    )
+    .await;
+    MaintenanceResolutionAttempt {
+        result,
+        catalog_update_elapsed,
+    }
+}
+
+async fn resolve_maintenance_operation_inner(
+    record: &OperationRecord,
+    catalog: &dyn Catalog,
+    table: &Table,
+    cache: ManifestCache,
+    tracker: Option<Arc<dyn ArtifactTracker>>,
+    catalog_update_elapsed: &mut Option<Duration>,
+) -> Result<MaintenanceResolution> {
     ensure!(
         matches!(
             record.operation.kind,
@@ -91,7 +154,7 @@ pub(super) async fn resolve_maintenance_operation(
         "operation is not maintenance"
     );
     if record.phase == OperationPhase::Building {
-        return Ok(None);
+        return Ok(MaintenanceResolution::new(None, "building", false));
     }
     let head = catalog.load_table(table.identifier()).await?;
     if record.operation.kind == OperationKind::Reconcile {
@@ -112,7 +175,11 @@ pub(super) async fn resolve_maintenance_operation(
             plan.snapshot_id,
             plan.sequence_number,
         )?;
-        return Ok(Some((plan.snapshot_id, plan.sequence_number)));
+        return Ok(MaintenanceResolution::new(
+            Some((plan.snapshot_id, plan.sequence_number)),
+            "reconcile_verified",
+            true,
+        ));
     }
     let plan = if record.operation.kind == OperationKind::ManifestRewrite {
         RewritePlan::Manifests(serde_json::from_slice(&record.operation.payload)?)
@@ -135,20 +202,43 @@ pub(super) async fn resolve_maintenance_operation(
             .sequence_number
             .ok_or_else(|| anyhow::anyhow!("committed operation lacks a sequence number"))?;
         verify_snapshot(&head, base.uuid, snapshot, sequence)?;
-        return Ok(Some((snapshot, sequence)));
+        return Ok(MaintenanceResolution::new(
+            Some((snapshot, sequence)),
+            "committed_verified",
+            true,
+        ));
     }
     if let Some(snapshot) = find_operation(head.metadata(), &record.operation.id.0) {
-        return Ok(Some((snapshot.snapshot_id(), snapshot.sequence_number())));
+        return Ok(MaintenanceResolution::new(
+            Some((snapshot.snapshot_id(), snapshot.sequence_number())),
+            "operation_found",
+            true,
+        ));
     }
     base.validate(&head)?;
     if head.metadata().current_snapshot_id() != base.snapshot_id {
-        return Ok(None);
+        return Ok(MaintenanceResolution::new(None, "base_changed", false));
     }
     match plan
-        .commit(catalog, &head, &record.operation.id, cache, tracker)
+        .commit(
+            catalog,
+            &head,
+            &record.operation.id,
+            cache,
+            tracker,
+            catalog_update_elapsed,
+        )
         .await
     {
-        Ok(committed) => Ok(Some((committed.snapshot_id, committed.sequence_number))),
+        Ok(committed) => Ok(MaintenanceResolution {
+            outcome: Some((committed.snapshot_id, committed.sequence_number)),
+            path: if committed.already_committed {
+                "action_operation_found"
+            } else {
+                "catalog_updated"
+            },
+            catalog_already_committed: committed.already_committed,
+        }),
         Err(error) => {
             let refreshed = catalog.load_table(table.identifier()).await?;
             ensure!(
@@ -156,11 +246,19 @@ pub(super) async fn resolve_maintenance_operation(
                 "table identity changed during rewrite recovery"
             );
             if let Some(snapshot) = find_operation(refreshed.metadata(), &record.operation.id.0) {
-                return Ok(Some((snapshot.snapshot_id(), snapshot.sequence_number())));
+                return Ok(MaintenanceResolution {
+                    outcome: Some((snapshot.snapshot_id(), snapshot.sequence_number())),
+                    path: "commit_error_operation_found",
+                    catalog_already_committed: true,
+                });
             }
             base.validate(&refreshed)?;
             if refreshed.metadata().current_snapshot_id() != base.snapshot_id {
-                Ok(None)
+                Ok(MaintenanceResolution {
+                    outcome: None,
+                    path: "commit_error_base_changed",
+                    catalog_already_committed: false,
+                })
             } else {
                 Err(error)
             }

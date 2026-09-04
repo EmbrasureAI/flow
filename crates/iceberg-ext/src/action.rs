@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, MAIN_BRANCH, ManifestContentType,
@@ -23,6 +23,31 @@ pub struct CommitResult {
     pub snapshot_id: i64,
     pub sequence_number: i64,
     pub already_committed: bool,
+}
+
+/// The result of a commit together with the exact catalog update boundary.
+///
+/// `catalog_update_elapsed` is `None` when validation, recovery, or artifact
+/// preparation completed without calling [`Catalog::update_table`]. It remains
+/// available when that call returns an error so ambiguous outcomes can be
+/// diagnosed without timing unrelated manifest work.
+#[derive(Debug)]
+pub struct CommitAttempt {
+    pub result: Result<CommitResult>,
+    pub catalog_update_elapsed: Option<Duration>,
+}
+
+impl CommitAttempt {
+    pub fn catalog_update_attempted(&self) -> bool {
+        self.catalog_update_elapsed.is_some()
+    }
+
+    pub fn already_committed(&self) -> Option<bool> {
+        self.result
+            .as_ref()
+            .ok()
+            .map(|result| result.already_committed)
+    }
 }
 
 /// Atomically add data and position-delete files in one ordinary v2 snapshot.
@@ -171,6 +196,7 @@ impl RowDeltaAction {
                 data_sequence: -1,
                 delete_sequence: -1,
             },
+            None,
         )
         .await
     }
@@ -295,6 +321,31 @@ impl RewriteFilesAction {
     }
 
     pub async fn commit(&self, catalog: &dyn Catalog, table: &Table) -> Result<CommitResult> {
+        self.commit_with_diagnostics(catalog, table).await.result
+    }
+
+    /// Commit while retaining whether and how long the catalog update itself ran.
+    pub async fn commit_with_diagnostics(
+        &self,
+        catalog: &dyn Catalog,
+        table: &Table,
+    ) -> CommitAttempt {
+        let mut catalog_update_elapsed = None;
+        let result = self
+            .commit_inner(catalog, table, &mut catalog_update_elapsed)
+            .await;
+        CommitAttempt {
+            result,
+            catalog_update_elapsed,
+        }
+    }
+
+    async fn commit_inner(
+        &self,
+        catalog: &dyn Catalog,
+        table: &Table,
+        catalog_update_elapsed: &mut Option<Duration>,
+    ) -> Result<CommitResult> {
         let head = catalog.load_table(table.identifier()).await?;
         if head.metadata().uuid() != self.base.uuid {
             return Err(conflict("table identity changed"));
@@ -424,6 +475,7 @@ impl RewriteFilesAction {
                     .unwrap_or(self.base.sequence_number),
                 delete_sequence: self.delete_sequence.unwrap_or(-1),
             },
+            Some(catalog_update_elapsed),
         )
         .await
     }
@@ -494,6 +546,7 @@ async fn publish(
     table: &Table,
     view: &SnapshotView,
     publication: Publication<'_>,
+    catalog_update_elapsed: Option<&mut Option<Duration>>,
 ) -> Result<CommitResult> {
     if publication.operation_id.is_empty() {
         return Err(invalid("operation ID must not be empty"));
@@ -685,13 +738,14 @@ async fn publish(
         .with_manifest_list(manifest_list)
         .with_summary(summary)
         .build();
-    commit_snapshot(catalog, table, snapshot).await
+    commit_snapshot(catalog, table, snapshot, catalog_update_elapsed).await
 }
 
 pub(crate) async fn commit_snapshot(
     catalog: &dyn Catalog,
     table: &Table,
     snapshot: Snapshot,
+    catalog_update_elapsed: Option<&mut Option<Duration>>,
 ) -> Result<CommitResult> {
     let metadata = table.metadata();
     let snapshot_id = snapshot.snapshot_id();
@@ -727,7 +781,12 @@ pub(crate) async fn commit_snapshot(
             },
         ])
         .build();
-    let table = catalog.update_table(commit).await?;
+    let catalog_update_started = Instant::now();
+    let updated = catalog.update_table(commit).await;
+    if let Some(elapsed) = catalog_update_elapsed {
+        *elapsed = Some(catalog_update_started.elapsed());
+    }
+    let table = updated?;
     Ok(CommitResult {
         table,
         snapshot_id,

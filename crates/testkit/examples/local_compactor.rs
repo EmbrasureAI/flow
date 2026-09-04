@@ -23,8 +23,8 @@ use std::{
 
 const MARKER: &str = "local-test.compaction-id";
 const BATCH_ROWS: usize = 1024;
-const MAX_INPUT_BYTES: u64 = 512 << 20;
-const MAX_INPUT_FILES: usize = 256;
+const DEFAULT_MAX_INPUT_BYTES: u64 = 512 << 20;
+const DEFAULT_MAX_INPUT_FILES: usize = 256;
 
 #[derive(Parser)]
 struct Args {
@@ -32,6 +32,10 @@ struct Args {
     config: PathBuf,
     #[arg(long, default_value_t = 3000)]
     interval_ms: u64,
+    #[arg(long, default_value_t = DEFAULT_MAX_INPUT_FILES)]
+    max_input_files: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_INPUT_BYTES)]
+    max_input_bytes: u64,
 }
 
 // Only destination settings are deserialized from the shared configuration.
@@ -67,6 +71,8 @@ impl Target {
 async fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.interval_ms > 0, "interval must be positive");
+    ensure!(args.max_input_files > 0, "max input files must be positive");
+    ensure!(args.max_input_bytes > 0, "max input bytes must be positive");
     let config: Config = toml::from_str(&std::fs::read_to_string(&args.config)?)?;
     ensure!(!config.tables.is_empty(), "at least one table is required");
     let catalog = RestCatalogBuilder::default()
@@ -75,7 +81,12 @@ async fn main() -> Result<()> {
         .await?;
     println!(
         "{}",
-        json!({"event": "compactor_ready", "pid": std::process::id()})
+        json!({
+            "event": "compactor_ready",
+            "pid": std::process::id(),
+            "max_input_files": args.max_input_files,
+            "max_input_bytes": args.max_input_bytes,
+        })
     );
     let mut interval = tokio::time::interval(Duration::from_millis(args.interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -88,14 +99,19 @@ async fn main() -> Result<()> {
             _ = interval.tick() => {}
         }
         for target in &config.tables {
-            compact(&catalog, target)
+            compact(&catalog, target, args.max_input_files, args.max_input_bytes)
                 .await
                 .with_context(|| format!("compact {}", target.target_table))?;
         }
     }
 }
 
-async fn compact(catalog: &dyn Catalog, target: &Target) -> Result<()> {
+async fn compact(
+    catalog: &dyn Catalog,
+    target: &Target,
+    max_input_files: usize,
+    max_input_bytes: u64,
+) -> Result<()> {
     let ident = TableIdent::new(
         NamespaceIdent::from_vec(target.target_namespace.clone())?,
         target.target_table.clone(),
@@ -141,8 +157,12 @@ async fn compact(catalog: &dyn Catalog, target: &Target) -> Result<()> {
         return Ok(());
     }
     ensure!(
-        bytes <= MAX_INPUT_BYTES && view.live_files.len() <= MAX_INPUT_FILES,
-        "fixture maintenance budget exceeded; increase the explicit input budget"
+        bytes <= max_input_bytes && view.live_files.len() <= max_input_files,
+        "fixture maintenance budget exceeded: {} files / {} bytes exceeds configured maximum of {} files / {} bytes",
+        view.live_files.len(),
+        bytes,
+        max_input_files,
+        max_input_bytes,
     );
     let started = Instant::now();
     let operation = OperationId(format!("local-compaction-{}", uuid::Uuid::new_v4()));
@@ -152,6 +172,7 @@ async fn compact(catalog: &dyn Catalog, target: &Target) -> Result<()> {
             "event": "compaction_started", "table": target.target_table,
             "operation": operation.0, "base_snapshot": base_snapshot,
             "input_data_files": data.len(), "input_delete_files": deletes.len(), "input_bytes": bytes,
+            "max_input_files": max_input_files, "max_input_bytes": max_input_bytes,
         })
     );
     let scratch_dir = tempfile::tempdir()?;

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iceberg::spec::{ManifestContentType, ManifestListWriter, Operation, Snapshot, Summary};
 use iceberg::table::Table;
@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::{commit_snapshot, manifest_writer};
 use crate::{
-    CommitBase, CommitResult, ManifestCache, OPERATION_ID_KEY, conflict, find_operation, invalid,
+    CommitAttempt, CommitBase, CommitResult, ManifestCache, OPERATION_ID_KEY, conflict,
+    find_operation, invalid,
 };
 
 /// Limits one metadata-maintenance operation. Output size is estimated from
@@ -289,6 +290,31 @@ impl RewriteManifestsAction {
     }
 
     pub async fn commit(&self, catalog: &dyn Catalog, table: &Table) -> Result<CommitResult> {
+        self.commit_with_diagnostics(catalog, table).await.result
+    }
+
+    /// Commit while retaining whether and how long the catalog update itself ran.
+    pub async fn commit_with_diagnostics(
+        &self,
+        catalog: &dyn Catalog,
+        table: &Table,
+    ) -> CommitAttempt {
+        let mut catalog_update_elapsed = None;
+        let result = self
+            .commit_inner(catalog, table, &mut catalog_update_elapsed)
+            .await;
+        CommitAttempt {
+            result,
+            catalog_update_elapsed,
+        }
+    }
+
+    async fn commit_inner(
+        &self,
+        catalog: &dyn Catalog,
+        table: &Table,
+        catalog_update_elapsed: &mut Option<Duration>,
+    ) -> Result<CommitResult> {
         let head = catalog.load_table(table.identifier()).await?;
         let table = &head;
         if table.metadata().uuid() != self.base.uuid {
@@ -332,6 +358,6 @@ impl RewriteManifestsAction {
                 additional_properties: properties,
             })
             .build();
-        commit_snapshot(catalog, table, snapshot).await
+        commit_snapshot(catalog, table, snapshot, Some(catalog_update_elapsed)).await
     }
 }

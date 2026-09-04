@@ -691,8 +691,8 @@ async fn keyless_external_rewrites_preserve_duplicates_and_identity_across_resta
         index.clone(),
         catalog.clone(),
         Policy {
-            l0_soft_files: 2,
-            l0_hard_files: 4,
+            stable_small_soft_files: 2,
+            stable_small_hard_files: 4,
             min_file_age_ms: 0,
             ..Default::default()
         },

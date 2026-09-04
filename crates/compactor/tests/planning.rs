@@ -1,4 +1,6 @@
-use flow_compactor::{DeleteDependency, Error, FileCandidate, Level, Policy, PublicationPressure};
+use flow_compactor::{
+    DataRewriteScope, DeleteDependency, Error, FileCandidate, Level, Policy, PublicationPressure,
+};
 use flow_model::FileId;
 use std::collections::BTreeSet;
 
@@ -29,6 +31,107 @@ fn hard_debt_pauses_publication_and_plan_is_deterministic_and_bounded() {
     files.reverse();
     assert_eq!(policy.plan(4, 1, &files, &[]).unwrap().unwrap(), plan);
 }
+
+#[test]
+fn data_rewrite_scope_excludes_stable_files_from_plans() {
+    let mut files = vec![file(0, 1 << 20), file(1, 1 << 20)];
+    let mut stable = file(2, 512 << 20);
+    stable.level = Level::L2;
+    files.push(stable.clone());
+
+    let l0_only = Policy {
+        data_rewrite_scope: DataRewriteScope::L0Only,
+        l0_soft_files: 2,
+        l0_hard_files: 4,
+        ..Default::default()
+    };
+    let plan = l0_only.plan(4, 1, &files, &[]).unwrap().unwrap();
+    assert_eq!(
+        plan.input_files,
+        BTreeSet::from([files[0].id.clone(), files[1].id.clone()])
+    );
+    assert_eq!(plan.output_level, Level::L1);
+    assert!(l0_only.plan(4, 1, &[stable], &[]).unwrap().is_none());
+
+    let disabled = Policy {
+        data_rewrite_scope: DataRewriteScope::Disabled,
+        ..Default::default()
+    };
+    assert!(disabled.plan(4, 1, &files, &[]).unwrap().is_none());
+}
+
+#[test]
+fn stable_small_file_limits_are_validated_independently() {
+    for policy in [
+        Policy {
+            stable_small_soft_files: 0,
+            ..Default::default()
+        },
+        Policy {
+            stable_small_soft_files: 33,
+            stable_small_hard_files: 32,
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(policy.validate(), Err(Error::InvalidPolicy(_))));
+    }
+}
+
+#[test]
+fn l0_only_can_relax_stable_debt_without_weakening_l0_backpressure() {
+    let stable = (100..132)
+        .map(|id| {
+            let mut candidate = file(id, 1 << 20);
+            candidate.level = Level::L1;
+            candidate
+        })
+        .collect::<Vec<_>>();
+    let strict = Policy {
+        data_rewrite_scope: DataRewriteScope::L0Only,
+        ..Default::default()
+    };
+    assert_eq!(
+        strict.debt(&stable).unwrap().pressure,
+        PublicationPressure::Pause
+    );
+    assert!(strict.plan(4, 1, &stable, &[]).unwrap().is_none());
+
+    let diagnostic = Policy {
+        data_rewrite_scope: DataRewriteScope::L0Only,
+        stable_small_soft_files: 1_000_000,
+        stable_small_hard_files: 2_000_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        diagnostic.debt(&stable).unwrap().pressure,
+        PublicationPressure::Healthy
+    );
+    let mut files = stable;
+    files.extend((0..32).map(|id| file(id, 1 << 20)));
+    assert_eq!(
+        diagnostic.debt(&files).unwrap().pressure,
+        PublicationPressure::Pause
+    );
+    let plan = diagnostic.plan(4, 1, &files, &[]).unwrap().unwrap();
+    assert_eq!(plan.input_files.len(), diagnostic.max_group_files);
+    assert_eq!(plan.output_level, Level::L1);
+    assert!(
+        files
+            .iter()
+            .filter(|file| plan.input_files.contains(&file.id))
+            .all(|file| file.level == Level::L0)
+    );
+
+    files.retain(|file| !plan.input_files.contains(&file.id));
+    let mut output = file(999, plan.input_bytes);
+    output.level = plan.output_level;
+    files.push(output);
+    assert_eq!(
+        diagnostic.debt(&files).unwrap().pressure,
+        PublicationPressure::Healthy
+    );
+}
+
 #[test]
 fn shared_deletes_bound_reads_without_expanding_data_inputs() {
     let mut files = (0..4).map(|id| file(id, 64 << 20)).collect::<Vec<_>>();

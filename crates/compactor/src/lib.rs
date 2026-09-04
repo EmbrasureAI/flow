@@ -13,6 +13,15 @@ pub enum Level {
     L2,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DataRewriteScope {
+    Disabled,
+    L0Only,
+    #[default]
+    All,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileCandidate {
     pub id: FileId,
@@ -38,8 +47,11 @@ pub struct DeleteDependency {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
+    pub data_rewrite_scope: DataRewriteScope,
     pub l0_soft_files: usize,
     pub l0_hard_files: usize,
+    pub stable_small_soft_files: usize,
+    pub stable_small_hard_files: usize,
     pub l0_soft_bytes: u64,
     pub l0_hard_bytes: u64,
     pub oldest_l0_soft_ms: u64,
@@ -60,8 +72,11 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
+            data_rewrite_scope: DataRewriteScope::All,
             l0_soft_files: 24,
             l0_hard_files: 32,
+            stable_small_soft_files: 24,
+            stable_small_hard_files: 32,
             l0_soft_bytes: 128 << 20,
             l0_hard_bytes: 256 << 20,
             oldest_l0_soft_ms: 10_000,
@@ -140,6 +155,8 @@ impl Policy {
     pub fn validate(&self) -> Result<()> {
         if self.l0_soft_files == 0
             || self.l0_soft_files > self.l0_hard_files
+            || self.stable_small_soft_files == 0
+            || self.stable_small_soft_files > self.stable_small_hard_files
             || self.l0_soft_bytes == 0
             || self.l0_soft_bytes > self.l0_hard_bytes
             || self.oldest_l0_soft_ms == 0
@@ -204,7 +221,7 @@ impl Policy {
             }
         }
         if debt.l0_files >= self.l0_soft_files
-            || debt.small_files >= self.l0_soft_files
+            || debt.small_files >= self.stable_small_soft_files
             || debt.l0_bytes >= self.l0_soft_bytes
             || debt.oldest_l0_ms >= self.oldest_l0_soft_ms
             || debt.max_delete_files >= self.delete_files_soft
@@ -213,7 +230,7 @@ impl Policy {
             debt.pressure = PublicationPressure::Delay;
         }
         if debt.l0_files >= self.l0_hard_files
-            || debt.small_files >= self.l0_hard_files
+            || debt.small_files >= self.stable_small_hard_files
             || debt.l0_bytes >= self.l0_hard_bytes
             || debt.oldest_l0_ms >= self.oldest_l0_hard_ms
             || debt.max_delete_files >= self.delete_files_hard
@@ -256,7 +273,7 @@ impl Policy {
             f.delete_file_count >= self.delete_files_soft || self.needs_delete_reclamation(f)
         };
         let needs_small_file_rewrite = |file: &FileCandidate| {
-            debt.small_files >= self.l0_soft_files
+            debt.small_files >= self.stable_small_soft_files
                 && file.level != Level::L0
                 && file.size_bytes < self.l1_target_bytes
         };
@@ -271,7 +288,14 @@ impl Policy {
         let mut eligible: Vec<_> = files
             .iter()
             .filter(|file| {
-                (file.age_ms >= self.min_file_age_ms || debt.pressure == PublicationPressure::Pause)
+                let in_scope = match self.data_rewrite_scope {
+                    DataRewriteScope::Disabled => false,
+                    DataRewriteScope::L0Only => file.level == Level::L0,
+                    DataRewriteScope::All => true,
+                };
+                in_scope
+                    && (file.age_ms >= self.min_file_age_ms
+                        || debt.pressure == PublicationPressure::Pause)
                     && match file.level {
                         Level::L0 => {
                             debt.pressure != PublicationPressure::Healthy

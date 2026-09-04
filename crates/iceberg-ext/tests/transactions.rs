@@ -233,9 +233,19 @@ async fn rewrite_survives_disjoint_append_and_preserves_sequence_numbers() {
         .await
         .unwrap();
     let strict = rewrite.clone().require_base_snapshot();
-    let error = strict.commit(&catalog, &unrelated.table).await.unwrap_err();
+    let strict_attempt = strict
+        .commit_with_diagnostics(&catalog, &unrelated.table)
+        .await;
+    assert!(!strict_attempt.catalog_update_attempted());
+    assert_eq!(strict_attempt.already_committed(), None);
+    let error = strict_attempt.result.unwrap_err();
     assert_eq!(error.kind(), iceberg::ErrorKind::PreconditionFailed);
-    let result = rewrite.commit(&catalog, &unrelated.table).await.unwrap();
+    let rewrite_attempt = rewrite
+        .commit_with_diagnostics(&catalog, &unrelated.table)
+        .await;
+    assert!(rewrite_attempt.catalog_update_attempted());
+    assert_eq!(rewrite_attempt.already_committed(), Some(false));
+    let result = rewrite_attempt.result.unwrap();
     assert_eq!(result.sequence_number, 3);
     assert_eq!(
         result
@@ -275,7 +285,12 @@ async fn rewrite_survives_disjoint_append_and_preserves_sequence_numbers() {
         .await
         .unwrap();
     assert_eq!(later.sequence_number, 4);
-    let retry = strict.commit(&catalog, &initial.table).await.unwrap();
+    let retry_attempt = strict
+        .commit_with_diagnostics(&catalog, &initial.table)
+        .await;
+    assert!(!retry_attempt.catalog_update_attempted());
+    assert_eq!(retry_attempt.already_committed(), Some(true));
+    let retry = retry_attempt.result.unwrap();
     assert!(retry.already_committed);
     assert_eq!(retry.snapshot_id, result.snapshot_id);
 }
@@ -400,7 +415,10 @@ async fn manifest_rewrite_preserves_data_delete_identities_and_fences_stale_meta
                 .is_err()
         );
     }
-    let committed = rewrite.commit(&catalog, &table).await.unwrap();
+    let commit_attempt = rewrite.commit_with_diagnostics(&catalog, &table).await;
+    assert!(commit_attempt.catalog_update_attempted());
+    assert_eq!(commit_attempt.already_committed(), Some(false));
+    let committed = commit_attempt.result.unwrap();
     let after = SnapshotView::current(&committed.table).await.unwrap();
     assert_eq!(after.manifest_count(), 2);
     assert_eq!(after.live_files.len(), before.live_files.len());
@@ -422,11 +440,17 @@ async fn manifest_rewrite_preserves_data_delete_identities_and_fences_stale_meta
         }
     }
     let snapshot_count = committed.table.metadata().snapshots().len();
-    let recovered = rewrite.commit(&catalog, &table).await.unwrap();
+    let recovery_attempt = rewrite.commit_with_diagnostics(&catalog, &table).await;
+    assert!(!recovery_attempt.catalog_update_attempted());
+    assert_eq!(recovery_attempt.already_committed(), Some(true));
+    let recovered = recovery_attempt.result.unwrap();
     assert!(recovered.already_committed);
     assert_eq!(recovered.snapshot_id, committed.snapshot_id);
     assert_eq!(recovered.table.metadata().snapshots().len(), snapshot_count);
-    assert!(stale.commit(&catalog, &table).await.is_err());
+    let stale_attempt = stale.commit_with_diagnostics(&catalog, &table).await;
+    assert!(!stale_attempt.catalog_update_attempted());
+    assert_eq!(stale_attempt.already_committed(), None);
+    assert!(stale_attempt.result.is_err());
     assert!(
         RewriteManifestsAction::plan(&committed.table, "idle-manifests", &policy)
             .await

@@ -38,10 +38,16 @@ No separate export task is created.
 | `flow_table_*` | L0 count/bytes/age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
+| `flow_compaction_finalization_actor_lane_hold_seconds` | Completed data-build finalization from actual table-lane reservation through cleanup and lane release |
+| `flow_external_reconciliations_total` | External snapshots successfully verified and durably applied to the row index, labelled by table and bounded reconciliation kind |
 | `flow_artifact_{files,bytes}_written_total` | Successfully finished data/delete artifacts, including attempts later invalidated |
 | `flow_garbage_delete_requests_total` | Conservative deletion requests against registered obsolete artifacts |
 
 Recovered catalog markers are counted separately and excluded from latency samples. Source-to-service times require synchronized clocks; the production benchmark records calibration uncertainty and complete per-transaction observations. Artifact counters do not include internal SDK retry traffic or catalog-owned metadata writes and must not be presented as cloud billing measurements.
+
+`external_snapshot_reconciled` carries the exact table ID, snapshot ID, sequence
+number and reconciliation kind. It is emitted only after the verified snapshot
+has been durably applied to the row index and the applied operation is cleared.
 
 `transaction_journaled` includes `journal_payload_bytes` from the durable chunk
 descriptor. This counts bincode mutation vectors after rollback and before
@@ -114,12 +120,27 @@ only after catalog resolution and index application succeed. Correlate the
 operation ID; worker, catch-up and completion outputs are successive observations
 of the same artifacts, not separate writes to add together.
 
-`maintenance_recovered` separates catalog resolution from durable commit marking
-and index application. It reports the original operation delta count, starting
-apply cursor, and applied/obsolete rows from this invocation only. A retry after
-partial application reports the remaining work, not lifetime totals. The event
-also identifies the phase at entry; it can describe ordinary publication or
-recovery of an already committed snapshot. `delete_rewrite_completed` similarly
+`maintenance_recovery_terminal` is emitted exactly once for every recovery call,
+including success, replan and error outcomes. It reports the operation delta
+count, starting apply cursor, and applied/obsolete rows from this invocation
+only. A retry after partial application reports the remaining work, not lifetime
+totals. The event also identifies the phase at entry; it can describe ordinary
+publication or recovery of an already committed snapshot. Its exclusive
+diagnostics split the durable operation lookup, catalog-resolution phase, the
+actual `Catalog::update_table` await, durable commit marking, state application,
+discard-before-replan and unassigned recovery overhead.
+`catalog_resolution_path` states whether the operation committed, was already
+found, was already marked committed, or needs replanning. `maintenance_recovered`
+remains as a compatibility success event after completed state application, with
+the legacy `catalog_resolve_ms` and `mark_apply_ms` aggregates for comparisons
+with older reports. `compaction_completed.coordinator_prepare_publish_ms` covers
+the coordinator interval from preflight preparation through durable application;
+`coordinator_prepare_publish_other_ms` excludes the reported preparation and
+publish/application intervals. Join the operation ID to
+`compaction_finalization_actor_lane_released`, whose `lane_hold_ms` begins at the
+daemon's busy-lane reservation and ends immediately after release. It includes
+task dispatch, retries, coordinator work, candidate cleanup and scratch removal.
+`delete_rewrite_completed` similarly
 records admitted rows, scanned rows and produced file/row/byte totals with its
 operation and catalog snapshot. These file sizes exclude metadata artifacts and
 SDK traffic; process-wide storage counters remain a separate observation. `ingest_prepared`, `epoch_collapsed` and `epoch_completed`

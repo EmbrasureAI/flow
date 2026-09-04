@@ -14,7 +14,7 @@ use flow_coordinator::{
     WalPressure, collapse_epoch,
 };
 use flow_ingress_journal::{Journal, JournalReader};
-use flow_model::{PgLsn, SourceId, SourceTransaction, TableId, TableSchema};
+use flow_model::{OperationId, PgLsn, SourceId, SourceTransaction, TableId, TableSchema};
 use flow_pg_source::{Acknowledgement, tokio_postgres::Client};
 use flow_state_store::{
     ControlStore, OperationKind, OperationPhase, StateStore, StateStoreOptions,
@@ -436,8 +436,11 @@ impl PublishRuntime {
                     ack.send(feedback(ledger))?;
                 }
                 Some(result) = running.next(), if !running.is_empty() => {
-                    let TableCompletion { id, transactions, outcome, elapsed, reserved_build } = result?;
+                    let TableCompletion { id, transactions, outcome, elapsed, reserved_build, finalization_lane } = result?;
                     busy.remove(&id);
+                    if let Some(lane) = finalization_lane {
+                        lane.record_release(id, Instant::now());
+                    }
                     scheduler.stall(id, false);
                     match outcome {
                         TableOutcome::Build(build) => {
@@ -589,12 +592,29 @@ impl PublishRuntime {
                             schedule_transactions(id, queue, &mut scheduler, profiles[&id]);
                             scheduler.stall(id, true);
                         }
+                        let lane_acquired_at = Instant::now();
                         busy.insert(id);
                         scheduler.stall(id, true);
+                        let finalization_lane = candidate.as_ref().map(|candidate| {
+                            FinalizationLane {
+                                operation_id: candidate.ready.operation_id().clone(),
+                                acquired_at: lane_acquired_at,
+                            }
+                        });
                         let schema = schemas[&id].clone();
                         let table = tables[&id].clone();
                         let work = work.clone();
-                        running.push(Box::pin(async move { work.run(table, schema, transactions, options, candidate).await }));
+                        running.push(Box::pin(async move {
+                            work.run(
+                                table,
+                                schema,
+                                transactions,
+                                options,
+                                candidate,
+                                finalization_lane,
+                            )
+                            .await
+                        }));
                     }
                 }
                 _ = health.tick() => {
@@ -1006,6 +1026,31 @@ struct TableCompletion {
     outcome: TableOutcome,
     elapsed: Duration,
     reserved_build: bool,
+    finalization_lane: Option<FinalizationLane>,
+}
+
+struct FinalizationLane {
+    operation_id: OperationId,
+    acquired_at: Instant,
+}
+
+impl FinalizationLane {
+    fn record_release(self, table_id: TableId, released_at: Instant) -> Duration {
+        let held = released_at.saturating_duration_since(self.acquired_at);
+        metrics::histogram!(
+            "flow_compaction_finalization_actor_lane_hold_seconds",
+            "table_id" => table_id.0.to_string()
+        )
+        .record(held.as_secs_f64());
+        tracing::info!(
+            event = "compaction_finalization_actor_lane_released",
+            operation_id = %self.operation_id.0,
+            table_id = table_id.0,
+            lane_hold_ms = held.as_secs_f64() * 1000.0,
+            "completed compaction finalization released the table actor lane"
+        );
+        held
+    }
 }
 
 fn retry_table_work(error: &anyhow::Error) -> bool {
@@ -1172,6 +1217,7 @@ impl TableWork {
         transactions: Vec<SourceTransaction>,
         options: WorkOptions,
         mut candidate: Option<CompletedBuild>,
+        finalization_lane: Option<FinalizationLane>,
     ) -> Result<TableCompletion> {
         let started = Instant::now();
         let mut attempt = 0u32;
@@ -1207,6 +1253,7 @@ impl TableWork {
                         outcome,
                         elapsed: started.elapsed(),
                         reserved_build,
+                        finalization_lane,
                     });
                 }
             }
@@ -1415,12 +1462,16 @@ impl TableWork {
                 || optional && pressure == flow_compactor::PublicationPressure::Delay)
         {
             let before = current.metadata().current_snapshot_id();
+            let data_rewrite_scope = self.config.compaction.data_rewrite_scope;
+            let restricted_data_rewrites =
+                data_rewrite_scope != flow_compactor::DataRewriteScope::All;
             let consolidate_deletes = inventory.delete_file_count
                 >= self.config.compaction.delete_files_soft
-                && !inventory
-                    .files
-                    .iter()
-                    .any(|file| self.config.compaction.needs_delete_reclamation(file));
+                && (restricted_data_rewrites
+                    || !inventory
+                        .files
+                        .iter()
+                        .any(|file| self.config.compaction.needs_delete_reclamation(file)));
             let rewritten = if consolidate_deletes {
                 self.compact(&current, schema, CompactionKind::Deletes)
                     .await?
@@ -1432,14 +1483,15 @@ impl TableWork {
                 if soft && options.build_admission == BuildAdmission::Wait {
                     return Ok(MaintenanceOutcome::Complete(current, true));
                 }
-                if let Some(build) = self
-                    .maintain_data(
-                        &current,
-                        schema,
-                        soft && options.build_admission == BuildAdmission::Start,
-                        repair_cursor,
-                    )
-                    .await?
+                if data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
+                    && let Some(build) = self
+                        .maintain_data(
+                            &current,
+                            schema,
+                            soft && options.build_admission == BuildAdmission::Start,
+                            repair_cursor,
+                        )
+                        .await?
                 {
                     return Ok(MaintenanceOutcome::Build(build));
                 }
@@ -1540,6 +1592,67 @@ impl TableWork {
                 .record(started.elapsed().as_secs_f64());
         }
         Ok(MaintenanceOutcome::Complete(current, false))
+    }
+}
+
+#[cfg(test)]
+mod finalization_lane_tests {
+    use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use std::io::{self, Write};
+
+    struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completed_build_reports_the_scheduler_lane_interval_and_operation() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_writer = trace.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || TraceWriter(trace_writer.clone()))
+            .finish();
+        let acquired_at = Instant::now();
+        let lane = FinalizationLane {
+            operation_id: OperationId("rewrite-observability-test".into()),
+            acquired_at,
+        };
+
+        let held = tracing::subscriber::with_default(subscriber, || {
+            lane.record_release(TableId(17), acquired_at + Duration::from_millis(25))
+        });
+        assert_eq!(held, Duration::from_millis(25));
+
+        let metrics = metrics.render();
+        assert!(
+            metrics.contains(
+                "flow_compaction_finalization_actor_lane_hold_seconds_sum{table_id=\"17\"} 0.025"
+            ),
+            "{metrics}"
+        );
+        let trace = String::from_utf8(trace.lock().unwrap().clone()).unwrap();
+        assert!(
+            trace.contains("event=\"compaction_finalization_actor_lane_released\"")
+                && trace.contains("operation_id=rewrite-observability-test")
+                && trace.contains("table_id=17")
+                && trace.contains("lane_hold_ms=25"),
+            "{trace}"
+        );
     }
 }
 

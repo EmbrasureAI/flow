@@ -86,6 +86,10 @@ pub struct ReadyCompaction {
 }
 
 impl ReadyCompaction {
+    pub fn operation_id(&self) -> &OperationId {
+        self.ownership.operation_id()
+    }
+
     pub async fn discard(self) -> Result<()> {
         self.ownership.release_after_join().await
     }
