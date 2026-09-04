@@ -102,17 +102,54 @@ impl TableCopy {
         store.put_source_transaction(&Self::key(table), &serde_json::to_vec(self)?)?;
         Ok(())
     }
-    fn path(&self, config: &Config) -> Result<std::path::PathBuf> {
+    fn path(&self, config: &Config, table: TableId) -> Result<std::path::PathBuf> {
+        let prefix = format!("table-{}-", table.0);
+        let identifier = self
+            .staging
+            .strip_prefix(&prefix)
+            .context("bootstrap staging directory belongs to another table")?;
+        let identifier = uuid::Uuid::parse_str(identifier)
+            .context("invalid bootstrap staging directory identifier")?;
         ensure!(
-            !self.staging.is_empty()
-                && self
-                    .staging
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            self.staging == format!("{prefix}{identifier}"),
             "invalid bootstrap staging directory"
         );
         Ok(config.state_dir.join("bootstrap").join(&self.staging))
     }
+}
+
+fn remove_staging(config: &Config, table: TableId, copy: &TableCopy) -> Result<()> {
+    if copy.staging.is_empty() {
+        return Ok(());
+    }
+    let path = copy.path(config, table)?;
+    match std::fs::remove_dir_all(&path) {
+        Ok(()) => std::fs::File::open(config.state_dir.join("bootstrap"))?
+            .sync_all()
+            .context("sync bootstrap staging deletion"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn recover_published_copy(
+    config: &Config,
+    store: &StateStore,
+    ledger: &mut SourceLedger,
+    table: TableId,
+    copy: &TableCopy,
+    ledger_cut: PgLsn,
+    snapshot: i64,
+) -> Result<()> {
+    ensure!(
+        copy.phase == CopyPhase::Published,
+        "cannot recover an unpublished table copy"
+    );
+    copy.save(store, table)?;
+    if ledger.watermarks().materialized_lsn < ledger_cut {
+        ledger.table_materialized(ledger_cut, table, snapshot)?;
+    }
+    remove_staging(config, table, copy)
 }
 
 /// Creates the permanent source incarnation once; subsequent calls resume its
@@ -443,14 +480,15 @@ pub(crate) async fn resume(
                 copy.phase = CopyPhase::Published;
             }
             if copy.phase == CopyPhase::Published {
-                copy.save(&store, schema.table_id)?;
-                if ledger.watermarks().materialized_lsn < initial_cut {
-                    ledger.table_materialized(
-                        initial_cut,
-                        schema.table_id,
-                        table_state.snapshot_id.unwrap_or(0),
-                    )?;
-                }
+                recover_published_copy(
+                    config,
+                    &store,
+                    &mut ledger,
+                    schema.table_id,
+                    &copy,
+                    initial_cut,
+                    table_state.snapshot_id.unwrap_or(0),
+                )?;
                 continue;
             }
             let copy_schema = flow_coordinator::load_source_schema(
@@ -521,10 +559,7 @@ pub(crate) async fn resume(
             if let Some(old) = old
                 && !old.staging.is_empty()
             {
-                let path = old.path(config)?;
-                if path.exists() {
-                    std::fs::remove_dir_all(path)?;
-                }
+                remove_staging(config, boot.schemas[index].table_id, &old)?;
             }
             plans.push((index, copy_schemas[index].clone(), copy, None));
         }
@@ -664,7 +699,7 @@ fn staged_copy(
     let reader = if copy.staging.is_empty() {
         main.clone()
     } else {
-        let path = copy.path(config)?;
+        let path = copy.path(config, schema.table_id)?;
         if !path.is_dir() {
             return Ok(None);
         }
@@ -741,7 +776,8 @@ async fn copy_and_publish(
             .collect::<Result<Vec<_>>>()?;
         let stream = BinaryCopyOutStream::new(output, &types);
         tokio::pin!(stream);
-        let (mut journal, recovered) = Journal::open(copy.path(config)?, journal_config(config))?;
+        let (mut journal, recovered) =
+            Journal::open(copy.path(config, schema.table_id)?, journal_config(config))?;
         ensure!(
             recovered.transactions.is_empty(),
             "new COPY staging directory is not empty"
@@ -834,9 +870,89 @@ async fn copy_and_publish(
         store.forget_applied(&epoch.id)?;
     }
     store.discard_transaction(&epoch.id.0)?;
-    if !copy.staging.is_empty() {
-        std::fs::remove_dir_all(copy.path(config)?)?;
-    }
+    remove_staging(config, schema.table_id, &copy)?;
     tracing::info!(event = "bootstrap_table_published", table_id = schema.table_id.0, rows = copy.rows, lsn = %copy.cut, "initial table base published");
     Ok((schema.table_id, snapshot.unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_coordinator::{AckMode, JournalDurability};
+    use flow_state_store::StateStoreOptions;
+
+    #[test]
+    fn published_copy_recovery_reconciles_ledger_and_reclaims_owned_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().to_owned();
+        let table = TableId(17);
+        let cut = PgLsn(41);
+        let copy = TableCopy {
+            cut,
+            staging: format!("table-{}-{}", table.0, uuid::Uuid::new_v4()),
+            phase: CopyPhase::Published,
+            rows: 3,
+            schema_version: 0,
+        };
+        let staging = copy.path(&config, table).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join("00000000000000000000.journal"),
+            b"durable copy",
+        )
+        .unwrap();
+
+        let store_path = root.path().join("index");
+        let store = StateStore::open(&store_path, StateStoreOptions::default()).unwrap();
+        let source = SourceId(config.source.id.clone());
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        let schema = config.tables[0].schema(table.0);
+        ledger
+            .journaled(envelope(&config, &[schema], cut, Default::default(), 0).unwrap())
+            .unwrap();
+        store.complete_noop(&table, cut, 0).unwrap();
+        copy.save(&store, table).unwrap();
+        drop(ledger);
+        drop(store);
+
+        let store = StateStore::open(&store_path, StateStoreOptions::default()).unwrap();
+        let copy = TableCopy::load(&store, table).unwrap().unwrap();
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        assert_eq!(ledger.acknowledgement(), PgLsn(0));
+        assert!(remove_staging(&config, TableId(table.0 + 1), &copy).is_err());
+        assert!(staging.is_dir());
+
+        recover_published_copy(&config, &store, &mut ledger, table, &copy, cut, 0).unwrap();
+        assert_eq!(ledger.acknowledgement(), cut);
+        assert!(!staging.exists());
+        drop(ledger);
+        drop(store);
+
+        let store = StateStore::open(&store_path, StateStoreOptions::default()).unwrap();
+        let copy = TableCopy::load(&store, table).unwrap().unwrap();
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source,
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        recover_published_copy(&config, &store, &mut ledger, table, &copy, cut, 0).unwrap();
+        assert_eq!(ledger.acknowledgement(), cut);
+        assert!(!staging.exists());
+    }
 }
