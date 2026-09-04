@@ -33,7 +33,7 @@ from reader_compare import compare_snapshots
 from benchmark_store import BenchmarkStore, DenseKeys, LATENCIES, PAGE_ROWS, QUEUE_ITEMS, bounded_lines, zipf_sample
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
-from run import Run, dump  # noqa: E402
+from run import Run, dump, lsn  # noqa: E402
 
 
 def micros():
@@ -548,6 +548,46 @@ columns = [
                           "FileIO calls/accepted bytes exclude hidden SDK requests and are not provider billing. "
                           "Initial COPY metrics are preserved separately in init-metrics.prom."}
 
+    def source_acknowledgement(self):
+        """Prove PostgreSQL has acknowledged the exact materialized prefix."""
+        started_at_ms = micros() // 1000
+        status_path = self.directory / "state" / "status.json"
+
+        def aligned():
+            if not status_path.exists():
+                return None
+            status = json.loads(status_path.read_text())
+            if status["source_id"] != self.name or status["process_id"] != self.process.pid:
+                raise AssertionError("status observation does not belong to the current daemon")
+            if not status["ready"] or status["updated_at_ms"] <= started_at_ms:
+                return None
+            watermarks = status["watermarks"]
+            materialized = watermarks["materialized_lsn"]
+            locally_drained = (
+                status["pending_transactions"] == 0
+                and status["captured_durable_lsn"] == materialized
+                and watermarks["journal_durable_lsn"] == materialized
+                and watermarks["received_lsn"] == materialized
+            )
+            if not locally_drained:
+                return None
+            row = self.pg.execute(
+                "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name=%s",
+                (self.name,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                raise AssertionError("replication slot or confirmed flush LSN is missing")
+            confirmed = lsn(row[0])
+            if confirmed > materialized:
+                raise AssertionError("PostgreSQL acknowledged beyond the materialized watermark")
+            if confirmed < materialized:
+                return None
+            return {"confirmed_flush_lsn": row[0], "confirmed_flush_lsn_u64": confirmed,
+                    "materialized_lsn": materialized, "pending_transactions": 0,
+                    "matched_materialized": True}
+
+        return self.until("PostgreSQL did not acknowledge the exact materialized prefix", aligned)
+
     def compacted_reader_baseline(self, previous):
         self.start_compactor(self.args.reader_baseline_compactor)
         def ready():
@@ -619,6 +659,7 @@ columns = [
             self.start()
             self.start_compactor()
             self.phase("open-loop-workload", self.workload)
+            self.phase("post-drain-source-acknowledgement", self.source_acknowledgement)
             self.phase("full-source-target-verification", self.verify)
             self.phase("post-workload-inventory", self.inventory)
             self.phase("post-workload-reader", self.scans)
