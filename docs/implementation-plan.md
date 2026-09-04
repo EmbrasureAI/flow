@@ -40,6 +40,7 @@ Review every change against this chain. A performance improvement must preserve 
 - [Index-format upgrade](../target/production-upgrade-01/report.json): release05 → release06 preserved the control store, source identity and permanent slot; rebuilt format-2 state into format 3; consumed queued WAL; preserved exact CRUD/key moves and history; and reused the new generation on the next restart.
 - [Delete/residual integration](../crates/testkit/tests/delete_rewrite.rs): actual Parquet/Avro and stock Rust reads verify sequence filtering, shared targets, duplicate positions, exact deletion density, dangling-file removal, unchanged base files, lost-response recovery and full index-loss reconstruction.
 - [Release32 concurrent compaction](../target/production-concurrent-compaction-release32-01/report.json): seven passing real-service phases cover CRUD, key moves and delete/reinsert while compaction I/O is held, hard-debt acknowledgement pause, deadline retirement with BUILD protection, scratch cleanup, SIGTERM during held I/O and restart recovery with retained history.
+- [RocksDB staging profile](../target/sst-staging-profile-32/assessment.md): eighteen alternating fresh-database samples at 100,000 and 1,000,000 mappings compare current staging, a prevalidated ordinal WAL lower bound and external-SST staging. Exact forward/reverse owners, file counts, cursors and reopen checks pass, including cleanup after closing between SST ingestion and sealing.
 - [Linux demo](../target/production-linux-demo-01/report.json): a freshly built Linux image, fresh isolated volumes, standard Trino CRUD, non-root ownership, SIGTERM exit 0, resumed source backlog and idempotent initialization.
 
 These reports span successive builds. Older service/stress and workload reports remain evidence for their recorded binaries; newer targeted checks do not replace a complete final-release run. Failed workload reports remain visible in the [production qualification report](production-qualification.md).
@@ -112,6 +113,15 @@ and 1.801/2.058/3.278/1.397 at 10k, so every case still fails the 1.25 bound.
 These finite runs qualify their correctness and catalog-latency gates, not the
 full production target or sustained reader health.
 
+The [release32 RocksDB staging profile](../target/sst-staging-profile-32/assessment.md)
+does not support adopting external SSTs as a general staging optimization. Against
+the comparable prevalidated ordinal-WAL path, external SST reduces median staging
+activation from 277.925 ms to 1.543 ms at one million mappings, after 258.6 ms of
+background construction, but total staging plus apply rises 4.948% to 4,051.255 ms.
+Apply consumes 93.579% of that path. This narrows the next experiment to bounded
+atomic index-apply batches; live forward, reverse and count column families must
+remain one atomic transition.
+
 No sustained 50k, 100-table or 24-hour qualification is claimed. The separate
 [WAL check](../target/production-wal-overhead-01/assessment.md) and
 [pinned reader diagnostic](../target/production-reader-diagnostics-27-01/assessment.md)
@@ -122,8 +132,8 @@ by bounded-v2; final local watermarks must not be relabeled as that measurement.
 ## Remaining sequence
 
 1. Keep release32's split preparation and exact activation as the current base. Its finite 1k/10k matrix passes correctness and catalog latency, while all eight reader ratios remain above 1.25. Preserve exact table/head validation, Prepared ownership, deadline retirement, journal replay and the same measurement thresholds.
-2. Benchmark actual RocksDB external-SST ingestion against the current ordinal WAL-backed delta staging, using alternating fresh databases at 100,000 and 1,000,000 mappings. Measure staging and atomic multi-column-family apply separately, and require exact forward/reverse owners, file counts, cursors, reopen recovery and bounded resources. Do not infer a service gain from an isolated storage result.
-3. Adopt only a change supported by that comparison and its durability gates. Freeze a new immutable artifact and rerun the same A/B/C/D matrix; retain through-drain phase totals separately from raw work during the later reader baseline. If the storage candidate is unsupported, keep release32 and continue from the measured state-apply and publication-stall path rather than tuning the scheduler speculatively.
+2. Retain release32's current staging path. The external-SST comparison passes its correctness and reopen boundaries but does not improve total work at one million mappings; its tiny install only moves construction out of the activation barrier while the unchanged index apply dominates.
+3. Compare bounded index-apply row ceilings of 1,024, 4,096, 8,192 and 16,384 with a separate 8 MiB serialized-batch ceiling. Use 100,000 and 1,000,000 rows, eight-file and 256-file layouts and a wide-value byte-limit case. Require exact forward/reverse owners, counts, cursors, reopen and interruption recovery, plus bounded memory, WAL growth and lock hold. Adopt the smallest supported ceiling, then freeze a new artifact and rerun the same A/B/C/D matrix.
 4. After maintenance and reader health pass, repeat the 50k and 100-table workloads with the validated disk-backed harness, then run the required 24-hour dimensions. Qualify compaction debt, resource growth, index I/O, provider costs, planning/scan amplification and publication latency together.
 5. Extend source-version, reader-version and storage/catalog coverage beyond the recorded gates. Real-source tests cover PostgreSQL 14.24, 15.19, 16.15, 17.11 and 18.6; reader results apply to the exact versions in validation. Extend failure and retention checks to deployment conditions.
 6. Publish accurate OSS support and dependency/license policies, maintain Linux CI/demo checks, and prepare reusable upstream Iceberg patches.

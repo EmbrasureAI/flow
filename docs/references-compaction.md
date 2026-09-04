@@ -16,6 +16,69 @@ Moonlink source code was not copied, translated, or included as a dependency.
 | [RocksDB tuning guide](https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide) | Shared bounded block cache, Bloom filters, bounded memtables, batched writes, and scan cache bypass are initial choices. Hardware-dependent tuning requires measurements. |
 | [RocksDB checkpoints](https://github.com/facebook/rocksdb/wiki/Checkpoints) | Native checkpoints capture all column families consistently and can hard-link SSTs on the same filesystem. |
 
+## Prepared-state activation references
+
+These sources support the boundary between background preparation and exact
+activation; they do not establish benchmark equivalence, and no source code from
+these projects is copied or translated here.
+
+[Moonlink compaction](https://github.com/Mooncake-Labs/moonlink/blob/401c1d1ad5354f77bf64cbc4f008c4e62a16781d/src/moonlink/src/storage/compaction/compactor.rs#L240-L381)
+builds the surviving-row location map and replacement global index as compaction
+output. Its snapshot owner then
+[installs that prepared result and reconciles deletion logs](https://github.com/Mooncake-Labs/moonlink/blob/401c1d1ad5354f77bf64cbc4f008c4e62a16781d/src/moonlink/src/storage/mooncake_table/snapshot_maintenance.rs#L315-L427)
+that arrived after the build. This supports doing physical remapping and index
+construction off the table lane, followed by one owner-controlled catch-up and
+activation boundary. It does not support moving a row-by-row live-index rewrite
+into the activation path.
+
+RisingWave Hummock compaction creates immutable SST outputs. The meta service
+represents activation as a
+[small version delta that removes input SSTs and adds outputs](https://github.com/risingwavelabs/risingwave/blob/c351d73d4a33dacb824287a7d5b839e04dccf838/src/meta/src/hummock/manager/compaction/mod.rs#L147-L194),
+then validates the assignment and compaction-group version and
+[commits the affected metadata together](https://github.com/risingwavelabs/risingwave/blob/c351d73d4a33dacb824287a7d5b839e04dccf838/src/meta/src/hummock/manager/compaction/mod.rs#L821-L1007).
+Readers retain
+[pinned immutable versions](https://github.com/risingwavelabs/risingwave/blob/c351d73d4a33dacb824287a7d5b839e04dccf838/src/storage/src/hummock/local_version/pinned_version.rs#L40-L155)
+while newer state is published. The relevant property for this state store is
+that activation scales with the number of prepared artifacts, rather than the
+number of remapped rows.
+
+Materialize Persist gives each background merge result its
+[exact input identity and output](https://github.com/MaterializeInc/materialize/blob/6cef38c018b3b235e1fd937f493aa498c58c9542/src/persist-client/src/internal/trace.rs#L76-L87).
+Application checks the expected frontier and input range and can classify an
+[exact, subset, stale or invalid result](https://github.com/MaterializeInc/materialize/blob/6cef38c018b3b235e1fd937f493aa498c58c9542/src/persist-client/src/internal/trace.rs#L1184-L1283)
+before a small
+[compare-and-set state transition](https://github.com/MaterializeInc/materialize/blob/6cef38c018b3b235e1fd937f493aa498c58c9542/src/persist-client/src/internal/apply.rs#L357-L499).
+An indeterminate commit preserves an output that may have become referenced
+[until later reconciliation](https://github.com/MaterializeInc/materialize/blob/6cef38c018b3b235e1fd937f493aa498c58c9542/src/persist-client/src/internal/machine.rs#L1055-L1108).
+This is the reference for self-identifying external-compactor artifacts, exact
+base validation, idempotent activation outcomes and conservative orphan cleanup.
+
+The pinned RocksDB 10.4.2 C++ API documents multi-column-family external-file
+ingestion as all-or-none for manifest recovery, while warning that concurrent
+reads can observe a mixture across column families unless they use a snapshot
+([`DB::IngestExternalFiles`](https://github.com/facebook/rocksdb/blob/410c5623195ecbe4699b9b5a5f622c7325cec6fe/include/rocksdb/db.h#L1990-L2006)).
+The pinned `rust-rocksdb` 0.24.0 API exposes only
+[single-column-family ingestion calls](https://github.com/rust-rocksdb/rust-rocksdb/blob/bb7d2168eab1bc7849f23adbcb825e3aba1bd2f4/src/db.rs#L2282-L2357).
+Sequentially ingesting SSTs into the live forward, reverse and count column
+families can therefore expose or recover only part of one logical transition;
+it cannot replace their atomic write batch. Current RocksDB main has a separate
+[prepare/commit ingestion API](https://github.com/facebook/rocksdb/blob/37234200b57d8d0a6a5c41f2d9811bbd2e293544/include/rocksdb/db.h#L2396-L2445),
+but that API is not present in the pinned engine or Rust binding.
+
+The next decision remains measurement-led. First compare the current resumable
+apply with larger memory-bounded cross-column-family `WriteBatch` chunks, each
+committed atomically, measuring preparation, lock hold, WAL cost, memory, reopen
+recovery and all forward/reverse/count/cursor invariants. External SST ingestion
+may also be measured for the isolated prepared-delta staging column family, where
+partial live-index visibility is not possible. If the bounded atomic batch meets
+the activation and resource limits, retain the simpler fixed-column-family
+design. If it does not, the next candidate is immutable, generation-prefixed
+index state prepared under an unreachable prefix, followed by exact catch-up and
+one small durable active-generation switch. Old generations then remain pinned
+for readers and are collected only after reconciliation. That larger change
+requires its own recovery and service measurements; results from Hummock,
+Persist or Moonlink do not qualify its performance here.
+
 ## Decisions
 
 The state store has one process owner. Its row mutex covers both CAS reads and

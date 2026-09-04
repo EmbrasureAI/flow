@@ -4,6 +4,9 @@
 //! not a Tokio executor thread. A table remains fenced until a committed delta is
 //! fully applied; recovery can resume between any two batches.
 
+#[cfg(all(test, feature = "apply-profile"))]
+#[path = "../tests/profiles/apply_batch.rs"]
+mod apply_batch_profile;
 mod buffer;
 mod control;
 mod reader;

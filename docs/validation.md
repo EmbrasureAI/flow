@@ -472,6 +472,16 @@ later work during the external reader baseline: release31 primary/raw data-rewri
 counts are 19/19, 9/9, 20/21 and 29/30, while release32 counts are 20/20, 9/10,
 20/21 and 31/31. Later raw work is excluded from phase and actor totals.
 
+The [release32 RocksDB staging profile](../target/sst-staging-profile-32/assessment.md)
+passes eighteen exact apply and reopen samples across 100,000 and 1,000,000
+mappings, plus cleanup after closing between external-SST ingestion and sealing.
+At one million mappings, external SST cuts the comparable prevalidated staging
+barrier from 277.925 ms to 1.543 ms after background construction, but its total
+is 4.948% slower because the unchanged live-index apply consumes 93.579% of the
+path. This evidence does not support adopting SST staging. The next gate is a
+bounded apply-batch comparison with row, serialized-byte, memory, WAL, lock-hold,
+reopen and interruption limits.
+
 ## Earlier concurrency and performance evidence
 
 The earlier [local service and stress suites](../tests/local/README.md) remain useful regression evidence. A 120-second stress run used three concurrent CRUD writers and an independent background compactor, observed fifty external compactions during writing, committed source transactions while the daemon was stopped, and compared complete rows and retained historical snapshots after recovery. That run predates the separate control store, parallel bootstrap and later schema work; it is not evidence that every newer path has sustained-load qualification.
@@ -486,5 +496,6 @@ The [production qualification report](production-qualification.md) owns measured
 - Repeat the complete gates on an immutable release artifact in CI. Broaden reader versions and storage/catalog providers; local MinIO and one REST implementation do not cover every cloud failure mode.
 - Complete the specification's workload matrix and 24-hour principal workloads, with sufficient drain, bounded compaction debt, complete observations and separate planning/delete-application measurements. Record failed targets alongside successes.
 - Qualify FULL-identity WAL overhead, journal/index footprint, maintenance bytes, storage/catalog requests and configurable-price accounting under declared deployment conditions.
+- Complete the bounded apply-batch comparison before changing the state-store default. Any candidate must preserve the atomic forward/reverse/count/cursor transition, pass reopen and interruption recovery and improve both 100,000-row and 1,000,000-row profiles within declared memory and lock-hold bounds.
 - Maintain dependency/license and image gates; prepare the reusable Iceberg API changes for upstream review.
 - Add low-fan-out partitioning and v3 only with their own source, standard-reader, delete, maintenance and recovery gates after the original v2 qualification prerequisites. They are subsequent implementation work, not early-scope exclusions.

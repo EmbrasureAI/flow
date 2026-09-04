@@ -1272,7 +1272,29 @@ during the final external reader baseline. The raw counts in the table retain th
 work only for disclosure; catch-up, state-apply, catalog and actor phase totals use
 the through-drain count and exclude later rewrites. Release32's reader ratios are
 1.284/1.317/1.538/1.438 at 1k and 1.801/2.058/3.278/1.397 at 10k. Reader
-amplification remains the failed gate. The next focused measurement is an
-actual-RocksDB external-SST versus ordinal WAL staging comparison; any supported
-change must retain crash/reopen and cross-column-family apply correctness before
-the same maintenance matrix is rerun.
+amplification remains the failed gate.
+
+## Release32 RocksDB staging profile
+
+The [actual-RocksDB profile](../target/sst-staging-profile-32/assessment.md) runs
+three rotated fresh-database samples for each of 100,000 and 1,000,000 mappings.
+It compares current staging with two prevalidated compaction lower bounds: ordinal
+WAL records and an LZ4 external SST installed into the isolated delta column
+family. Every sample applies a 90% replacement and 10% delete rewrite over 256
+old and 256 new files. Reopen validation checks every staged delta, all primary
+keys, reverse owners, per-file counts, the operation cursor and final table state.
+
+At one million mappings, median external-SST construction takes 258.6 ms and its
+foreground install plus seal takes 1.543 ms, versus 277.925 ms for ordinal WAL
+staging. The unchanged live-index apply then takes 3,791.127 ms, or 93.579% of
+the external-SST total. Its 4,051.255 ms median total is 4.948% slower than the
+ordinal-WAL lower bound. At 100,000 mappings, the SST total is 3.996% faster, but
+that smaller result does not offset the one-million-row regression or justify a
+new storage path.
+
+The profile also closes and reopens after ingesting 4,096 SST ordinals while the
+operation remains Building, discards that unsealed operation and reuses its ID
+through a normal exact apply. This passes the intended reopen cleanup boundary;
+it is not exhaustive machine-crash injection. The result rejects external SST as
+the next general optimization and focuses the next comparison on larger bounded
+atomic apply batches, with independent row and serialized-byte ceilings.

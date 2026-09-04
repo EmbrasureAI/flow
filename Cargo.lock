@@ -1480,6 +1480,7 @@ dependencies = [
  "proptest",
  "rocksdb",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
