@@ -11,7 +11,77 @@ use flow_materializer::iceberg_schema;
 use flow_model::{SourceId, TableId, TableSchema};
 use flow_state_store::{ControlStore, StateStore, StateStoreOptions};
 use iceberg::{Catalog, table::Table};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+struct CleanupDirectory {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl CleanupDirectory {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn retain(&mut self) {
+        self.armed = false;
+    }
+
+    fn remove(&mut self) -> Result<()> {
+        remove_directory_and_sync(&self.path)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for CleanupDirectory {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = remove_directory_and_sync(&self.path)
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "failed to remove abandoned index rebuild directory"
+            );
+        }
+    }
+}
+
+// Field order is intentional: close RocksDB before removing its directory.
+struct RebuildCandidate {
+    store: Option<StateStore>,
+    directory: CleanupDirectory,
+}
+
+impl RebuildCandidate {
+    fn new(store: StateStore, directory: CleanupDirectory) -> Self {
+        Self {
+            store: Some(store),
+            directory,
+        }
+    }
+
+    fn store(&self) -> &StateStore {
+        self.store.as_ref().expect("candidate store is open")
+    }
+
+    fn close(&mut self) {
+        drop(self.store.take());
+    }
+}
 
 fn options(config: &Config) -> StateStoreOptions {
     StateStoreOptions {
@@ -21,14 +91,15 @@ fn options(config: &Config) -> StateStoreOptions {
 }
 
 pub(crate) fn open(config: &Config, control: ControlStore) -> Result<StateStore> {
-    match control.active_generation()? {
-        Some(active) => Ok(StateStore::open_with_control(
-            active.path,
-            options(config),
-            control,
-        )?),
-        None => Ok(control.initialize_index(config.state_dir.join("index"), options(config))?),
-    }
+    let store = match control.active_generation()? {
+        Some(active) => StateStore::open_with_control(active.path, options(config), control)?,
+        None => control.initialize_index(config.state_dir.join("index"), options(config))?,
+    };
+    // RocksDB opens metadata lazily and may not touch a damaged SST until its
+    // first point lookup. Verify the complete replaceable index now so a
+    // supervisor restart deterministically enters the rebuild path.
+    store.validate_storage()?;
+    Ok(store)
 }
 
 /// The caller must validate persisted target UUIDs before invoking this method.
@@ -42,6 +113,7 @@ pub(crate) async fn rebuild(
     targets: &BTreeMap<TableId, Table>,
 ) -> Result<StateStore> {
     let started = Instant::now();
+    let previous = control.active_generation()?;
     for operation in control.pending_operations()? {
         let table = targets
             .get(&operation.operation.table_id)
@@ -127,43 +199,42 @@ pub(crate) async fn rebuild(
         if !usable || !checkpoint.path.join("CURRENT").is_file() {
             continue;
         }
-        let directory = candidate_directory(config)?;
-        let candidate = directory.clone();
+        let directory = candidate_directory(&config.state_dir)?;
+        let candidate = directory.path().to_owned();
         let authority = control.clone();
         let options = options(config);
         match tokio::task::spawn_blocking(move || {
-            authority.restore_checkpoint(&checkpoint, candidate, options)
+            let index = authority.restore_checkpoint(&checkpoint, candidate, options)?;
+            index.validate_storage()?;
+            Ok::<_, flow_state_store::Error>(index)
         })
         .await?
         {
             Ok(index) => {
-                restored_candidate = Some((directory, index));
+                restored_candidate = Some(RebuildCandidate::new(index, directory));
                 break;
             }
             Err(error) => {
                 tracing::warn!(%error, "checkpoint restore failed; trying another recovery source");
-                if directory.exists() {
-                    std::fs::remove_dir_all(&directory)?;
-                }
             }
         }
     }
     let restored = restored_candidate.is_some();
-    let (directory, replacement) = if let Some(candidate) = restored_candidate {
+    let mut candidate = if let Some(candidate) = restored_candidate {
         candidate
     } else {
-        let directory = candidate_directory(config)?;
-        let candidate = directory.clone();
+        let directory = candidate_directory(&config.state_dir)?;
+        let path = directory.path().to_owned();
         let options = options(config);
-        let index =
-            tokio::task::spawn_blocking(move || StateStore::open(candidate, options)).await??;
-        (directory, index)
+        let index = tokio::task::spawn_blocking(move || StateStore::open(path, options)).await??;
+        RebuildCandidate::new(index, directory)
     };
     if !restored {
-        let scratch_directory = directory.with_extension("scratch");
-        let scratch = StateStore::open(&scratch_directory, options(config))?;
+        let mut scratch_directory =
+            CleanupDirectory::new(candidate.directory.path().with_extension("scratch"));
+        let scratch = StateStore::open(scratch_directory.path(), options(config))?;
         let maintenance = TableMaintenance::new(
-            replacement.clone(),
+            candidate.store().clone(),
             catalog.clone(),
             config.compaction.clone(),
             crate::services::writer_config(config),
@@ -177,7 +248,7 @@ pub(crate) async fn rebuild(
                 .rebuild_index(
                     table,
                     schema,
-                    replacement.clone(),
+                    candidate.store().clone(),
                     scratch.clone(),
                     authority
                         .get(&schema.table_id)
@@ -189,7 +260,7 @@ pub(crate) async fn rebuild(
         }
         drop(maintenance);
         drop(scratch);
-        std::fs::remove_dir_all(scratch_directory)?;
+        scratch_directory.remove()?;
     }
     // An external rewrite can race a multi-table scan. Never select locations
     // from an older head and start emitting position deletes against the new one.
@@ -207,29 +278,275 @@ pub(crate) async fn rebuild(
             "target schema changed during index rebuild"
         );
         if head.metadata().current_snapshot_id()
-            != replacement.table_state(&schema.table_id)?.snapshot_id
+            != candidate.store().table_state(&schema.table_id)?.snapshot_id
         {
             return Err(ReplanRequired.into());
         }
     }
     let authority = control.clone();
+    let replacement = candidate.store().clone();
     let active =
         tokio::task::spawn_blocking(move || authority.activate_rebuilt(&replacement)).await??;
+    // From this point the control store names this directory. Never let error
+    // cleanup remove the authoritative generation, even if reopening fails.
+    candidate.directory.retain();
+    candidate.close();
+    let store = StateStore::open_with_control(&active.path, options(config), control)?;
+    if let Err(error) = retire_superseded_generations(
+        &config.state_dir,
+        &active.path,
+        previous
+            .as_ref()
+            .map(|generation| generation.path.as_path()),
+    ) {
+        // The new generation is already authoritative and reopen-validated.
+        // Cleanup failure must not trigger another rebuild and another directory.
+        tracing::warn!(%error, "failed to retire superseded index generations");
+    }
     tracing::info!(
         event = "index_generation_activated", tables = schemas.len(), restored_checkpoint = restored,
         elapsed_ms = started.elapsed().as_millis() as u64, path = %active.path.display(),
         "recovered authoritative row index"
     );
-    Ok(StateStore::open_with_control(
-        active.path,
-        options(config),
-        control,
-    )?)
+    Ok(store)
 }
 
-fn candidate_directory(config: &Config) -> Result<PathBuf> {
-    let parent = config.state_dir.join("index-generations");
-    std::fs::create_dir_all(&parent)?;
-    std::fs::File::open(&config.state_dir)?.sync_all()?;
-    Ok(parent.join(format!("index-{}", uuid::Uuid::new_v4())))
+fn candidate_directory(state_dir: &Path) -> Result<CleanupDirectory> {
+    let root = fs::canonicalize(state_dir)?;
+    let requested_parent = state_dir.join("index-generations");
+    fs::create_dir_all(&requested_parent)?;
+    let kind = fs::symlink_metadata(&requested_parent)?.file_type();
+    ensure!(
+        kind.is_dir() && !kind.is_symlink(),
+        "index generation directory must be a real directory"
+    );
+    let parent = fs::canonicalize(&requested_parent)?;
+    ensure!(
+        parent.parent() == Some(root.as_path()),
+        "index generation directory escapes the configured state directory"
+    );
+    fs::File::open(&root)?.sync_all()?;
+    let path = parent.join(format!("index-{}", uuid::Uuid::new_v4()));
+    ensure!(
+        !path.exists(),
+        "new index generation path unexpectedly exists"
+    );
+    Ok(CleanupDirectory::new(path))
+}
+
+fn remove_directory_and_sync(path: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn retire_superseded_generations(
+    state_dir: &Path,
+    active: &Path,
+    previous: Option<&Path>,
+) -> Result<()> {
+    let active = fs::canonicalize(active)?;
+    let previous = previous.and_then(|path| fs::canonicalize(path).ok());
+    let managed = managed_generation_directories(state_dir)?;
+    ensure!(
+        managed.contains(&active),
+        "active index is outside the managed state directories"
+    );
+    let keep = [Some(active), previous]
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    let mut synced = BTreeSet::new();
+    let mut first_error = None;
+    for path in managed {
+        if keep.contains(&path) {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    synced.insert(parent.to_owned());
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    anyhow::anyhow!(
+                        "remove superseded index generation {}: {error}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    for parent in synced {
+        if let Err(error) = fs::File::open(&parent).and_then(|directory| directory.sync_all()) {
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!(
+                    "sync index generation parent {} after removal: {error}",
+                    parent.display()
+                )
+            });
+        }
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn managed_generation_directories(state_dir: &Path) -> Result<Vec<PathBuf>> {
+    let root = fs::canonicalize(state_dir)?;
+    let mut managed = Vec::new();
+    let legacy = state_dir.join("index");
+    if is_real_directory(&legacy)? {
+        let legacy = fs::canonicalize(legacy)?;
+        ensure!(
+            legacy.parent() == Some(root.as_path()),
+            "legacy index directory escapes the configured state directory"
+        );
+        managed.push(legacy);
+    }
+
+    let requested_parent = state_dir.join("index-generations");
+    if !is_real_directory(&requested_parent)? {
+        return Ok(managed);
+    }
+    let parent = fs::canonicalize(requested_parent)?;
+    ensure!(
+        parent.parent() == Some(root.as_path()),
+        "index generation directory escapes the configured state directory"
+    );
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || !is_managed_generation_name(&entry.file_name()) {
+            continue;
+        }
+        let path = fs::canonicalize(entry.path())?;
+        ensure!(
+            path.parent() == Some(parent.as_path()),
+            "index generation escapes its managed directory"
+        );
+        managed.push(path);
+    }
+    Ok(managed)
+}
+
+fn is_real_directory(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_managed_generation_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let name = name.strip_suffix(".scratch").unwrap_or(name);
+    name.strip_prefix("index-")
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn fail_after_candidate_build(state_dir: &Path) -> Result<()> {
+        let directory = candidate_directory(state_dir)?;
+        let replacement = StateStore::open(directory.path(), StateStoreOptions::default())?;
+        let candidate = RebuildCandidate::new(replacement, directory);
+        let scratch_directory =
+            CleanupDirectory::new(candidate.directory.path().with_extension("scratch"));
+        let scratch = StateStore::open(scratch_directory.path(), StateStoreOptions::default())?;
+        ensure!(
+            candidate.store().index_is_empty(&TableId(1))?
+                && scratch.index_is_empty(&TableId(1))?,
+            "fresh rebuild stores must be empty"
+        );
+        Err(ReplanRequired.into())
+    }
+
+    #[test]
+    fn repeated_head_races_remove_candidate_and_scratch_directories() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+
+        for _ in 0..4 {
+            let error = fail_after_candidate_build(&state_dir).unwrap_err();
+            assert!(error.downcast_ref::<ReplanRequired>().is_some());
+            assert!(
+                managed_generation_directories(&state_dir)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                fs::read_dir(state_dir.join("index-generations"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_success_retains_only_active_and_previous_generation() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let control = ControlStore::open(state_dir.join("control")).unwrap();
+        let legacy_path = state_dir.join("index");
+        drop(
+            control
+                .initialize_index(&legacy_path, StateStoreOptions::default())
+                .unwrap(),
+        );
+        let legacy_path = fs::canonicalize(&legacy_path).unwrap();
+
+        for attempt in 0..5 {
+            let previous = control.active_generation().unwrap().unwrap();
+            let directory = candidate_directory(&state_dir).unwrap();
+            let replacement =
+                StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+            let mut candidate = RebuildCandidate::new(replacement, directory);
+            let active = control.activate_rebuilt(candidate.store()).unwrap();
+            candidate.directory.retain();
+            candidate.close();
+            drop(
+                StateStore::open_with_control(
+                    &active.path,
+                    StateStoreOptions::default(),
+                    control.clone(),
+                )
+                .unwrap(),
+            );
+
+            let stale_scratch = state_dir
+                .join("index-generations")
+                .join(format!("index-{}.scratch", uuid::Uuid::new_v4()));
+            fs::create_dir(&stale_scratch).unwrap();
+            retire_superseded_generations(&state_dir, &active.path, Some(&previous.path)).unwrap();
+
+            let retained = managed_generation_directories(&state_dir).unwrap();
+            assert_eq!(retained.len(), 2);
+            assert!(retained.contains(&active.path));
+            assert!(retained.contains(&previous.path));
+            assert!(!stale_scratch.exists());
+            if attempt == 0 {
+                assert!(legacy_path.exists());
+            } else {
+                assert!(!legacy_path.exists());
+            }
+        }
+    }
 }

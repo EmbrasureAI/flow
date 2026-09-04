@@ -1,7 +1,7 @@
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId};
 use flow_state_store::{
-    ControlStore, Error, IndexDelta, OperationKind, OperationPhase, PreparedOperation, StateStore,
-    StateStoreOptions,
+    ControlStore, Error, IndexDelta, OperationKind, OperationPhase, OperationRecord,
+    PreparedOperation, StateStore, StateStoreOptions,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -409,4 +409,41 @@ fn old_index_formats_import_authority_but_require_rebuilt_live_counts() {
             [3]
         );
     }
+}
+
+#[test]
+fn corrupt_control_operation_stops_before_index_rebuild() {
+    let temp = TempDir::new().unwrap();
+    let (control, index) = initialize(temp.path());
+    let id = OperationId("corrupt-control-cursor".into());
+    index
+        .prepare(
+            operation(&id.0, Some(1), 20),
+            [
+                delta("second", 4, 20),
+                delta("second", 5, 20),
+                delta("second", 6, 20),
+            ],
+        )
+        .unwrap();
+    index.mark_committed(&id, 2, 2).unwrap();
+    drop(index);
+    drop(control);
+
+    let control_path = temp.path().join("control");
+    let options = rocksdb::Options::default();
+    let db = rocksdb::DB::open(&options, &control_path).unwrap();
+    let mut key = vec![1];
+    key.extend_from_slice(id.0.as_bytes());
+    let encoded = db.get(&key).unwrap().unwrap();
+    let mut record: OperationRecord = bincode::deserialize(&encoded).unwrap();
+    record.applied_count = record.delta_count + 1;
+    db.put(&key, bincode::serialize(&record).unwrap()).unwrap();
+    db.flush_wal(true).unwrap();
+    drop(db);
+
+    assert!(matches!(
+        ControlStore::open(&control_path),
+        Err(Error::AuthorityCorruption(_))
+    ));
 }

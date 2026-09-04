@@ -70,10 +70,12 @@ impl ControlStore {
             None => db.put_opt(VERSION, [1], &durable_write())?,
             _ => {}
         }
-        Ok(Self(Arc::new(Inner {
+        let store = Self(Arc::new(Inner {
             db,
             writer: Mutex::new(()),
-        })))
+        }));
+        store.validate_operation_records()?;
+        Ok(store)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ()>> {
@@ -292,7 +294,7 @@ impl ControlStore {
     pub fn pending_operations(&self) -> Result<Vec<OperationRecord>> {
         self.scan(record_key(OPERATIONS, &[]))
             .filter_map(|entry| {
-                match entry.and_then(|(_, value)| decode::<OperationRecord>(&value)) {
+                match entry.and_then(|(key, value)| decode_control_operation(&key, &value)) {
                     Ok(record) if record.phase == OperationPhase::Applied => None,
                     other => Some(other),
                 }
@@ -309,12 +311,13 @@ impl ControlStore {
         value: &[u8],
     ) -> Result<()> {
         let _guard = self.lock()?;
+        let operation_key = record_key(OPERATIONS, id.0.as_bytes());
         let record: OperationRecord = self
             .0
             .db
-            .get(record_key(OPERATIONS, id.0.as_bytes()))?
+            .get(&operation_key)?
             .ok_or_else(|| Error::InvalidState("unknown recovery operation".into()))
-            .and_then(|bytes| decode(&bytes))?;
+            .and_then(|bytes| decode_control_operation(&operation_key, &bytes))?;
         let state = self
             .table_state(&record.operation.table_id)?
             .ok_or_else(|| Error::RecoveryRequired("missing table authority".into()))?;
@@ -346,7 +349,7 @@ impl ControlStore {
             .db
             .get(&key)?
             .ok_or_else(|| Error::InvalidState("unknown control operation".into()))
-            .and_then(|bytes| decode(&bytes))?;
+            .and_then(|bytes| decode_control_operation(&key, &bytes))?;
         let mut state = self
             .table_state(&record.operation.table_id)?
             .ok_or_else(|| Error::RecoveryRequired("operation has no table authority".into()))?;
@@ -570,6 +573,32 @@ impl ControlStore {
             .iterator_opt(IteratorMode::From(&prefix, Direction::Forward), options)
             .map(|entry| entry.map_err(Error::from))
     }
+
+    fn validate_operation_records(&self) -> Result<()> {
+        for entry in self.scan(record_key(OPERATIONS, &[])) {
+            let (key, value) = entry?;
+            decode_control_operation(&key, &value)?;
+        }
+        Ok(())
+    }
+}
+
+fn decode_control_operation(key: &[u8], value: &[u8]) -> Result<OperationRecord> {
+    let record = decode::<OperationRecord>(value).map_err(|error| {
+        Error::AuthorityCorruption(format!("operation record cannot be decoded: {error}"))
+    })?;
+    if key.get(1..) != Some(record.operation.id.0.as_bytes()) {
+        return Err(Error::AuthorityCorruption(
+            "operation key does not match its record".into(),
+        ));
+    }
+    if let Some(reason) = record.invariant_violation() {
+        return Err(Error::AuthorityCorruption(format!(
+            "operation {} has an invalid persisted {reason}",
+            record.operation.id.0
+        )));
+    }
+    Ok(record)
 }
 
 pub(crate) fn is_authority(family: &str) -> bool {

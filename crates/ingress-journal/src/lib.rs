@@ -51,6 +51,22 @@ impl Default for JournalConfig {
     }
 }
 
+impl JournalConfig {
+    /// Validate frame, segment, quota, and transaction limits without opening storage.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_frame_bytes == 0
+            || u64::from(self.max_frame_bytes) + HEADER as u64 > self.segment_bytes
+            || self.segment_bytes > self.quota_bytes
+            || self.max_open_transactions == 0
+        {
+            return Err(Error::Config(
+                "frame must fit a segment, segment must fit quota, and transaction limits must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("journal IO: {0}")]
@@ -171,15 +187,7 @@ pub struct Journal {
 
 impl Journal {
     pub fn open(path: impl AsRef<Path>, config: JournalConfig) -> Result<(Self, Recovery)> {
-        if config.max_frame_bytes == 0
-            || u64::from(config.max_frame_bytes) + HEADER as u64 > config.segment_bytes
-            || config.segment_bytes > config.quota_bytes
-            || config.max_open_transactions == 0
-        {
-            return Err(Error::Config(
-                "frame must fit a segment, segment must fit quota, and transaction limits must be positive",
-            ));
-        }
+        config.validate()?;
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let lock = OpenOptions::new()

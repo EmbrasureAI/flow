@@ -112,10 +112,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let store = match opened {
         Ok(store) => store,
         Err(error)
-            if matches!(
-                error.downcast_ref::<flow_state_store::Error>(),
-                Some(flow_state_store::Error::RecoveryRequired(_))
-            ) =>
+            if error
+                .downcast_ref::<flow_state_store::Error>()
+                .is_some_and(flow_state_store::Error::requires_index_rebuild) =>
         {
             tracing::warn!(%error, "rebuilding the row index from durable control and Iceberg");
             let mut attempt = 0u32;

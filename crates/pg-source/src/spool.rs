@@ -33,6 +33,23 @@ impl Default for SpoolConfig {
     }
 }
 
+impl SpoolConfig {
+    /// Validate frame, segment, quota, and transaction limits without opening storage.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_chunk_bytes == 0
+            || u64::from(self.max_chunk_bytes) + HEADER > self.segment_bytes
+            || self.segment_bytes > self.quota_bytes
+            || self.max_transactions == 0
+            || self.max_subtransactions == 0
+        {
+            return Err(Error::Config(
+                "invalid spool frame, segment, quota, or transaction limits",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Savepoint {
     xid: u32,
@@ -62,16 +79,7 @@ impl TransactionSpool {
     /// `root` must be a dedicated spool directory. Old `txn-*` directories are
     /// discarded because only terminal transactions in the journal are durable.
     pub fn open(root: impl AsRef<Path>, config: SpoolConfig) -> Result<Self> {
-        if config.max_chunk_bytes == 0
-            || u64::from(config.max_chunk_bytes) + HEADER > config.segment_bytes
-            || config.segment_bytes > config.quota_bytes
-            || config.max_transactions == 0
-            || config.max_subtransactions == 0
-        {
-            return Err(Error::Config(
-                "invalid spool frame, segment, quota, or transaction limits",
-            ));
-        }
+        config.validate()?;
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root)?;
         let lock = OpenOptions::new()

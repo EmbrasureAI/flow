@@ -1,7 +1,7 @@
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId, Value};
 use flow_state_store::{
     BufferResult, Change, CollapseBuffer, IndexDelta, OperationKind, OperationPhase,
-    PreparedOperation, StateStore, StateStoreOptions,
+    OperationRecord, PreparedOperation, StateStore, StateStoreOptions,
 };
 use tempfile::TempDir;
 
@@ -1287,5 +1287,68 @@ fn malformed_or_overflowing_counts_do_not_partially_apply_index_changes() {
                 .is_none()
         );
         assert_eq!(store.file_rows(&TableId(7), &FileId("a".into())).count(), 1);
+    }
+}
+
+#[test]
+fn corrupt_persisted_apply_cursors_fail_closed_after_reopen() {
+    use flow_state_store::Error;
+
+    for (case, applied_count) in [("at-end", 3), ("past-end", 4)] {
+        let temp = TempDir::new().unwrap();
+        let id = OperationId(format!("corrupt-cursor-{case}"));
+        let store = open(temp.path());
+        store
+            .prepare(
+                operation(&id.0, None, 10),
+                [insert(1, "a", 0), insert(2, "a", 1), insert(3, "a", 2)],
+            )
+            .unwrap();
+        store.mark_committed(&id, 1, 1).unwrap();
+        let table_before = store.table_state(&TableId(7)).unwrap();
+        drop(store);
+
+        let options = rocksdb::Options::default();
+        let families = rocksdb::DB::list_cf(&options, temp.path()).unwrap();
+        let db = rocksdb::DB::open_cf(&options, temp.path(), families).unwrap();
+        let operations = db.cf_handle("prepared_operations").unwrap();
+        let encoded = db.get_cf(&operations, id.0.as_bytes()).unwrap().unwrap();
+        let mut record: OperationRecord = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(record.delta_count, 3);
+        record.applied_count = applied_count;
+        db.put_cf(
+            &operations,
+            id.0.as_bytes(),
+            bincode::serialize(&record).unwrap(),
+        )
+        .unwrap();
+        db.flush_wal(true).unwrap();
+        drop(operations);
+        drop(db);
+
+        let error = match StateStore::open(temp.path(), StateStoreOptions::default()) {
+            Ok(_) => panic!("corrupt operation cursor was accepted during reopen"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::RecoveryRequired(_)));
+
+        let options = rocksdb::Options::default();
+        let families = rocksdb::DB::list_cf(&options, temp.path()).unwrap();
+        let db = rocksdb::DB::open_cf(&options, temp.path(), families).unwrap();
+        let operations = db.cf_handle("prepared_operations").unwrap();
+        let encoded = db.get_cf(&operations, id.0.as_bytes()).unwrap().unwrap();
+        let record: OperationRecord = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(record.phase, OperationPhase::Committed);
+        assert_eq!(record.applied_count, applied_count);
+        let table: flow_state_store::TableState = bincode::deserialize(
+            &db.get_cf(
+                &db.cf_handle("table_state").unwrap(),
+                TableId(7).0.to_be_bytes(),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(table, table_before);
     }
 }

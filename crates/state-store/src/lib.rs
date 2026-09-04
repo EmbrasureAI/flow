@@ -46,6 +46,16 @@ const DELTAS: &str = "index_deltas";
 const TABLES: &str = "table_state";
 const SPOOL: &str = "transaction_mutations";
 const SOURCE: &str = "source_transactions";
+const STATE_COLUMN_FAMILIES: [&str; 8] = [
+    PK,
+    REVERSE,
+    FILE_COUNTS,
+    OPERATIONS,
+    DELTAS,
+    TABLES,
+    SPOOL,
+    SOURCE,
+];
 // Version 3 adds exact per-file counts; older indexes require reconstruction.
 const FORMAT_VERSION: u8 = 3;
 
@@ -57,6 +67,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("index generation requires recovery: {0}")]
     RecoveryRequired(String),
+    #[error("durable control authority is corrupt: {0}")]
+    AuthorityCorruption(String),
     #[error("state serialization: {0}")]
     Encoding(#[from] bincode::Error),
     #[error("invalid state transition: {0}")]
@@ -77,6 +89,15 @@ pub enum Error {
     #[error("state mutex poisoned; restart and recover before publishing")]
     Poisoned,
 }
+
+impl Error {
+    /// Whether this failure means the replaceable index must be rebuilt before reuse.
+    pub fn requires_index_rebuild(&self) -> bool {
+        matches!(self, Self::RecoveryRequired(_))
+            || matches!(self, Self::Database(error) if error.kind() == rocksdb::ErrorKind::Corruption)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 /// Raw durable ledger record, owned by its calling subsystem.
 pub type RawEntry = (Box<[u8]>, Box<[u8]>);
@@ -190,6 +211,54 @@ pub struct OperationRecord {
     pub sequence_number: Option<i64>,
     pub delta_count: u64,
     pub applied_count: u64,
+}
+
+impl OperationRecord {
+    fn invariant_violation(&self) -> Option<&'static str> {
+        if self.applied_count > self.delta_count {
+            return Some("apply cursor");
+        }
+
+        match self.phase {
+            OperationPhase::Building | OperationPhase::Prepared => {
+                if self.applied_count != 0 {
+                    return Some("pre-commit apply cursor");
+                }
+                if self.snapshot_id.is_some() || self.sequence_number.is_some() {
+                    return Some("pre-commit catalog outcome");
+                }
+            }
+            OperationPhase::Committed | OperationPhase::Applied => {
+                if self.snapshot_id.is_none()
+                    || self.sequence_number.is_none_or(|sequence| sequence < 0)
+                {
+                    return Some("committed catalog outcome");
+                }
+            }
+        }
+
+        match self.phase {
+            OperationPhase::Committed
+                if self.delta_count != 0 && self.applied_count == self.delta_count =>
+            {
+                Some("committed apply cursor")
+            }
+            OperationPhase::Applied if self.applied_count != self.delta_count => {
+                Some("completed apply cursor")
+            }
+            _ => None,
+        }
+    }
+
+    fn validate_persisted(&self) -> Result<()> {
+        match self.invariant_violation() {
+            Some(reason) => Err(Error::RecoveryRequired(format!(
+                "operation {} has an invalid persisted {reason}; recover durable state before publishing",
+                self.operation.id.0
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,17 +386,7 @@ impl StateStore {
         options.create_missing_column_families(true);
         options.set_max_background_jobs(4);
         options.set_atomic_flush(true);
-        let columns = [
-            PK,
-            REVERSE,
-            FILE_COUNTS,
-            OPERATIONS,
-            DELTAS,
-            TABLES,
-            SPOOL,
-            SOURCE,
-        ]
-        .map(|name| {
+        let columns = STATE_COLUMN_FAMILIES.map(|name| {
             let mut cf = Options::default();
             cf.set_block_based_table_factory(&table);
             cf.set_write_buffer_size(config.write_buffer_bytes);
@@ -359,6 +418,7 @@ impl StateStore {
         } else {
             0
         };
+        validate_operation_records(&db)?;
         Ok(Self(Arc::new(Inner {
             db,
             writer: Mutex::new(()),
@@ -425,15 +485,22 @@ impl StateStore {
     }
 
     pub fn operation(&self, id: &OperationId) -> Result<Option<OperationRecord>> {
-        self.get(OPERATIONS, id.0.as_bytes())
+        let record: Option<OperationRecord> = self.get(OPERATIONS, id.0.as_bytes())?;
+        if let Some(record) = &record {
+            record.validate_persisted()?;
+        }
+        Ok(record)
     }
 
     pub fn pending_operations(&self) -> Result<Vec<OperationRecord>> {
         self.scan(OPERATIONS, Vec::new())
             .filter_map(|value| match value {
                 Ok((_, bytes)) => match decode::<OperationRecord>(&bytes) {
-                    Ok(record) if record.phase != OperationPhase::Applied => Some(Ok(record)),
-                    Ok(_) => None,
+                    Ok(record) => match record.validate_persisted() {
+                        Ok(()) if record.phase != OperationPhase::Applied => Some(Ok(record)),
+                        Ok(()) => None,
+                        Err(error) => Some(Err(error)),
+                    },
                     Err(error) => Some(Err(error)),
                 },
                 Err(error) => Some(Err(error)),
@@ -637,7 +704,11 @@ impl StateStore {
                 encoded.clear();
                 bincode::serialize_into(&mut encoded, &delta)?;
                 batch.put_cf(&cf, &ordinal, &encoded);
-                record.delta_count += 1;
+                record.delta_count = record.delta_count.checked_add(1).ok_or_else(|| {
+                    Error::RecoveryRequired(
+                        "prepared delta count overflow; rebuild the index".into(),
+                    )
+                })?;
             }
             if record.delta_count == start {
                 return Ok(());
@@ -1368,6 +1439,32 @@ impl StateStore {
         Ok(())
     }
 
+    /// Verify that every stored key and value is readable with checksum verification.
+    /// This does not establish semantic consistency or catalog authority.
+    pub fn validate_storage(&self) -> Result<()> {
+        let read_options = || {
+            let mut options = ReadOptions::default();
+            options.fill_cache(false);
+            options.set_verify_checksums(true);
+            options
+        };
+
+        for entry in self.0.db.iterator_opt(IteratorMode::Start, read_options()) {
+            entry?;
+        }
+        for name in STATE_COLUMN_FAMILIES {
+            let handle = self.0.db.cf_handle(name).expect("opened column family");
+            for entry in self
+                .0
+                .db
+                .iterator_cf_opt(&handle, read_options(), IteratorMode::Start)
+            {
+                entry?;
+            }
+        }
+        Ok(())
+    }
+
     fn require_operation(&self, id: &OperationId) -> Result<OperationRecord> {
         self.operation(id)?
             .ok_or_else(|| Error::InvalidState("unknown operation".into()))
@@ -1473,6 +1570,29 @@ impl StateStore {
             &end,
         );
     }
+}
+
+fn validate_operation_records(db: &DB) -> Result<()> {
+    let family = db.cf_handle(OPERATIONS).expect("opened column family");
+    let mut options = ReadOptions::default();
+    options.fill_cache(false);
+    options.set_verify_checksums(true);
+    for entry in db.iterator_cf_opt(&family, options, IteratorMode::Start) {
+        let (key, value) = entry?;
+        let record = decode::<OperationRecord>(&value).map_err(|error| {
+            Error::RecoveryRequired(format!(
+                "persisted operation record cannot be decoded: {error}"
+            ))
+        })?;
+        if key.as_ref() != record.operation.id.0.as_bytes() {
+            return Err(Error::RecoveryRequired(
+                "persisted operation key does not match its record; recover durable state before publishing"
+                    .into(),
+            ));
+        }
+        record.validate_persisted()?;
+    }
+    Ok(())
 }
 
 fn record_apply_batch_metrics(
@@ -1611,6 +1731,41 @@ fn is_obsolete(current: Option<&BorrowedRowLocation<'_>>, expected: Option<&RowL
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_rebuild_classifier_is_narrow() {
+        assert!(Error::RecoveryRequired("rebuild".into()).requires_index_rebuild());
+        assert!(!Error::AuthorityCorruption("control".into()).requires_index_rebuild());
+        assert!(!Error::InvalidState("invalid transition".into()).requires_index_rebuild());
+        assert!(
+            !Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied"
+            ))
+            .requires_index_rebuild()
+        );
+    }
+
+    #[test]
+    fn rocksdb_corruption_is_classified_for_index_rebuild() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+        std::fs::write(
+            directory.path().join("MANIFEST-000001"),
+            b"corrupt manifest",
+        )
+        .unwrap();
+
+        let error = match StateStore::open(directory.path(), StateStoreOptions::default()) {
+            Ok(_) => panic!("corrupt RocksDB manifest was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, Error::Database(inner) if inner.kind() == rocksdb::ErrorKind::Corruption),
+            "unexpected error: {error}"
+        );
+        assert!(error.requires_index_rebuild());
+    }
 
     #[test]
     fn borrowed_row_location_preserves_codec_and_malformed_boundaries() {

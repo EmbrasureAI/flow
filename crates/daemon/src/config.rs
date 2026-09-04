@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, ensure};
 use flow_coordinator::{AckMode, JournalDurability, Priority};
+use flow_ingress_journal::JournalConfig;
 use flow_model::{Column, TableId, TableSchema};
+use flow_pg_source::SpoolConfig;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -134,6 +136,20 @@ impl Config {
         self.compaction.validate()?;
         self.parquet_read.validate()?;
         let l = &self.limits;
+        JournalConfig {
+            quota_bytes: l.journal_bytes,
+            max_frame_bytes: l.chunk_bytes,
+            ..JournalConfig::default()
+        }
+        .validate()
+        .context("invalid journal limits")?;
+        SpoolConfig {
+            quota_bytes: l.spool_bytes,
+            max_chunk_bytes: l.chunk_bytes,
+            ..SpoolConfig::default()
+        }
+        .validate()
+        .context("invalid spool limits")?;
         ensure!(
             l.chunk_bytes >= 64
                 && l.source_message_bytes >= l.chunk_bytes as usize
@@ -156,6 +172,10 @@ impl Config {
                 && l.retained_checkpoints > 0
                 && l.manifest_max_count >= 2,
             "invalid history, checkpoint, or manifest maintenance limits"
+        );
+        ensure!(
+            l.garbage_interval_secs > 0 && l.orphan_grace_secs > 0,
+            "garbage interval and orphan grace must be positive"
         );
         let mut sources = BTreeMap::new();
         let mut targets = BTreeMap::new();
@@ -182,5 +202,73 @@ impl Config {
             table.schema(0).validate()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> Config {
+        toml::from_str(include_str!("../../../examples/flow.toml")).unwrap()
+    }
+
+    #[test]
+    fn rejects_limits_that_downstream_fixed_configuration_cannot_use() {
+        type Invalidate = fn(&mut Limits);
+        type Case = (&'static str, Invalidate, &'static str);
+
+        valid_config().validate().unwrap();
+        let cases: [Case; 5] = [
+            (
+                "journal quota below one segment",
+                |limits| {
+                    limits.journal_bytes = JournalConfig::default().segment_bytes - 1;
+                },
+                "invalid journal limits",
+            ),
+            (
+                "spool quota below one segment",
+                |limits| {
+                    limits.spool_bytes = SpoolConfig::default().segment_bytes - 1;
+                },
+                "invalid spool limits",
+            ),
+            (
+                "chunk larger than a journal frame",
+                |limits| {
+                    limits.chunk_bytes =
+                        u32::try_from(JournalConfig::default().segment_bytes).unwrap();
+                    limits.source_message_bytes = limits.chunk_bytes as usize;
+                    limits.batch_bytes = limits.chunk_bytes as usize;
+                    limits.parquet_row_group_bytes = limits.batch_bytes;
+                },
+                "invalid journal limits",
+            ),
+            (
+                "zero garbage interval",
+                |limits| {
+                    limits.garbage_interval_secs = 0;
+                },
+                "garbage interval and orphan grace must be positive",
+            ),
+            (
+                "zero orphan grace",
+                |limits| {
+                    limits.orphan_grace_secs = 0;
+                },
+                "garbage interval and orphan grace must be positive",
+            ),
+        ];
+
+        for (case, invalidate, expected) in cases {
+            let mut config = valid_config();
+            invalidate(&mut config.limits);
+            let error = config.validate().expect_err(case);
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{case} returned {error:#}"
+            );
+        }
     }
 }
