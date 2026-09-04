@@ -92,6 +92,10 @@ oldest_l0_hard_ms = 4611686018427387904
             text += '''stable_small_soft_files = 1000000
 stable_small_hard_files = 2000000
 '''
+        elif self.args.stable_small_soft_files is not None:
+            text += f'''stable_small_soft_files = {self.args.stable_small_soft_files}
+stable_small_hard_files = {self.args.stable_small_hard_files}
+'''
         if self.args.maintenance_mode == "disabled":
             text += '''delete_files_soft = 1000000
 delete_files_hard = 2000000
@@ -926,6 +930,11 @@ columns = [
             "delete_rewrites_enabled": args.maintenance_mode != "disabled",
             "data_debt_bounds_relaxed_for_finite_diagnostic": args.maintenance_mode in ("disabled", "delete-only"),
             "stable_small_file_bounds_relaxed_for_finite_diagnostic": args.maintenance_mode != "current",
+            "stable_small_file_bounds": {
+                "soft": args.stable_small_soft_files,
+                "hard": args.stable_small_hard_files,
+                "source": "explicit" if args.stable_small_soft_files is not None else "binary_default",
+            },
             "delete_debt_bounds_relaxed_for_finite_diagnostic": args.maintenance_mode == "disabled",
             "manifest_max_count": args.manifest_max_count,
         }
@@ -1014,6 +1023,8 @@ def main():
     parser.add_argument("--compactor-interval-ms", type=int, default=3000)
     parser.add_argument("--maintenance-mode", choices=("disabled", "delete-only", "l0-only", "current"),
                         default="current")
+    parser.add_argument("--stable-small-soft-files", type=int)
+    parser.add_argument("--stable-small-hard-files", type=int)
     parser.add_argument("--manifest-max-count", type=int, default=64)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
@@ -1054,6 +1065,13 @@ def main():
             or args.reader_baseline_timeout <= 0):
         parser.error("pending transactions, reader-baseline budgets and timeouts must be positive; "
                      "manifest max count must be at least two")
+    if (args.stable_small_soft_files is None) != (args.stable_small_hard_files is None):
+        parser.error("stable-small soft and hard limits must be supplied together")
+    if args.stable_small_soft_files is not None:
+        if args.maintenance_mode != "current":
+            parser.error("stable-small overrides require --maintenance-mode current")
+        if args.stable_small_soft_files <= 0 or args.stable_small_soft_files > args.stable_small_hard_files:
+            parser.error("stable-small limits must be positive with soft at most hard")
     if args.key_distribution == "zipf" and (not math.isfinite(args.zipf_exponent) or not 0 < args.zipf_exponent <= 2):
         parser.error("Zipf exponent must be finite and greater than zero, at most two")
     Benchmark(args).execute()
