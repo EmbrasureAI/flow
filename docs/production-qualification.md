@@ -1188,3 +1188,91 @@ strict Clippy, the release build and Rust 1.94. The change is retained as a smal
 allocation reduction. It does not explain release29's full service regression or
 qualify source admission, catalog latency, reader slowdown or final PostgreSQL
 acknowledgement.
+
+## Release31 maintenance baseline and release32 phase split
+
+The controlled matrix holds the manifest-rewrite threshold at 1,000,000 and runs
+four policies: A disables native maintenance, B allows delete consolidation only, C adds bounded
+L0 data rewriting, and D uses the current L0/L1/L2 policy. Each case seeds one
+100,000-row table, warms for ten seconds and schedules 100-row mixed transactions
+for sixty seconds at 1,000 or 10,000 mutations/s. Release31 is frozen at commit
+`2d8905383dee369704a56faf5acc1123d6bce59c` with daemon SHA-256
+`2c871a39cc1df7b30e7bee366c2de7cbdcea56e6d7089f520f5719b88359d7a9` and external
+compactor SHA-256 `bba2b925b13e373bb524e5208b904aaee37d78926c6258bce40ad5de878bce24`.
+Release32 is frozen at commit `5efbf5b89005d1b59d6bc88bfbcce2259774e891`
+with daemon SHA-256 `9519e6c30e8964c8147b726381ca665ca128949aae004eb31b9cb76880f4882b`
+and external compactor SHA-256 `b92922700e757652c2433244d0c5adcf540138d23276e103a6586fe1822fbe8d`.
+The [comparison](../target/production-maintenance-matrix-release32-01/comparison.md)
+records both build manifests, source trees and unchanged harness hashes.
+
+The same release32 daemon passes all seven phases in the
+[concurrent-compaction service gate](../target/production-concurrent-compaction-release32-01/report.json).
+It publishes real updates, deletes, key moves and delete/reinsert while compaction
+I/O is held, pauses ACK at hard debt, requests cancellation at 30.003 seconds and
+retains BUILD until join/retire at 37.042 seconds, then removes scratch. SIGTERM
+exits 0 in 1.032 seconds with I/O held, and restart recovery preserves current and
+retained historical rows without a worker panic. This exercises the split's
+successful service path plus build cancellation and restart boundaries; it is not
+a sustained workload qualification.
+
+It also passes all twelve correctness and recovery phases in the
+[release32 fault gate](../target/production-faults-release32-01/report.json): an
+actual committed-response loss, catalog HTTP outage, durable REST/MinIO/PostgreSQL
+restarts, SIGKILL with journaled unacknowledged work, successful catalog commit
+before physical index loss, wide/unchanged TOAST and independent reader/manifest
+audit. Final rows match 12,080 orders and 17 accounts, the initial 4,096-row
+history is unchanged, 14 external compaction commits are audited and no worker
+panic occurs. The external compactor needs supervisor restarts during the catalog
+outage, REST restart and PostgreSQL restart; two later shutdowns exit 0 without
+forced kill. Correctness/recovery passes, while uninterrupted compactor
+availability remains unqualified.
+
+| Case | Catalog mutations/s, release31 → 32 | Catalog p95/p99 ms, release31 → 32 | Data/delete files, release31 → 32 | Reader ratio, release31 → 32 |
+| --- | ---: | ---: | ---: | ---: |
+| 1k A, disabled | 998.0 → 997.0 | 515.7/535.3 → 504.5/522.5 | 153/152 → 153/152 | 1.281 → 1.284 |
+| 1k B, delete-only | 997.9 → 994.8 | 515.5/531.8 → 500.5/525.4 | 152/7 → 153/3 | 1.395 → 1.317 |
+| 1k C, L0-only | 997.5 → 993.3 | 520.7/551.1 → 517.0/528.7 | 20/7 → 21/7 | 1.525 → 1.538 |
+| 1k D, current | 993.0 → 994.5 | 512.5/581.8 → 519.7/527.5 | 21/1 → 4/2 | 1.315 → 1.438 |
+| 10k A, disabled | 9,920.5 → 9,977.2 | 498.4/528.7 → 494.2/516.9 | 173/172 → 171/170 | 1.733 → 1.801 |
+| 10k B, delete-only | 9,952.0 → 9,976.3 | 737.1/950.5 → 668.3/869.4 | 186/2 → 174/2 | 2.002 → 2.058 |
+| 10k C, L0-only | 9,953.9 → 9,947.9 | 682.0/844.4 → 687.6/870.4 | 29/1 → 27/1 | 3.097 → 3.278 |
+| 10k D, current | 9,965.8 → 9,947.6 | 620.4/859.3 → 604.0/799.1 | 20/4 → 8/3 | 1.445 → 1.397 |
+
+All 600 measured 1k arrivals and all 6,000 measured 10k arrivals commit in every
+case, with no missed or unrecorded arrivals; the source schedule sustains exactly
+1,000 and 10,000 mutations/s. All sixteen release31/release32 cases meet the
+catalog p95 below one second and p99 below two seconds. They also pass exact source
+acknowledgement, complete source/target rows, durable reconciliation after the
+independent same-final-state compactor, daemon and compactor exit 0 without forced
+kill, and the zero-worker-panic check. Every reader ratio exceeds 1.25, so all
+case runs return nonzero and neither release is performance-qualified.
+
+Release32 starts preparation in the background after a build, captures one
+immutable RocksDB view, and permits foreground activation only when the catalog head
+and complete table state still equal the prepared state. The primary maintenance
+scope ends at the report's resource snapshot after warmup, workload and drain.
+
+| Active case | Data rewrites through drain/raw log, release31 → 32 | Preparation started/ready/deadline/invalidated | Activation committed/no-change/invalidated | Foreground actor ms, release31 → release32 handoff + finalization | Publication stall ms, release31 proxy → release32 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1k C | 19/19 → 20/20 | 20/20/0/0 | 20/0/0 | 2,339.368 → 78.216 + 1,443.959 = 1,522.175 | 2,339.368 → 2,118.186 |
+| 1k D | 9/9 → 9/10 | 9/9/0/0 | 9/0/0 | 1,786.497 → 31.782 + 1,559.704 = 1,591.487 | 1,786.497 → 2,033.862 |
+| 10k C | 20/21 → 20/21 | 20/20/0/0 | 20/0/0 | 6,970.142 → 65.288 + 4,427.113 = 4,492.401 | 6,970.142 → 7,846.988 |
+| 10k D | 29/30 → 31/31 | 31/31/0/0 | 31/0/0 | 10,433.008 → 104.673 + 9,026.505 = 9,131.178 | 10,433.008 → 12,596.863 |
+
+A and B perform no data preparations. No release32 case has an in-flight
+preparation at observation or uses strict fallback. Release31 has no direct
+publication-stall metric; its old finalization actor hold is the closest proxy
+because catch-up and activation both occupied that lane. The split lowers summed
+actor occupancy in every active case, but direct publication stall improves only
+in 1k-C relative to that proxy. It therefore establishes the concurrency boundary
+and preserves finite correctness/latency, but does not establish lower total stall.
+
+Raw daemon logs can include maintenance that starts after the resource snapshot
+during the final external reader baseline. The raw counts in the table retain that
+work only for disclosure; catch-up, state-apply, catalog and actor phase totals use
+the through-drain count and exclude later rewrites. Release32's reader ratios are
+1.284/1.317/1.538/1.438 at 1k and 1.801/2.058/3.278/1.397 at 10k. Reader
+amplification remains the failed gate. The next focused measurement is an
+actual-RocksDB external-SST versus ordinal WAL staging comparison; any supported
+change must retain crash/reopen and cross-column-family apply correctness before
+the same maintenance matrix is rerun.

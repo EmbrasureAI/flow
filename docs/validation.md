@@ -135,12 +135,18 @@ sequence applicability, deduplication, exact live-row counts, and subsequent CDC
 
 Concurrent data-build integration captures a real immutable RocksDB index view,
 then publishes intervening updates, deletes, key moves and delete/reinsert before
-finalizing. Actual-file tests verify translated position masks, original data
-sequences, residual deletes, exact current and historical rows, and index density.
-Lost-response cases recover the corrected plan after reopening and after physical
-index loss. Independent data rewrites and delete-only rewrites both invalidate
-selected inputs safely. Durable BUILD tests verify GC/history protection, control
-copying across generations, startup abandonment and normal Prepared promotion.
+activation. Preparation runs outside the table actor; activation requires the
+prepared catalog head and complete table state to match exactly. Actual-file tests
+verify translated position masks, original data sequences, residual deletes,
+exact current and historical rows, and index density. No-op LSN drift and real
+update/delete drift reject stale prepared candidates without changing the catalog,
+index or ownership, after which CDC continues. A held scratch writer forces the
+preparation deadline; CDC proceeds while BUILD protection remains, then retirement
+joins and removes ownership and scratch. Lost-response cases recover the corrected
+plan after reopening and after physical index loss. Independent data rewrites and
+delete-only rewrites both invalidate selected inputs safely. Durable BUILD tests
+verify GC/history protection, control copying across generations, startup
+abandonment and normal Prepared promotion.
 
 The lost-response pipeline tests keep recovery reads unavailable after the catalog commits, close and reopen the index at durable Prepared, then reconnect. They verify reader visibility, no duplicate logical publication, and recovery through a subsequent external rewrite. A response loss that can be resolved inline is not substituted for that crash boundary.
 
@@ -155,9 +161,9 @@ The following reports were produced on 2026-09-04 UTC. Paths are retained local 
 | Schema and lifecycle contracts | [contracts-08](../target/production-contracts-08/report.json) | All eleven phases passed on release24: idle nullable additions with lost catalog response and native compaction, queued schema versions across crash, streamed DDL abort, savepoints, historical schema widths, checkpoint retention/restore, SIGTERM/status and primary-key drift. No worker panics after stopping. |
 | Scheduler liveness and health cancellation | [health-04](../target/production-health-04/report.json) | Stalled only the WAL-health query while two-table CRUD/key moves published; held catalog commits to verify `table_workers = 1`; observed checkpoint creation, a five-second query timeout without overlapping connections, and prompt SIGTERM with readiness false. |
 | CDC priority and maintenance recovery | [maintenance-priority-02](../target/production-maintenance-priority-02/report.json) | All six phases passed: initial COPY/handoff, source publication and ACK before a held soft-pressure compaction with CDC still queued, SIGTERM before the compaction's catalog outcome, restart recovery with exact current/history rows, and hard-pressure publication/ACK blocking until compaction completed. |
-| CDC during local compaction builds | [concurrent-compaction-07](../target/production-concurrent-compaction-07/report.json) | All seven phases passed on release28: concurrent CRUD/ACK, translated masks, history, hard-debt blocking, real cancellation deadline and join, and SIGTERM/restart with BUILD and scratch cleanup. Logs contain no worker panics. |
+| CDC during local compaction builds | [release32 concurrent-compaction](../target/production-concurrent-compaction-release32-01/report.json) | All seven phases passed on release32: update/delete/key-move/reinsert during held reads, translated masks and history, hard-debt ACK blocking, cancellation at 30.003 s with BUILD retained until join/retire at 37.042 s, scratch cleanup, and SIGTERM exit 0 in 1.032 s during held I/O followed by restart recovery. Logs contain no worker panics. |
 | Unsupported source changes | [column incarnation](../target/production-contracts-column-incarnation-01/report.json), [non-null default](../target/production-contracts-non-null-default-01/report.json), [volatile default](../target/production-contracts-volatile-default-01/report.json) | Rejected changes whose physical or historical meaning could not be safely inferred; tested acknowledgement fencing. |
-| Durable service failures with local compaction | [faults-15](../target/production-faults-15/report.json) | All twelve correctness and recovery phases passed on release28: successful commit with lost response, HTTP outage, REST/MinIO/PostgreSQL restarts, SIGKILL with unacknowledged durable work, successful catalog commit followed by physical index loss, wide TOAST updates and manifest audit. Both crash phases prove current Prepared requests succeeded after the old process stopped and before replacement. Exact 12,080 orders/17 accounts and 4,096 historical rows; no unplanned daemon exits or worker panics. The external compactor required three supervisor restarts. |
+| Durable service failures with local compaction | [release32 faults](../target/production-faults-release32-01/report.json) | All twelve correctness and recovery phases passed on release32: actual committed-response loss, catalog outage, durable REST/MinIO/PostgreSQL restarts, SIGKILL with journaled unacknowledged work, successful catalog commit followed by physical index loss, wide/unchanged TOAST and independent reader/manifest audit. Exact 12,080 orders/17 accounts and 4,096 initial historical rows; no worker panics. Three external-compactor supervisor restarts are availability incidents. |
 | External compactor backpressure | [pressure-01](../target/production-pressure-01/report.json) | Hard reader debt paused publication and ACK while capture continued; independent compaction reconciled and released the table; subsequent mutations and history remained correct. |
 | Retained delete-budget backlog | [budget-recovery-03](../target/production-budget-recovery-03/report.json) | Release13 resumed the failed matrix09 state and permanent slot with unchanged budgets; cleared 13,794 pending transactions; matched all 447,100 rows; preserved the 309,160-row historical snapshot, identities and original report; reached the journal ACK barrier and passed restart. |
 | Independent Java readers and maintenance | [readers-06](../target/production-readers-06/report.json) | Sixteen phases on release23 with native compaction enabled; independently attributed Spark data/delete/manifest rewrites, exact keyed and keyless duplicate rows in Spark/Trino/DuckDB, retained history, subsequent CDC and restart. |
@@ -255,7 +261,30 @@ restarts during injected outages; uninterrupted availability is not claimed.
 The schema/lifecycle suite finished with exactly 4,085 orders and 17 accounts.
 Both suites checked stopped-process logs and found no worker panics.
 
-The latest [concurrent-compaction-07](../target/production-concurrent-compaction-07/report.json)
+The release32 [concurrent-compaction gate](../target/production-concurrent-compaction-release32-01/report.json)
+passes all seven phases with daemon SHA-256
+`9519e6c30e8964c8147b726381ca665ca128949aae004eb31b9cb76880f4882b`.
+Real updates, deletes, key moves and delete/reinsert publish while compaction reads
+are held; the hard-pressure phase keeps ACK behind maintenance. Deadline
+cancellation is requested at 30.003 seconds, retains BUILD through the held read,
+then joins, retires and removes scratch at build age 37.042 seconds. SIGTERM exits
+0 in 1.032 seconds with I/O held; restart reclaims the BUILD and scratch and
+preserves exact current and initial/build-base histories. No worker panics occur.
+
+The same daemon passes all twelve correctness and recovery phases in
+[faults-release32-01](../target/production-faults-release32-01/report.json).
+The gate crosses an actual committed-response loss, catalog HTTP outage, durable
+REST, MinIO and PostgreSQL restarts, SIGKILL with journaled unacknowledged work,
+a successful catalog commit before physical index loss, wide and unchanged TOAST,
+and independent reader/manifest checks. Final rows match 12,080 orders and 17
+accounts; the initial 4,096-row snapshot is unchanged, 14 external compaction
+commits are audited and no worker panics occur. The external compactor exits 1
+and is restarted by its supervisor during catalog outage, REST restart and
+PostgreSQL restart. Its later two shutdowns exit 0 without forced kill. The gate
+therefore passes correctness/recovery and does not claim uninterrupted compactor
+availability.
+
+The earlier [concurrent-compaction-07](../target/production-concurrent-compaction-07/report.json)
 passed all seven phases on immutable [release28](../target/qualification-binaries/release28.json),
 including bounded mapping-stage overlap and reusable journal replay.
 Cancellation requested at 30.002 seconds retained BUILD; actual join and
@@ -419,6 +448,29 @@ reader-debt latency budget. The separate pressure test checks the pause/resume
 contract with its own small thresholds. The [Linux demo validator](../demo/README.md)
 creates its own project with no host ports, retains reports and removes only its
 fresh containers and volumes.
+
+## Controlled maintenance policy matrix
+
+The frozen [release31 baseline](../target/production-maintenance-matrix-release31-01/matrix.json)
+and [release32 split-preparation matrix](../target/production-maintenance-matrix-release32-01/matrix.json)
+run disabled, delete-only, L0-only and current maintenance at 1,000 and 10,000
+mutations/s. All sixteen cases have complete scheduled arrivals, exact final rows
+and source acknowledgement, durable reconciliation after an independent same-state
+external rewrite, daemon and compactor exit 0 without forced kill, and no worker
+panic. Every case meets the finite catalog p95/p99 1/2-second gate. All sixteen
+fail the 1.25 reader ratio, so neither matrix is an overall performance pass.
+
+In release32 the through-drain resource snapshot records 20, 9, 20 and 31 data
+rewrites for 1k-C, 1k-D, 10k-C and 10k-D. Each starts and readies one preparation
+per rewrite, each activates as committed, and none records a deadline, invalidation,
+no-change result, in-flight preparation or strict fallback. Their summed handoff
+plus finalization actor occupancy is 1,522.175, 1,591.487, 4,492.401 and 9,131.178
+ms; direct publication stall is 2,118.186, 2,033.862, 7,846.988 and 12,596.863 ms.
+The [comparison](../target/production-maintenance-matrix-release32-01/comparison.md)
+keeps these primary phase totals at the resource snapshot. Raw daemon logs include
+later work during the external reader baseline: release31 primary/raw data-rewrite
+counts are 19/19, 9/9, 20/21 and 29/30, while release32 counts are 20/20, 9/10,
+20/21 and 31/31. Later raw work is excluded from phase and actor totals.
 
 ## Earlier concurrency and performance evidence
 

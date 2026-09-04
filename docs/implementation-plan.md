@@ -23,7 +23,7 @@ Review every change against this chain. A performance improvement must preserve 
 | Bootstrap | Up to four COPY workers, concurrent CDC, per-table staging, L1 initial files and durable ACK fence. Interrupted copies retain the permanent slot and recopy only unfinished tables from a temporary snapshot; staged and published tables retain their own cuts. |
 | Schemas | Durable source schema registry, versioned journal records and supported nullable additive publication. Unsupported defaults, key/type changes and physical column/source incarnation changes fail safely rather than inventing values. |
 | Publication and recovery | Exact indexed-base CAS, operation-marker resolution, durable Prepared payloads, conditional index apply, separate control authority, automatic generation rebuild and checkpoint registration/activation. |
-| Maintenance | Bounded data compaction with residual deletes and locally concurrent builds, standalone delete consolidation, exact per-file deletion density, keyed and keyless append-only external reconciliation, manifest rewrite, protected artifact cleanup and snapshot retention, and reader-debt pause/resume. |
+| Maintenance | Bounded data compaction with residual deletes and locally concurrent builds, background catch-up preparation followed by exact activation, deadline retirement that preserves BUILD protection, standalone delete consolidation, exact per-file deletion density, keyed and keyless append-only external reconciliation, manifest rewrite, protected artifact cleanup and snapshot retention, and reader-debt pause/resume. |
 | Scheduling and operations | Table priorities, observed publication-service estimates, bounded backlog accounting, status and graceful termination, retained checkpoints, containerized non-root runtime and reproducible service gates. FileIO/REST diagnostics distinguish API activity from provider requests; isolated WAL and pinned reader-planning checks add independent measurements. |
 | Standard readers | Actual Spark, Trino, DuckDB and stock Iceberg Rust reads. Java Spark position-delete, data-file and manifest rewrites followed by CDC and restart have passed exact-row checks. |
 
@@ -34,10 +34,12 @@ Review every change against this chain. A performance improvement must preserve 
 - [Bootstrap recovery](../target/production-bootstrap-02/report.json) and [DDL between COPY attempts](../target/production-bootstrap-ddl-02/report.json): mid-COPY crash, durable staging reuse, concurrent CDC, index deletion and automatic rebuild.
 - [Schema/lifecycle contracts](../target/production-contracts-08/report.json): eleven passing phases on release24 covering idle nullable additions during native compaction, lost response, queued versions, abort/savepoint boundaries, historical schema widths, checkpoint restore and SIGTERM/status. Separate contract reports verify unsupported defaults and column incarnation fencing.
 - [Durable faults](../target/production-faults-15/report.json): twelve passing phases on release28 across actual service outages/restarts, successful-commit response loss, durable unpublished work and physical index loss. Both crash phases require successful current-phase Prepared requests after SIGKILL and before replacement. The independent compactor pauses across those two forced-success phases and runs through the other faults.
+- [Release32 durable faults](../target/production-faults-release32-01/report.json): twelve passing correctness/recovery phases cover committed-response loss, catalog outage, durable REST/MinIO/PostgreSQL restarts, SIGKILL with journaled work, a successful catalog commit followed by physical index loss, wide/unchanged TOAST and an independent reader/manifest audit. Three external-compactor supervisor restarts remain availability incidents.
 - [Reader-debt recovery](../target/production-pressure-01/report.json): publication and ACK pause, continued capture, external compaction and automatic resumption.
 - [Independent readers](../target/production-readers-06/report.json): sixteen passing phases on release23, native compaction before and after independently attributed Spark rewrites, exact keyed and keyless duplicate rows across Spark/Trino/DuckDB, retained histories and source changes across restart.
 - [Index-format upgrade](../target/production-upgrade-01/report.json): release05 → release06 preserved the control store, source identity and permanent slot; rebuilt format-2 state into format 3; consumed queued WAL; preserved exact CRUD/key moves and history; and reused the new generation on the next restart.
 - [Delete/residual integration](../crates/testkit/tests/delete_rewrite.rs): actual Parquet/Avro and stock Rust reads verify sequence filtering, shared targets, duplicate positions, exact deletion density, dangling-file removal, unchanged base files, lost-response recovery and full index-loss reconstruction.
+- [Release32 concurrent compaction](../target/production-concurrent-compaction-release32-01/report.json): seven passing real-service phases cover CRUD, key moves and delete/reinsert while compaction I/O is held, hard-debt acknowledgement pause, deadline retirement with BUILD protection, scratch cleanup, SIGTERM during held I/O and restart recovery with retained history.
 - [Linux demo](../target/production-linux-demo-01/report.json): a freshly built Linux image, fresh isolated volumes, standard Trino CRUD, non-root ownership, SIGTERM exit 0, resumed source backlog and idempotent initialization.
 
 These reports span successive builds. Older service/stress and workload reports remain evidence for their recorded binaries; newer targeted checks do not replace a complete final-release run. Failed workload reports remain visible in the [production qualification report](production-qualification.md).
@@ -90,6 +92,26 @@ improves 1.92% with one file and 3.64% with 256 files; obsolete apply improves
 4.35% and 4.79%. The full release gate passes 129 active tests. This is retained
 as a bounded improvement and does not qualify the failed service control.
 
+Release31 establishes the controlled maintenance baseline. Release32 moves
+catalog-head validation, one immutable RocksDB index view and catch-up preparation
+out of the table actor, then activates only if the prepared catalog and complete
+table state still match exactly. The identical [A/B/C/D comparison](../target/production-maintenance-matrix-release32-01/comparison.md)
+runs disabled, delete-only, L0-only and current maintenance at 1,000 and 10,000
+mutations/s. Every release31 and release32 case has complete measured arrivals,
+exact source acknowledgement and final rows, durable external reconciliation,
+clean daemon and compactor exits, and catalog p95/p99 below 1/2 seconds.
+
+Release32 records 20/20, 9/9, 20/20 and 31/31 started/ready preparations in the
+1k-C, 1k-D, 10k-C and 10k-D cases; all activated and none reached a deadline,
+invalidated or used strict fallback. Foreground actor occupancy falls from
+2,339.368/1,786.497/6,970.142/10,433.008 ms to
+1,522.175/1,591.487/4,492.401/9,131.178 ms respectively. Direct publication
+stall is 2,118.186/2,033.862/7,846.988/12,596.863 ms; release31 has only the old
+actor-hold proxy. The release32 reader ratios are 1.284/1.317/1.538/1.438 at 1k
+and 1.801/2.058/3.278/1.397 at 10k, so every case still fails the 1.25 bound.
+These finite runs qualify their correctness and catalog-latency gates, not the
+full production target or sustained reader health.
+
 No sustained 50k, 100-table or 24-hour qualification is claimed. The separate
 [WAL check](../target/production-wal-overhead-01/assessment.md) and
 [pinned reader diagnostic](../target/production-reader-diagnostics-27-01/assessment.md)
@@ -99,11 +121,11 @@ by bounded-v2; final local watermarks must not be relabeled as that measurement.
 
 ## Remaining sequence
 
-1. Resolve the measured service critical path using release29's retained arrival, publication and compaction records. The buffer is exercised in every runtime epoch and reduces collapse work, but the service still misses the source, catalog and reader gates. The borrowed index view removes one measured allocation source but its isolated 1.92–3.64% apply improvement is too small to assume service qualification. Continue separating source-admission stalls, table-lane occupancy and physical maintenance amplification before the next focused change. The rejected [atomic-flush experiment](../target/atomic-flush-profile-28/assessment.md) remains rejected. Preserve physical-head validation, journal replay, exact Prepared ownership and existing workload thresholds; speculative next-epoch reservation remains deferred.
-2. Repeat the measured workloads after a supported optimization, preserving the local build/catch-up protocol, measurement protocol and resource budgets. Once the 50k and 100-table cases meet their gates, extend the same artifact to the remaining workload dimensions.
-3. Use the validated disk-backed harness for subsequent workloads and retain its measurement protocol. The seven-phase composite-key and capture-quota service gate passes on release23, including crash/rebuild, acknowledgement fencing and same-slot recovery. Preserve existing format compatibility; the rejected dictionary experiment does not require a new format-upgrade campaign.
-4. Extend source-version, reader-version and storage/catalog coverage beyond the recorded gates. Real-source tests cover PostgreSQL 14.24, 15.19, 16.15, 17.11 and 18.6; reader results apply to the exact versions in validation. Extend failure and retention checks to deployment conditions.
-5. Extend reader-observation and resource accounting, then run the original workload matrix for its required 24-hour durations. Qualify steady-state compaction, resource growth, index I/O, provider costs, planning and scan amplification, and publication latency together. The passing finite WAL/planning checks and short saturation probes do not satisfy this gate.
+1. Keep release32's split preparation and exact activation as the current base. Its finite 1k/10k matrix passes correctness and catalog latency, while all eight reader ratios remain above 1.25. Preserve exact table/head validation, Prepared ownership, deadline retirement, journal replay and the same measurement thresholds.
+2. Benchmark actual RocksDB external-SST ingestion against the current ordinal WAL-backed delta staging, using alternating fresh databases at 100,000 and 1,000,000 mappings. Measure staging and atomic multi-column-family apply separately, and require exact forward/reverse owners, file counts, cursors, reopen recovery and bounded resources. Do not infer a service gain from an isolated storage result.
+3. Adopt only a change supported by that comparison and its durability gates. Freeze a new immutable artifact and rerun the same A/B/C/D matrix; retain through-drain phase totals separately from raw work during the later reader baseline. If the storage candidate is unsupported, keep release32 and continue from the measured state-apply and publication-stall path rather than tuning the scheduler speculatively.
+4. After maintenance and reader health pass, repeat the 50k and 100-table workloads with the validated disk-backed harness, then run the required 24-hour dimensions. Qualify compaction debt, resource growth, index I/O, provider costs, planning/scan amplification and publication latency together.
+5. Extend source-version, reader-version and storage/catalog coverage beyond the recorded gates. Real-source tests cover PostgreSQL 14.24, 15.19, 16.15, 17.11 and 18.6; reader results apply to the exact versions in validation. Extend failure and retention checks to deployment conditions.
 6. Publish accurate OSS support and dependency/license policies, maintain Linux CI/demo checks, and prepare reusable upstream Iceberg patches.
 7. Add low-fan-out partitioning, then v3 behavior only after the specification's preceding qualification gates, with separate interoperable delete/rewrite/recovery validation.
 
