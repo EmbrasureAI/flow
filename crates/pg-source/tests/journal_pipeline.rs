@@ -277,10 +277,14 @@ fn exact_source_types_agree_between_copy_binary_and_cdc_text() {
         replica_identity: b'f',
         columns: types
             .iter()
-            .map(|(name, _, oid)| PgColumn {
+            .map(|(name, data_type, oid)| PgColumn {
                 name: (*name).into(),
                 type_oid: *oid,
-                type_modifier: -1,
+                type_modifier: if matches!(data_type, ColumnType::Decimal { .. }) {
+                    4 + (20 << 16) + 4
+                } else {
+                    -1
+                },
                 identity: true,
             })
             .collect(),
@@ -318,6 +322,11 @@ fn exact_source_types_agree_between_copy_binary_and_cdc_text() {
     assert_eq!(expected[2], Value::TimestampTzMicros(946_684_800_000_001));
     assert_eq!(expected[5], Value::Float64(f64::from(0.1f32)));
     assert_eq!(decode_row(&schema, &relation, &binary).unwrap(), expected);
+    let mut incompatible_numeric = relation.clone();
+    incompatible_numeric.columns[0].type_modifier = 4 + (20 << 16) + 5;
+    assert!(decode_row(&schema, &incompatible_numeric, &text).is_err());
+    incompatible_numeric.columns[0].type_modifier = -1;
+    assert!(decode_row(&schema, &incompatible_numeric, &text).is_err());
     let mut wrong_scale = text;
     wrong_scale[0] = Cell::Text(Bytes::from_static(b"1.00001"));
     assert!(decode_row(&schema, &relation, &wrong_scale).is_err());

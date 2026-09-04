@@ -23,15 +23,21 @@ pub async fn preflight_table(
     table: &str,
     mutable: bool,
 ) -> Result<TablePreflight> {
-    let row = client.query_opt("SELECT c.oid, c.relreplident::text, ARRAY(SELECT k.attnum::smallint FROM pg_catalog.pg_index i CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinal) WHERE i.indrelid = c.oid AND i.indisprimary AND k.ordinal <= i.indnkeyatts ORDER BY k.ordinal) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')", &[&namespace, &table]).await?.ok_or(Error::Config("source table not found"))?;
+    let row = client.query_opt("SELECT c.oid, c.relkind::text, c.relreplident::text, ARRAY(SELECT k.attnum::smallint FROM pg_catalog.pg_index i CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinal) WHERE i.indrelid = c.oid AND i.indisprimary AND k.ordinal <= i.indnkeyatts ORDER BY k.ordinal) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')", &[&namespace, &table]).await?.ok_or(Error::Config("source table not found"))?;
     let relation_oid: u32 = row.get(0);
-    let identity: String = row.get(1);
+    let relation_kind: String = row.get(1);
+    if relation_kind != "r" {
+        return Err(Error::Config(
+            "partitioned PostgreSQL source roots are unsupported; replicate a regular table",
+        ));
+    }
+    let identity: String = row.get(2);
     let replica_identity = identity
         .as_bytes()
         .first()
         .copied()
         .ok_or(Error::Protocol("empty replica identity"))?;
-    let primary_key_attributes = row.get::<_, Vec<i16>>(2);
+    let primary_key_attributes = row.get::<_, Vec<i16>>(3);
     if mutable && primary_key_attributes.is_empty() {
         return Err(Error::Config(
             "mutable replicated tables require a primary key",

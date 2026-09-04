@@ -29,7 +29,7 @@ pub async fn fetch_table_metadata(
     table: &str,
 ) -> Result<TableMetadata> {
     let rows = client.query(
-        "SELECT c.oid, c.relreplident::text, a.attname, a.atttypid, a.atttypmod,
+        "SELECT c.oid, c.relkind::text, c.relreplident::text, a.attname, a.atttypid, a.atttypmod,
                 EXISTS (SELECT 1 FROM pg_catalog.pg_index i
                         CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ordinal)
                         WHERE i.indrelid=c.oid AND i.indisprimary
@@ -49,7 +49,13 @@ pub async fn fetch_table_metadata(
     let first = rows
         .first()
         .ok_or(Error::Config("source table has no supported columns"))?;
-    let identity: String = first.get(1);
+    let relation_kind: String = first.get(1);
+    if relation_kind != "r" {
+        return Err(Error::Config(
+            "partitioned PostgreSQL source roots are unsupported; replicate a regular table",
+        ));
+    }
+    let identity: String = first.get(2);
     let relation = Relation {
         id: first.get(0),
         namespace: namespace.to_owned(),
@@ -61,25 +67,25 @@ pub async fn fetch_table_metadata(
         columns: rows
             .iter()
             .map(|row| Column {
-                name: row.get(2),
-                type_oid: row.get(3),
-                type_modifier: row.get(4),
-                identity: row.get(5),
+                name: row.get(3),
+                type_oid: row.get(4),
+                type_modifier: row.get(5),
+                identity: row.get(6),
             })
             .collect(),
     };
     let columns = rows
         .iter()
         .map(|row| ColumnMetadata {
-            nullable: row.get(6),
-            generated: row.get(7),
-            null_default: row.get::<_, Option<bool>>(8).unwrap_or(false),
-            null_missing_value: row.get(9),
+            nullable: row.get(7),
+            generated: row.get(8),
+            null_default: row.get::<_, Option<bool>>(9).unwrap_or(false),
+            null_missing_value: row.get(10),
         })
         .collect();
     Ok(TableMetadata {
-        storage_id: first.get(10),
-        attribute_numbers: rows.iter().map(|row| row.get(11)).collect(),
+        storage_id: first.get(11),
+        attribute_numbers: rows.iter().map(|row| row.get(12)).collect(),
         relation,
         columns,
     })
@@ -190,7 +196,7 @@ pub fn validate_schema_metadata(
     Ok(())
 }
 
-fn column_type(column: &Column) -> Result<ColumnType> {
+pub(crate) fn column_type(column: &Column) -> Result<ColumnType> {
     Ok(match column.type_oid {
         16 => ColumnType::Bool,
         21 | 23 => ColumnType::Int32,

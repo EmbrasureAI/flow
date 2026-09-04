@@ -501,30 +501,14 @@ pub(crate) fn validate_relation(schema: &TableSchema, relation: &Relation) -> Re
         ));
     }
     for (expected, actual) in schema.columns.iter().zip(&relation.columns) {
-        if expected.name != actual.name || !supports_oid(&expected.data_type, actual.type_oid) {
+        if expected.name != actual.name || crate::schema::column_type(actual)? != expected.data_type
+        {
             return Err(Error::Config(
                 "source column name or type differs from configured schema",
             ));
         }
     }
     Ok(())
-}
-
-fn supports_oid(kind: &ColumnType, oid: u32) -> bool {
-    matches!(
-        (kind, oid),
-        (ColumnType::Bool, 16)
-            | (ColumnType::Int32, 21 | 23)
-            | (ColumnType::Int64, 20)
-            | (ColumnType::Float64, 700 | 701)
-            | (ColumnType::String, 25 | 1042 | 1043)
-            | (ColumnType::Binary, 17)
-            | (ColumnType::Date, 1082)
-            | (ColumnType::TimestampMicros, 1114)
-            | (ColumnType::TimestampTzMicros, 1184)
-            | (ColumnType::Uuid, 2950)
-            | (ColumnType::Decimal { .. }, 1700)
-    )
 }
 
 pub fn decode_row(schema: &TableSchema, relation: &Relation, tuple: &Tuple) -> Result<Row> {
