@@ -211,6 +211,7 @@ columns = [
         # Writers own disjoint positive keys; negative keys are immutable reader probes.
         keys = self.key_pools[worker]
         record = None
+        pending_postcommit = None
         interval = args.transaction_rows / args.rate
         try:
             with psycopg.connect(args.postgres_url, autocommit=True, connect_timeout=10) as pg:
@@ -224,12 +225,19 @@ columns = [
                     due = start_mono + sequence * interval
                     if self.stop_writers.wait(max(0, due - time.monotonic())):
                         return
+                    admitted_ns = time.monotonic_ns()
                     record = {"sequence": sequence, "scheduled_at_micros": start_us + int(sequence * interval * 1e6),
-                              "measured": sequence * interval >= args.warmup, "table": self.names[(sequence // args.writers) % args.tables]}
-                    if time.monotonic() - due > args.max_start_delay_ms / 1000:
+                              "measured": sequence * interval >= args.warmup, "table": self.names[(sequence // args.writers) % args.tables],
+                              "admission_lag_micros": (admitted_ns - int(due * 1e9)) / 1000}
+                    if pending_postcommit is not None:
+                        record["previous_postcommit_keys_micros"] = pending_postcommit["postcommit_keys_micros"]
+                    if record["admission_lag_micros"] > args.max_start_delay_ms * 1000:
                         record["missed_arrival"] = True
-                        self.store.record(record)
+                        record["intent_enqueue_wait_micros"] = self.store.record(
+                            record, enqueue_field="intent_enqueue_wait_micros")
+                        pending_postcommit = None
                         continue
+                    key_prepare_started_ns = time.monotonic_ns()
                     name, marker = record["table"], -(sequence + 1)
                     active = keys[name]
                     updates = int(args.transaction_rows * {"mixed": .7, "update90": .9, "append": 0}[args.profile])
@@ -244,25 +252,41 @@ columns = [
                     chosen = [active[index] for index in selected]
                     update_keys, delete_keys = chosen[:updates], chosen[updates:]
                     new_keys = [args.initial_rows + 1 + sequence * args.transaction_rows + i for i in range(inserts - 1)]
+                    record["key_prepare_micros"] = (time.monotonic_ns() - key_prepare_started_ns) / 1000
                     record["started_at_micros"] = micros()
-                    self.store.record(record, marker)
-                    with pg.transaction():
-                        record["xid"] = pg.execute("SELECT pg_current_xact_id()::text").fetchone()[0]
-                        if updates:
-                            affected = pg.execute(sql.SQL("UPDATE {} SET version=%s,payload={} WHERE id=ANY(%s)").format(sql.Identifier(name), self.payload_expression("id::text || ':' || %s::text")),
-                                                  (sequence + 1, sequence + 1, math.ceil(args.row_bytes / 32), args.row_bytes, update_keys)).rowcount
-                            assert affected == updates, "workload update missed its owned keys"
-                        if deletes:
-                            affected = pg.execute(sql.SQL("DELETE FROM {} WHERE id=ANY(%s)").format(sql.Identifier(name)), (delete_keys,)).rowcount
-                            assert affected == deletes, "workload delete missed its owned keys"
-                        affected = pg.execute(sql.SQL("INSERT INTO {} SELECT i,%s,{} FROM unnest(%s::bigint[]) i").format(sql.Identifier(name), self.payload_expression("i::text || ':' || %s::text")),
-                                              (sequence + 1, sequence + 1, math.ceil(args.row_bytes / 32), args.row_bytes, new_keys + [marker])).rowcount
-                        assert affected == inserts, "workload inserted an unexpected number of rows"
+                    record["intent_enqueue_wait_micros"] = self.store.record(
+                        record, marker, enqueue_field="intent_enqueue_wait_micros")
+                    pending_postcommit = None
+                    postgres_started_ns = time.monotonic_ns()
+                    try:
+                        with pg.transaction():
+                            record["xid"] = pg.execute("SELECT pg_current_xact_id()::text").fetchone()[0]
+                            if updates:
+                                affected = pg.execute(sql.SQL("UPDATE {} SET version=%s,payload={} WHERE id=ANY(%s)").format(sql.Identifier(name), self.payload_expression("id::text || ':' || %s::text")),
+                                                      (sequence + 1, sequence + 1, math.ceil(args.row_bytes / 32), args.row_bytes, update_keys)).rowcount
+                                assert affected == updates, "workload update missed its owned keys"
+                            if deletes:
+                                affected = pg.execute(sql.SQL("DELETE FROM {} WHERE id=ANY(%s)").format(sql.Identifier(name)), (delete_keys,)).rowcount
+                                assert affected == deletes, "workload delete missed its owned keys"
+                            affected = pg.execute(sql.SQL("INSERT INTO {} SELECT i,%s,{} FROM unnest(%s::bigint[]) i").format(sql.Identifier(name), self.payload_expression("i::text || ':' || %s::text")),
+                                                  (sequence + 1, sequence + 1, math.ceil(args.row_bytes / 32), args.row_bytes, new_keys + [marker])).rowcount
+                            assert affected == inserts, "workload inserted an unexpected number of rows"
+                    finally:
+                        record["postgres_transaction_micros"] = (time.monotonic_ns() - postgres_started_ns) / 1000
                     record.update(commit_response_at_micros=micros(), mutations=args.transaction_rows,
                                   update_rows=updates, delete_rows=deletes, insert_rows=inserts, marker=marker)
-                    self.store.record(record, marker)
-                    active.remove_selected(selected[updates:])
-                    active.extend(new_keys)
+                    record["commit_enqueue_wait_micros"] = self.store.record(
+                        record, marker, enqueue_field="commit_enqueue_wait_micros")
+                    postcommit_started_ns = time.monotonic_ns()
+                    try:
+                        active.remove_selected(selected[updates:])
+                        active.extend(new_keys)
+                    finally:
+                        pending_postcommit = {
+                            "sequence": sequence,
+                            "measured": record["measured"],
+                            "postcommit_keys_micros": (time.monotonic_ns() - postcommit_started_ns) / 1000,
+                        }
         except BaseException:
             self.errors.append(traceback.format_exc())
             if record is not None:
@@ -271,6 +295,11 @@ columns = [
                 except BaseException:
                     self.errors.append(traceback.format_exc())
         finally:
+            if pending_postcommit is not None:
+                try:
+                    self.store.sample("writer_terminal", {"worker": worker, **pending_postcommit})
+                except BaseException:
+                    self.errors.append(traceback.format_exc())
             with self.writer_lock:
                 self.writer_connections[worker] = None
 
@@ -442,6 +471,7 @@ columns = [
                                             percentiles["commit_to_catalog"].get("p99_ms", float("inf")) < self.args.catalog_p99_ms),
                 "catalog_latency_slo_ms": {"p95": self.args.catalog_p95_ms, "p99": self.args.catalog_p99_ms},
                 "scheduled_to_reader_including_failures": requested,
+                "writer_timing": self.store.writer_timing_summary(),
                 "all_committed_transactions_observed": observations_complete,
                 "target_arrival_rate_sustained": summary["missed"] == 0 and window_rows / self.args.duration >= self.args.rate * .95}
 
@@ -550,15 +580,17 @@ columns = [
     def execute(self):
         args = self.args
         self.report["measurement_protocol"] = {
-            "version": "disk-evidence-paged-probes-v2",
+            "version": "disk-evidence-paged-probes-v3",
             "probe_query": "one page of outstanding marker IDs per table/poll; ascending sequence with wrap; holes retained",
             "probe_page_rows": PAGE_ROWS, "recorder_queue_items": QUEUE_ITEMS,
             "sqlite_cache_mib_per_connection": 16, "sqlite_temp_store": "FILE", "sqlite_mmap_bytes": 0,
             "duckdb_memory_limit": "1GiB", "verification": "named PostgreSQL cursor plus sorted DuckDB CSV disk sink; 4096-row comparison",
             "key_storage": "8-byte disk slots per writer/table; same rank sampling and swap-last order",
+            "writer_timing": "monotonic admission, key preparation, recorder enqueue, PostgreSQL transaction and causal predecessor postcommit key-file timings; microseconds",
+            "postcommit_attribution": "previous_postcommit_keys_micros is work before the recorded arrival; a final value per writer is reported separately and is not part of that arrival cohort",
             "evidence": "evidence.sqlite3; existing JSON arrays exported as streams",
             "scope": "bounded Python collections and engine-managed spill budgets, not an RSS guarantee for native libraries or catalog metadata",
-            "comparison": "changed reader query and storage overhead require a fresh matched control; previous reports are unchanged",
+            "comparison": "writer timing instrumentation changes producer and recorder overhead and requires a fresh v3 matched control; previous reports are unchanged",
         }
         self.report.update(profile=args.profile, seed=args.seed, initial_rows_per_table=args.initial_rows,
                            tables=args.tables, payload_bytes=args.row_bytes, warmup_seconds=args.warmup,

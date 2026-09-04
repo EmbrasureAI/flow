@@ -174,6 +174,71 @@ class BenchmarkStorageTest(unittest.TestCase):
                 failed.close()
             self.assertFalse(failed.thread.is_alive())
 
+    def test_writer_timing_schema_queue_measurement_and_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = BenchmarkStore(Path(temporary) / "timings.sqlite3")
+            try:
+                legacy_columns = [
+                    "sequence", "table_name", "measured", "scheduled_at_micros", "missed_arrival",
+                    "started_at_micros", "xid", "wire_xid", "probe_marker", "commit_response_at_micros",
+                    "mutations", "update_rows", "delete_rows", "insert_rows", "marker",
+                    "reader_observed_at_micros",
+                ]
+                columns = [row[1] for row in store.db.execute("PRAGMA table_info(transactions)")]
+                self.assertEqual(columns[:len(legacy_columns)], legacy_columns)
+
+                for value in range(1, 6):
+                    store.record({
+                        "sequence": value,
+                        "table": "timed",
+                        "measured": True,
+                        "scheduled_at_micros": value,
+                        "admission_lag_micros": value,
+                        "key_prepare_micros": value * 2,
+                        "intent_enqueue_wait_micros": value * 3,
+                        "postgres_transaction_micros": value * 4,
+                        "commit_enqueue_wait_micros": value * 5,
+                        "previous_postcommit_keys_micros": value * 6,
+                    })
+                enqueue_wait = store.record(
+                    {"sequence": 10, "table": "timed", "measured": False, "scheduled_at_micros": 10},
+                    enqueue_field="intent_enqueue_wait_micros",
+                )
+                store.sample("writer_terminal", {
+                    "worker": 0, "sequence": 5, "measured": True, "postcommit_keys_micros": 37,
+                })
+                store.sample("writer_terminal", {
+                    "worker": 1, "sequence": 0, "measured": False, "postcommit_keys_micros": 999,
+                })
+                summary = store.writer_timing_summary()
+
+                measured = summary["measured_arrival_cohort_micros"]
+                self.assertEqual(measured["admission_lag_micros"], {
+                    "count": 5, "total": 15, "p50": 3, "p95": 5, "p99": 5, "max": 5,
+                })
+                self.assertEqual(measured["previous_postcommit_keys_micros"]["total"], 90)
+                self.assertEqual(summary["terminal_postcommit_keys_micros"], {
+                    "count": 1, "total": 37, "p50": 37, "p95": 37, "p99": 37, "max": 37,
+                })
+                persisted = store.db.execute(
+                    "SELECT intent_enqueue_wait_micros FROM transactions WHERE sequence=10"
+                ).fetchone()[0]
+                self.assertEqual(persisted, enqueue_wait)
+                self.assertGreaterEqual(enqueue_wait, 0)
+
+                recorder = summary["recorder_queue"]
+                self.assertGreaterEqual(recorder["high_water_items"], 1)
+                self.assertLessEqual(recorder["high_water_items"], recorder["capacity_items"])
+                self.assertEqual(recorder["enqueue_count"],
+                                 sum(item["count"] for item in recorder["by_kind"].values()))
+                self.assertEqual(recorder["by_kind"]["transaction"]["count"], 6)
+                self.assertEqual(recorder["by_kind"]["sample"]["count"], 2)
+                with self.assertRaises(ValueError):
+                    store.record({"sequence": 11, "table": "timed", "measured": False,
+                                  "scheduled_at_micros": 11}, enqueue_field="unknown")
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
