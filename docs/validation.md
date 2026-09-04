@@ -482,6 +482,25 @@ path. This evidence does not support adopting SST staging. The next gate is a
 bounded apply-batch comparison with row, serialized-byte, memory, WAL, lock-hold,
 reopen and interruption limits.
 
+The [coupled row-ceiling comparison](../target/apply-batch-row-profile-33/assessment.md)
+rechecks 72 exact samples and retains the 1,024-row control. Larger calls widen
+PK and reverse-owner lookups together and regress most cases. The follow-up
+[decoupled comparison](../target/apply-batch-decoupled-profile-33/assessment.md)
+fixes lookup chunks at 1,024 rows while measuring 36 rotated samples across the
+1,024-row control and 4,096/8,192-row atomic-commit candidates. All forward and
+reverse entries, per-file counts, cursors, table state and clean reopen checks
+pass. A later lookup-chunk conflict
+also has focused atomicity coverage proving that the entire unsubmitted commit
+group rolls back without advancing the cursor.
+
+The fixed lookup width holds reverse-owner reads constant across commit sizes.
+The candidates improve one-million-row, 256-file compaction by paired medians of
+12.54% and 12.38%, below the declared 20% gate. The 100,000-row gains are 3.42%
+and 4.46%, below 10%, and update/delete gains are 0.49% and 0.07%. The largest
+observed call is 54.20 ms and batch payload 3.60 MiB; neither result overrides
+the failed workload gates or proves safety for wide keys. The state-store default
+remains 1,024 and no 8 MiB cap is adopted.
+
 ## Earlier concurrency and performance evidence
 
 The earlier [local service and stress suites](../tests/local/README.md) remain useful regression evidence. A 120-second stress run used three concurrent CRUD writers and an independent background compactor, observed fifty external compactions during writing, committed source transactions while the daemon was stopped, and compared complete rows and retained historical snapshots after recovery. That run predates the separate control store, parallel bootstrap and later schema work; it is not evidence that every newer path has sustained-load qualification.
@@ -496,6 +515,6 @@ The [production qualification report](production-qualification.md) owns measured
 - Repeat the complete gates on an immutable release artifact in CI. Broaden reader versions and storage/catalog providers; local MinIO and one REST implementation do not cover every cloud failure mode.
 - Complete the specification's workload matrix and 24-hour principal workloads, with sufficient drain, bounded compaction debt, complete observations and separate planning/delete-application measurements. Record failed targets alongside successes.
 - Qualify FULL-identity WAL overhead, journal/index footprint, maintenance bytes, storage/catalog requests and configurable-price accounting under declared deployment conditions.
-- Complete the bounded apply-batch comparison before changing the state-store default. Any candidate must preserve the atomic forward/reverse/count/cursor transition, pass reopen and interruption recovery and improve both 100,000-row and 1,000,000-row profiles within declared memory and lock-hold bounds.
+- Retain the 1,024-row state-store apply default. The completed coupled and decoupled screens reject larger commit groups. Qualify any generation-switch replacement against the same atomic forward/reverse/count/cursor, reopen, interruption, memory and lock-hold boundaries before changing the live-index path.
 - Maintain dependency/license and image gates; prepare the reusable Iceberg API changes for upstream review.
 - Add low-fan-out partitioning and v3 only with their own source, standard-reader, delete, maintenance and recovery gates after the original v2 qualification prerequisites. They are subsequent implementation work, not early-scope exclusions.

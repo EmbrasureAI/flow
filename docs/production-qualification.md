@@ -1298,3 +1298,38 @@ through a normal exact apply. This passes the intended reopen cleanup boundary;
 it is not exhaustive machine-crash injection. The result rejects external SST as
 the next general optimization and focuses the next comparison on larger bounded
 atomic apply batches, with independent row and serialized-byte ceilings.
+
+## State-store apply-batch profiles
+
+The [first comparison](../target/apply-batch-row-profile-33/assessment.md) runs 72
+rotated actual-RocksDB samples. Its compaction cases cover 100,000 and 1,000,000
+rows with eight and 256 files; its 90/10 update-delete cases use 100,000 and
+1,000,000 rows with 256 files. It verifies exact forward and reverse mappings,
+file counts, operation cursors, table state and clean reopen.
+None of the coupled 4,096, 8,192 or 16,384-row settings improves every case;
+all increase call tails and peak RSS. The result retains 1,024.
+
+The [decoupled comparison](../target/apply-batch-decoupled-profile-33/assessment.md)
+uses source commit `8be299ac751510fc5d61ed6aab4e8c1cac49939e` and frozen binary
+`6e96635fc3087f9ea83231a3883680c367793d900a049cdadd57488e28590abc`.
+It fixes PK and reverse lookup chunks at 1,024 rows, then runs 27 compaction and
+nine update-delete samples with 1,024, 4,096 and 8,192-row atomic commits. The
+runner retains commands, logs, timing/RSS output, exact serialized `WriteBatch`
+bytes and operation counts, reverse-owner reads and phase distributions. All 36
+samples pass exact apply and reopen validation.
+
+Reverse-owner reads are identical across commit sizes in every workload, so the
+experiment removes the identified lookup-width confound. Paired-median improvements
+for 4,096/8,192 are 3.42%/4.46% at 100,000 rows and 256 files,
+12.54%/12.38% at one million rows and 256 files, and 0.49%/0.07% for the
+one-million-row update-delete case. The eight-file results are -0.19%/+3.71%.
+The largest observed call is 54.20 ms, the largest narrow-row batch is 3.60 MiB,
+and the maximum median RSS increase is 12.47 MiB. Both candidates fail the
+declared 10% and 20% compaction gains. No production ceiling changes, serialized
+8 MiB cap or release33 service claim follow from this result.
+
+The initial decoupled run stopped after five samples because a live directory
+census raced a RocksDB background file removal. It published no report. The final
+profile measures directory and WAL footprints only after a clean database close;
+the passing reports use a rebuilt binary and fresh artifact directories. This is
+a harness correction, not an apply-path failure.

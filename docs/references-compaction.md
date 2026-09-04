@@ -65,19 +65,20 @@ it cannot replace their atomic write batch. Current RocksDB main has a separate
 [prepare/commit ingestion API](https://github.com/facebook/rocksdb/blob/37234200b57d8d0a6a5c41f2d9811bbd2e293544/include/rocksdb/db.h#L2396-L2445),
 but that API is not present in the pinned engine or Rust binding.
 
-The next decision remains measurement-led. First compare the current resumable
-apply with larger memory-bounded cross-column-family `WriteBatch` chunks, each
-committed atomically, measuring preparation, lock hold, WAL cost, memory, reopen
-recovery and all forward/reverse/count/cursor invariants. External SST ingestion
-may also be measured for the isolated prepared-delta staging column family, where
-partial live-index visibility is not possible. If the bounded atomic batch meets
-the activation and resource limits, retain the simpler fixed-column-family
-design. If it does not, the next candidate is immutable, generation-prefixed
-index state prepared under an unreachable prefix, followed by exact catch-up and
-one small durable active-generation switch. Old generations then remain pinned
-for readers and are collected only after reconciliation. That larger change
-requires its own recovery and service measurements; results from Hummock,
-Persist or Moonlink do not qualify its performance here.
+The [measured apply comparisons](../target/apply-batch-decoupled-profile-33/assessment.md)
+reject larger live-index `WriteBatch` commits. The implementation can now hold
+PK and reverse lookup chunks at 1,024 rows while building a larger atomic commit,
+and it records exact serialized bytes, operations, owner reads and phase timing.
+At 4,096 and 8,192 commit rows, owner reads stay fixed and resource limits pass,
+but the 100,000 and one-million-row gains remain below their declared gates.
+The production default therefore remains 1,024.
+
+The next candidate is immutable, generation-prefixed index state prepared under
+an unreachable prefix, followed by exact catch-up and one small durable
+active-generation switch. Old generations must remain pinned for readers and be
+collected only after reconciliation. That larger change requires its own recovery
+and service measurements; results from Hummock, Persist or Moonlink do not qualify
+its performance here.
 
 ## Decisions
 

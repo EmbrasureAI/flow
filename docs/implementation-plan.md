@@ -41,6 +41,7 @@ Review every change against this chain. A performance improvement must preserve 
 - [Delete/residual integration](../crates/testkit/tests/delete_rewrite.rs): actual Parquet/Avro and stock Rust reads verify sequence filtering, shared targets, duplicate positions, exact deletion density, dangling-file removal, unchanged base files, lost-response recovery and full index-loss reconstruction.
 - [Release32 concurrent compaction](../target/production-concurrent-compaction-release32-01/report.json): seven passing real-service phases cover CRUD, key moves and delete/reinsert while compaction I/O is held, hard-debt acknowledgement pause, deadline retirement with BUILD protection, scratch cleanup, SIGTERM during held I/O and restart recovery with retained history.
 - [RocksDB staging profile](../target/sst-staging-profile-32/assessment.md): eighteen alternating fresh-database samples at 100,000 and 1,000,000 mappings compare current staging, a prevalidated ordinal WAL lower bound and external-SST staging. Exact forward/reverse owners, file counts, cursors and reopen checks pass, including cleanup after closing between SST ingestion and sealing.
+- Index apply profiles: the [72-sample coupled screen](../target/apply-batch-row-profile-33/assessment.md) rejects 4,096, 8,192 and 16,384 rows. A [second 36-sample screen](../target/apply-batch-decoupled-profile-33/assessment.md) fixes lookup chunks at 1,024 while comparing 1,024, 4,096 and 8,192-row atomic commits. Every sample passes exact index and reopen checks; neither larger commit group meets the declared workload gains.
 - [Linux demo](../target/production-linux-demo-01/report.json): a freshly built Linux image, fresh isolated volumes, standard Trino CRUD, non-root ownership, SIGTERM exit 0, resumed source backlog and idempotent initialization.
 
 These reports span successive builds. Older service/stress and workload reports remain evidence for their recorded binaries; newer targeted checks do not replace a complete final-release run. Failed workload reports remain visible in the [production qualification report](production-qualification.md).
@@ -122,6 +123,18 @@ Apply consumes 93.579% of that path. This narrows the next experiment to bounded
 atomic index-apply batches; live forward, reverse and count column families must
 remain one atomic transition.
 
+The [coupled apply screen](../target/apply-batch-row-profile-33/assessment.md)
+passes 72 exact samples but rejects every larger row ceiling. The
+[decoupled screen](../target/apply-batch-decoupled-profile-33/assessment.md)
+then holds lookup chunks at 1,024 rows. Reverse-owner reads remain identical for
+every commit size, and 4,096/8,192-row commits improve the heavy one-million-row,
+256-file compaction by paired medians of 12.54%/12.38%. They reach only
+3.42%/4.46% at 100,000 rows and 0.49%/0.07% for the one-million-row update/delete
+case; 4,096 regresses 0.19% in the eight-file case. Both candidates miss the
+10% and 20% compaction gates. The default stays at 1,024 rows, so this experiment
+does not justify a serialized 8 MiB cap or a service-matrix rerun for a larger
+row ceiling. The retained implementation still requires final service validation.
+
 No sustained 50k, 100-table or 24-hour qualification is claimed. The separate
 [WAL check](../target/production-wal-overhead-01/assessment.md) and
 [pinned reader diagnostic](../target/production-reader-diagnostics-27-01/assessment.md)
@@ -133,7 +146,7 @@ by bounded-v2; final local watermarks must not be relabeled as that measurement.
 
 1. Keep release32's split preparation and exact activation as the current base. Its finite 1k/10k matrix passes correctness and catalog latency, while all eight reader ratios remain above 1.25. Preserve exact table/head validation, Prepared ownership, deadline retirement, journal replay and the same measurement thresholds.
 2. Retain release32's current staging path. The external-SST comparison passes its correctness and reopen boundaries but does not improve total work at one million mappings; its tiny install only moves construction out of the activation barrier while the unchanged index apply dominates.
-3. Compare bounded index-apply row ceilings of 1,024, 4,096, 8,192 and 16,384 with a separate 8 MiB serialized-batch ceiling. Use 100,000 and 1,000,000 rows, eight-file and 256-file layouts and a wide-value byte-limit case. Require exact forward/reverse owners, counts, cursors, reopen and interruption recovery, plus bounded memory, WAL growth and lock hold. Adopt the smallest supported ceiling, then freeze a new artifact and rerun the same A/B/C/D matrix.
+3. Retain the 1,024-row apply default. The coupled and fixed-lookup comparisons reject larger atomic commits, so do not add a byte cap or rerun the service matrix for those candidates. Preserve the new phase and serialized-batch observations. The next index candidate is an unreachable generation prepared outside the live-index barrier, followed by exact catch-up and one durable active-generation switch; qualify it against the same correctness, recovery, memory, lock-hold and service gates before adoption.
 4. After maintenance and reader health pass, repeat the 50k and 100-table workloads with the validated disk-backed harness, then run the required 24-hour dimensions. Qualify compaction debt, resource growth, index I/O, provider costs, planning/scan amplification and publication latency together.
 5. Extend source-version, reader-version and storage/catalog coverage beyond the recorded gates. Real-source tests cover PostgreSQL 14.24, 15.19, 16.15, 17.11 and 18.6; reader results apply to the exact versions in validation. Extend failure and retention checks to deployment conditions.
 6. Publish accurate OSS support and dependency/license policies, maintain Linux CI/demo checks, and prepare reusable upstream Iceberg patches.
