@@ -2,7 +2,7 @@
 
 The implementation has passing local recovery and interoperability gates, but has not met the specification's performance qualification. The target is 50,000 mixed mutations/s with PostgreSQL commit-to-catalog p95 below one second and p99 below two seconds for ordinary transactions. Correct final rows alone do not qualify that target.
 
-The latest [release34 recovery and service qualification](qualification/release34.md) records 154 passing Rust checks and 35 passing local service phases on a frozen release binary. Earlier results below retain their original binary and measurement scope.
+The latest [release35 fairness qualification](qualification/release35.md) passes 154 Rust checks and a service regression on both debug and optimized binaries. The preceding [release34 recovery campaign](qualification/release34.md) passes 35 local service phases and records its broader workload limits. Earlier results below retain their original binary and measurement scope.
 
 ## Environment and measurement
 

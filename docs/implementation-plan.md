@@ -29,7 +29,7 @@ Review every change against this chain. A performance improvement must preserve 
 
 ## Evidence checkpoints
 
-The frozen [release34 gate](qualification/release34.md) is the latest correctness checkpoint: 154 Rust tests, nine Python checks and 35 real service phases. It closes durable cleanup, generation corruption recovery and WAL-health status gaps. The serial release34 workload matrix is the next performance gate.
+The frozen [release34 gate](qualification/release34.md) is the latest correctness checkpoint: 154 Rust tests, nine Python checks and 35 real service phases. It closes durable cleanup, generation corruption recovery and WAL-health status gaps. The release34 workload matrix exposes starvation of soft maintenance under continuous CDC. [Release35](qualification/release35.md) adds a bounded capture opportunity and passes a service regression that fails on release34; its performance comparison follows completion of the baseline matrix.
 
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 
