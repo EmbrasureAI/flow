@@ -49,8 +49,7 @@ and restart boundaries and fails on release36's single-build limit. All 30
 optimized service phases pass. A complete matched cohort meets catalog p95/p99
 at 708/823 ms, but reader amplification worsens. Exact pinned snapshots reproduce
 the reader cost and expose current-snapshot deletion-manifest fanout alongside
-bounded pending L0 work; preserving deletion metadata while packing it more
-compactly is the next code review. The dependency-policy gate passes full
+bounded pending L0 work. The dependency-policy gate passes full
 macOS/Linux notice bundles and rejection checks. The first upstream-ready reader
 patch has a failing unmodified control and 31 passing fixed tests. Automatic cost
 input collection and the remaining upstream transaction primitives are separate
@@ -60,8 +59,14 @@ The [manifest-packing candidate](qualification/release38.md) addresses the measu
 metadata fanout in that same publication path. It preserves current deletion
 entries while sharing the new per-content manifests, and passes the workspace
 and recovery regressions; the unmodified control fails the intended output bound.
-Its optimized service/workload gate is next, including the changed independent
-compactor because that fixture uses the same publication library.
+All 30 frozen optimized service phases and direct Java snapshot-removal API
+checks pass. The matched diagnostic admits all 7,000 transactions and verifies
+1,070,000 rows with exact source ACK. Catalog p95/p99 meet the finite-case targets
+at 838/1,052 ms, but reader amplification remains unqualified at 1.763. Both the
+daemon and independent reference compactor change because they share the
+publication library. Exact pins confirm fewer manifests in both native and
+reference layouts, with remaining data/delete fanout and failed reader wall-time
+ratios. This diagnostic does not complete the 50k or 24-hour production gates.
 
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 

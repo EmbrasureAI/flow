@@ -2,7 +2,7 @@
 
 The implementation has passing local recovery and interoperability gates, but has not met the specification's performance qualification. The target is 50,000 mixed mutations/s with PostgreSQL commit-to-catalog p95 below one second and p99 below two seconds for ordinary transactions. Correct final rows alone do not qualify that target.
 
-The [release37 candidate](qualification/release37.md) passes 30 frozen optimized service phases. A matched 100-table, eight-worker diagnostic admits every transaction and verifies all 1,070,000 rows. Two background builds reduce catalog p95/p99 from 1,581/1,900 to 708/823 ms, but maximum reader amplification rises from 1.392 to 1.684 and remains unqualified. The [release36](qualification/release36.md) uninstrumented control missed 390 source arrivals; that failure is not replaced by these sampled diagnostics. Earlier results below retain their original binary and measurement scope.
+The [release38 candidate](qualification/release38.md) passes 30 frozen optimized service phases and a direct Java snapshot-removal API check. Its matched 100-table, eight-worker diagnostic admits every transaction and verifies all 1,070,000 rows with exact source ACK. Catalog p95/p99 are 838/1,052 ms, compared with [release37](qualification/release37.md)'s 708/823 ms; maximum reader amplification is 1.763 versus 1.684, still above 1.25. Both the daemon and reference compactor changed, so reference metadata is not held constant. The [release36](qualification/release36.md) uninstrumented control missed 390 source arrivals; that failure is not replaced by these sampled diagnostics. The 50k and 24-hour gates remain unmet. Earlier results below retain their original binary and measurement scope.
 
 ## Environment and measurement
 
