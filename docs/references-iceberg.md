@@ -32,6 +32,14 @@ applicable inputs. It also registers positional-delete completion waiters before
 releasing the state lock. The complete stock-reader regression remains in the
 delete-rewrite integration suite.
 
+The [upstream-ready sequence-isolation patch series](patches/upstream/README.md)
+targets verified upstream main `6fa8e03834dca17481441ec758afbbe12efc27f6`.
+Its native Parquet regression fails on that base with the leaked position and
+passes with the fix, alongside 30 existing reader tests. The series adapts to
+upstream's newer V3 reader and excludes the already merged lost-wakeup fix.
+Commands, patch hashes and results are recorded with the series. This packaging
+does not alter the vendored runtime; no upstream submission has been made.
+
 ## Standards and reference behavior
 
 The [Iceberg format specification](https://iceberg.apache.org/spec/#sequence-numbers)

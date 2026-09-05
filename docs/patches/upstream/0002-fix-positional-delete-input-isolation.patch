@@ -1,0 +1,154 @@
+diff --git a/crates/iceberg/src/arrow/delete_filter.rs b/crates/iceberg/src/arrow/delete_filter.rs
+--- a/crates/iceberg/src/arrow/delete_filter.rs
++++ b/crates/iceberg/src/arrow/delete_filter.rs
+@@ -27,7 +27,7 @@
+ use crate::expr::{Bind, BoundPredicate, Predicate};
+ use crate::runtime::Runtime;
+ use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
+-use crate::spec::DataContentType;
++use crate::spec::{DataContentType, DataFileFormat};
+ use crate::{Error, ErrorKind, Result};
+ 
+ #[derive(Debug)]
+@@ -44,13 +44,22 @@
+     /// The file is currently being loaded by a task.
+     /// The notifier allows other tasks to wait for completion.
+     Loading(Arc<Notify>),
+-    /// The file has been fully loaded and merged into the delete vector map.
+-    Loaded,
++    /// Keep vectors scoped to their input file so scan-task applicability,
++    /// including sequence-number filtering, is preserved when combining them.
++    Loaded(HashMap<String, DeleteVector>),
++}
++
++#[derive(Debug)]
++struct CachedPositionalDeleteVector {
++    inputs: Vec<String>,
++    vector: Arc<Mutex<DeleteVector>>,
+ }
+ 
+ #[derive(Debug, Default)]
+ struct DeleteFileFilterState {
++    /// V3 deletion vectors are already scoped to their referenced data file.
+     delete_vectors: HashMap<String, Arc<Mutex<DeleteVector>>>,
++    positional_delete_vectors: HashMap<String, CachedPositionalDeleteVector>,
+     equality_deletes: HashMap<String, EqDelState>,
+     positional_deletes: HashMap<String, PosDelState>,
+ }
+@@ -89,7 +98,46 @@
+         &self,
+         file_scan_task: &FileScanTask,
+     ) -> Option<Arc<Mutex<DeleteVector>>> {
+-        self.get_delete_vector_for_path(file_scan_task.data_file_path())
++        // A V3 deletion vector supersedes positional delete files for this task.
++        if file_scan_task
++            .deletes()
++            .iter()
++            .any(|file| file.file_format == DataFileFormat::Puffin)
++        {
++            return self.get_delete_vector_for_path(file_scan_task.data_file_path());
++        }
++
++        let mut inputs = file_scan_task
++            .deletes()
++            .iter()
++            .filter(|file| file.file_type == DataContentType::PositionDeletes)
++            .map(|file| file.file_path.clone())
++            .collect::<Vec<_>>();
++        inputs.sort_unstable();
++        inputs.dedup();
++        let path = file_scan_task.data_file_path();
++        let mut state = self.state.write().unwrap();
++        if let Some(cached) = state.positional_delete_vectors.get(path)
++            && cached.inputs == inputs
++        {
++            return Some(cached.vector.clone());
++        }
++        let mut combined = None;
++        for input in &inputs {
++            if let Some(PosDelState::Loaded(vectors)) = state.positional_deletes.get(input)
++                && let Some(vector) = vectors.get(path)
++            {
++                *combined.get_or_insert_with(DeleteVector::default) |= vector;
++            }
++        }
++        let vector = Arc::new(Mutex::new(combined?));
++        state
++            .positional_delete_vectors
++            .insert(path.to_owned(), CachedPositionalDeleteVector {
++                inputs,
++                vector: vector.clone(),
++            });
++        Some(vector)
+     }
+ 
+     /// Retrieve a delete vector for a data file
+@@ -129,7 +177,7 @@
+ 
+         if let Some(state) = state.positional_deletes.get(file_path) {
+             match state {
+-                PosDelState::Loaded => return PosDelLoadAction::AlreadyLoaded,
++                PosDelState::Loaded(_) => return PosDelLoadAction::AlreadyLoaded,
+                 PosDelState::Loading(notify) => {
+                     return PosDelLoadAction::WaitFor(notify.clone().notified_owned());
+                 }
+@@ -145,12 +193,16 @@
+     }
+ 
+     /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
+-    pub(crate) fn finish_pos_del_load(&self, file_path: &str) {
++    pub(crate) fn finish_pos_del_load(
++        &self,
++        file_path: &str,
++        vectors: HashMap<String, DeleteVector>,
++    ) {
+         let notify = {
+             let mut state = self.state.write().unwrap();
+             if let Some(PosDelState::Loading(notify)) = state
+                 .positional_deletes
+-                .insert(file_path.to_string(), PosDelState::Loaded)
++                .insert(file_path.to_string(), PosDelState::Loaded(vectors))
+             {
+                 Some(notify)
+             } else {
+@@ -324,7 +376,7 @@
+         };
+ 
+         // Loader completes and signals before the waiter awaits.
+-        filter.finish_pos_del_load(path);
++        filter.finish_pos_del_load(path, HashMap::new());
+ 
+         let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+         assert!(
+diff --git a/crates/iceberg/src/arrow/caching_delete_file_loader.rs b/crates/iceberg/src/arrow/caching_delete_file_loader.rs
+--- a/crates/iceberg/src/arrow/caching_delete_file_loader.rs
++++ b/crates/iceberg/src/arrow/caching_delete_file_loader.rs
+@@ -229,11 +229,8 @@
+                 while let Some(item) = results_stream.next().await {
+                     match item? {
+                         ParsedDeleteFileContext::DelVecs { file_path, results } => {
+-                            for (data_file_path, delete_vector) in results.into_iter() {
+-                                del_filter.upsert_delete_vector(data_file_path, delete_vector);
+-                            }
+                             // Mark the positional delete file as fully loaded so waiters can proceed
+-                            del_filter.finish_pos_del_load(&file_path);
++                            del_filter.finish_pos_del_load(&file_path, results);
+                         }
+                         ParsedDeleteFileContext::DelVec {
+                             data_file_path,
+diff --git a/crates/iceberg/src/delete_vector.rs b/crates/iceberg/src/delete_vector.rs
+--- a/crates/iceberg/src/delete_vector.rs
++++ b/crates/iceberg/src/delete_vector.rs
+@@ -309,6 +309,12 @@
+     }
+ }
+ 
++impl BitOrAssign<&DeleteVector> for DeleteVector {
++    fn bitor_assign(&mut self, other: &DeleteVector) {
++        self.inner.bitor_assign(&other.inner);
++    }
++}
++
+ // Reproduces Iceberg-Java's `deletion-vector-v1` framing so tests can round-trip through
+ // `deserialize` without a Java writer, and so other test modules can build blob fixtures.
+ // Cross-implementation golden fixtures produced by Iceberg-Java are tracked separately; this

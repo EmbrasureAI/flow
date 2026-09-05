@@ -1,0 +1,59 @@
+{
+  "base_commit": "6fa8e03834dca17481441ec758afbbe12efc27f6",
+  "toolchain": "1.97.1",
+  "target_dir": "/Users/victor/Documents/ChatGPT/embrasure-flow/target",
+  "profile": "dev with CARGO_PROFILE_DEV_DEBUG=1, matching the parent workspace",
+  "jobs": 4,
+  "negative_control": {
+    "command": "cargo +1.97.1 test --locked -j 4 -p iceberg --lib test_positional_deletes_are_scoped_to_scan_task",
+    "exit_code": 101,
+    "result": "intended assertion failure: leaked position 7",
+    "test_binary": "/Users/victor/Documents/ChatGPT/embrasure-flow/target/debug/deps/iceberg-b582e55273ff2452",
+    "binary_sha256": "9687cb387449606b9bae58f36a8ca147917c8691ab95f40dc5af59b2d20ae129",
+    "log": "target/upstream-delete-isolation/validation/negative-control.log",
+    "log_sha256": "1d7d54531a0a45556ecc41994ac3e61f03bceb09408e09842147f7369a53c3eb"
+  },
+  "validated_at_utc": "2026-09-05T04:38:59.514603+00:00",
+  "environment": {
+    "CARGO_TARGET_DIR": "/Users/victor/Documents/ChatGPT/embrasure-flow/target",
+    "CARGO_PROFILE_DEV_DEBUG": "1"
+  },
+  "upstream_cargo_lock_sha256": "114187196ed27cb11d72c11e33de48ea3dd3b5b5537609448d10cb30b58c4db9",
+  "patches": {
+    "0001-test-positional-delete-input-isolation.patch": "f2c60303fc1fb0dee42e0f170a75e4fad4348cf2ed69cdce83b9685acbddfc70",
+    "0002-fix-positional-delete-input-isolation.patch": "2298b0c86d3765d7d1d952f779e98fc137bd93e2473a9551c600c058e324e923"
+  },
+  "fixed": {
+    "delete_filter": {
+      "command": "cargo +1.97.1 test --locked -j 4 -p iceberg --lib arrow::delete_filter::tests",
+      "exit_code": 0,
+      "passed": 4,
+      "failed": 0,
+      "test_binary": "/Users/victor/Documents/ChatGPT/embrasure-flow/target/debug/deps/iceberg-b582e55273ff2452",
+      "binary_sha256": "38f50c31b80cf3f35c2fd41f73eade0a507163f19d087889700934dff8edc25d",
+      "log": "target/upstream-delete-isolation/validation/fixed-delete-filter.log",
+      "log_sha256": "6fcfeca8cea4e8e35ff0ccf350008a533a05d3f52a0e28deb0fea46abbb6e1b9"
+    },
+    "loader": {
+      "command": "cargo +1.97.1 test --locked -j 4 -p iceberg --lib arrow::caching_delete_file_loader::tests",
+      "exit_code": 0,
+      "passed": 27,
+      "failed": 0,
+      "test_binary": "/Users/victor/Documents/ChatGPT/embrasure-flow/target/debug/deps/iceberg-b582e55273ff2452",
+      "binary_sha256": "38f50c31b80cf3f35c2fd41f73eade0a507163f19d087889700934dff8edc25d",
+      "log": "target/upstream-delete-isolation/validation/fixed-loader.log",
+      "log_sha256": "1fd7541035a1b46a93f57b43762702d94bbe6dd5e544bb9155aee6e1c68a508d"
+    }
+  },
+  "sequential_clean_base_patch_application": "passed; output matches tested source bytes",
+  "tested_source_sha256": {
+    "crates/iceberg/src/arrow/delete_filter.rs": "de40c4a54b700773ea240450ffc3627e04ef51a1077164e815bcc43fc92edf8e",
+    "crates/iceberg/src/arrow/caching_delete_file_loader.rs": "4c3569bc01e55f0e46318eddc30dd80db150741bedc978ac25de96e3650a3ba7",
+    "crates/iceberg/src/delete_vector.rs": "e2d7f28fea122717e554e8593529fa13b3751903ae157c8e9f588ca39eb182cf"
+  },
+  "limitations": [
+    "Only the two relevant reader test modules were executed; no full upstream suite.",
+    "Upstream already emits an unrelated dead-code warning in strict_metrics_evaluator.rs.",
+    "The regression models already planned scan tasks and does not test manifest planning."
+  ]
+}
