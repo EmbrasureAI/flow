@@ -82,6 +82,13 @@ jobs:
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts target/service-concurrent-compaction
+      - name: Two-table compaction cancellation and recovery
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/parallel_compaction.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts target/service-parallel-compaction
       - name: WAL monitor timeout, readiness and recovery
         if: matrix.postgres == '18.6'
         run: >-

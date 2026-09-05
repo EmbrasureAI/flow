@@ -395,10 +395,10 @@ impl PublishRuntime {
         let mut capture_goal = receive.borrow_and_update().durable_lsn;
         let mut busy = HashSet::new();
         let mut running = FuturesUnordered::<BoxFuture<'static, Result<TableCompletion>>>::new();
-        // One speculative build shares the configured worker budget with CDC.
-        // Reservations include capture and completed candidates, so another
-        // table cannot start a build before the first one is finalized.
-        let background_builds = config.limits.table_workers > 1;
+        // At most two speculative builds share the worker budget with CDC,
+        // leaving one actor slot reusable for publication. Reservations span
+        // capture, build, preparation, ready candidates and finalization.
+        let background_build_limit = config.limits.table_workers.saturating_sub(1).min(2);
         let mut build_active = HashSet::new();
         let mut builds = FuturesUnordered::<BoxFuture<'static, BuildCompletion>>::new();
         let mut ready_builds = BTreeMap::<TableId, CompletedBuild>::new();
@@ -408,6 +408,7 @@ impl PublishRuntime {
         let mut waiting_for_build = HashSet::new();
         // Timed-out workers retain durable ownership and resource accounting,
         // but are no longer candidates that may pause foreground publication.
+        // New builds wait until every retiring worker has joined.
         let mut retiring_builds = HashSet::new();
         // Preparation reads a frozen index snapshot. Hold only this table's
         // next CDC epoch until that candidate activates or is retired.
@@ -801,15 +802,17 @@ impl PublishRuntime {
                         let free_workers = config.limits.table_workers.saturating_sub(
                             running.len() + builds.len() + preparations.len() + retirements.len()
                         );
-                        let probe = if work.compaction && background_builds
+                        let probe = if work.compaction && background_build_limit > 0
                             && config.compaction.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
                             && free_workers >= 1
-                            && build_active.is_empty()
+                            && build_active.len() < background_build_limit
                             && retiring_builds.is_empty()
                             && scheduler.next_deadline().is_some_and(|due| due <= now)
                         {
                             maintenance_due.iter()
-                                .filter(|(id, due)| **due <= now && !busy.contains(*id) && !fenced_fallback.contains(*id))
+                                .filter(|(id, due)| **due <= now && !busy.contains(*id)
+                                    && !build_active.contains(*id) && !retiring_builds.contains(*id)
+                                    && !fenced_fallback.contains(*id))
                                 .min_by_key(|(_, due)| **due)
                                 .map(|(id, _)| *id)
                         } else {
@@ -895,9 +898,11 @@ impl PublishRuntime {
                                 waiting_for_build.remove(&id);
                             }
                             BuildAdmission::Fenced
-                        } else if !background_builds || fenced_fallback.remove(&id) {
+                        } else if background_build_limit == 0 || fenced_fallback.remove(&id) {
                             BuildAdmission::Fenced
-                        } else if idle && build_active.is_empty() && retiring_builds.is_empty() {
+                        } else if idle && build_active.len() < background_build_limit
+                            && !build_active.contains(&id) && retiring_builds.is_empty()
+                        {
                             build_active.insert(id);
                             BuildAdmission::Start
                         } else {

@@ -714,6 +714,24 @@ fixture passes on the candidate debug build in `target/release35-fairness-debug-
 with 721 transactions still pending when a build is admitted. Release performance
 qualification remains separate.
 
+## Two-table background compaction
+
+`parallel_compaction.py` holds actual Parquet reads from two distinct table builds
+at once. It verifies CDC and ACK progress, translated position deletes and exact
+current/history rows, ownership through the real 30-second cancellation deadline,
+and recovery of both abandoned builds after SIGTERM. It also checks that a table
+cannot admit another build while its worker remains held.
+
+```sh
+uv run tests/production/parallel_compaction.py \
+  --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+  --binary target/debug/embrasure-flow --artifacts target/service-parallel-compaction
+```
+
+The fixture uses four table workers and soft-only input debt. Release36 is an
+expected negative control: its single-build limit cannot satisfy the second
+held-read assertion within 15 seconds.
+
 ## Periodic maintenance during queued CDC
 
 `periodic_maintenance.py` reuses the durable-backlog fixture to require a manifest

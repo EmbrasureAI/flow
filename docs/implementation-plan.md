@@ -42,6 +42,14 @@ and verifies 1,070,000 rows in each case: eight workers lower catalog p95 from
 smaller source tails coincide with backend WAL waits; the original missed-arrival
 bursts remain unexplained. Runtime defaults and workload thresholds stay unchanged.
 
+The [bounded parallel build candidate](qualification/release37.md) now tests two
+distinct-table lifecycles against that measured maintenance congestion. Its
+two-table service regression passes CDC, exact delete translation, cancellation
+and restart boundaries and fails on release36's single-build limit. Optimized
+correctness and a matched performance comparison must justify adoption before
+moving to further tuning. The separate OSS delivery work remains automatic cost
+input collection, license-policy enforcement and upstream patch packaging.
+
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 
 - [Bootstrap recovery](../target/production-bootstrap-02/report.json) and [DDL between COPY attempts](../target/production-bootstrap-ddl-02/report.json): mid-COPY crash, durable staging reuse, concurrent CDC, index deletion and automatic rebuild.
