@@ -33,11 +33,11 @@ The frozen [release34 gate](qualification/release34.md) closes durable cleanup, 
 
 [Release36](qualification/release36.md) separates periodic metadata work from data
 build scheduling and allows checkpoint rotation with pending catalog work. Its
-155-test Rust gate and three debug service cases pass; final optimized service and
-performance checks remain in progress. The 100-table trace shows more observed
-actor work than four workers can sustain at the requested rate, so the next
-controlled performance comparison changes only the worker count from four to
-eight. Runtime defaults remain unchanged.
+155-test Rust gate, 16 Python checks, three debug service cases and 24 frozen
+optimized service phases pass. The new 100-table control preserves accepted data
+but misses 390 source arrivals, so the four/eight-worker comparison stops before
+its second case. The next diagnostic separates backend commit waits from producer
+scheduling delays; runtime defaults and workload thresholds remain unchanged.
 
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 

@@ -2,9 +2,9 @@
 
 This change allows manifest consolidation, snapshot expiry, object reclamation
 and checkpoint rotation to progress during a continuously queued CDC workload.
-The evidence below uses a debug binary and establishes correctness and forward
-progress. Optimized performance qualification remains separate; this is not a
-production-qualified release.
+The evidence below includes debug regressions and 24 passing service phases on
+one frozen optimized artifact. Performance qualification remains separate; this
+is not a production-qualified release.
 
 ## Implementation and repository checks
 
@@ -68,6 +68,60 @@ retention, one-second garbage interval/grace, two-second checkpoint interval,
 two retained checkpoints, and a 10 ms delay per proxied catalog request in the
 passing cases. These are finite stress-test settings, not default policy or
 ingestion latency measurements.
+
+## Frozen optimized artifact
+
+The optimized artifact was built from clean commit
+`a9cfadb24f872e4ef40c3658b2d96fe99f9989f0`, tree
+`27c1ab3af356da9c7ee373df426028d6820bb8ff`, with Rust 1.97.1 for
+`aarch64-apple-darwin`, the release profile and thin LTO. Its build manifest is
+`target/qualification-binaries/release36/build-manifest.json`.
+
+- Daemon SHA-256: `c646a1bb39fdcc92b09dd349088ed8387130dcaa352d4005063a7fcbd64677a7`.
+- External compactor SHA-256: `930c928c398fb145a0e3c0c06f034ee50b9c88f68b768f7b73c1b847fbd02595`.
+- Cargo.lock SHA-256: `2d84ac4f5caa3d832aa41c8020efcb083513c12e936309bd9d9259f8021aa8af`.
+
+The serial optimized campaign in `target/release36-campaign/summary.json` passed
+all 24 phases against the durable PostgreSQL 18.6, REST catalog and MinIO fixture:
+
+| Case | Phases | Elapsed | Report SHA-256 |
+| --- | ---: | ---: | --- |
+| Periodic cleanup with two hot tables | 5 | 99.670 s | `3729428eb19abf5ea6cab0101c37208e7752a268590de67bae516901f590246d` |
+| Concurrent compaction and recovery | 7 | 180.986 s | `51074bf9c91a7f4db2ce5f4e2767670570e96d0d0cffdc26ee6b84853a28f118` |
+| Durable service faults | 12 | 74.120 s | `5ac326cf4d7db359f310dfd81a59c8580350d3704697706c4c667f1669467abd` |
+
+The optimized periodic case deleted the old manifest list at 30.945 seconds
+with 592 transactions pending, six checkpoint rotations and 32 background builds.
+It then verified all 5,118 orders, 17 accounts, source ACK and the 4,096 tagged
+initial orders. The concurrent case covers held-read CDC, translated deletes,
+hard-debt ACK pause, deadline cancellation/join and interrupted-build restart.
+Fault coverage includes lost successful commit responses, actual durable service
+restarts, crash/journal replay, physical index loss, wide/unchanged TOAST and an
+independent reader/manifest audit. The external compactor required three supervisor
+restarts across outages; this is recovery evidence, not uninterrupted availability.
+
+## Hundred-table performance control
+
+The four-worker control in `target/release36-performance` failed source admission,
+so its strict campaign stopped before running the eight-worker comparison.
+All 6,610 accepted transactions reached the journal, catalog and reader, and the
+final 1,066,100 rows across 100 tables matched PostgreSQL with exact final ACK.
+However, 390 of 6,000 measured arrivals were missed. Catalog p95/p99 was
+23,591.508/25,107.711 ms, drain was 26.970 seconds, and the maximum reader ratio
+was 1.546. This is an overall failure, not evidence of a worker-count improvement.
+The report SHA-256 is
+`2b66f7c3e1692f1e4a7e010e638493b55f46fd24b43c57ba13bac65cd0f1d38f`.
+
+The retained source-arrival assessment finds bursty client response delays:
+28 PostgreSQL transaction intervals exceed 250 ms, with approximately 91% of
+their cumulative duration after the PostgreSQL commit timestamp and before the
+client receives success. That timestamp precedes the durable commit response;
+it does not distinguish WAL flush, transport or Python scheduling delay.
+The recorder queue peaks at 45/256 items and its longest enqueue is 100 microseconds.
+WAL-triggered checkpoints overlap 227 missed arrivals, while the largest
+163-arrival cluster falls between them. Checkpoints alone are not an established
+cause. Producer thread stacks and backend wait events are the next diagnostic;
+PostgreSQL settings, workload thresholds and runtime defaults remain unchanged.
 
 ## Retained failures and limits
 
