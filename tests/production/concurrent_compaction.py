@@ -278,11 +278,16 @@ class ConcurrentRun(Run):
         assert not self.object_proxy.release_reads.is_set(), "test released worker before daemon exit"
         self.process = None
         self.log.close()
+        # Accounts may also start maintenance before SIGTERM. Snapshot all
+        # remaining scratch after exit, when no worker can create or retire it.
+        scratch = [path for path in (self.directory / "state/compaction").iterdir() if path.is_dir()]
+        assert scratch, "shutdown removed scratch while the selected worker was unjoined"
         self.object_proxy.release_reads.set()
         self.start()
-        self.until("restart did not discard durable abandoned BUILD", lambda:
-                   any(event.get("message") == "discarded compaction builds from the previous process"
-                       and event.get("abandoned") == 1 for event in self.log_fields()))
+        recovered = self.until("restart did not discard durable abandoned BUILD", lambda:
+                   next((event for event in self.log_fields()
+                         if event.get("message") == "discarded compaction builds from the previous process"), None))
+        assert 1 <= recovered["abandoned"] <= min(2, len(scratch)), "recovery exceeds bounded BUILD ownership"
         self.until("restart retained abandoned build scratch", lambda:
                    all(not path.exists() for path in scratch), timeout=10)
         self.wait_materialized(barriers["source_barrier"])
@@ -291,6 +296,7 @@ class ConcurrentRun(Run):
         assert self.rows("orders", self.initial_metadata) == self.initial_rows
         return build | barriers | {"sigterm_seconds": round(elapsed, 3), "exit_code": code,
                                    "durable_build_discarded": True,
+                                   "discarded_builds": recovered["abandoned"],
                                    "reclaimed_scratch": [str(path.relative_to(self.directory)) for path in scratch],
                                    "rows_after_restart": result}
 

@@ -35,3 +35,22 @@ The default workspace passes 154 active tests across 40 binaries, with one
 manual profile ignored (`target/release39-workspace-tests.log`). Formatting and
 strict Clippy (`target/release39-clippy.log`) pass. Frozen optimized service and
 performance validation remain required.
+
+The optimized artifact is frozen from clean commit
+`2856bd82c613e92dccfa2e9b6965c51d812ee752`, tree
+`8d4a5bbd4189d51dbee6892048d07c0768c932d4`. Daemon SHA-256 is
+`720b6b1e7e9fcc4838bce9a2f13d8848c5a4bd72c9db38de2869117fa9c62f37`;
+the independent compactor is unchanged from release38 at
+`776710a6edb2cdee3f5fff225cb90cb21594266fad817b8af7167706d633cbce`.
+
+The first optimized service run passes the new hard-preparation check, then fails
+an existing restart assertion that assumed exactly one abandoned BUILD. Logs
+show that the accounts table also started maintenance before SIGTERM, and
+restart correctly discarded two builds. `target/release39-campaign` retains this
+failed run (report SHA-256
+`56eb2e824576f31c632fc8cdf1ba4473dbec03d4faeb860cfd10a04fc7df7219`).
+The corrected fixture permits the scheduler's bounded one or two
+abandoned builds, snapshots every remaining scratch directory after process
+exit, and requires all of them to be removed on restart. The dedicated parallel
+fixture separately requires exactly two held owners and two recovered BUILDs.
+The corrected service campaign uses the same frozen binary.
