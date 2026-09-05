@@ -100,9 +100,9 @@ identities. The rejected source and patch remain ignored local evidence as
 
 | Report | SHA-256 |
 | --- | --- |
-| [Current serial control](../../target/release38-source-pipeline/serial/report.json) | `fce60d1663b6b94c9b3a95cfc292d94a7a2d46dc7f644ddb0d71edc3111d8f93` |
-| [Rejected pipeline](../../target/release38-source-pipeline/pipelined/report.json) | `729c9c125bf9e5c511d957c68fb41583fcc1705fc862b51061d760c077ca4f58` |
-| [Writer semantics](../../target/source-pipeline-validation/results/report.json) | `b15475aa63c82c72a624662e5306e94f2bced9354acc7cccdb0c27054796f1e1` |
+| Current serial control (`target/release38-source-pipeline/serial/report.json`, local artifact) | `fce60d1663b6b94c9b3a95cfc292d94a7a2d46dc7f644ddb0d71edc3111d8f93` |
+| Rejected pipeline (`target/release38-source-pipeline/pipelined/report.json`, local artifact) | `729c9c125bf9e5c511d957c68fb41583fcc1705fc862b51061d760c077ca4f58` |
+| Writer semantics (`target/source-pipeline-validation/results/report.json`, local artifact) | `b15475aa63c82c72a624662e5306e94f2bced9354acc7cccdb0c27054796f1e1` |
 
 This complete serial source-only gate permits a new full 50k ingestion test;
 it does not establish capacity while the daemon, compaction and readers compete
@@ -116,9 +116,9 @@ identity, machine information and the PostgreSQL observations.
 
 | Report | SHA-256 |
 | --- | --- |
-| [Initial four writers](../../target/release35-source-capacity/writers4/report.json) | `1b4efb8f898a6fbcec04475924a95f6af9dd0a5b202a10c25c6b98b92f957ce7` |
-| [Eight writers](../../target/release35-source-capacity/writers8/report.json) | `8bd3ad34a2aa7342521da16fe4976e10fb73c6e09cc82705d98eb8f7ac896c88` |
-| [Repeated four writers](../../target/release35-source-capacity/writers4-paired/report.json) | `702e394908df84cdf765ec973f72d3e9d3070e46093dc287fe80300acd9f93fe` |
+| Initial four writers (`target/release35-source-capacity/writers4/report.json`, local artifact) | `1b4efb8f898a6fbcec04475924a95f6af9dd0a5b202a10c25c6b98b92f957ce7` |
+| Eight writers (`target/release35-source-capacity/writers8/report.json`, local artifact) | `8bd3ad34a2aa7342521da16fe4976e10fb73c6e09cc82705d98eb8f7ac896c88` |
+| Repeated four writers (`target/release35-source-capacity/writers4-paired/report.json`, local artifact) | `702e394908df84cdf765ec973f72d3e9d3070e46093dc287fe80300acd9f93fe` |
 
 All three use producer `benchmark.py` SHA-256
 `28d9e804b8969bab98e3547d4e215e9eace36256cc4b83c91e207d783706b41c`

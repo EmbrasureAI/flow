@@ -19,9 +19,9 @@ were retained and inactive; capacity was raised to 256 with the same preservatio
 and durability settings. REST was restarted after PostgreSQL to clear stale JDBC
 connections.
 
-The [benchmark](../tests/production/README.md) schedules arrivals independently of completion, counts missed arrivals, and compares sorted final source and Iceberg rows. Publication latency uses source commit timestamps, durable journal events and actual successful catalog response events. Before/after clock calibration preserves raw values and offset uncertainty. Reader visibility is a polling upper bound, reported separately. Read timings include planning and execution and cannot qualify a planning-only target.
+The [benchmark](../../tests/production/README.md) schedules arrivals independently of completion, counts missed arrivals, and compares sorted final source and Iceberg rows. Publication latency uses source commit timestamps, durable journal events and actual successful catalog response events. Before/after clock calibration preserves raw values and offset uncertainty. Reader visibility is a polling upper bound, reported separately. Read timings include planning and execution and cannot qualify a planning-only target.
 
-Qualification requires no missed arrivals, at least 95% of the requested mutation rate committed inside the measurement window, complete observations, exact final rows and both latency targets. Failed admissions and missing observations stay visible. SDK operation/byte diagnostics support comparisons but do not claim billed request counts; see [observability](observability.md).
+Qualification requires no missed arrivals, at least 95% of the requested mutation rate committed inside the measurement window, complete observations, exact final rows and both latency targets. Failed admissions and missing observations stay visible. SDK operation/byte diagnostics support comparisons but do not claim billed request counts; see [observability](../observability.md).
 
 These tests cross real logical replication, durable files, S3, REST compare-and-swap and independent readers. They do not qualify remote-region latency, TLS, managed storage or independent-host failure domains. Restarting PostgreSQL also interrupts the catalog database. HA, distributed compaction protocols, Z-order compaction and global autocompaction are excluded from early functionality by the user's scope clarification.
 
@@ -87,12 +87,12 @@ Lower I/O did not qualify publication latency: measured p95 and p99 increased at
 
 ## Residual-rewrite follow-up
 
-[Matrix05](../target/production-matrix-05/matrix.json) used immutable release08 SHA256 `fc9357b1ee50b2aa51a85a253186db0ab4fefcd660e66c97248099cb0a5a4f37`. It includes residual data/delete rewriting, bounded Parquet reads and writer admission, and the corrected size-tier guard. It retained the one-table, 100,000-initial-row, 256-byte compressible-payload workload, 100 mutations per transaction, four writers, ten seconds of warmup and sixty measured seconds. These results measure the combined implementation, not the isolated contribution of each change.
+Matrix05 (`target/production-matrix-05/matrix.json`, local artifact) used immutable release08 SHA256 `fc9357b1ee50b2aa51a85a253186db0ab4fefcd660e66c97248099cb0a5a4f37`. It includes residual data/delete rewriting, bounded Parquet reads and writer admission, and the corrected size-tier guard. It retained the one-table, 100,000-initial-row, 256-byte compressible-payload workload, 100 mutations per transaction, four writers, ten seconds of warmup and sixty measured seconds. These results measure the combined implementation, not the isolated contribution of each change.
 
 | Requested mutations/s | Completed measured transactions | Source mutations/s in window | Catalog p95 / p99 | Reader scan ratio | Result |
 | --- | --- | ---: | --- | ---: | --- |
-| [1,000](../target/production-matrix-05/mixed-1k/report.json) | 600/600 | 1,000.00 | 638.31 / 1,050.78 ms | 0.900 | Passed this bounded workload |
-| [10,000](../target/production-matrix-05/mixed-10k/report.json) | 6,000/6,000 | 10,001.67 | 1,320.39 / 1,727.90 ms | 0.962 | p95 failed; p99 passed |
+| 1,000 (`target/production-matrix-05/mixed-1k/report.json`, local artifact) | 600/600 | 1,000.00 | 638.31 / 1,050.78 ms | 0.900 | Passed this bounded workload |
+| 10,000 (`target/production-matrix-05/mixed-10k/report.json`, local artifact) | 6,000/6,000 | 10,001.67 | 1,320.39 / 1,727.90 ms | 0.962 | p95 failed; p99 passed |
 
 Both runs had zero missed arrivals, no missing journal/catalog/reader observations, and exact final source and Iceberg rows. Catalog drain after the measurement window was 0.546 s and 0.527 s respectively. The reader ratio compares the median of three warm scans before and after independently compacting the **same final logical rows**, using exact retained metadata locations. Both reader checks passed. These short measurements combine planning and scan time; a ratio below one is not evidence that fragmentation improves readers, and does not qualify a planning-only or sustained reader target.
 
@@ -107,13 +107,13 @@ The next measured scheduling change is to publish already-due CDC before soft ma
 
 ## Broader release08 workloads
 
-[Matrix06](../target/production-matrix-06/matrix.json) used the same immutable release08 SHA256 `fc9357b1ee50b2aa51a85a253186db0ab4fefcd660e66c97248099cb0a5a4f37`. All three cases used ten seconds of warmup, sixty measured seconds, four source writers and 100 mutations per transaction. Every committed transaction was eventually observed at the journal, catalog and reader, and full source/target row checks passed. **All three performance qualifications failed.**
+Matrix06 (`target/production-matrix-06/matrix.json`, local artifact) used the same immutable release08 SHA256 `fc9357b1ee50b2aa51a85a253186db0ab4fefcd660e66c97248099cb0a5a4f37`. All three cases used ten seconds of warmup, sixty measured seconds, four source writers and 100 mutations per transaction. Every committed transaction was eventually observed at the journal, catalog and reader, and full source/target row checks passed. **All three performance qualifications failed.**
 
 | Case | Committed / scheduled transactions | Source mutations/s in window | Catalog p95 / p99 | Catalog drain | Reader scan ratio | Failed checks |
 | --- | --- | ---: | --- | --- | --- | --- |
-| [Mixed 50k](../target/production-matrix-06/mixed-50k/report.json) | 30,000/30,000 | 49,998.33 | 161.763 / 167.283 s | 167.100 s | 1.427 | Both catalog latency targets; reader scan |
-| [Wide 1k](../target/production-matrix-06/wide-1k/report.json) | 600/600 | 1,000.00 | 1.098 / 1.379 s | 0.139 s | 0.831 | Catalog p95; p99 and reader passed |
-| [Ten tables, aggregate 10k](../target/production-matrix-06/ten-tables-10k/report.json) | 5,994/6,000 | 9,990.00 | 6.579 / 8.075 s | 0.269 s | 1.076–1.332 | Six missed arrivals; both catalog latency targets; three reader checks |
+| Mixed 50k (`target/production-matrix-06/mixed-50k/report.json`, local artifact) | 30,000/30,000 | 49,998.33 | 161.763 / 167.283 s | 167.100 s | 1.427 | Both catalog latency targets; reader scan |
+| Wide 1k (`target/production-matrix-06/wide-1k/report.json`, local artifact) | 600/600 | 1,000.00 | 1.098 / 1.379 s | 0.139 s | 0.831 | Catalog p95; p99 and reader passed |
+| Ten tables, aggregate 10k (`target/production-matrix-06/ten-tables-10k/report.json`, local artifact) | 5,994/6,000 | 9,990.00 | 6.579 / 8.075 s | 0.269 s | 1.076–1.332 | Six missed arrivals; both catalog latency targets; three reader checks |
 
 Mixed 50k used one table with 100,000 initial rows and 256-byte compressible payloads. It admitted every scheduled transaction, but catalog throughput including drain was only 13,210 mutations/s. Commit-to-journal p95 was **114.139 s** and p99 118.209 s, so substantial delay accumulated before journal durability as well as before publication. Data maintenance completed 109 rewrites totaling 150.35 s across warmup, measurement and drain. The final 450,000 rows matched exactly after the backlog drained; this does not qualify sustained 50k ingestion.
 
@@ -131,9 +131,9 @@ The long commit-to-journal interval motivated per-transaction capture timing to 
 
 ## Repeated reader comparison
 
-[Reader-repeat01](../target/production-reader-repeat-01/report.json) re-read the exact original and compacted metadata locations recorded by matrix06, using DuckDB 1.5.5 and the same recorded extension versions. It ran separately from ingestion and started no fixture processes. The retained-report command records caller-managed quiescence; it does not stop shared services. This check did not rerun the source workload or change its previous qualification result.
+Reader-repeat01 (`target/production-reader-repeat-01/report.json`, local artifact) re-read the exact original and compacted metadata locations recorded by matrix06, using DuckDB 1.5.5 and the same recorded extension versions. It ran separately from ingestion and started no fixture processes. The retained-report command records caller-managed quiescence; it does not stop shared services. This check did not rerun the source workload or change its previous qualification result.
 
-The shared [comparison helper](../tests/production/reader_compare.py) explicitly warms each layout twice, then records twenty samples per layout in alternating A/B and B/A pairs. All warmup and measured samples are retained. The ratio remains original median divided by compacted median, and every table must remain at or below **1.25**. Each query checks equal aggregates; the retained reports also contain the matching full-row verification. New benchmark runs capture and verify the compacted metadata, stop their owned daemon and compactor, and use this same comparison protocol.
+The shared [comparison helper](../../tests/production/reader_compare.py) explicitly warms each layout twice, then records twenty samples per layout in alternating A/B and B/A pairs. All warmup and measured samples are retained. The ratio remains original median divided by compacted median, and every table must remain at or below **1.25**. Each query checks equal aggregates; the retained reports also contain the matching full-row verification. New benchmark runs capture and verify the compacted metadata, stop their owned daemon and compactor, and use this same comparison protocol.
 
 | Retained case | Original median | Compacted median | Repeated ratio | Result |
 | --- | ---: | ---: | ---: | --- |
@@ -146,16 +146,16 @@ All ten tables passed the repeated reader check, with ratios from 1.129 to 1.197
 
 ## Release09 scheduling and capture measurements
 
-[Matrix07](../target/production-matrix-07/matrix.json) used release09 SHA256 `6827d39f51abdfa978b8b5c3d4b7966620fdf06c8479b92164ecb88d682cf071`, recorded in the [binary manifest](../target/qualification-binaries/release09.json). This binary includes due-CDC-before-soft-maintenance ordering and capture phase timing. The same one-table, 100,000-initial-row mixed workload ran for ten warmup seconds and sixty measured seconds. Every scheduled transaction committed, every committed transaction was observed, and exact final rows matched.
+Matrix07 (`target/production-matrix-07/matrix.json`, local artifact) used release09 SHA256 `6827d39f51abdfa978b8b5c3d4b7966620fdf06c8479b92164ecb88d682cf071`, recorded in the binary manifest (`target/qualification-binaries/release09.json`, local artifact). This binary includes due-CDC-before-soft-maintenance ordering and capture phase timing. The same one-table, 100,000-initial-row mixed workload ran for ten warmup seconds and sixty measured seconds. Every scheduled transaction committed, every committed transaction was observed, and exact final rows matched.
 
 | Requested mutations/s | Completed transactions | Catalog median | Catalog p95 / p99 | Result |
 | --- | --- | ---: | --- | --- |
-| [1,000](../target/production-matrix-07/mixed-1k/report.json) | 600/600 | 289.50 ms | 495.82 / 661.94 ms | Source load and catalog latency passed |
-| [10,000](../target/production-matrix-07/mixed-10k/report.json) | 6,000/6,000 | 266.04 ms | 1,313.15 / 1,832.03 ms | Catalog p95 failed; p99 passed |
+| 1,000 (`target/production-matrix-07/mixed-1k/report.json`, local artifact) | 600/600 | 289.50 ms | 495.82 / 661.94 ms | Source load and catalog latency passed |
+| 10,000 (`target/production-matrix-07/mixed-10k/report.json`, local artifact) | 6,000/6,000 | 266.04 ms | 1,313.15 / 1,832.03 ms | Catalog p95 failed; p99 passed |
 
 Both sustained their requested source arrival rate. Catalog drain was 0.014 s and 0.208 s. At 10k, the median fell from matrix05's 529.04 ms to 266.04 ms, but the p95 target remains unmet. These runs omitted the compacted reader comparison: `reader_scan_qualified` is null, so the 1k pass covers source load and catalog latency only. The separate repeat above measures retained release08 layouts, not release09 output.
 
-[Capture-profile09](../target/production-capture-profile-09/report.json) used the same release09 binary for a separate fifteen-second, no-warmup 50k probe with 100 mutations per transaction. All 7,500 scheduled transactions committed, were observed and matched final rows. It failed latency: commit-to-journal p95 was 22.087 s, catalog p95/p99 were 22.671/24.007 s, and catalog drain was 23.771 s.
+Capture-profile09 (`target/production-capture-profile-09/report.json`, local artifact) used the same release09 binary for a separate fifteen-second, no-warmup 50k probe with 100 mutations per transaction. All 7,500 scheduled transactions committed, were observed and matched final rows. It failed latency: commit-to-journal p95 was 22.087 s, catalog p95/p99 were 22.671/24.007 s, and catalog drain was 23.771 s.
 
 The 7,500 measured journal-sync phases totaled **30.623 s**, a mean of **4.083 ms per transaction**. Sync accounted for 90.5% of the five instrumented capture phases' aggregate duration. The other means were 0.157 ms for spool creation, 0.157 ms for disposal, 0.065 ms for schema validation and 0.050 ms for spool replay/append. These are phase wall-time counters, not total capture CPU time. At the offered 500 transactions/s, individual sync barriers alone consumed more time than the fifteen-second source window. This evidence motivates bounded journal group commit while preserving durable transaction visibility and acknowledgement boundaries. Its implementation and qualification follow these reports; no group-commit performance result is claimed here.
 
@@ -167,7 +167,7 @@ The complete workload dimensions, sustained 50k target, 24-hour principal worklo
 
 Immutable release10 (`66e10f7b0cb08f97254414aaef48a28d95a94dc450c631be3ff4deb41d8cac4a`)
 adds bounded journal group commit. The otherwise matching fifteen-second
-[capture probe](../target/production-capture-profile-10/report.json) committed
+capture probe (`target/production-capture-profile-10/report.json`, local artifact) committed
 and observed all 7,500 transactions with exact final rows and no missed arrivals.
 Journal p95 fell from 22,087.16 ms in profile09 to 24.56 ms; 1,077 barriers sealed
 7,500 transactions and spent 5.724 s syncing, versus 30.623 s for 7,500 barriers.
@@ -177,7 +177,7 @@ first-journal-to-final-catalog interval. This attributes the remaining delay to
 compaction occupying the table lane, without claiming every foreground cost is
 profiled.
 
-[Matrix08](../target/production-matrix-08/matrix.json) uses immutable release11
+Matrix08 (`target/production-matrix-08/matrix.json`, local artifact) uses immutable release11
 (`97c92a74ce2c16e4829b0389b9a3dae01791d054c1feee130cc7efebcdb52dc4`), adding
 bounded batched index reads. Every committed transaction was observed and final
 rows matched, but every case failed performance qualification. Reader ratios
@@ -206,7 +206,7 @@ adds the local build/catch-up protocol. The six-phase held-S3-read gate, twelve
 service-failure phases, and eleven schema/lifecycle phases passed on this binary;
 [validation](validation.md) records exact provenance and supervisor incidents.
 
-[Matrix09](../target/production-matrix-09/matrix.json) preserves two failed overall
+Matrix09 (`target/production-matrix-09/matrix.json`, local artifact) preserves two failed overall
 qualifications. Mixed 10k committed and observed all 6,000 transactions, with
 exact final rows and no missed arrivals. Catalog p95/p99 **803.77/1,027.55 ms**
 passed, compared with 1,584.49/2,013.78 ms in matrix08. Journal p95 was 19.24 ms and
@@ -224,8 +224,8 @@ match because the journal backlog had not drained; this does not itself prove
 permanent data loss. The stopped fixture and its durable backlog are retained
 for recovery verification after the fix.
 
-A [pinned dependency census](../target/matrix09-dependency-inventory-01/report.json)
-and [exact position census](../target/matrix09-dependency-inventory-01/positions.json)
+A pinned dependency census (`target/matrix09-dependency-inventory-01/report.json`, local artifact)
+and exact position census (`target/matrix09-dependency-inventory-01/positions.json`, local artifact)
 found 7 delete files containing 1,043,408 unique, effective positions and 2.92 MB.
 The 1M-row limit was exceeded; file and byte limits were not. One 925,296-row
 shared file covered 21 data targets, and delete metadata lacked path bounds.
@@ -237,7 +237,7 @@ backlog before new performance claims.
 
 ## Saved backlog recovery: release13
 
-[Recovery03](../target/production-budget-recovery-03/report.json) resumed matrix09's
+Recovery03 (`target/production-budget-recovery-03/report.json`, local artifact) resumed matrix09's
 unchanged source, permanent slot and state directory using immutable release13
 (`e5824095f71aabb5e9492a992bcb4d9e0959965c179c7f661b3977de16b00a03`).
 The release passed workspace tests, strict project Clippy, formatting and Rust
@@ -261,7 +261,7 @@ their failed reports remain retained. No fresh source load ran during recovery,
 so this result closes the saved-backlog correctness failure without qualifying
 50k throughput or latency.
 
-The [matrix09 10k layout census](../target/reader-layout-census-09-10k/summary.json)
+The matrix09 10k layout census (`target/reader-layout-census-09-10k/summary.json`, local artifact)
 also narrows its reader failure. The original layout decoded 207,824 physical
 rows for 170,000 live rows, versus 170,000 after full compaction. It had 42 versus
 22 row groups and 4.36 versus 3.57 MB of projected compressed column data. Codecs
@@ -271,7 +271,7 @@ apportion the measured 1.544× time among decoding, file opens, deletes and plan
 
 ## Fresh mixed workloads: release14
 
-[Matrix10](../target/production-matrix-10/matrix.json) uses immutable release14
+Matrix10 (`target/production-matrix-10/matrix.json`, local artifact) uses immutable release14
 (`b8f430122b6b02d3a2e6c4fedd107bf1a28557790be3793537f6237869d5f2bf`),
 with bounded repair retries and a guard against delete consolidation undoing
 admissible data work. The full Rust gates and seven-phase live concurrency test
@@ -291,12 +291,12 @@ deadlock and incomplete-observation failure, but does not qualify sustained
 50k publication. Reader medians were 8.571 versus 5.712 ms at 10k and 24.990
 versus 9.248 ms at 50k, using the unchanged balanced twenty-pair protocol.
 
-The [physical census](../target/reader-layout-census-10/report.json) found
+The physical census (`target/reader-layout-census-10/report.json`, local artifact) found
 199,088 versus 170,000 physical rows at 10k, and 721,675 versus 450,000 at 50k.
 The latter retained **271,675 effective deleted rows**, 94 versus 58 row groups,
 and 15.18 versus 9.52 MB of projected compressed data. All delete files now have
 path bounds. Compression and encodings match the fully compacted layouts.
-The [warmed profiles](../target/reader-layout-census-10/profiles-02/summary.json)
+The warmed profiles (`target/reader-layout-census-10/profiles-02/summary.json`, local artifact)
 show similar 50k planning times and a larger difference inside `ICEBERG_SCAN`;
 they do not separate deletion, decoding and I/O. Operator times accumulate
 across eighteen threads and are not additive wall-time components.
@@ -314,7 +314,7 @@ the next policy review uses exact per-file deletion counts to assess that choice
 
 ## Deletion-reclamation priority and phase attribution: release15
 
-[Matrix11](../target/production-matrix-11/matrix.json) uses immutable release15
+Matrix11 (`target/production-matrix-11/matrix.json`, local artifact) uses immutable release15
 (`93fe88b5c60cc9369d5fd0b90f0a105bfc069840e7125620eeca7ac4ee8e5ae1`).
 Its planner prioritizes larger absolute deletion reclamation when delete-file
 pressure rises, preserving hard L0 urgency and all input budgets. Formatting,
@@ -335,7 +335,7 @@ passed narrowly; both overall qualifications failed. The 50k final layout had
 independent full compaction. Native data rewrites decreased from 39 to 27.
 These short-run improvements do not qualify the requested capacity.
 
-The [layout census](../target/reader-layout-census-11/report.json) found 623,310
+The layout census (`target/reader-layout-census-11/report.json`, local artifact) found 623,310
 physical rows, 173,360 effective deleted positions and 82 row groups at 50k.
 Twenty-four of 27 rewrites reduced global delete-file count, compared with 21 of
 39 previously. Every rewrite starting at the hard delete-file limit brought it
@@ -345,7 +345,7 @@ worker's file, row or byte limits. The final reader-baseline shutdown also logge
 a worker runtime panic despite process exit 0; it is retained as a lifecycle
 failure to fix separately from the measured ingestion interval.
 
-[Phase attribution](../target/production-matrix-11/mixed-50k/phase-attribution.json)
+Phase attribution (`target/production-matrix-11/mixed-50k/phase-attribution.json`, local artifact)
 accounts for 102.248 of the 105.475 seconds through the final ingest catalog event.
 Serial compaction used 37.760 seconds: 33.109 seconds finalizing 26 concurrent
 builds, plus 4.651 seconds for one strict rewrite. Background workers used 26.296
@@ -365,11 +365,11 @@ retains counter-export offsets and unsuccessful/malformed log lines.
 
 ## Row-processing and worker-lifecycle changes: release16
 
-[Matrix12](../target/production-matrix-12/matrix.json) uses immutable release16
+Matrix12 (`target/production-matrix-12/matrix.json`, local artifact) uses immutable release16
 (`e949003057d57cd8ef588901bfa2b5c0d11b265df7e7cf6d1b9a1d4a847ceea6`).
 It adds bounded batched collapse lookups, fewer row/key copies, one-pass catch-up
 staging and independent worker I/O runtimes. Full Rust/MSRV checks and the
-[seven-phase live concurrency gate](../target/production-concurrent-compaction-04/report.json)
+seven-phase live concurrency gate (`target/production-concurrent-compaction-04/report.json`, local artifact)
 passed. Both workloads observed every scheduled transaction, matched the complete
 final row streams and logged no worker panics. Both still failed qualification.
 
@@ -384,7 +384,7 @@ slowdown worsened from release15 even as publication delay improved; neither
 metric can substitute for the other. The 10k p95 and reader ratio narrowly missed
 the unchanged limits and remain failures.
 
-[Compared phase totals](../target/production-matrix-12/mixed-50k/phase-comparison.json)
+Compared phase totals (`target/production-matrix-12/mixed-50k/phase-comparison.json`, local artifact)
 show serial compaction falling from 37.760 to 31.869 seconds and aggregate
 compaction preparation from 22.553 to 18.628 seconds. Ingest collapse fell from
 19.556 to 15.765 seconds; ingest preparation remained nearly unchanged at 24.386
@@ -393,14 +393,14 @@ batch preparation and 4.804 seconds of writes. Controlled lock waits remain
 negligible. Catch-up now includes staging that previously appeared under
 plan/seal; the subphase shift alone is not an optimization gain.
 
-The [isolated StateStore comparison](../target/state-row-profile/report.json)
+The isolated StateStore comparison (`target/state-row-profile/report.json`, local artifact)
 used three alternating samples per immutable executable and fresh controlled
 RocksDB directories, without simultaneous builds or service workloads. Median
 unique-key collapse improved 17%, repeated-key collapse 13%, and update apply 4%.
 That sequential-key microbenchmark did not time delta staging and cannot qualify
 service throughput.
 
-The subsequent [delta-staging comparison](../target/state-row-profile-staging/tuning/runs-01/report.json)
+The subsequent delta-staging comparison (`target/state-row-profile-staging/tuning/runs-01/report.json`, local artifact)
 used six alternating runs of immutable executables, fresh controlled RocksDB,
 113-byte file paths and 524,288 updates in 512 bounded staging calls. Inputs were
 constructed outside the timers. Reusing buffers, column-family handles and
@@ -413,7 +413,7 @@ result is measured separately.
 
 ## Staging follow-up
 
-[Matrix13](../target/production-matrix-13/matrix.json) uses immutable release17
+Matrix13 (`target/production-matrix-13/matrix.json`, local artifact) uses immutable release17
 (`e3ff13ef73cf87bddb45c8eaeb5c1614ef46200c87ed058f521fc3e0589045c2`), including
 the staging allocation change, preparation phase observations and structural
 schema comparison for external reconciliation after multiple nullable additions.
@@ -429,7 +429,7 @@ after it. No worker panics were found. The run still failed both latency targets
 and its reader ratio worsened to 2.875 (28.264/9.831 ms). Its observed final
 inventory held 31 data files and 16 delete files with 23 native compaction commits.
 
-The [phase attribution](../target/production-matrix-13/mixed-50k/phase-attribution.json)
+The phase attribution (`target/production-matrix-13/mixed-50k/phase-attribution.json`, local artifact)
 shows ingest preparation falling from 24.386 to 19.879 seconds. Of that total,
 index/delete staging consumed 12.035 seconds, data writing 3.646, delete writing
 0.985 and other preparation 3.213. These are whole-event accumulated durations,
@@ -439,7 +439,7 @@ post-catalog work from 15.090 to 15.699. Writer/staging overlap cannot save more
 than the 3.646 seconds of data writing before contention and boundary costs,
 so it remains deferred while duplicate-lookup work is examined.
 
-The [ordered-marker comparison](../target/state-row-profile-staging/monotone/runs-01/report.json)
+The ordered-marker comparison (`target/state-row-profile-staging/monotone/runs-01/report.json`, local artifact)
 then measured a bounded reverse-seek proof ahead of duplicate lookup. Six
 alternating runs reduced monotone staging median from 0.817822 to 0.306169 seconds
 (62.6%), with non-overlapping ranges. Other phase medians changed by about 0–2%.
@@ -451,7 +451,7 @@ was introduced.
 
 ## Wider release18 workloads
 
-[Matrix14](../target/production-matrix-14/matrix.json) used immutable release18
+Matrix14 (`target/production-matrix-14/matrix.json`, local artifact) used immutable release18
 (`5edaf98ff094031f5ccab06e229b2bf83d8b009d06af8724bb54cb9407c2289b`), including
 the marker-range proof. Full Rust tests, formatting, strict Clippy and Rust 1.94
 checks passed. Every case committed and observed all scheduled transactions,
@@ -497,7 +497,7 @@ original run unchanged.
 
 ## Hundred-table retained reader recovery
 
-[Recovery01](../target/production-reader-recovery-01/recovery.json) fetched the
+Recovery01 (`target/production-reader-recovery-01/recovery.json`, local artifact) fetched the
 current catalog metadata without changing it, preserved raw REST and S3 metadata,
 and pinned one data file with no delete files for each of the 100 tables. All
 1,070,000 ordered rows matched the counts and SHA-256 hashes from the original
@@ -506,9 +506,9 @@ fixture clients or sampled daemon PID, and retained daemon/compactor logs had
 no worker panics. Original process exit codes were not retained and are not
 reconstructed by this check.
 
-The [recovered input report](../target/production-reader-recovery-01/input-report.json)
+The recovered input report (`target/production-reader-recovery-01/input-report.json`, local artifact)
 records these pins and the original report's hash. The separate
-[reader repeat](../target/production-reader-recovery-01/reader-repeat.json)
+reader repeat (`target/production-reader-recovery-01/reader-repeat.json`, local artifact)
 completed all 100 tables without a reader I/O error, using the unchanged two
 warmup scans and twenty alternating pairs per layout. Every aggregate matched.
 Only 68 tables met the 1.25 ratio limit: the median table ratio was **1.0996**,
@@ -520,10 +520,10 @@ original report remains byte-identical with SHA-256
 
 ## Release20 and interrupted reader observation
 
-[Release20](../target/qualification-binaries/release20.json) adds shorter ingest
+Release20 (`target/qualification-binaries/release20.json`, local artifact) adds shorter ingest
 paths, catch-up phase attribution, a shared maintenance I/O driver and one-second
 metrics export cadence. Full Rust/MSRV gates and all seven live concurrency
-phases passed. Its [matrix15 mixed-50k run](../target/production-matrix-15/mixed-50k/report.json)
+phases passed. Its matrix15 mixed-50k run (`target/production-matrix-15/mixed-50k/report.json`, local artifact)
 committed 29,985 of 30,000 scheduled transactions and observed every commit.
 All 449,850 final rows matched. Catalog p95/p99 were **13,659.38/14,458.08 ms**,
 drain was **12.771 seconds**, and measured-cohort throughput including drain was
@@ -531,14 +531,14 @@ drain was **12.771 seconds**, and measured-cohort throughput including drain was
 catalog-latency and reader gates; its fifteen missed arrivals also make the
 admitted cohort different from release18's. No worker panics were logged.
 
-The [hundred-table case](../target/production-matrix-15/hundred-tables-10k/report.json)
+The hundred-table case (`target/production-matrix-15/hundred-tables-10k/report.json`, local artifact)
 failed during live observation on another DuckDB HTTP HEAD with no response,
 this time for `events_90`. It stopped after 5,875 committed transactions and 113
 missed arrivals across warmup and measurement, leaving 1,102 durable pending
 transactions. No complete workload latency or final reader qualification is
 claimed for that interrupted run.
 
-The separate [retained-backlog recovery](../target/production-reader-failure-recovery-01/report.json)
+The separate retained-backlog recovery (`target/production-reader-failure-recovery-01/report.json`, local artifact)
 used the same immutable binary, state, configuration and permanent slot. It
 cleared all 1,102 pending transactions, matched **1,058,750 rows across 100 tables**,
 preserved the exact 1,047,830 rows in the pinned pre-recovery snapshots, and
@@ -550,7 +550,7 @@ diagnosis follows.
 
 ## Reader transport diagnosis
 
-The [retained diagnostic](../target/reader-transport-15/assessment.md) establishes
+The retained diagnostic (`target/reader-transport-15/assessment.md`, local artifact) establishes
 the cause of both hundred-table reader failures. Docker's VM port forwarder
 logged `connect: cannot assign requested address` for all four retries at
 10:32:46 UTC in matrix14 and 11:02:10 UTC in matrix15. A read-only diagnostic
@@ -582,19 +582,19 @@ this explicitly recorded transport configuration is still required.
 
 ## Counted batching and matched pending windows: release21
 
-[Release21](../target/qualification-binaries/release21.json) passed formatting,
+Release21 (`target/qualification-binaries/release21.json`, local artifact) passed formatting,
 workspace tests, strict Clippy, Rust 1.94 checks and the nine-phase live
-[journal/ledger upgrade](../target/production-journal-upgrade-01/report.json).
+journal/ledger upgrade (`target/production-journal-upgrade-01/report.json`, local artifact).
 Its daemon SHA-256 is
 `a014a32b00470c03e389638347876beb12cace2434416b8e1120dfb13bc06348`;
 the exact source archive and build-tool versions are retained in
-[source-release21.json](../target/qualification-binaries/source-release21.json).
+source-release21.json (`target/qualification-binaries/source-release21.json`, local artifact).
 The build adds durable per-table source mutation counts and removes transient
 prepared-delta iterator copies. Its initial admission implementation also uses
 10,000 mutations as a hard epoch limit, which the measurements below exposed as
 a costly restriction.
 
-All three [matrix16 cases](../target/production-matrix-16/matrix.json) used stock
+All three matrix16 cases (`target/production-matrix-16/matrix.json`, local artifact) used stock
 DuckDB connection caching, unchanged retry/metadata-cache settings, sixty measured
 seconds after ten seconds of warmup, four source writers, native concurrent
 compaction and the same compacted-reader protocol. Every committed transaction
@@ -617,7 +617,7 @@ missed 1,568 arrivals and delivered only 23,416 measured-cohort mutations/s when
 drain is included. Its exact row digest is
 `0ced59403863ab6c3a859dc9aef0b8d394850d4287ed86d5ed62e8c0feb0b28b`.
 
-[Phase attribution](../target/production-matrix-16/mixed-50k/phase-attribution.json)
+Phase attribution (`target/production-matrix-16/mixed-50k/phase-attribution.json`, local artifact)
 shows 335 ingestion epochs, with 334 containing exactly 100 source transactions.
 Release20 had 142 epochs, mostly 256 transactions. The pre-final table-lane
 interval increased from 82.771 to 131.420 seconds: serial compaction from 27.319
@@ -638,13 +638,13 @@ release21's failed reports remain unchanged.
 
 ## Corrected admission and residual merge: release22
 
-[Release22](../target/qualification-binaries/release22.json), daemon SHA-256
+Release22 (`target/qualification-binaries/release22.json`, local artifact), daemon SHA-256
 `217946a5d004b7d00e87216cae62071c04159a86f1565d33325c0183bf75ddf6`, passed
 formatting, workspace all-target tests, strict Clippy and Rust 1.94 checks.
-The [seven-phase concurrent-compaction gate](../target/production-concurrent-compaction-06/report.json)
+The seven-phase concurrent-compaction gate (`target/production-concurrent-compaction-06/report.json`, local artifact)
 passed with exact current and historical rows, deadline cancellation and actual
 join, held-I/O shutdown and restart, and no worker panics. The
-[fixture SIGINT regression](../target/production-compactor-shutdown-01/report.json)
+fixture SIGINT regression (`target/production-compactor-shutdown-01/report.json`, local artifact)
 reproduced release21's lost signal; release22 completed the held pass and exited
 0 in 18.4 ms after release. Source and toolchain provenance are retained.
 
@@ -655,7 +655,7 @@ into the bounded writer. Sequence rules, H validation and Prepared/CAS recovery
 are unchanged. Stream traversal now appears in residual-write timing, so a drop
 in residual-spool time alone is not a speedup measurement.
 
-[Matrix17 mixed-50k](../target/production-matrix-17/mixed-50k/report.json) used the
+Matrix17 mixed-50k (`target/production-matrix-17/mixed-50k/report.json`, local artifact) used the
 same declared connection-cache protocol, sixty measured seconds after ten
 seconds of warmup, four source writers, pending window 256 and native concurrent
 compaction. All **30,000/30,000 transactions** committed and were observed, with
@@ -675,23 +675,23 @@ Original versus compacted pins contained 20/1 data files, 8/0 delete files and
 Both the daemon and baseline compactor exited 0, with no worker panics. The row-cap
 regression recovered, but latency and reader performance still fail.
 
-[Phase attribution](../target/production-matrix-17/mixed-50k/phase-attribution.json)
+Phase attribution (`target/production-matrix-17/mixed-50k/phase-attribution.json`, local artifact)
 records an 80.044-second pre-final interval: 26.150 seconds of serial compaction,
 15.866 of collapse, 16.046 of preparation, 13.939 of post-catalog work, 4.786 of
 ingestion catalog work and 0.216 of completion. The seven catch-up phases total
 13.840 seconds across all logged catch-ups. These are path measurements, not
 isolated CPU costs or a controlled estimate of either individual source change.
 
-Separate [reader profiles](../target/reader-path-profile-22-02/assessment.md)
+Separate reader profiles (`target/reader-path-profile-22-02/assessment.md`, local artifact)
 retain the same verified pins: median planning was 1.990/1.883 ms, and accumulated
 parallel scan-operator time was 38.545/23.496 ms. These instrumented measurements
 show a larger scan difference than planning difference; they neither replace the
 quiet paired ratio nor isolate network, decoding and CPU. A separate
-[instrumented daemon sample](../target/production-cpu-profile-22/profile.json)
+instrumented daemon sample (`target/production-cpu-profile-22/profile.json`, local artifact)
 also preserved exact rows and all 30,000 observations. Its profiler overhead
 precludes treating it as a quiet qualification run.
 
-The [exact pinned-layout census](../target/reader-layout-census-22/assessment.md)
+The exact pinned-layout census (`target/reader-layout-census-22/assessment.md`, local artifact)
 found 625,705 physical data rows and 175,705 unique, applicable deleted positions,
 leaving the verified 450,000 live rows. There were no duplicate, dangling or
 sequence-inapplicable delete records. Data row groups were 84 versus 58, with
@@ -704,7 +704,7 @@ pass. This census reads exact delete rows and data footers, not timed data scans
 
 ## Source-ledger lock isolation: release23
 
-The [wall-stack assessment](../target/production-cpu-profile-22/callpath-assessment.md)
+The wall-stack assessment (`target/production-cpu-profile-22/callpath-assessment.md`, local artifact)
 found the main coordinator waiting for the row/spool mutex during source-ledger
 registration in 1,381/4,308 observations (32.06%). This is sampled wall time,
 not CPU utilization or a speedup forecast. The change bypasses that mutex only
@@ -714,10 +714,10 @@ row/table/operation read-modify-write paths keep their lock. Checkpoints hold bo
 locks and recheck failure. Actual-database liveness, failed control-write and
 reopen tests passed, as did all Rust/MSRV gates.
 
-The immutable [release23](../target/qualification-binaries/source-release23.json)
+The immutable release23 (`target/qualification-binaries/source-release23.json`, local artifact)
 daemon is `da62b6bb44c9fe242742c3b647141f887a9cba58a31c4afaddef7a6d684c35b8`.
-[Matrix18](../target/production-matrix-18/matrix.json) used an immutable
-[copy of the previous harness](../target/qualification-harnesses/release23/manifest.json),
+Matrix18 (`target/production-matrix-18/matrix.json`, local artifact) used an immutable
+copy of the previous harness (`target/qualification-harnesses/release23/manifest.json`, local artifact),
 with the same sixty-second window, ten-second warmup, stock connection cache,
 default row/descriptor budgets and native concurrent compaction. This separates
 the measurement from subsequent bounded-recorder development.
@@ -736,7 +736,7 @@ The 50k digest remains
 `6029dd6903ebdb7ad7cf65b6b400da97bdbead0020a7d9fe02c9a5f41ecfb47a`.
 Its original pin contains 17 data files, seven delete files and 15,221,949 data
 bytes; the compacted pin contains one data file, no deletes and 11,096,051 bytes.
-The [phase attribution](../target/production-matrix-18/mixed-50k/phase-attribution.json)
+The phase attribution (`target/production-matrix-18/mixed-50k/phase-attribution.json`, local artifact)
 shows an interval of 78.225 seconds through the last catalog completion. Collapse
 remained 15.861 seconds, preparation 15.739 and post-catalog work 14.236. Serial
 compaction totaled 23.826 seconds, with no strict fallback in this run. The
@@ -746,7 +746,7 @@ liveness fix, not a 32% reduction in row-processing cost.
 
 ## Processing-batch sensitivity on release23
 
-A single [same-binary variant](../target/production-batch-sensitivity-23/report.json)
+A single same-binary variant (`target/production-batch-sensitivity-23/report.json`, local artifact)
 changed `batch_rows` from 1,024 to 4,096, retaining the immutable previous harness,
 8 MiB decoded writer batches, 32 MiB row groups, source chunk bytes, pending
 window, compaction policy, workload and SLOs. It was motivated by repeated
@@ -763,7 +763,7 @@ processes exited 0; no worker panics occurred.
 Compared with matrix18's 1,024-row control, catalog p95 fell from 9,169.489 ms
 and drain from 8.225 seconds. Sampled daemon RSS increased from 462,929,920 to
 532,660,224 bytes; one-second sampling is not a true peak bound.
-[Phase attribution](../target/production-batch-sensitivity-23/phase-attribution.json)
+Phase attribution (`target/production-batch-sensitivity-23/phase-attribution.json`, local artifact)
 records 12.317 seconds of collapse (previously 15.861), 12.251 of post-catalog
 work (14.236) and 15.612 of preparation (15.739). Total catch-up work fell from
 13.810 to 10.821 seconds. The variant also had 163 rather than 153 epochs and
@@ -779,12 +779,12 @@ full rows with a server-side PostgreSQL cursor and DuckDB CSV spill. Actual-file
 tests preserve uniform/hot/Zipf rank selection, delete swap order, missing-probe
 holes, unsigned LSN ordering, failure tails and recorder shutdown. Offline replay
 of 7,000 retained transactions reproduced all 17 existing workload fields.
-[Validation evidence](../target/benchmark-storage-validation-01/report.json)
+Validation evidence (`target/benchmark-storage-validation-01/report.json`, local artifact)
 records the exact sources and inputs.
 
-The [live smoke](../target/production-bounded-protocol-smoke-01/report.json)
+The live smoke (`target/production-bounded-protocol-smoke-01/report.json`, local artifact)
 passed with 600 total transactions across three tables, native compaction and
-36,000 exact final rows. A fresh [50k control](../target/production-bounded-protocol-matched-01/report.json)
+36,000 exact final rows. A fresh 50k control (`target/production-bounded-protocol-matched-01/report.json`, local artifact)
 then used immutable release23, default 1,024-row batches and the same 60-second
 measurement plus ten-second warmup. Protocol `disk-evidence-paged-probes-v2`
 changes the observation query and explicitly sets DuckDB's memory limit to 1 GiB;
@@ -804,7 +804,7 @@ how much of the catalog-latency difference it caused. A bounded fixed-pin query
 comparison found no benefit from an explicit marker range: current `IN` and
 `IN` plus `BETWEEN` had medians of 50.598 and 51.049 ms over four alternating
 pairs, returning the same 1,024 IDs from four data files. DuckDB already supplied
-dynamic range filters. [Profiles](../target/probe-sql-profile-v2-02/operator-summary.json)
+dynamic range filters. Profiles (`target/probe-sql-profile-v2-02/operator-summary.json`, local artifact)
 retain this rejected explanation; the bounded query and protocol were unchanged.
 
 ## Rejected compact physical-index encoding
@@ -812,7 +812,7 @@ retain this rejected explanation; the bounded query and protocol were unchanged.
 A private file-token dictionary was implemented and tested against actual
 RocksDB databases, preserving public paths and durable plans. Snapshot retention,
 atomic last-reference retirement, obsolete-row handling and corruption checks
-passed. The [24-sample comparison](../target/compact-index-profile/runs-01/report.json)
+passed. The 24-sample comparison (`target/compact-index-profile/runs-01/report.json`, local artifact)
 used 32,768 rows, three update rounds, identical 111-byte paths, eight or 256
 files, 1,024/4,096-row batches and three alternating repetitions per variant.
 It measured actual apply batches and separate read, collapse and storage costs.
@@ -830,8 +830,8 @@ dictionary tuning or service qualification is claimed.
 
 ## Measured maintenance work on release25
 
-The [unchanged bounded-protocol control](../target/production-bounded-protocol-matched-25/report.json)
-uses [release25](../target/qualification-binaries/source-release25.json), the same
+The unchanged bounded-protocol control (`target/production-bounded-protocol-matched-25/report.json`, local artifact)
+uses release25 (`target/qualification-binaries/source-release25.json`, local artifact), the same
 frozen harness, default 1,024-row batches and compaction budgets. Its only runtime
 changes since release24 add bounded observations at existing durability and
 maintenance boundaries. All 30,000 measured transactions committed and were
@@ -848,7 +848,7 @@ physical data rows, built 2,235,749 rows and applied 1,900,019 mappings. The
 difference is exactly 335,730 catch-up masks. Each concurrent pass satisfies
 built mappings = accepted + masked, and accepted = applied, with no obsolete
 rows or partial apply cursor. These are physical-work counts, not unique source
-rows. [Phase attribution](../target/production-bounded-protocol-matched-25/phase-attribution.json)
+rows. Phase attribution (`target/production-bounded-protocol-matched-25/phase-attribution.json`, local artifact)
 records **27.018 seconds** of serial maintenance, including **11.059 seconds**
 of inner catch-up and **8.998 seconds** of commit marking and index application.
 Residual writing consumed 1.669 seconds inside catch-up. These nested intervals
@@ -864,7 +864,7 @@ counting boundaries for further optimization, not production cost qualification.
 
 ## Release26 matched control
 
-The [same bounded workload](../target/production-bounded-protocol-matched-26/report.json)
+The same bounded workload (`target/production-bounded-protocol-matched-26/report.json`, local artifact)
 uses immutable release26, the frozen v2 harness and unchanged batching and
 maintenance budgets. All 30,000 measured transactions committed and were observed;
 all 35,000 transactions including warmup joined exactly across journal, catalog
@@ -881,10 +881,10 @@ New registration histograms record 4,993 successful pages covering all 35,000
 transactions in 1.310 seconds of dispatcher time. This interval includes reading
 and validating descriptors and registering their durable ledger entries. It is
 separate from capture-thread journal sync, and the two totals must not be added
-as serial publication work. The [retained audit](../target/bounded-protocol-validation-26/summary.json)
+as serial publication work. The retained audit (`target/bounded-protocol-validation-26/summary.json`, local artifact)
 verifies all joins, metric counts, exact rows, hashes and stopped clients.
 
-The [maintenance comparison](../target/compaction-work-amplification-26/assessment.md)
+The maintenance comparison (`target/compaction-work-amplification-26/assessment.md`, local artifact)
 finds slightly more physical work before final ingestion: 4,747,664 admitted
 rows, 2,323,160 built rows and 467,438 late masks. All completed passes preserve
 the mapping and artifact count invariants. Serial maintenance falls from 27.018
@@ -894,7 +894,7 @@ the whole latency difference to allocation savings. Controlled rewrite apply
 preparation still accounts for 6.026 seconds across the full run; its enclosing
 metric does not distinguish decoding, reads and write-batch construction.
 
-A subsequent [spool-serialization comparison](../target/state-encoding-profile-26/assessment.md)
+A subsequent spool-serialization comparison (`target/state-encoding-profile-26/assessment.md`, local artifact)
 reused one encoding buffer per state batch. All twelve actual-database samples
 and the failure/reopen checks passed, but collapse results were inconsistent:
 1.79% slower with eight files and 3.20% faster with 256, with overlapping ranges.
@@ -902,7 +902,7 @@ Unchanged read paths moved by similar amounts. The candidate was rejected and
 all state-store sources restored exactly to release26. Its code and results are
 retained; no live-workload gain is claimed.
 
-The subsequent [reverse-owner comparison](../target/reverse-owner-profile-26/assessment.md)
+The subsequent reverse-owner comparison (`target/reverse-owner-profile-26/assessment.md`, local artifact)
 supports one narrower index change. A bounded seek can prove that every target
 in a single-file batch lies beyond its existing indexed positions; otherwise
 the original ownership reads remain. One-file apply median fell from 233.061
@@ -914,14 +914,14 @@ not an end-to-end latency claim.
 
 ## Release27 bounded control and crash recovery
 
-Immutable [release27](../target/qualification-binaries/release27.json) passed all
+Immutable release27 (`target/qualification-binaries/release27.json`, local artifact) passed all
 120 active Rust tests, strict Clippy, the Rust 1.94 check and the corrected
-[12-phase service-fault suite](../target/production-faults-14/report.json).
-The [first fault attempt](../target/production-faults-13/failure-summary.json)
+12-phase service-fault suite (`target/production-faults-14/report.json`, local artifact).
+The first fault attempt (`target/production-faults-13/failure-summary.json`, local artifact)
 retains a legitimate catalog conflict that prevented the fixture's forced-success
 crash boundary; the subsequent fixture correction did not change the binaries.
 
-The [unchanged bounded-v2 control](../target/production-bounded-protocol-matched-27/report.json)
+The unchanged bounded-v2 control (`target/production-bounded-protocol-matched-27/report.json`, local artifact)
 verified all **34,881 committed transactions** and **448,810 exact final rows**,
 before and after independent baseline compaction. It missed **119 of 30,000
 scheduled measured arrivals**; 29,881 measured transactions committed, and every
@@ -933,7 +933,7 @@ full-scan slowdown **2.092×**. All three remain performance failures. The admit
 cohort differs from earlier controls, so this run does not establish a matched
 full-rate improvement. Both owned clients exited 0; no worker panics occurred.
 
-The [retained audit](../target/bounded-protocol-validation-27/readout.md) verifies
+The retained audit (`target/bounded-protocol-validation-27/readout.md`, local artifact) verifies
 all outcome records and identifies two missed-arrival clusters across all four
 source writers. The retained client intervals include recorder and source work;
 they cannot isolate PostgreSQL execution or recorder backpressure as the cause.
@@ -950,7 +950,7 @@ additional uncompleted build remains separate from committed output.
 
 ## Isolated PostgreSQL WAL overhead
 
-The [replica-identity comparison](../target/production-wal-overhead-01/assessment.md)
+The replica-identity comparison (`target/production-wal-overhead-01/assessment.md`, local artifact)
 passed 12 cases and 24 measured phases on an isolated PostgreSQL 18.6 cluster:
 48,000 mutations with exact rows, identical ordered changes between FULL and
 DEFAULT, and three alternating pairs for each payload. No catalog or daemon
@@ -967,7 +967,7 @@ container and volume were confirmed removed.
 
 ## Pinned reader planning and selective queries
 
-The [release27 reader diagnostic](../target/production-reader-diagnostics-27-01/assessment.md)
+The release27 reader diagnostic (`target/production-reader-diagnostics-27-01/assessment.md`, local artifact)
 uses the exact verified 448,810-row pre/post-compaction pins after owned writers
 stopped. All 176 query attempts returned matching aggregates, including 2,057
 rows selected by `id BETWEEN 1 AND 10000`; all 80 detailed profiles are retained.
@@ -988,7 +988,7 @@ frozen source remain unchanged.
 
 ## Journal replay and whole-collapse diagnostics
 
-The [journal comparison](../target/journal-replay-profile/assessment.md) supports
+The journal comparison (`target/journal-replay-profile/assessment.md`, local artifact) supports
 retaining one reusable reader per epoch. Three alternating pairs replayed the
 same checksummed files with unchanged payload checks. At 29,600 bytes per
 transaction, median warm replay fell from 0.777 to 0.220 seconds per 65,536
@@ -997,7 +997,7 @@ mutation decoding, index work and publication were outside that timer. All input
 file hashes stayed unchanged; actual-file tests cover errors, partial iterators,
 transaction-ID reuse, independent readers and a growing tail that later rolls.
 
-A separate [whole-collapse diagnostic](../target/whole-collapse-profile-27/assessment.md)
+A separate whole-collapse diagnostic (`target/whole-collapse-profile-27/assessment.md`, local artifact)
 uses the unchanged release27 reader and real journal, controlled index and
 Parquet publication. Three fixed runs each processed 256 transactions containing
 25,600 mutations, with repeated keys, updates, deletes and primary-key moves.
@@ -1012,7 +1012,7 @@ onto the production collapse total. They support the small replay change and
 direct batch-phase measurement in the next service run. Speculative epoch
 reservation remains deferred.
 
-The [compaction mapping comparison](../target/catchup-overlap-profile-27/assessment.md)
+The compaction mapping comparison (`target/catchup-overlap-profile-27/assessment.md`, local artifact)
 supports overlapping one accepted batch's staging with the next batch's checks
 at the same fenced head. Median whole catch-up fell from **249.173 to 226.342 ms**,
 or **9.163%**, with non-overlapping observed ranges across three alternating
@@ -1027,15 +1027,15 @@ qualify service latency or reader performance.
 
 ## Release28 correctness and bounded control
 
-Immutable [release28](../target/qualification-binaries/source-release28.json)
+Immutable release28 (`target/qualification-binaries/source-release28.json`, local artifact)
 passed all 124 active Rust tests, strict Clippy and Rust 1.94 checks. The
-[campaign](../target/release28-campaign/execution/summary.json) then passed all
+campaign (`target/release28-campaign/execution/summary.json`, local artifact) then passed all
 seven concurrent-compaction phases and twelve service-fault phases before running
 one unchanged bounded-v2 control. Every owned process group was empty before the
 next gate. The fault suite retained three independent-compactor supervisor
 restarts as availability incidents.
 
-The [control](../target/production-bounded-protocol-matched-28/report.json)
+The control (`target/production-bounded-protocol-matched-28/report.json`, local artifact)
 committed and observed all **35,000 transactions**, including all 30,000 measured
 arrivals. No arrivals were missed. Exact **450,000 final rows** and their checksum
 matched before and after independent baseline compaction.
@@ -1052,14 +1052,14 @@ matched before and after independent baseline compaction.
 committed cohort is not a matched full-rate baseline. The combined changes and
 shared host also prevent attributing the difference to one optimization.
 
-The [retained audit](../target/bounded-protocol-validation-28/readout.md) checks
+The retained audit (`target/bounded-protocol-validation-28/readout.md`, local artifact) checks
 SQLite integrity, every source/journal/catalog/reader join and recalculated
 percentiles. All local source frontiers ended at 90,270,299,304 with zero pending
 transactions. The frozen harness did not retain a final PostgreSQL
 `confirmed_flush_lsn`, so those local frontiers do not prove the server's final
 received ACK. Daemon and baseline compactor exited zero, with no worker panics.
 
-Direct [StateStore timing](../target/collapse-production-audit-28/assessment.md)
+Direct StateStore timing (`target/collapse-production-audit-28/assessment.md`, local artifact)
 records 3,439 write attempts with matching counts across all six phases. Lifetime
 collapse batch time totals 14.550 seconds: primary-key lookup 6.164 seconds,
 staged writes 4.298 seconds, prior-spool reads 2.381 seconds, binding 1.227 seconds,
@@ -1069,7 +1069,7 @@ and metric emission. They differ from the isolated all-miss fixture and do not
 measure CPU time.
 
 
-The [compaction audit](../target/compaction-work-amplification-28/assessment.md)
+The compaction audit (`target/compaction-work-amplification-28/assessment.md`, local artifact)
 verifies all 25 completed operations against their logged mappings, masks, deletes
 and applies; no incomplete builds remain in this run. Before final ingest,
 maintenance occupied 19.391 seconds and the measured table-lane union occupied
@@ -1082,7 +1082,7 @@ focuses on the measured database work, preserving the existing compaction protoc
 
 ## Rejected independent-flush experiment
 
-The [fixed StateStore comparison](../target/atomic-flush-profile-28/assessment.md)
+The fixed StateStore comparison (`target/atomic-flush-profile-28/assessment.md`, local artifact)
 tested removing `atomic_flush=true` while keeping WAL enabled and every durability
 barrier unchanged. Six actual-database samples, in alternating order, passed exact
 rows, reverse mappings, counts and checkpoint/reopen checks. A separate abrupt-exit
@@ -1092,7 +1092,7 @@ Median lifecycle time rose from **1.476 to 1.618 seconds**; observed ranges over
 (1.291–1.587 versus 1.371–2.000 seconds). Pre-checkpoint retained index WAL grew
 from about **20.96 MB to 455.64 MB**. Fewer flushes did not establish a performance
 benefit. The candidate was rejected, and the
-[restoration proof](../target/atomic-flush-profile-28/restoration-proof.json)
+restoration proof (`target/atomic-flush-profile-28/restoration-proof.json`, local artifact)
 verifies that production Rust source again matches release28. The candidate and
 its targeted test remain in the diagnostic archive. No release29 service campaign
 ran, and no new throughput or latency result is claimed.
@@ -1107,7 +1107,7 @@ initial copies, oversized transactions and legacy descriptors use disk directly.
 This leaves transaction scheduling, persisted formats and durability barriers
 unchanged.
 
-The [finite actual-file comparison](../target/collapse-buffer-profile-29/runs-01/report.json)
+The finite actual-file comparison (`target/collapse-buffer-profile-29/runs-01/report.json`, local artifact)
 uses one frozen candidate executable with disk-only and 32 MiB settings. Three
 alternating pairs per workload each replay 256 transactions of 100 mutations:
 60 ordinary updates, 10 key moves, 20 inserts and 10 deletes, with three-column
@@ -1159,7 +1159,7 @@ from 12.537 seconds in release28 to 6.369 seconds in release29. This confirms th
 buffer is active and reducing its intended work, but does not explain or erase
 the end-to-end failure.
 
-[Phase attribution](../target/phase-attribution-29/README.md) shows the prefinal
+Phase attribution (`target/phase-attribution-29/README.md`, local artifact) shows the prefinal
 table lane grew from 67.317 to 68.893 seconds despite less committed source work.
 Release29 spends 22.285 seconds in maintenance, including 11.857 seconds of catch-up
 and 7.774 seconds of mark/apply. Preparation plus commit after ingestion catalog
@@ -1179,7 +1179,7 @@ then leaves reverse ownership, file counts, cursor updates and the durable write
 batch on the existing owned delta. Codec tests require byte-for-byte
 reserialization and matching trailing, truncated and invalid UTF-8 behavior.
 
-The [finite comparison](../target/apply-borrow-profile-29/assessment.md) runs
+The finite comparison (`target/apply-borrow-profile-29/assessment.md`, local artifact) runs
 twelve serial actual-RocksDB samples across one-file and 256-file layouts. Each
 sample applies 98,304 accepted replacements and 24,576 obsolete rewrite rows in
 1,024-row batches, then verifies every forward row, reverse owner and file count
@@ -1207,11 +1207,11 @@ compactor SHA-256 `bba2b925b13e373bb524e5208b904aaee37d78926c6258bce40ad5de878bc
 Release32 is frozen at commit `5efbf5b89005d1b59d6bc88bfbcce2259774e891`
 with daemon SHA-256 `9519e6c30e8964c8147b726381ca665ca128949aae004eb31b9cb76880f4882b`
 and external compactor SHA-256 `b92922700e757652c2433244d0c5adcf540138d23276e103a6586fe1822fbe8d`.
-The [comparison](../target/production-maintenance-matrix-release32-01/comparison.md)
+The comparison (`target/production-maintenance-matrix-release32-01/comparison.md`, local artifact)
 records both build manifests, source trees and unchanged harness hashes.
 
 The same release32 daemon passes all seven phases in the
-[concurrent-compaction service gate](../target/production-concurrent-compaction-release32-01/report.json).
+concurrent-compaction service gate (`target/production-concurrent-compaction-release32-01/report.json`, local artifact).
 It publishes real updates, deletes, key moves and delete/reinsert while compaction
 I/O is held, pauses ACK at hard debt, requests cancellation at 30.003 seconds and
 retains BUILD until join/retire at 37.042 seconds, then removes scratch. SIGTERM
@@ -1221,7 +1221,7 @@ successful service path plus build cancellation and restart boundaries; it is no
 a sustained workload qualification.
 
 It also passes all twelve correctness and recovery phases in the
-[release32 fault gate](../target/production-faults-release32-01/report.json): an
+release32 fault gate (`target/production-faults-release32-01/report.json`, local artifact): an
 actual committed-response loss, catalog HTTP outage, durable REST/MinIO/PostgreSQL
 restarts, SIGKILL with journaled unacknowledged work, successful catalog commit
 before physical index loss, wide/unchanged TOAST and independent reader/manifest
@@ -1281,7 +1281,7 @@ amplification remains the failed gate.
 
 ## Release32 RocksDB staging profile
 
-The [actual-RocksDB profile](../target/sst-staging-profile-32/assessment.md) runs
+The actual-RocksDB profile (`target/sst-staging-profile-32/assessment.md`, local artifact) runs
 three rotated fresh-database samples for each of 100,000 and 1,000,000 mappings.
 It compares current staging with two prevalidated compaction lower bounds: ordinal
 WAL records and an LZ4 external SST installed into the isolated delta column
@@ -1306,7 +1306,7 @@ atomic apply batches, with independent row and serialized-byte ceilings.
 
 ## State-store apply-batch profiles
 
-The [first comparison](../target/apply-batch-row-profile-33/assessment.md) runs 72
+The first comparison (`target/apply-batch-row-profile-33/assessment.md`, local artifact) runs 72
 rotated actual-RocksDB samples. Its compaction cases cover 100,000 and 1,000,000
 rows with eight and 256 files; its 90/10 update-delete cases use 100,000 and
 1,000,000 rows with 256 files. It verifies exact forward and reverse mappings,
@@ -1314,7 +1314,7 @@ file counts, operation cursors, table state and clean reopen.
 None of the coupled 4,096, 8,192 or 16,384-row settings improves every case;
 all increase call tails and peak RSS. The result retains 1,024.
 
-The [decoupled comparison](../target/apply-batch-decoupled-profile-33/assessment.md)
+The decoupled comparison (`target/apply-batch-decoupled-profile-33/assessment.md`, local artifact)
 uses source commit `8be299ac751510fc5d61ed6aab4e8c1cac49939e` and frozen binary
 `6e96635fc3087f9ea83231a3883680c367793d900a049cdadd57488e28590abc`.
 It fixes PK and reverse lookup chunks at 1,024 rows, then runs 27 compaction and

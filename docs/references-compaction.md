@@ -65,7 +65,7 @@ it cannot replace their atomic write batch. Current RocksDB main has a separate
 [prepare/commit ingestion API](https://github.com/facebook/rocksdb/blob/37234200b57d8d0a6a5c41f2d9811bbd2e293544/include/rocksdb/db.h#L2396-L2445),
 but that API is not present in the pinned engine or Rust binding.
 
-The [measured apply comparisons](../target/apply-batch-decoupled-profile-33/assessment.md)
+The measured apply comparisons (`target/apply-batch-decoupled-profile-33/assessment.md`, local artifact)
 reject larger live-index `WriteBatch` commits. The implementation can now hold
 PK and reverse lookup chunks at 1,024 rows while building a larger atomic commit,
 and it records exact serialized bytes, operations, owner reads and phase timing.
@@ -131,7 +131,7 @@ every possible target. Counter reads require the same unfenced table snapshot;
 older index formats rebuild from catalog authority before using these counters.
 Both applicable fanout and total delete-file count contribute to reader debt,
 so dangling files cannot accumulate outside the maintenance policy. The real
-[format-2-to-3 upgrade gate](../target/production-upgrade-01/report.json) rebuilt
+format-2-to-3 upgrade gate (`target/production-upgrade-01/report.json`, local artifact) rebuilt
 those derived counts without replacing control authority or the permanent slot.
 
 External data rewrites are accepted only after comparing every live key and its
@@ -154,7 +154,7 @@ hint. A compacted singleton does not repeatedly rewrite just because it is small
 
 ## Measured follow-up
 
-[Matrix04](production-qualification.md#delete-consolidation-follow-up) measured
+[Matrix04](development/production-qualification.md#delete-consolidation-follow-up) measured
 delete-only consolidation and exact density on release06. Its 1k run used six
 data rewrites and 19 delete passes, with 30.209 MB returned by storage reads and
 21.643 MB accepted by streaming writes, down from 101.246 MB and 78.526 MB in

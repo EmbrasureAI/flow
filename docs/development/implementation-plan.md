@@ -70,24 +70,24 @@ ratios. This diagnostic does not complete the 50k or 24-hour production gates.
 
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 
-- [Bootstrap recovery](../target/production-bootstrap-02/report.json) and [DDL between COPY attempts](../target/production-bootstrap-ddl-02/report.json): mid-COPY crash, durable staging reuse, concurrent CDC, index deletion and automatic rebuild.
-- [Schema/lifecycle contracts](../target/production-contracts-08/report.json): eleven passing phases on release24 covering idle nullable additions during native compaction, lost response, queued versions, abort/savepoint boundaries, historical schema widths, checkpoint restore and SIGTERM/status. Separate contract reports verify unsupported defaults and column incarnation fencing.
-- [Durable faults](../target/production-faults-15/report.json): twelve passing phases on release28 across actual service outages/restarts, successful-commit response loss, durable unpublished work and physical index loss. Both crash phases require successful current-phase Prepared requests after SIGKILL and before replacement. The independent compactor pauses across those two forced-success phases and runs through the other faults.
-- [Release32 durable faults](../target/production-faults-release32-01/report.json): twelve passing correctness/recovery phases cover committed-response loss, catalog outage, durable REST/MinIO/PostgreSQL restarts, SIGKILL with journaled work, a successful catalog commit followed by physical index loss, wide/unchanged TOAST and an independent reader/manifest audit. Three external-compactor supervisor restarts remain availability incidents.
-- [Reader-debt recovery](../target/production-pressure-01/report.json): publication and ACK pause, continued capture, external compaction and automatic resumption.
-- [Independent readers](../target/production-readers-06/report.json): sixteen passing phases on release23, native compaction before and after independently attributed Spark rewrites, exact keyed and keyless duplicate rows across Spark/Trino/DuckDB, retained histories and source changes across restart.
-- [Index-format upgrade](../target/production-upgrade-01/report.json): release05 → release06 preserved the control store, source identity and permanent slot; rebuilt format-2 state into format 3; consumed queued WAL; preserved exact CRUD/key moves and history; and reused the new generation on the next restart.
-- [Delete/residual integration](../crates/testkit/tests/delete_rewrite.rs): actual Parquet/Avro and stock Rust reads verify sequence filtering, shared targets, duplicate positions, exact deletion density, dangling-file removal, unchanged base files, lost-response recovery and full index-loss reconstruction.
-- [Release32 concurrent compaction](../target/production-concurrent-compaction-release32-01/report.json): seven passing real-service phases cover CRUD, key moves and delete/reinsert while compaction I/O is held, hard-debt acknowledgement pause, deadline retirement with BUILD protection, scratch cleanup, SIGTERM during held I/O and restart recovery with retained history.
-- [RocksDB staging profile](../target/sst-staging-profile-32/assessment.md): eighteen alternating fresh-database samples at 100,000 and 1,000,000 mappings compare current staging, a prevalidated ordinal WAL lower bound and external-SST staging. Exact forward/reverse owners, file counts, cursors and reopen checks pass, including cleanup after closing between SST ingestion and sealing.
-- Index apply profiles: the [72-sample coupled screen](../target/apply-batch-row-profile-33/assessment.md) rejects 4,096, 8,192 and 16,384 rows. A [second 36-sample screen](../target/apply-batch-decoupled-profile-33/assessment.md) fixes lookup chunks at 1,024 while comparing 1,024, 4,096 and 8,192-row atomic commits. Every sample passes exact index and reopen checks; neither larger commit group meets the declared workload gains.
-- [Linux demo](../target/production-linux-demo-01/report.json): a freshly built Linux image, fresh isolated volumes, standard Trino CRUD, non-root ownership, SIGTERM exit 0, resumed source backlog and idempotent initialization.
+- Bootstrap recovery (`target/production-bootstrap-02/report.json`, local artifact) and DDL between COPY attempts (`target/production-bootstrap-ddl-02/report.json`, local artifact): mid-COPY crash, durable staging reuse, concurrent CDC, index deletion and automatic rebuild.
+- Schema/lifecycle contracts (`target/production-contracts-08/report.json`, local artifact): eleven passing phases on release24 covering idle nullable additions during native compaction, lost response, queued versions, abort/savepoint boundaries, historical schema widths, checkpoint restore and SIGTERM/status. Separate contract reports verify unsupported defaults and column incarnation fencing.
+- Durable faults (`target/production-faults-15/report.json`, local artifact): twelve passing phases on release28 across actual service outages/restarts, successful-commit response loss, durable unpublished work and physical index loss. Both crash phases require successful current-phase Prepared requests after SIGKILL and before replacement. The independent compactor pauses across those two forced-success phases and runs through the other faults.
+- Release32 durable faults (`target/production-faults-release32-01/report.json`, local artifact): twelve passing correctness/recovery phases cover committed-response loss, catalog outage, durable REST/MinIO/PostgreSQL restarts, SIGKILL with journaled work, a successful catalog commit followed by physical index loss, wide/unchanged TOAST and an independent reader/manifest audit. Three external-compactor supervisor restarts remain availability incidents.
+- Reader-debt recovery (`target/production-pressure-01/report.json`, local artifact): publication and ACK pause, continued capture, external compaction and automatic resumption.
+- Independent readers (`target/production-readers-06/report.json`, local artifact): sixteen passing phases on release23, native compaction before and after independently attributed Spark rewrites, exact keyed and keyless duplicate rows across Spark/Trino/DuckDB, retained histories and source changes across restart.
+- Index-format upgrade (`target/production-upgrade-01/report.json`, local artifact): release05 → release06 preserved the control store, source identity and permanent slot; rebuilt format-2 state into format 3; consumed queued WAL; preserved exact CRUD/key moves and history; and reused the new generation on the next restart.
+- [Delete/residual integration](../../crates/testkit/tests/delete_rewrite.rs): actual Parquet/Avro and stock Rust reads verify sequence filtering, shared targets, duplicate positions, exact deletion density, dangling-file removal, unchanged base files, lost-response recovery and full index-loss reconstruction.
+- Release32 concurrent compaction (`target/production-concurrent-compaction-release32-01/report.json`, local artifact): seven passing real-service phases cover CRUD, key moves and delete/reinsert while compaction I/O is held, hard-debt acknowledgement pause, deadline retirement with BUILD protection, scratch cleanup, SIGTERM during held I/O and restart recovery with retained history.
+- RocksDB staging profile (`target/sst-staging-profile-32/assessment.md`, local artifact): eighteen alternating fresh-database samples at 100,000 and 1,000,000 mappings compare current staging, a prevalidated ordinal WAL lower bound and external-SST staging. Exact forward/reverse owners, file counts, cursors and reopen checks pass, including cleanup after closing between SST ingestion and sealing.
+- Index apply profiles: the 72-sample coupled screen (`target/apply-batch-row-profile-33/assessment.md`, local artifact) rejects 4,096, 8,192 and 16,384 rows. A second 36-sample screen (`target/apply-batch-decoupled-profile-33/assessment.md`, local artifact) fixes lookup chunks at 1,024 while comparing 1,024, 4,096 and 8,192-row atomic commits. Every sample passes exact index and reopen checks; neither larger commit group meets the declared workload gains.
+- Linux demo (`target/production-linux-demo-01/report.json`, local artifact): a freshly built Linux image, fresh isolated volumes, standard Trino CRUD, non-root ownership, SIGTERM exit 0, resumed source backlog and idempotent initialization.
 
 These reports span successive builds. Older service/stress and workload reports remain evidence for their recorded binaries; newer targeted checks do not replace a complete final-release run. Failed workload reports remain visible in the [production qualification report](production-qualification.md).
 
 ## Latest performance checkpoint
 
-Immutable [release29](../target/qualification-binaries/source-release29.json)
+Immutable release29 (`target/qualification-binaries/source-release29.json`, local artifact)
 passes 128 active Rust tests, strict Clippy, formatting and Rust 1.94 compatibility.
 The current-epoch buffer shares disk mutation rules and validates its captured
 schema, complete table state and physical head before publication. Its explicit
@@ -95,16 +95,16 @@ schema, complete table state and physical head before publication. Its explicit
 writer workspace remain separate. Persisted formats and durability barriers are
 unchanged.
 
-All fourteen [finite comparison cases](../target/collapse-buffer-profile-29/assessment.md)
+All fourteen finite comparison cases (`target/collapse-buffer-profile-29/assessment.md`, local artifact)
 pass exact current/history/index checks, including forced disk fallback. Lifecycle
 medians improve 29.88% for repeated keys and 10.71% for distinct keys. The
-[interrupted bootstrap/DDL gate](../target/production-bootstrap-ddl-03/report.json)
-passes five phases, and [faults16](../target/production-faults-16/report.json) passes
+interrupted bootstrap/DDL gate (`target/production-bootstrap-ddl-03/report.json`, local artifact)
+passes five phases, and faults16 (`target/production-faults-16/report.json`, local artifact) passes
 twelve phases including successful-commit response loss, index loss and external
 reconciliation. Three independent-compactor supervisor restarts remain recorded
 as availability incidents.
 
-The [bounded service control](../target/production-bounded-protocol-matched-29/report.json)
+The bounded service control (`target/production-bounded-protocol-matched-29/report.json`, local artifact)
 requests 50k mixed mutations/s with native concurrent compaction:
 
 | Check | Measured | Required |
@@ -127,7 +127,7 @@ and the bounded-v2 measurement protocol stay fixed.
 
 The first focused index-apply change removes duplicate owned decoding of current
 file paths and partitions without changing the durable representation. Its
-[twelve-sample actual-RocksDB comparison](../target/apply-borrow-profile-29/assessment.md)
+twelve-sample actual-RocksDB comparison (`target/apply-borrow-profile-29/assessment.md`, local artifact)
 passes exact forward/reverse/count/checkpoint/reopen checks. Median apply time
 improves 1.92% with one file and 3.64% with 256 files; obsolete apply improves
 4.35% and 4.79%. The full release gate passes 129 active tests. This is retained
@@ -136,7 +136,7 @@ as a bounded improvement and does not qualify the failed service control.
 Release31 establishes the controlled maintenance baseline. Release32 moves
 catalog-head validation, one immutable RocksDB index view and catch-up preparation
 out of the table actor, then activates only if the prepared catalog and complete
-table state still match exactly. The identical [A/B/C/D comparison](../target/production-maintenance-matrix-release32-01/comparison.md)
+table state still match exactly. The identical A/B/C/D comparison (`target/production-maintenance-matrix-release32-01/comparison.md`, local artifact)
 runs disabled, delete-only, L0-only and current maintenance at 1,000 and 10,000
 mutations/s. Every release31 and release32 case has complete measured arrivals,
 exact source acknowledgement and final rows, durable external reconciliation,
@@ -153,7 +153,7 @@ and 1.801/2.058/3.278/1.397 at 10k, so every case still fails the 1.25 bound.
 These finite runs qualify their correctness and catalog-latency gates, not the
 full production target or sustained reader health.
 
-The [release32 RocksDB staging profile](../target/sst-staging-profile-32/assessment.md)
+The release32 RocksDB staging profile (`target/sst-staging-profile-32/assessment.md`, local artifact)
 does not support adopting external SSTs as a general staging optimization. Against
 the comparable prevalidated ordinal-WAL path, external SST reduces median staging
 activation from 277.925 ms to 1.543 ms at one million mappings, after 258.6 ms of
@@ -162,9 +162,9 @@ Apply consumes 93.579% of that path. This narrows the next experiment to bounded
 atomic index-apply batches; live forward, reverse and count column families must
 remain one atomic transition.
 
-The [coupled apply screen](../target/apply-batch-row-profile-33/assessment.md)
+The coupled apply screen (`target/apply-batch-row-profile-33/assessment.md`, local artifact)
 passes 72 exact samples but rejects every larger row ceiling. The
-[decoupled screen](../target/apply-batch-decoupled-profile-33/assessment.md)
+decoupled screen (`target/apply-batch-decoupled-profile-33/assessment.md`, local artifact)
 then holds lookup chunks at 1,024 rows. Reverse-owner reads remain identical for
 every commit size, and 4,096/8,192-row commits improve the heavy one-million-row,
 256-file compaction by paired medians of 12.54%/12.38%. They reach only
@@ -175,8 +175,8 @@ does not justify a serialized 8 MiB cap or a service-matrix rerun for a larger
 row ceiling. The retained implementation still requires final service validation.
 
 No sustained 50k, 100-table or 24-hour qualification is claimed. The separate
-[WAL check](../target/production-wal-overhead-01/assessment.md) and
-[pinned reader diagnostic](../target/production-reader-diagnostics-27-01/assessment.md)
+WAL check (`target/production-wal-overhead-01/assessment.md`, local artifact) and
+pinned reader diagnostic (`target/production-reader-diagnostics-27-01/assessment.md`, local artifact)
 close specific measurement gaps without qualifying provider costs or the remaining
 workload dimensions. Final server-side PostgreSQL acknowledgement was not captured
 by bounded-v2; final local watermarks must not be relabeled as that measurement.

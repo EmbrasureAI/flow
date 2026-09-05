@@ -1,8 +1,11 @@
 [package]
 name = "flow-coordinator"
+description = "CDC ingestion and commit coordination for Embrasure Flow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

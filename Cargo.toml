@@ -12,6 +12,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
+repository = "https://github.com/EmbrasureAI/embrasure-flow"
+publish = false
 
 [workspace.dependencies]
 flow-model = { path = "crates/model" }

@@ -15,7 +15,7 @@ the user's main-branch retention policy. This is a small extension seam, not
 a replacement Iceberg metadata implementation. No upstream submission has
 been made.
 
-A [local reconstruction check](../target/vendor-patch-verification-26/report.json)
+A local reconstruction check (`target/vendor-patch-verification-26/report.json`, local artifact)
 applied all five documented patches without fuzz to the cached 0.10.1 release
 packages. All 224 vendored files matched, excluding the two project-specific
 `LOCAL_CHANGES.md` notes. The report records patch and package archive hashes

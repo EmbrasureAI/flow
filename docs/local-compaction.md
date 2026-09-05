@@ -136,15 +136,15 @@ The real RocksDB, Parquet/Avro and Iceberg-reader integration gates cover:
   recovery and subsequent bounded data compaction. Ordinary consolidation
   preserves dependency locality before and after index reopen.
 
-[Concurrent-compaction-04](../target/production-concurrent-compaction-04/report.json)
+Concurrent-compaction-04 (`target/production-concurrent-compaction-04/report.json`, local artifact)
 passed the same seven phases on release16 after one-pass staging and independent
 worker runtimes. Cancellation requested at 30.003 seconds retained ownership
 until actual join at build age 33.021 seconds. SIGTERM exited 0 in 1.030 seconds
 with I/O held; restart restored exact 36,089 orders and 17 accounts and retained
 both historical row streams. No worker panics were logged. The
-[validation report](validation.md) records the binary digest and final watermarks.
+[validation report](development/validation.md) records the binary digest and final watermarks.
 
-The historical [concurrent-compaction-03](../target/production-concurrent-compaction-03/report.json)
+The historical concurrent-compaction-03 (`target/production-concurrent-compaction-03/report.json`, local artifact)
 passed seven phases on release14
 `b8f430122b6b02d3a2e6c4fedd107bf1a28557790be3793537f6237869d5f2bf`.
 Cancellation was requested at 30.003 seconds with durable BUILD ownership
@@ -158,7 +158,7 @@ build history retained 36,093. Final status was stopped with zero pending work a
 received/journal/materialized watermarks equal at `7/F4478BE8`. The five transport
 errors were deliberately held GETs; there were no catalog errors.
 
-The historical [concurrent-compaction-02](../target/production-concurrent-compaction-02/report.json)
+The historical concurrent-compaction-02 (`target/production-concurrent-compaction-02/report.json`, local artifact)
 passed all six live phases on immutable release12
 `0ebc7471c1edd8f792fcec846e37bcac17b6ba2158b8984161964059290cb6f5`.
 An actual S3 GET remained held while CRUD and ACK progressed; the result contained

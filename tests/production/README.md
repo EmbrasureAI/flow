@@ -27,7 +27,7 @@ more runs for inspection, then apply Compose again with all fixture clients
 stopped. Restart REST afterward to replace connections to the restarted catalog
 database. This preserves volumes and retained slots.
 
-After collecting reports, remove only this disposable project with the same Compose arguments followed by `down --volumes`. This destroys its fixture data; retained files under `target/production-*` remain. The harness itself leaves containers and volumes running for inspection. Measured results and limitations are in [the qualification report](../../docs/production-qualification.md).
+After collecting reports, remove only this disposable project with the same Compose arguments followed by `down --volumes`. This destroys its fixture data; retained files under `target/production-*` remain. The harness itself leaves containers and volumes running for inspection. Measured results and limitations are in [the qualification report](../../docs/development/production-qualification.md).
 
 ## Check source-generator capacity
 
@@ -200,7 +200,7 @@ metadata-cache setting. Retry and metadata-cache defaults are unchanged, and
 reader errors still fail the run. This prevents the connection churn that
 exhausted Docker Desktop's forwarding addresses in matrix14 and matrix15;
 matching VM errors and a controlled retained-pin reproduction establish the
-[transport cause](../../docs/production-qualification.md#reader-transport-diagnosis).
+[transport cause](../../docs/development/production-qualification.md#reader-transport-diagnosis).
 Those original failures and scan ratios remain unchanged. Future comparisons
 must account for the recorded transport setting when comparing reports.
 
@@ -328,7 +328,7 @@ Measurement semantics follow PostgreSQL's documentation for
 [WAL positions](https://www.postgresql.org/docs/18/functions-admin.html#FUNCTIONS-ADMIN-BACKUP)
 and [checkpoint control data](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-CONTROLDATA).
 
-The first [retained run](../../target/production-wal-overhead-01/assessment.md)
+The first retained run (`target/production-wal-overhead-01/assessment.md`, local artifact)
 passed all 12 cases / 24 phases, with 48,000 exact committed mutations. Median
 FULL/DEFAULT generated-WAL ratios were 1.415× after checkpoint and 1.643× without
 a new checkpoint for 256-byte rows; wide unchanged-TOAST ratios were 3.318× and
@@ -473,12 +473,12 @@ and the original replication slot intact. Rust integration tests separately veri
 the old/new serialized headers and decoders; the Python gate does not parse state
 files or convert their formats itself.
 
-[Journal-upgrade-01](../../target/production-journal-upgrade-01/report.json) passed
+Journal-upgrade-01 (`target/production-journal-upgrade-01/report.json`, local artifact) passed
 all nine phases from release20 to release21. Both original six-transaction
 Prepared operations recovered; final rows matched 15,074 orders and 18 accounts,
 with the original index and retained snapshots unchanged. Final stopped status
 had zero pending work and no worker panics. Exact binary hashes and held/recovered
-frontiers are recorded in [validation](../../docs/validation.md).
+frontiers are recorded in [validation](../../docs/development/validation.md).
 
 ## Health and scheduler liveness
 
@@ -502,14 +502,14 @@ Set `FLOW_POSTGRES_URL` and the AWS environment variables as above, use a new
 artifact directory, and keep the binary unchanged during the run. The harness
 uses free proxy ports and stops only its own processes; it never restarts services.
 
-[Health-04](../../target/production-health-04/report.json) passed on debug binary
+Health-04 (`target/production-health-04/report.json`, local artifact) passed on debug binary
 SHA-256 `cebe8ec88b290c1b97dd223fb19f2a733a11d7612cfa43721529ca60ffcc31eb`:
 4,090 orders and 17 accounts matched PostgreSQL, table-commit concurrency remained
 one, the blocked query closed after 5.002 seconds, and SIGTERM exited successfully
 in 0.011 seconds with readiness false. These timings verify the cancellation
 boundary; they are not ingestion performance measurements.
 
-[Health-03](../../target/production-health-03/report.json) caught a real driver
+Health-03 (`target/production-health-03/report.json`, local artifact) caught a real driver
 leak: CDC progressed, but dropping a timed-out PostgreSQL client left its connection
 task waiting for a response, allowing two health connections to overlap. The fix
 owns and aborts that task. Health-01 and health-02 failed earlier during catalog
@@ -541,7 +541,7 @@ Use an immutable binary and fresh artifact directory. Run separately from
 performance measurements; the harness uses free proxy ports and stops its own
 daemon, proxy and producer without restarting services.
 
-[Maintenance-priority-02](../../target/production-maintenance-priority-02/report.json)
+Maintenance-priority-02 (`target/production-maintenance-priority-02/report.json`, local artifact)
 passed all six phases on the debug binary
 `target/maintenance-priority-fixture/embrasure-flow`, SHA-256
 `8c52195f0e8168c3662d7b3feb618a6d402560a2ef3b7bfa83ce2aad579c3865`.
@@ -552,7 +552,7 @@ source barrier was visible and acknowledged. SIGTERM exited successfully in
 all 4,094 orders and 17 accounts, and the retained initial snapshot kept its
 4,096 orders. These are boundary checks, not ingestion performance measurements.
 
-[Maintenance-priority-01](../../target/production-maintenance-priority-01/report.json)
+Maintenance-priority-01 (`target/production-maintenance-priority-01/report.json`, local artifact)
 preserves the passing soft-pressure and recovery phases plus an interrupted
 hard-phase setup. The fixture lowered the hard age while a final producer L0 tail
 remained, correctly preventing the next seed publication. The second attempt
@@ -597,13 +597,13 @@ serially with other fault and performance suites. The report keeps every phase,
 binary digest and proxy error; the JSONL traces also retain ordinary HEAD 404
 checks for not-yet-created objects.
 
-[Concurrent-compaction-04](../../target/production-concurrent-compaction-04/report.json)
+Concurrent-compaction-04 (`target/production-concurrent-compaction-04/report.json`, local artifact)
 passed all seven phases on release16, including exact rows/history, actual
 cancellation/join, and SIGTERM/restart with I/O held. Shutdown took 1.030 seconds;
 no worker panics occurred. Both this fixture and the workload harness now check
 joined-process logs for panics independently of exit codes.
 
-The historical [concurrent-compaction-03](../../target/production-concurrent-compaction-03/report.json)
+The historical concurrent-compaction-03 (`target/production-concurrent-compaction-03/report.json`, local artifact)
 passed all seven phases on release14 SHA-256
 `b8f430122b6b02d3a2e6c4fedd107bf1a28557790be3793537f6237869d5f2bf`.
 The real deadline requested cancellation at 30.003 seconds with BUILD verified;
@@ -614,7 +614,7 @@ exact 36,089 orders and 17 accounts, preserving initial and build history. Final
 status was stopped with zero pending transactions and aligned watermarks.
 Five transport errors came from deliberately held GETs; no catalog errors occurred.
 
-[Concurrent-compaction-01](../../target/production-concurrent-compaction-01/report.json)
+Concurrent-compaction-01 (`target/production-concurrent-compaction-01/report.json`, local artifact)
 passed all six phases on debug binary SHA-256
 `3fdab1859d9947bf5fad21543dcdc46960de47b7702b4fe63dd391ba2fe53fed`.
 The held build retained data sequence 4, translated eight stale rows into deletes
@@ -625,7 +625,7 @@ run preceded the scratch-reclamation assertion now included in the gate; its
 report is preserved unchanged. These injected stalls test correctness and
 liveness, not ingestion latency.
 
-[Concurrent-compaction-02](../../target/production-concurrent-compaction-02/report.json)
+Concurrent-compaction-02 (`target/production-concurrent-compaction-02/report.json`, local artifact)
 repeated all six phases on release binary SHA-256
 `0ebc7471c1edd8f792fcec846e37bcac17b6ba2158b8984161964059290cb6f5`,
 including removal of the held build's old scratch directory after restart.

@@ -1,5 +1,12 @@
 name: Service integration
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
 concurrency:
   group: services-${{ github.ref }}
   cancel-in-progress: true
@@ -15,6 +22,7 @@ jobs:
       COMPOSE_PROJECT_NAME: flow-ci
       COMPOSE_FILE: tests/production/compose.yaml
       FLOW_POSTGRES_IMAGE: postgres:${{ matrix.postgres }}-bookworm
+      FLOW_PRODUCTION_PG_CPUS: '2'
       FLOW_PRODUCTION_PG_PORT: '0'
       FLOW_PRODUCTION_S3_PORT: '0'
       FLOW_PRODUCTION_REST_PORT: '0'

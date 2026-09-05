@@ -69,6 +69,6 @@ whitespace checks, and sequential clean-base patch application also passed; the
 reconstructed sources match the tested sources byte for byte.
 [`validation.json`](validation.json) records commands and patch, source, binary,
 and log SHA-256 hashes. Full local logs are retained in
-[`target/upstream-delete-isolation/validation/`](../../../target/upstream-delete-isolation/validation/).
+`target/upstream-delete-isolation/validation/` (`target/upstream-delete-isolation/validation`, local artifact).
 The full upstream suite was not run. No runtime or vendored sources were changed
 to prepare or validate this candidate.

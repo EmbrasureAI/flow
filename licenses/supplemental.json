@@ -24,14 +24,14 @@
     {
       "name": "flatbuffers",
       "version": "25.12.19",
-      "file": "upstream/flatbuffers/LICENSE",
+      "file": "upstream/apache/LICENSE-2.0",
       "source": "https://raw.githubusercontent.com/google/flatbuffers/7e163021e59cca4f8e1e35a7c828b5c6b7915953/LICENSE",
       "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
     },
     {
       "name": "librocksdb-sys",
       "version": "0.17.3+10.4.2",
-      "file": "upstream/rust-rocksdb/LICENSE",
+      "file": "upstream/apache/LICENSE-2.0",
       "source": "https://raw.githubusercontent.com/rust-rocksdb/rust-rocksdb/bb7d2168eab1bc7849f23adbcb825e3aba1bd2f4/LICENSE",
       "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
     },
