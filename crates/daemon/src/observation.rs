@@ -1,5 +1,5 @@
 //! Prometheus textfile output and bounded-cardinality service observations.
-use crate::config::Config;
+use crate::{config::Config, lifecycle::SourceHealthStatus};
 use anyhow::Result;
 use flow_coordinator::{Inventory, SourceLedger};
 use flow_model::{PgLsn, TableId};
@@ -14,6 +14,7 @@ const EXPORT_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) struct Observation {
     handle: PrometheusHandle,
     last_export: Option<(Instant, bool)>,
+    source_health: SourceHealthStatus,
 }
 impl Observation {
     pub(crate) fn install() -> Result<Self> {
@@ -35,7 +36,12 @@ impl Observation {
                 )?
                 .install_recorder()?,
             last_export: None,
+            source_health: SourceHealthStatus::Unknown,
         })
+    }
+
+    pub(crate) fn record_source_health(&mut self, health: impl Into<SourceHealthStatus>) {
+        self.source_health = health.into();
     }
 
     /// Flush process counters even when initialization failed before a source
@@ -65,7 +71,14 @@ impl Observation {
         ready: bool,
         now: Instant,
     ) -> Result<bool> {
-        crate::lifecycle::emit(config, Some(ledger), Some(captured), ready)?;
+        let ready = ready && self.source_health.permits_readiness();
+        crate::lifecycle::emit(
+            config,
+            Some(ledger),
+            Some(captured),
+            ready,
+            Some(self.source_health),
+        )?;
         if self.last_export.is_some_and(|(last, was_ready)| {
             ready == was_ready && now.duration_since(last) < EXPORT_INTERVAL
         }) {
@@ -87,6 +100,14 @@ impl Observation {
             ),
             ("flow_materialized_lsn", watermarks.materialized_lsn.0),
             ("flow_pending_transactions", ledger.pending_count() as u64),
+            (
+                "flow_source_health_check_available",
+                u64::from(self.source_health.check_available()),
+            ),
+            (
+                "flow_source_at_risk",
+                u64::from(self.source_health.at_risk()),
+            ),
         ] {
             writeln!(text, "# TYPE {name} gauge\n{name} {value}")?;
         }
@@ -134,7 +155,7 @@ pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flow_coordinator::{AckMode, JournalDurability};
+    use flow_coordinator::{AckMode, JournalDurability, SourceHealth};
     use flow_model::SourceId;
     use flow_state_store::{StateStore, StateStoreOptions};
     use tempfile::TempDir;
@@ -157,6 +178,7 @@ mod tests {
         let mut observation = Observation {
             handle: PrometheusBuilder::new().build_recorder().handle(),
             last_export: None,
+            source_health: SourceHealthStatus::Unknown,
         };
         let metrics = temp.path().join("metrics.prom");
         let status = temp.path().join("status.json");
@@ -169,6 +191,16 @@ mod tests {
                 .write_at(&config, &ledger, PgLsn(10), true, now)
                 .unwrap()
         );
+        assert_eq!(read_status()["source_health"], "unknown");
+        assert_eq!(read_status()["ready"], true);
+        observation.record_source_health(SourceHealth::Healthy);
+        assert!(
+            !observation
+                .write_at(&config, &ledger, PgLsn(10), true, now)
+                .unwrap()
+        );
+        assert_eq!(read_status()["source_health"], "healthy");
+        assert_eq!(read_status()["ready"], true);
         let first = std::fs::read(&metrics).unwrap();
         assert!(
             !observation
@@ -184,6 +216,7 @@ mod tests {
         assert_eq!(std::fs::read(&metrics).unwrap(), first);
         assert_eq!(read_status()["captured_durable_lsn"], 20);
         assert_eq!(read_status()["ready"], true);
+        assert_eq!(read_status()["source_health"], "healthy");
         let due = now + EXPORT_INTERVAL;
         assert!(
             observation
@@ -219,18 +252,40 @@ mod tests {
                 .contains("flow_journal_durable_lsn 50\n")
         );
         let stopped = due + Duration::from_millis(1);
+        observation.record_source_health(SourceHealth::AtRisk);
         assert!(
             observation
-                .write_at(&config, &ledger, PgLsn(60), false, stopped)
+                .write_at(&config, &ledger, PgLsn(60), true, stopped)
                 .unwrap()
         );
         assert_eq!(read_status()["ready"], false);
+        assert_eq!(read_status()["source_health"], "at_risk");
+        assert!(
+            std::fs::read_to_string(&metrics)
+                .unwrap()
+                .contains("flow_source_at_risk 1\n")
+        );
+        observation.record_source_health(SourceHealth::Warning);
         assert!(
             observation
                 .write_at(&config, &ledger, PgLsn(70), true, stopped)
                 .unwrap()
         );
         assert_eq!(read_status()["ready"], true);
+        assert_eq!(read_status()["source_health"], "warning");
+        observation.record_source_health(SourceHealthStatus::Unavailable);
+        assert!(
+            observation
+                .write_at(&config, &ledger, PgLsn(70), true, stopped)
+                .unwrap()
+        );
+        assert_eq!(read_status()["ready"], false);
+        assert_eq!(read_status()["source_health"], "unavailable");
+        assert!(
+            std::fs::read_to_string(&metrics)
+                .unwrap()
+                .contains("flow_source_health_check_available 0\n")
+        );
 
         // Status failure leaves the last exported metrics and cadence intact.
         let before = std::fs::read(&metrics).unwrap();

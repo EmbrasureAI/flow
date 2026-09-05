@@ -2,6 +2,13 @@
 
 `embrasure-flow status` reads an atomic local observation without locking the state database. It reports the source identity, process, readiness, observation timestamp, captured durable LSN, ledger watermarks and registered pending transactions. Readiness expires after fifteen seconds without an update. SIGINT and SIGTERM clear it before shutdown. This file is not recovery authority.
 
+`source_health` reports `unknown` before the first WAL check, then `healthy`,
+`warning`, `at_risk`, `unavailable`, or `slot_lost`. Hard WAL/journal pressure and
+failed monitoring clear readiness while capture and publication can continue.
+A successful later check restores readiness; a lost slot is recorded before the
+process exits for resynchronization. Initial `unknown` permits startup readiness
+and is distinguished from a failed check by the health-availability metric.
+
 `state_dir/metrics.prom` uses Prometheus text format for a textfile collector. Its integer LSN text remains exact; Prometheus stores floating-point samples, so use `status` for exact comparisons beyond its integer precision. Metrics reset on process restart. `init` installs its own recorder and flushes bootstrap duration, outcome and I/O diagnostics on success or failure. The next `init` or `run` replaces that process snapshot; archive `metrics.prom` after initialization to retain COPY cost diagnostics. Labels contain configured table IDs, not row keys or object paths.
 
 Source ledger completion and ACK feedback precede observation writes. Status
@@ -20,6 +27,8 @@ No separate export task is created.
 | `flow_ledger_registered_lsn` | Prefix registered with source-wide completion tracking |
 | `flow_materialized_lsn` | Contiguous source prefix published across every affected table |
 | `flow_pending_transactions` | Registered, incomplete source transactions; compare the captured and registered LSNs to detect additional disk backlog |
+| `flow_source_health_check_available` | Whether the latest WAL check returned a result; zero before the first result or after a monitoring failure |
+| `flow_source_at_risk` | Latest check found hard WAL/journal pressure or a lost slot; inspect availability before interpreting zero as healthy |
 | `flow_commit_to_journal_seconds` | Source commit timestamp to successful journal durability |
 | `flow_journal_committed_payload_bytes_total` | Serialized mutation-chunk payload bytes in successfully synced source transactions; excludes aborted subtransactions, journal framing and terminal records |
 | `flow_source_registration_seconds` | Successful dispatcher page read and durable source-ledger registration, before feedback; includes blocking database work |

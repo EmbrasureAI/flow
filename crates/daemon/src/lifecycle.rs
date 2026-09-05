@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
-use flow_coordinator::{SourceLedger, Watermarks};
+use flow_coordinator::{SourceHealth, SourceLedger, Watermarks};
 use flow_model::PgLsn;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,18 +19,57 @@ pub(crate) struct Status {
     pending_transactions: usize,
     #[serde(default)]
     captured_durable_lsn: PgLsn,
+    #[serde(default)]
+    source_health: SourceHealthStatus,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceHealthStatus {
+    #[default]
+    Unknown,
+    Healthy,
+    Warning,
+    AtRisk,
+    Unavailable,
+    SlotLost,
+}
+
+impl SourceHealthStatus {
+    pub(crate) fn permits_readiness(self) -> bool {
+        !matches!(self, Self::AtRisk | Self::Unavailable | Self::SlotLost)
+    }
+
+    pub(crate) fn check_available(self) -> bool {
+        !matches!(self, Self::Unknown | Self::Unavailable)
+    }
+
+    pub(crate) fn at_risk(self) -> bool {
+        matches!(self, Self::AtRisk | Self::SlotLost)
+    }
+}
+
+impl From<SourceHealth> for SourceHealthStatus {
+    fn from(health: SourceHealth) -> Self {
+        match health {
+            SourceHealth::Healthy => Self::Healthy,
+            SourceHealth::Warning => Self::Warning,
+            SourceHealth::AtRisk => Self::AtRisk,
+            SourceHealth::SlotLost => Self::SlotLost,
+        }
+    }
 }
 
 pub(crate) struct Lifecycle(Config);
 impl Lifecycle {
     pub(crate) fn start(config: &Config) -> Result<Self> {
-        emit(config, None, None, false)?;
+        emit(config, None, None, false, Some(SourceHealthStatus::Unknown))?;
         Ok(Self(config.clone()))
     }
 }
 impl Drop for Lifecycle {
     fn drop(&mut self) {
-        if let Err(error) = emit(&self.0, None, None, false) {
+        if let Err(error) = emit(&self.0, None, None, false, None) {
             tracing::warn!(%error, "could not mark local status stopped");
         }
     }
@@ -41,6 +80,7 @@ pub(crate) fn emit(
     ledger: Option<&SourceLedger>,
     captured: Option<PgLsn>,
     ready: bool,
+    source_health: Option<SourceHealthStatus>,
 ) -> Result<()> {
     let mut status = read(config).unwrap_or_else(|_| Status {
         source_id: config.source.id.clone(),
@@ -50,6 +90,7 @@ pub(crate) fn emit(
         watermarks: Watermarks::default(),
         pending_transactions: 0,
         captured_durable_lsn: PgLsn(0),
+        source_health: SourceHealthStatus::Unknown,
     });
     status.process_id = std::process::id();
     status.ready = ready;
@@ -60,6 +101,9 @@ pub(crate) fn emit(
     }
     if let Some(captured) = captured {
         status.captured_durable_lsn = captured;
+    }
+    if let Some(source_health) = source_health {
+        status.source_health = source_health;
     }
     write_observation(
         &config.state_dir.join("status.json"),

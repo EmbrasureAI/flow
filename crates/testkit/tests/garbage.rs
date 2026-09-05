@@ -1,17 +1,32 @@
 use flow_compactor::Policy;
 use flow_coordinator::{Epoch, GarbagePolicy, GarbageProtection, TableMaintenance, TablePublisher};
+use flow_iceberg_ext::ArtifactSet;
 use flow_materializer::WriterConfig;
 use flow_model::{OperationId, PgLsn, SourceId, TableSchema, Value};
 use flow_state_store::{Change, ControlStore, StateStore, StateStoreOptions};
 use flow_testkit::{catalog, scan, schema, table};
 use iceberg::{Catalog, table::Table};
+use serde::Serialize;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
+
+#[derive(Serialize)]
+struct RegistryFixture {
+    table_uuid: uuid::Uuid,
+    table_id: flow_model::TableId,
+    location: String,
+    operation: OperationId,
+    created_ms: u64,
+    unfenced_since_ms: Option<u64>,
+    artifacts: ArtifactSet,
+    cursor: u64,
+    protected: bool,
+}
 
 fn files(root: &Path) -> BTreeSet<PathBuf> {
     let mut result = BTreeSet::new();
@@ -66,6 +81,7 @@ async fn collect(
                     grace: Duration::from_millis(1),
                     max_objects: 3,
                     max_records: 2,
+                    max_duration: Duration::from_secs(1),
                 },
                 protection,
             )
@@ -75,6 +91,146 @@ async fn collect(
         deleted += report.delete_requests;
     }
     deleted
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_spin() {
+    let temp = TempDir::new().unwrap();
+    let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
+    let schema = schema(1);
+    let table = table(catalog.as_ref(), &schema).await;
+    let control = ControlStore::open(temp.path().join("control")).unwrap();
+    let index_path = temp.path().join("index");
+    let options = StateStoreOptions::default();
+    let store = control
+        .initialize_index(&index_path, options.clone())
+        .unwrap();
+    let make_maintenance = |store| {
+        TableMaintenance::new(
+            store,
+            catalog.clone(),
+            Policy::default(),
+            WriterConfig::default(),
+        )
+        .unwrap()
+    };
+    let maintenance = make_maintenance(store.clone());
+    let location = table.metadata().location().trim_end_matches('/');
+    let data = Path::new(location).join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let prefix = format!("owned-artifacts/v1/{}/", table.metadata().uuid());
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let mut protected_operations = BTreeSet::new();
+    let mut paths = Vec::new();
+    for ordinal in 0..80 {
+        let path = data.join(format!("gc-{ordinal:03}.parquet"));
+        std::fs::write(&path, b"registered orphan").unwrap();
+        let operation = OperationId(format!("gc-{ordinal:03}"));
+        if ordinal < 8 {
+            protected_operations.insert(operation.clone());
+        }
+        let young = ordinal == 79;
+        let record = RegistryFixture {
+            table_uuid: table.metadata().uuid(),
+            table_id: schema.table_id,
+            location: location.to_owned(),
+            operation,
+            created_ms: if young { now_ms } else { 0 },
+            unfenced_since_ms: Some(if young { now_ms } else { 0 }),
+            artifacts: ArtifactSet {
+                paths: vec![path.to_string_lossy().into_owned()],
+                ranges: Vec::new(),
+            },
+            cursor: 0,
+            protected: false,
+        };
+        store
+            .put_source_transaction(
+                format!("{prefix}{ordinal:03}").as_bytes(),
+                &bincode::serialize(&record).unwrap(),
+            )
+            .unwrap();
+        paths.push(path);
+    }
+    let protection = GarbageProtection {
+        operations: protected_operations,
+        ..Default::default()
+    };
+    let policy = GarbagePolicy {
+        grace: Duration::from_secs(60 * 60),
+        max_objects: 8,
+        max_records: 8,
+        max_duration: Duration::from_secs(1),
+    };
+    let first = maintenance
+        .collect_garbage(&table, schema.table_id, &policy, &protection)
+        .await
+        .unwrap();
+    assert_eq!(first.examined_records, 8);
+    assert_eq!(first.delete_requests, 0);
+    assert!(first.continuation_required);
+    drop(maintenance);
+    drop(store);
+
+    let store = StateStore::open_with_control(index_path, options, control).unwrap();
+    let maintenance = make_maintenance(store.clone());
+    let mut passes = 1;
+    let mut retired = first.retired_records;
+    let mut continuation_required = first.continuation_required;
+    while continuation_required {
+        let report = maintenance
+            .collect_garbage(&table, schema.table_id, &policy, &protection)
+            .await
+            .unwrap();
+        passes += 1;
+        retired += report.retired_records;
+        assert!(report.examined_records <= policy.max_records);
+        assert!(report.examined_objects <= policy.max_objects);
+        if passes == 2 {
+            assert_eq!(report.delete_requests, 8, "restart resumed after page one");
+        }
+        continuation_required = report.continuation_required;
+        assert!(passes < 20, "bounded forward sweep must terminate");
+    }
+    assert_eq!(passes, 10, "the 80-record sweep must span bounded pages");
+    assert_eq!(retired, 71);
+    assert!(
+        paths[8..79].iter().all(|path| !path.exists()),
+        "every eligible registered orphan is removed"
+    );
+    assert!(
+        paths[..8].iter().all(|path| path.exists()),
+        "explicit operation protection is retained"
+    );
+    assert!(paths[79].exists(), "the grace period is retained");
+    assert_eq!(
+        store
+            .source_transactions_after(prefix.as_bytes(), None)
+            .count(),
+        9
+    );
+
+    let mut idle_passes = 0;
+    loop {
+        let idle = maintenance
+            .collect_garbage(&table, schema.table_id, &policy, &protection)
+            .await
+            .unwrap();
+        idle_passes += 1;
+        assert_eq!(idle.delete_requests, 0);
+        assert_eq!(idle.retired_records, 0);
+        if !idle.continuation_required {
+            break;
+        }
+        assert!(idle_passes < 3, "ineligible-only sweep must terminate");
+    }
+    assert_eq!(idle_passes, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

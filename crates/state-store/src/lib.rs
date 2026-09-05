@@ -495,16 +495,30 @@ impl StateStore {
     pub fn pending_operations(&self) -> Result<Vec<OperationRecord>> {
         self.scan(OPERATIONS, Vec::new())
             .filter_map(|value| match value {
-                Ok((_, bytes)) => match decode::<OperationRecord>(&bytes) {
-                    Ok(record) => match record.validate_persisted() {
-                        Ok(()) if record.phase != OperationPhase::Applied => Some(Ok(record)),
-                        Ok(()) => None,
-                        Err(error) => Some(Err(error)),
-                    },
+                Ok((key, bytes)) => match decode_operation_record(&key, &bytes) {
+                    Ok(record) if record.phase != OperationPhase::Applied => Some(Ok(record)),
+                    Ok(_) => None,
                     Err(error) => Some(Err(error)),
                 },
                 Err(error) => Some(Err(error)),
             })
+            .collect()
+    }
+
+    /// Return at most `limit` completed operations awaiting durable retirement.
+    /// The caller must first persist any source-ledger progress represented by
+    /// these operations. Records and their keys are validated before exposure.
+    pub fn applied_operations(&self, limit: usize) -> Result<Vec<OperationRecord>> {
+        self.scan(OPERATIONS, Vec::new())
+            .filter_map(|value| match value {
+                Ok((key, bytes)) => match decode_operation_record(&key, &bytes) {
+                    Ok(record) if record.phase == OperationPhase::Applied => Some(Ok(record)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                },
+                Err(error) => Some(Err(error)),
+            })
+            .take(limit)
             .collect()
     }
 
@@ -1354,32 +1368,54 @@ impl StateStore {
     /// completion in the source ledger. Public data files and row indices stay
     /// untouched; replay is subsequently fenced by the materialized watermark.
     pub fn forget_applied(&self, id: &OperationId) -> Result<()> {
-        let _guard = self.lock()?;
-        let record = self.require_operation(id)?;
-        if record.phase != OperationPhase::Applied
-            || self
-                .table_state(&record.operation.table_id)?
-                .pending_operation
-                .as_ref()
-                == Some(id)
-        {
+        self.forget_applied_batch(std::slice::from_ref(id))
+    }
+
+    /// Atomically retire a bounded page of completed operations, their staged
+    /// deltas, and any ingest collapse spool after the caller durably records the
+    /// corresponding source progress.
+    pub fn forget_applied_batch(&self, ids: &[OperationId]) -> Result<()> {
+        if ids.len() > self.0.batch_rows {
             return Err(Error::InvalidState(
-                "cannot forget an incomplete or fenced operation".into(),
+                "applied-operation retirement exceeds the state batch limit".into(),
             ));
         }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock()?;
+        let mut kinds = Vec::with_capacity(ids.len());
+        for id in ids {
+            let record = self.require_operation(id)?;
+            if record.phase != OperationPhase::Applied
+                || self
+                    .table_state(&record.operation.table_id)?
+                    .pending_operation
+                    .as_ref()
+                    == Some(id)
+            {
+                return Err(Error::InvalidState(
+                    "cannot forget an incomplete or fenced operation".into(),
+                ));
+            }
+            kinds.push(record.operation.kind);
+        }
         let mut batch = StateBatch::default();
-        self.delete_prefix(&mut batch, DELTAS, &operation_prefix(id));
-        batch
-            .control
-            .delete(control::record_key(OPERATIONS, id.0.as_bytes()));
-        batch.delete_cf(
-            &self
-                .0
-                .db
-                .cf_handle(OPERATIONS)
-                .expect("opened column family"),
-            id.0.as_bytes(),
-        );
+        let operations = self
+            .0
+            .db
+            .cf_handle(OPERATIONS)
+            .expect("opened column family");
+        for (id, kind) in ids.iter().zip(kinds) {
+            self.delete_prefix(&mut batch, DELTAS, &operation_prefix(id));
+            if kind == OperationKind::Ingest {
+                self.delete_prefix(&mut batch, SPOOL, &operation_prefix(id));
+            }
+            batch
+                .control
+                .delete(control::record_key(OPERATIONS, id.0.as_bytes()));
+            batch.delete_cf(&operations, id.0.as_bytes());
+        }
         self.write(batch)
     }
 
@@ -1579,20 +1615,25 @@ fn validate_operation_records(db: &DB) -> Result<()> {
     options.set_verify_checksums(true);
     for entry in db.iterator_cf_opt(&family, options, IteratorMode::Start) {
         let (key, value) = entry?;
-        let record = decode::<OperationRecord>(&value).map_err(|error| {
-            Error::RecoveryRequired(format!(
-                "persisted operation record cannot be decoded: {error}"
-            ))
-        })?;
-        if key.as_ref() != record.operation.id.0.as_bytes() {
-            return Err(Error::RecoveryRequired(
-                "persisted operation key does not match its record; recover durable state before publishing"
-                    .into(),
-            ));
-        }
-        record.validate_persisted()?;
+        decode_operation_record(&key, &value)?;
     }
     Ok(())
+}
+
+fn decode_operation_record(key: &[u8], value: &[u8]) -> Result<OperationRecord> {
+    let record = decode::<OperationRecord>(value).map_err(|error| {
+        Error::RecoveryRequired(format!(
+            "persisted operation record cannot be decoded: {error}"
+        ))
+    })?;
+    if key != record.operation.id.0.as_bytes() {
+        return Err(Error::RecoveryRequired(
+            "persisted operation key does not match its record; recover durable state before publishing"
+                .into(),
+        ));
+    }
+    record.validate_persisted()?;
+    Ok(record)
 }
 
 fn record_apply_batch_metrics(

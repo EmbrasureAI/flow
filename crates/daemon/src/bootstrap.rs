@@ -124,12 +124,15 @@ fn remove_staging(config: &Config, table: TableId, copy: &TableCopy) -> Result<(
     }
     let path = copy.path(config, table)?;
     match std::fs::remove_dir_all(&path) {
-        Ok(()) => std::fs::File::open(config.state_dir.join("bootstrap"))?
-            .sync_all()
-            .context("sync bootstrap staging deletion"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("remove {}", path.display()));
+        }
     }
+    std::fs::File::open(config.state_dir.join("bootstrap"))?
+        .sync_all()
+        .context("sync bootstrap staging deletion")
 }
 
 fn recover_published_copy(
@@ -555,12 +558,12 @@ pub(crate) async fn resume(
                 schema_version: copy_schemas[index].version,
             };
             let old = TableCopy::load(&store, boot.schemas[index].table_id)?;
-            copy.save(&store, boot.schemas[index].table_id)?;
             if let Some(old) = old
                 && !old.staging.is_empty()
             {
                 remove_staging(config, boot.schemas[index].table_id, &old)?;
             }
+            copy.save(&store, boot.schemas[index].table_id)?;
             plans.push((index, copy_schemas[index].clone(), copy, None));
         }
     }
@@ -868,8 +871,9 @@ async fn copy_and_publish(
     copy.save(store, schema.table_id)?;
     if store.operation(&epoch.id)?.is_some() {
         store.forget_applied(&epoch.id)?;
+    } else {
+        store.discard_transaction(&epoch.id.0)?;
     }
-    store.discard_transaction(&epoch.id.0)?;
     remove_staging(config, schema.table_id, &copy)?;
     tracing::info!(event = "bootstrap_table_published", table_id = schema.table_id.0, rows = copy.rows, lsn = %copy.cut, "initial table base published");
     Ok((schema.table_id, snapshot.unwrap_or(0)))

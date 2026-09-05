@@ -217,6 +217,75 @@ fn recovery_resumes_atomic_index_batches_and_keeps_table_fenced() {
 }
 
 #[test]
+fn applied_operation_retirement_is_bounded_and_atomic() {
+    let temp = TempDir::new().unwrap();
+    let store = open(temp.path());
+    let cases = [
+        ("applied-a", None, 100, 10, 1),
+        ("applied-b", Some(100), 101, 11, 2),
+        ("applied-c", Some(101), 102, 12, 3),
+    ];
+    for (name, base, snapshot, lsn, key) in cases {
+        let id = OperationId(name.into());
+        store
+            .prepare(operation(name, base, lsn), [insert(key, name, 0)])
+            .unwrap();
+        store.mark_committed(&id, snapshot, snapshot).unwrap();
+        assert!(store.apply_committed(&id).unwrap().complete);
+    }
+
+    let first = store.applied_operations(2).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|record| record.operation.id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["applied-a", "applied-b"]
+    );
+    let all = cases
+        .iter()
+        .map(|(name, ..)| OperationId((*name).into()))
+        .collect::<Vec<_>>();
+    assert!(store.forget_applied_batch(&all).is_err());
+    assert_eq!(store.applied_operations(3).unwrap().len(), 3);
+    store
+        .collapse_changes(
+            "applied-a",
+            [(
+                TableId(7),
+                PrimaryKey(vec![1]),
+                Change::Update(vec![Value::Int32(2)]),
+            )],
+        )
+        .unwrap();
+    store.seal_transaction("applied-a").unwrap();
+    assert_eq!(
+        store.collapsed("applied-a", &TableId(7)).unwrap().count(),
+        1
+    );
+
+    let first_ids = first
+        .into_iter()
+        .map(|record| record.operation.id)
+        .collect::<Vec<_>>();
+    store.forget_applied_batch(&first_ids).unwrap();
+    assert!(store.operation(&first_ids[0]).unwrap().is_none());
+    assert!(store.operation(&first_ids[1]).unwrap().is_none());
+    assert!(store.collapsed("applied-a", &TableId(7)).is_err());
+    store
+        .prepare(
+            operation("applied-a", Some(102), 13),
+            [insert(1, "applied-a", 0)],
+        )
+        .unwrap();
+    store.discard_uncommitted(&first_ids[0]).unwrap();
+    assert_eq!(
+        store.applied_operations(2).unwrap()[0].operation.id,
+        OperationId("applied-c".into())
+    );
+}
+
+#[test]
 fn index_conflict_never_partially_applies_a_batch() {
     for reverse_conflict in [false, true] {
         let temp = TempDir::new().unwrap();

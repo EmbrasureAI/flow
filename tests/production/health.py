@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["duckdb==1.5.5", "psycopg[binary]==3.3.5", "boto3==1.43.88", "fastavro==1.12.2", "pytz==2026.3.post1"]
 # ///
-"""Stall only the WAL-health query; verify CDC, worker admission and shutdown."""
+"""Stall WAL-health queries; verify readiness recovery, CDC and shutdown."""
 
 import argparse
 import json
@@ -46,6 +46,8 @@ class HealthProxy:
         self.active = self.peak = self.started = 0
         self.completed = []
         self.stopped = threading.Event()
+        self.stall_health = threading.Event()
+        self.stall_health.set()
         proxy = self
 
         class Server(socketserver.ThreadingTCPServer):
@@ -73,7 +75,8 @@ class HealthProxy:
                             kind = receive(self.request, 1)
                             header = receive(self.request, 4)
                             body = receive(self.request, struct.unpack("!I", header)[0] - 4)
-                            if kind in (b"P", b"Q") and b"pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)" in body:
+                            if (proxy.stall_health.is_set() and kind in (b"P", b"Q")
+                                    and b"pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)" in body):
                                 held = time.monotonic()
                                 with proxy.lock:
                                     proxy.started += 1
@@ -176,10 +179,34 @@ class HealthRun(Run):
     def timeout_checkpoint_shutdown(self):
         self.until("health query did not time out", lambda: self.health.completed, timeout=8)
         assert 4 <= self.health.completed[0] < 7, self.health.completed
+
+        def source_status(health, ready):
+            status = json.loads((self.directory / "state/status.json").read_text())
+            return status if status["source_health"] == health and status["ready"] == ready else None
+
+        unavailable = self.until("timed-out health query did not clear readiness",
+            lambda: source_status("unavailable", False), timeout=3)
         self.until("health retry was not started", lambda: self.health.started >= 2 and self.health.active == 1, timeout=12)
+        barrier = self.transaction([
+            "UPDATE orders SET payload='health-unavailable' WHERE id <= 16",
+            "DELETE FROM orders WHERE id BETWEEN 20 AND 23",
+            "INSERT INTO orders (id,tenant,payload) VALUES (9001,3,'after-health-timeout')",
+        ])
+        self.wait_materialized(barrier)
+        cdc = self.compare("cdc-with-unavailable-source-health")
+        assert source_status("unavailable", False), "CDC publication incorrectly restored readiness"
         self.until("checkpoint did not complete beside stalled health", lambda:
             (self.directory / "state/checkpoints").exists()
             and any((self.directory / "state/checkpoints").iterdir()), timeout=3)
+
+        # A held query remains blocked until cancellation; subsequent connections
+        # pass through normally once the current timeout has closed its socket.
+        self.health.stall_health.clear()
+        recovered = self.until("successful health query did not restore readiness",
+            lambda: source_status("healthy", True), timeout=15)
+        self.health.stall_health.set()
+        self.until("health query was not stalled again before shutdown",
+            lambda: self.health.active == 1, timeout=10)
         started = time.monotonic()
         self.process.send_signal(signal.SIGTERM)
         code = self.process.wait(timeout=3)
@@ -195,7 +222,8 @@ class HealthRun(Run):
         assert self.catalog_proxy.peak_posts == 1, "worker limit was exceeded"
         return {"health_timeout_seconds": self.health.completed[0], "health_queries": self.health.started,
                 "health_peak_inflight": self.health.peak, "sigterm_seconds": elapsed,
-                "exit_code": code, "ready": status["ready"]}
+                "unavailable_status": unavailable, "recovered_status": recovered,
+                "cdc_while_unavailable": cdc, "exit_code": code, "ready": status["ready"]}
 
     def execute(self):
         try:

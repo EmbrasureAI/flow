@@ -38,6 +38,7 @@ async fn collect(f: &Fixture, head: &Table) {
                 grace: Duration::from_millis(1),
                 max_objects: 512,
                 max_records: 64,
+                max_duration: Duration::from_secs(1),
             },
             &GarbageProtection::default(),
         )

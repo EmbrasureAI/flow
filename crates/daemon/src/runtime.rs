@@ -1,6 +1,7 @@
 use crate::{
     bootstrap::{bootstrap, persist_bootstrap, tables},
     config::Config,
+    lifecycle::SourceHealthStatus,
     services::{catalog, journal_config, ledger},
     source::{
         CaptureProgress, capture_loop, connect, connect_owned, retryable_connection,
@@ -222,7 +223,13 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
             _ => bail!("index reconciliation must complete before source capture"),
         }
     }
-    ledger.reconcile_table_progress()?;
+    let retired = reconcile_source_progress(&store, &mut ledger)?;
+    if retired > 0 {
+        tracing::info!(
+            retired,
+            "retired applied operations after source-ledger recovery"
+        );
+    }
     let abandoned = flow_coordinator::discard_abandoned_builds(&store)?;
     if abandoned > 0 {
         tracing::info!(
@@ -302,6 +309,28 @@ fn feedback(ledger: &SourceLedger) -> Acknowledgement {
         received: ledger.watermarks().received_lsn,
         durable: ledger.acknowledgement(),
         materialized: ledger.watermarks().materialized_lsn,
+    }
+}
+
+fn reconcile_source_progress(store: &StateStore, ledger: &mut SourceLedger) -> Result<usize> {
+    // An Applied ingest operation is the durable proof used to recover the
+    // crash between index application and ledger completion. Never remove it
+    // until reconciliation has persisted that source progress.
+    ledger.reconcile_table_progress()?;
+    let mut retired = 0usize;
+    loop {
+        let operations = store.applied_operations(store.batch_rows())?;
+        if operations.is_empty() {
+            return Ok(retired);
+        }
+        let ids = operations
+            .into_iter()
+            .map(|record| record.operation.id)
+            .collect::<Vec<_>>();
+        store.forget_applied_batch(&ids)?;
+        retired = retired
+            .checked_add(ids.len())
+            .context("applied-operation retirement count overflow")?;
     }
 }
 
@@ -695,7 +724,13 @@ impl PublishRuntime {
                     maintenance_due.insert(id, Instant::now());
                 }
                 Some(result) = health_checks.next(), if !health_checks.is_empty() => {
-                    health_client = result?;
+                    let result: HealthCheckResult = result?;
+                    health_client = result.connection;
+                    observation.record_source_health(result.source_health);
+                    observation.write(config, ledger, capture_goal, true)?;
+                    if result.source_health == SourceHealthStatus::SlotLost {
+                        bail!("replication slot lost WAL; resynchronization required");
+                    }
                 }
                 Some(result) = checkpoints.next(), if !checkpoints.is_empty() => {
                     result?;
@@ -875,11 +910,16 @@ struct HealthConnection {
     _connection: crate::source::ConnectionTask,
 }
 
+struct HealthCheckResult {
+    connection: Option<HealthConnection>,
+    source_health: SourceHealthStatus,
+}
+
 async fn check_health(
     config: Config,
     client: Option<HealthConnection>,
-) -> Result<Option<HealthConnection>> {
-    let result: Result<HealthConnection> = async {
+) -> Result<HealthCheckResult> {
+    let result: Result<(HealthConnection, SourceHealth)> = async {
         let client = match client {
             Some(client) => client,
             None => {
@@ -893,16 +933,22 @@ async fn check_health(
                 }
             }
         };
-        check_wal(&client.client, &config).await?;
-        Ok(client)
+        let source_health = check_wal(&client.client, &config).await?;
+        Ok((client, source_health))
     }
     .await;
     match result {
-        Ok(client) => Ok(Some(client)),
+        Ok((client, source_health)) => Ok(HealthCheckResult {
+            connection: Some(client),
+            source_health: source_health.into(),
+        }),
         Err(error) if retryable_connection(&error) || error.is::<tokio::time::error::Elapsed>() => {
             // Dropping the owned driver closes even an unanswered query.
             tracing::warn!(%error, "WAL health check interrupted; reconnecting on next check");
-            Ok(None)
+            Ok(HealthCheckResult {
+                connection: None,
+                source_health: SourceHealthStatus::Unavailable,
+            })
         }
         Err(error) => Err(error),
     }
@@ -976,12 +1022,14 @@ fn history_due(table: &Table, retention_seconds: u64) -> Result<bool> {
         .any(|s| s.timestamp_ms() >= 0 && (s.timestamp_ms() as u128) < cutoff))
 }
 
-async fn check_wal(client: &Client, config: &Config) -> Result<()> {
+async fn check_wal(client: &Client, config: &Config) -> Result<SourceHealth> {
     let row = tokio::time::timeout(HEALTH_TIMEOUT, client.query_opt(
         "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, wal_status, safe_wal_size FROM pg_catalog.pg_replication_slots WHERE slot_name=$1",
         &[&config.source.slot],
-    )).await.context("WAL health query timed out")??
-        .context("replication slot disappeared; resynchronization required")?;
+    )).await.context("WAL health query timed out")??;
+    let Some(row) = row else {
+        return Ok(SourceHealth::SlotLost);
+    };
     let retained: Option<i64> = row.get(0);
     let status: Option<String> = row.get(1);
     let safe: Option<i64> = row.get(2);
@@ -1012,13 +1060,13 @@ async fn check_wal(client: &Client, config: &Config) -> Result<()> {
     if let Some(bytes) = pressure.safe_wal_bytes {
         metrics::gauge!("flow_source_safe_wal_bytes").set(bytes as f64);
     }
-    match pressure.health(
+    let health = pressure.health(
         config.limits.wal_soft_bytes,
         config.limits.wal_hard_bytes,
         config.limits.journal_bytes,
-    ) {
-        SourceHealth::Healthy => {}
-        SourceHealth::SlotLost => bail!("replication slot lost WAL; resynchronization required"),
+    );
+    match health {
+        SourceHealth::Healthy | SourceHealth::SlotLost => {}
         health => tracing::error!(
             ?health,
             retained_wal_bytes = pressure.retained_bytes,
@@ -1026,7 +1074,7 @@ async fn check_wal(client: &Client, config: &Config) -> Result<()> {
             "source storage pressure; increase capacity or drain publication lag"
         ),
     }
-    Ok(())
+    Ok(health)
 }
 
 fn source_age(transaction: &SourceTransaction) -> Duration {
@@ -1978,6 +2026,7 @@ impl TableWork {
                 current = self.catalog.load_table(current.identifier()).await?;
             }
         }
+        let mut garbage_pending = false;
         if garbage_due {
             let protection = flow_coordinator::GarbageProtection::from_checkpoints(
                 id,
@@ -1996,16 +2045,19 @@ impl TableWork {
                     &protection,
                 )
                 .await?;
-            self.garbage_checked
-                .lock()
-                .map_err(|_| anyhow::anyhow!("maintenance clock lock poisoned"))?
-                .insert(id, Instant::now());
+            garbage_pending = report.continuation_required;
+            if !garbage_pending {
+                self.garbage_checked
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("maintenance clock lock poisoned"))?
+                    .insert(id, Instant::now());
+            }
             metrics::counter!("flow_garbage_delete_requests_total", "table_id" => id.0.to_string())
                 .increment(report.delete_requests as u64);
             metrics::histogram!("flow_garbage_collection_seconds", "table_id" => id.0.to_string())
                 .record(started.elapsed().as_secs_f64());
         }
-        Ok(MaintenanceOutcome::Complete(current, false))
+        Ok(MaintenanceOutcome::Complete(current, garbage_pending))
     }
 }
 
@@ -2210,5 +2262,151 @@ mod admission_tests {
         assert!(pending.loaded.is_empty());
         assert_eq!(ledger.pending_count(), 0);
         assert_eq!(ledger.acknowledgement(), PgLsn(91));
+    }
+}
+
+#[cfg(test)]
+mod startup_recovery_tests {
+    use super::*;
+    use flow_coordinator::{AckMode, JournalDurability};
+    use flow_model::{FileId, JournalChunks, PrimaryKey, RowLocation, TableMutationCount};
+    use flow_state_store::{IndexDelta, PreparedOperation};
+
+    #[test]
+    fn startup_reconciles_source_progress_before_retiring_applied_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_path = directory.path().join("control");
+        let index_path = directory.path().join("index");
+        let options = StateStoreOptions {
+            apply_batch_rows: 2,
+            ..Default::default()
+        };
+        let source = SourceId("startup-reconciliation".into());
+        let published = TableId(7);
+        let blocked = TableId(8);
+        let end = PgLsn(11);
+        let id = OperationId("durable-applied-epoch".into());
+
+        let control = ControlStore::open(&control_path).unwrap();
+        let store = control
+            .initialize_index(&index_path, options.clone())
+            .unwrap();
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        ledger
+            .journaled(SourceTransaction {
+                source_id: source.clone(),
+                xid: 1,
+                begin_lsn: PgLsn(9),
+                commit_lsn: PgLsn(10),
+                end_lsn: end,
+                commit_timestamp_micros: 0,
+                schema_versions: vec![],
+                affected_tables: vec![published, blocked],
+                mutation_chunks: JournalChunks::default(),
+                table_mutation_counts: Some(vec![
+                    TableMutationCount {
+                        table_id: published,
+                        mutations: 1,
+                    },
+                    TableMutationCount {
+                        table_id: blocked,
+                        mutations: 0,
+                    },
+                ]),
+            })
+            .unwrap();
+        store
+            .prepare(
+                PreparedOperation {
+                    id: id.clone(),
+                    table_id: published,
+                    kind: OperationKind::Ingest,
+                    base_snapshot_id: None,
+                    last_lsn: end,
+                    schema_version: 1,
+                    artifacts: vec!["data.parquet".into()],
+                    payload: vec![1],
+                },
+                [IndexDelta {
+                    key: PrimaryKey(vec![1]),
+                    expected: None,
+                    replacement: Some(RowLocation {
+                        data_file_id: FileId("data.parquet".into()),
+                        row_position: 0,
+                        data_sequence_number: -1,
+                        spec_id: 0,
+                        partition: vec![],
+                        source_commit_lsn: end,
+                        row_version: 1,
+                        row_fingerprint: [1; 16],
+                    }),
+                }],
+            )
+            .unwrap();
+        store.mark_committed(&id, 100, 1).unwrap();
+        assert!(store.apply_committed(&id).unwrap().complete);
+        assert_eq!(store.applied_operations(2).unwrap().len(), 1);
+        assert_eq!(
+            control.operation(&id).unwrap().unwrap().phase,
+            OperationPhase::Applied
+        );
+        drop(ledger);
+        drop(store);
+        drop(control);
+
+        let control = ControlStore::open(&control_path).unwrap();
+        let active = control.active_generation().unwrap().unwrap();
+        let store =
+            StateStore::open_with_control(&active.path, options.clone(), control.clone()).unwrap();
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        assert_eq!(ledger.acknowledgement(), PgLsn(0));
+        assert_eq!(reconcile_source_progress(&store, &mut ledger).unwrap(), 1);
+        assert_eq!(ledger.acknowledgement(), PgLsn(0));
+        assert_eq!(ledger.pending_tables(end).unwrap(), [blocked]);
+        assert!(store.operation(&id).unwrap().is_none());
+        assert!(control.operation(&id).unwrap().is_none());
+        assert_eq!(
+            control.table_state(&published).unwrap(),
+            Some(store.table_state(&published).unwrap())
+        );
+        drop(ledger);
+        drop(store);
+        drop(control);
+
+        // A second process sees the ledger's per-table completion even though
+        // its global acknowledgement was held back by another affected table.
+        let control = ControlStore::open(&control_path).unwrap();
+        let active = control.active_generation().unwrap().unwrap();
+        let store = StateStore::open_with_control(&active.path, options, control.clone()).unwrap();
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source,
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        assert_eq!(ledger.pending_tables(end).unwrap(), [blocked]);
+        assert!(store.applied_operations(2).unwrap().is_empty());
+        assert_eq!(
+            control.table_state(&published).unwrap(),
+            Some(store.table_state(&published).unwrap())
+        );
+
+        store.complete_noop(&blocked, end, 1).unwrap();
+        ledger.reconcile_table_progress().unwrap();
+        assert_eq!(ledger.acknowledgement(), end);
+        assert_eq!(ledger.pending_count(), 0);
     }
 }

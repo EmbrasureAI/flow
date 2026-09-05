@@ -291,6 +291,15 @@ impl ControlStore {
             .collect()
     }
 
+    pub fn operation(&self, id: &OperationId) -> Result<Option<OperationRecord>> {
+        let key = record_key(OPERATIONS, id.0.as_bytes());
+        self.0
+            .db
+            .get(&key)?
+            .map(|value| decode_control_operation(&key, &value))
+            .transpose()
+    }
+
     pub fn pending_operations(&self) -> Result<Vec<OperationRecord>> {
         self.scan(record_key(OPERATIONS, &[]))
             .filter_map(|entry| {
