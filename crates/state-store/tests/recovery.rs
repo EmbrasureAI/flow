@@ -69,6 +69,47 @@ fn file_counts(store: &StateStore, snapshot: i64, files: &[&str]) -> Vec<u64> {
 }
 
 #[test]
+fn prepared_delta_stream_owns_rows_and_stays_within_its_operation_after_reopen() {
+    let temp = TempDir::new().unwrap();
+    let expected = [insert(3, "s3://warehouse/é.parquet", 9), insert(1, "b", 2)];
+    {
+        let store = open(temp.path());
+        for (table, name) in [(7, "op"), (8, "op-next"), (9, "empty")] {
+            let mut prepared = operation(name, None, 10);
+            prepared.table_id = TableId(table);
+            store
+                .prepare(
+                    prepared,
+                    if name == "empty" { &[][..] } else { &expected }
+                        .iter()
+                        .cloned(),
+                )
+                .unwrap();
+        }
+        let mut building = operation("building", None, 10);
+        building.table_id = TableId(10);
+        store.begin_prepare(building).unwrap();
+        assert!(
+            store
+                .prepared_deltas(&OperationId("building".into()))
+                .is_err()
+        );
+    }
+    let rows = {
+        let store = open(temp.path());
+        let mut empty = store.prepared_deltas(&OperationId("empty".into())).unwrap();
+        assert!(empty.next().is_none());
+        assert!(empty.next().is_none());
+        let mut stream = store.prepared_deltas(&OperationId("op".into())).unwrap();
+        let rows = stream.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(stream.next().is_none());
+        assert!(stream.next().is_none());
+        rows
+    };
+    assert_eq!(rows, expected);
+}
+
+#[test]
 fn recovery_resumes_atomic_index_batches_and_keeps_table_fenced() {
     let temp = TempDir::new().unwrap();
     let id = OperationId("op".into());

@@ -472,9 +472,32 @@ impl StateStore {
         }
         let mut prefix = operation_prefix(id);
         prefix.push(0);
-        Ok(self.scan(DELTAS, prefix).map(|entry| {
-            let (_, bytes) = entry?;
-            decode(&bytes)
+        let cf = self.0.db.cf_handle(DELTAS).expect("opened column family");
+        let mut options = ReadOptions::default();
+        options.fill_cache(false);
+        if let Some(end) = prefix_end(&prefix) {
+            options.set_iterate_upper_bound(end);
+        }
+        let mut records = self.0.db.raw_iterator_cf_opt(&cf, options);
+        records.seek(&prefix);
+        let mut finished = false;
+        Ok(std::iter::from_fn(move || {
+            if finished {
+                return None;
+            }
+            let Some((key, value)) = records.item() else {
+                finished = true;
+                return records.status().err().map(|error| Err(error.into()));
+            };
+            if !key.starts_with(&prefix) {
+                finished = true;
+                return None;
+            }
+            // Decode while the iterator owns the bytes; advancing is safe once
+            // the returned delta owns its fields, without copying key or value.
+            let delta = decode(value);
+            records.next();
+            Some(delta)
         }))
     }
 

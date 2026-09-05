@@ -148,3 +148,36 @@ The retained release38 baseline is
 The serial follow-up runner records exit status 1 and complete report identity
 in `target/release39-followup/summary.json`. This is a finite local workload;
 the 50k, reader-health and 24-hour production gates remain unmet.
+
+## Prepared-delta allocation follow-up
+
+The next source change decodes prepared mappings directly from the RocksDB raw
+cursor, avoiding temporary owned copies of both the key and encoded value.
+Decoded rows remain owned; prefix bounds, checksum defaults, block-cache fill policy and
+terminal error propagation remain unchanged. No storage format or activation
+fence changes. This change is not part of the frozen release39 binary above.
+
+An isolated optimized measurement stages and seals 218,743 deterministic rewrite
+mappings through the normal state-store API, closes the database and opens it
+read-only. All old/new decoded records agree, with length-framed bincode SHA-256
+`42dbfcb0f5da754685f42b10bb51519ebf0564c9f4fcfb483da91ebe1b2cb9e0`.
+Twelve alternating warm scan pairs give median times of 62.317 ms for the generic
+iterator and 54.493 ms for the raw cursor; every pair improves, with a median
+paired reduction of 12.174%. This is synthetic real-RocksDB scan evidence, not
+retained workload replay or an end-to-end latency result. The initial attempt
+to replay the completed service operation failed because it had been retired.
+
+The local report is
+`target/prepared-delta-cursor-review/synthetic-report.json`, SHA-256
+`41934eb1c571199500ebe18c8e82a6d8c8850324484e4dfbad7b0749aa8db4e4`;
+measurement helper SHA-256 is
+`de53267b08fbcfbce56115d486a70172c1564d6577e98801bafec23dd2f587cd`.
+The temporary test-only measurement module was removed before the workspace
+gate. The permanent regression checks sealed/unsealed and empty operations,
+operation isolation, staging order, repeated exhaustion and owned results after
+closing a reopened database. The roughly eight-millisecond scan saving does not
+resolve the multi-second qualification gap.
+
+The follow-up passes all 155 active Rust tests (one ignored), strict workspace
+Clippy and formatting. Logs are retained under
+`target/prepared-delta-cursor-review/`.
