@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package notices from the locked daemon dependency graph, without compiling."""
+"""Check reviewed license terms and package locked daemon notices, without compiling."""
 
 import argparse
 import hashlib
@@ -69,6 +69,30 @@ def packages_for_daemon(metadata):
     return sorted((packages[p] for p in selected), key=lambda p: (p["name"], p["version"]))
 
 
+def check_policy(packages, policy):
+    """Match reviewed expressions verbatim; this is not an SPDX parser."""
+    for p in packages:
+        identity = f"{p['name']} {p['version']}"
+        if p["license"] not in policy["reviewed_expressions"]:
+            raise ValueError(f"unreviewed license expression: {identity}: {p['license']!r}")
+        native = policy["bundled_native"].get(p["name"])
+        if p["name"] in NATIVE_FILES and native is None:
+            raise ValueError(f"unreviewed bundled native component: {identity}")
+        review = native or policy["other_links"].get(p["name"])
+        if p.get("links") or native:
+            if (review is None or review["version"] != p["version"]
+                    or review["links"] != p.get("links")):
+                raise ValueError(f"unreviewed native linkage: {identity}: {p.get('links')!r}")
+        if native:
+            source = Path(p["manifest_path"]).parent
+            required = set(NATIVE_FILES.get(p["name"], []) + NATIVE_HEADERS.get(p["name"], []))
+            if not required.issubset(native["files"]):
+                raise ValueError(f"native notice policy is incomplete: {identity}")
+            for relative, expected in native["files"].items():
+                if sha256((source / relative).read_bytes()) != expected:
+                    raise ValueError(f"changed reviewed native notice: {identity}/{relative}")
+
+
 def package(args):
     rustc = capture("rustc", "-vV")
     target = args.target or next(line[6:] for line in rustc.splitlines() if line.startswith("host: "))
@@ -76,10 +100,19 @@ def package(args):
         "cargo", "metadata", "--locked", "--offline", "--format-version", "1",
         "--filter-platform", target,
     ))
+    policy_bytes = (ROOT / "licenses/policy.json").read_bytes()
+    policy = json.loads(policy_bytes)
+    if target not in policy["targets"]:
+        raise ValueError(f"unreviewed distribution target: {target}")
+    packages = packages_for_daemon(metadata)
+    check_policy(packages, policy)
     supplements = json.loads((ROOT / "licenses/supplemental.json").read_text())["supplements"]
     for entry in supplements:
         if sha256((ROOT / "licenses" / entry["file"]).read_bytes()) != entry["sha256"]:
             raise ValueError(f"changed supplemental notice: {entry['file']}")
+    if args.check_only:
+        print(f"License policy passed: {len(packages)} packages for {target}")
+        return
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output must be absent or empty: {output}")
@@ -87,10 +120,11 @@ def package(args):
     for name in ("LICENSE", "NOTICE"):
         copy_notice(ROOT / name, output / name)
     copy_notice(ROOT / "licenses/README.md", output / "README.md")
+    copy_notice(ROOT / "licenses/policy.json", output / "policy.json")
     lock_bytes = (ROOT / "Cargo.lock").read_bytes()
     locked = {(p["name"], p["version"]): p for p in tomllib.loads(lock_bytes.decode())["package"]}
     inventory = []
-    for p in packages_for_daemon(metadata):
+    for p in packages:
         name, version = p["name"], p["version"]
         source = Path(p["manifest_path"]).parent
         destination = output / "third-party" / f"{name}-{version}"
@@ -123,6 +157,7 @@ def package(args):
                 copy_notice(source / relative, destination / relative)
         inventory.append({
             "name": name, "version": version, "license": p["license"],
+            "reviewed_license_choice": policy["reviewed_expressions"][p["license"]],
             "repository": p["repository"], "source": p["source"] or str(source.relative_to(ROOT)),
             "crate_sha256": locked[(name, version)].get("checksum"),
             "supplemental_sources": additions,
@@ -137,6 +172,7 @@ def package(args):
         raise ValueError("Rust toolchain license files are missing")
     inventory_document = {
         "format_version": 1, "target": target, "rustc": rustc,
+        "license_policy_sha256": sha256(policy_bytes),
         "cargo_lock_sha256": sha256(lock_bytes), "packages": inventory,
         "files": {
             str(file.relative_to(output)): sha256(file.read_bytes())
@@ -149,6 +185,8 @@ def package(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--output", type=Path)
+    action.add_argument("--check-only", action="store_true", help="check policy without writing a bundle")
     parser.add_argument("--target", help="Cargo target triple; defaults to rustc host")
     package(parser.parse_args())
