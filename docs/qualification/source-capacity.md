@@ -1,13 +1,15 @@
 # Source-generator capacity prerequisite
 
-The source-only prerequisite fails at 50,000 offered mutations/s with both four
-and eight writers. These runs use the exact `Benchmark.writer`, seed and payload
+The current four-writer source-only control admits all 35,000 scheduled
+transactions at 50,000 offered mutations/s. Earlier four/eight/four-writer runs
+miss arrivals, demonstrating variable capacity rather than a fixed ceiling.
+These runs use the exact `Benchmark.writer`, seed and payload
 expression, with the existing bounded SQLite recorder and disk key pools. They
 create no ingestion daemon, replication slot, catalog, object-store or reader
 connection. They therefore measure source generation and PostgreSQL response
 capacity, not ingestion throughput or catalog latency.
 
-The serial order was four writers, eight writers, then four writers again. Each
+The original serial order was four writers, eight writers, then four writers again. Each
 run seeds 100,000 rows and offers 100-row mixed transactions with 256-byte
 payloads: 70 updates, 20 inserts and 10 deletes. Ten seconds of warmup precede
 60 measured seconds; the random seed is 20260905 and the arrival tolerance is
@@ -60,6 +62,51 @@ failure entirely to the daemon. They also do not excuse the independently
 measured publication backlog and reader overhead. A 50k ingestion claim requires
 a source configuration that admits the complete offered workload, followed by
 the same full ingestion and reader gates.
+
+## Current serial control and rejected pipeline
+
+The release38 follow-up keeps the four-writer workload and durability settings
+above. The serial control admits all 35,000 transactions and verifies 450,000
+final rows and every immutable marker. A candidate pipelines SQL within each
+source transaction while retaining affected-row checks before commit. It passes
+source correctness but misses one measured arrival, so it is reverted.
+
+| Generator | Measured committed / missed | Warmup committed / missed | Response-window mutations/s | SQL/response p95 | Final rows / markers |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Current serial | 30,000 / 0 | 5,000 / 0 | 49,998.33 | 5.613 ms | 450,000 / 35,000 |
+| Pipelined candidate | 29,999 / 1 | 5,000 / 0 | 50,001.67 | 4.638 ms | 449,990 / 34,999 |
+
+Both have zero unrecorded arrivals and incomplete commits. Response-window rates
+count responses within the wall window and do not replace the complete scheduled
+cohort check. PostgreSQL's system identifier and postmaster incarnation match
+before and after both runs; fsync, full-page writes, synchronous commits and
+logical WAL remain enabled. The lower candidate SQL/response p95 is a client
+elapsed measurement, not server CPU time or a complete-arrival capacity win.
+
+Eight actual-writer cases separately verify serial/pipelined equivalence for
+mixed, append and update-heavy profiles, plus pipeline rollback on affected-row
+mismatch and SQL error. Exact rows and key-pool hashes match each successful
+pair; failures preserve the original rows and keys without a committed record.
+This is writer-semantics coverage, not ingestion qualification.
+
+The serial control uses `benchmark.py` SHA-256
+`1d0d0f69b132599c1981a110efac0cc9552b6a42aed587219b544a3d5b2ab184`;
+the candidate uses `20f20d7388b7898e96d817bfe9ef91ffdd694b63b645aa3ced528000ffc0da54`.
+The source-capacity wrapper and recorder hashes match the later original runs.
+`target/release38-source-pipeline/comparison.json` records the decision and
+identities. The rejected source and patch remain ignored local evidence as
+`candidate-benchmark.py` and `candidate.patch`; the patch SHA-256 is
+`a4ce4f68060b222798e020e3efa1dca8197b948b38cf40f9bbbed56c1a31301f`.
+
+| Report | SHA-256 |
+| --- | --- |
+| [Current serial control](../../target/release38-source-pipeline/serial/report.json) | `fce60d1663b6b94c9b3a95cfc292d94a7a2d46dc7f644ddb0d71edc3111d8f93` |
+| [Rejected pipeline](../../target/release38-source-pipeline/pipelined/report.json) | `729c9c125bf9e5c511d957c68fb41583fcc1705fc862b51061d760c077ca4f58` |
+| [Writer semantics](../../target/source-pipeline-validation/results/report.json) | `b15475aa63c82c72a624662e5306e94f2bced9354acc7cccdb0c27054796f1e1` |
+
+This complete serial source-only gate permits a new full 50k ingestion test;
+it does not establish capacity while the daemon, compaction and readers compete
+for resources. The earlier failures remain valid for their recorded runs.
 
 ## Retained evidence
 

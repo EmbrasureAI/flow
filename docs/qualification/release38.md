@@ -172,3 +172,32 @@ smaller metadata layout. These are warmed reads of small tables, not sufficient
 evidence for changing general maintenance defaults. Planning excludes parsing
 and client overhead; operator timings are neither physical I/O wall time nor CPU
 measurements. The retained reports include the exact scripts, settings and pins.
+
+## Full 50k follow-up
+
+After the [complete serial source-only control](source-capacity.md), the unchanged
+generator runs the ordinary one-table, 100,000-initial-row 50k case against the
+same frozen release38 binaries. No other workloads or builds run concurrently.
+It admits 24,596 of 30,000 measured transactions and 4,254 of 5,000 warmup
+transactions; 6,150 arrivals are missed in total, with none unrecorded. All
+28,850 committed transactions are observed. Exact final rows match 388,500 rows,
+and PostgreSQL's confirmed flush LSN equals the materialized cursor with no
+pending transactions.
+
+The source commits 41,120 mutations/s inside the measured window. Catalog
+p95/p99 are 15,964.455/17,163.840 ms, drain is 11.731 seconds, and the reader
+ratio is 2.710. Source admission, catalog latency and reader health all fail.
+The source-only pass does not establish capacity under this shared workload.
+
+Offline phase attribution finds 13 background and four synchronous rewrites
+through ingestion. The slowest five percent of transactions spend a mean
+16.454 seconds between journal and collapse, versus 0.186 seconds from collapse
+to catalog. Known synchronous maintenance occupies about 58.5% of that waiting
+interval. These log-derived intervals include I/O and have unobserved gaps;
+they motivate examining hard-debt maintenance, not assigning all delay to it.
+
+The report is `target/release38-performance/serial-50k/report.json`, SHA-256
+`71fc5b3536095956b1d1f0e712abe29a43263ee9910aa89a99d9c90740ac0ae2`.
+The command and exit status are retained in `summary.json`; `analyze.py`
+reproduces `comparison.json`. This failed complete-path result remains separate
+from the 100-table sampled diagnostic above.
