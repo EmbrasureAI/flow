@@ -130,3 +130,35 @@ An export-failure cleanup correction then produces wrapper hash
 `87248d8260068c9dd5a64a770372ed5d1beb859d2c8c827171d8b8c6c2caaa3a`,
 used unchanged for the eight-writer and repeated four-writer runs. The correction
 does not change source scheduling, SQL, random selection or verification.
+
+## Rejected private-key file resize change
+
+The release39 pending-window diagnostic exposes significant source-worker
+transaction and postcommit key-file time; recorder backpressure does not account
+for its missed arrivals. SQL round-trip wall time includes client scheduling and
+network time, so these records do not establish a PostgreSQL fsync or GIL cause.
+
+The causal comparison follows each writer's committed transaction immediately
+preceding its first missed arrival. Across 1,071 baseline and 3,009 candidate
+transitions, mean source-worker cycles are 18.420 and 23.548 ms against an 8 ms
+schedule. PostgreSQL round-trip wall accounts for 81.1% and 74.9%; client key-file
+maintenance accounts for 12.7% and 20.8%. Recorder queue peaks are 17/256 and
+28/256 items. The reproducible offline analysis and all transitions are retained
+in `target/release39-pending320/source-diagnosis/`; report SHA-256 is
+`3a677aab11dc5f21d7ee93c87d31edb6bcf20299783a4c1765086c8b1912428b`.
+
+One isolated candidate removes the per-transaction file shrink in
+`DenseKeys.remove_selected`, retaining logical read bounds and trimming the tail
+at close. All 16 Python checks pass, including exact key order and final file
+bytes. Four private concurrent writers then execute 2,000 mixed key operations
+each, comparing eight alternating baseline/candidate samples with identical
+final files. Candidate median wall time regresses 14.849%, from 2.139 to
+2.457 seconds. The change and its additional test assertions are reverted.
+This file-only comparison contains no PostgreSQL or ingestion workload.
+
+The retained report is `target/dense-key-resize-review/report.json`, SHA-256
+`f999601345391d6e96bd391278e86345180c791f4cd4246914cc04cd8a639462`.
+That directory retains the executed helper, both source variants, rejected
+patch and a replay helper pointing at the saved candidate. This result does
+not justify another SQL or durability change, and does not alter the failed
+source-arrival or daemon-latency qualification results.
