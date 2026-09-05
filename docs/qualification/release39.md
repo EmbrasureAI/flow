@@ -33,8 +33,8 @@ Its report is `target/release39-negative-control/report.json`, SHA-256
 
 The default workspace passes 154 active tests across 40 binaries, with one
 manual profile ignored (`target/release39-workspace-tests.log`). Formatting and
-strict Clippy (`target/release39-clippy.log`) pass. Frozen optimized service and
-performance validation remain required.
+strict Clippy (`target/release39-clippy.log`) pass. The frozen optimized service
+gate below passes; performance qualification remains incomplete.
 
 The optimized artifact is frozen from clean commit
 `2856bd82c613e92dccfa2e9b6965c51d812ee752`, tree
@@ -54,3 +54,31 @@ abandoned builds, snapshots every remaining scratch directory after process
 exit, and requires all of them to be removed on restart. The dedicated parallel
 fixture separately requires exactly two held owners and two recovered BUILDs.
 The corrected service campaign uses the same frozen binary.
+
+## Corrected optimized service gate
+
+All 30 phases pass in `target/release39-campaign-02/summary.json`. The serial
+campaign verifies frozen binary, manifest and harness hashes before every case,
+without competing builds or workloads. The artifact uses Rust 1.97.1 with the
+release profile for `aarch64-apple-darwin`; its manifest is
+`target/qualification-binaries/release39/build-manifest.json`.
+
+| Case | Phases | Elapsed | Report SHA-256 |
+| --- | ---: | ---: | --- |
+| Concurrent compaction and recovery | 7 | 179.750 s | `397b7edb14c6856873a71fc8ebd6fa83c32773c9458898168d95b7986e77d7d3` |
+| Two held table builds | 6 | 71.930 s | `a44f914029b673519983c1e6a875d34cc2480289bbb48e5f11950d606cb066fa` |
+| Periodic cleanup with two hot tables | 5 | 97.940 s | `cf9527e77bc08f50660a85dea546fab5d3b6567b0fe52cf0e2ab41f0c3258c80` |
+| Durable service faults | 12 | 74.250 s | `1050322e8d2920a3be989391c909fc92e1939340a65909984e64d39a86015ecd` |
+
+The hard-pressure candidate completes preparation in 1,258.817 ms, survives the
+old 750 ms bound and publishes without retirement. Exact current rows and source
+ACK pass. The remaining concurrent phases verify translated deletes, retained
+history, the unchanged 30-second build cancellation fence, scratch reclamation
+after joining, graceful SIGTERM and restart recovery. Parallel, periodic and
+fault cases preserve their separate coverage, including external reconciliation.
+
+The independent compactor requires three supervisor restarts during injected
+outages. These are passing recovery checks, not uninterrupted availability.
+Independent reader and full 50k follow-ups are running separately; their results
+are not yet part of this gate. The original fixture failure remains retained,
+and these service results do not qualify the 50k, reader-health or 24-hour targets.
