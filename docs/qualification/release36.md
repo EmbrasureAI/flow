@@ -123,6 +123,65 @@ WAL-triggered checkpoints overlap 227 missed arrivals, while the largest
 cause. Producer thread stacks and backend wait events are the next diagnostic;
 PostgreSQL settings, workload thresholds and runtime defaults remain unchanged.
 
+The first instrumented attempt, `target/release36-source-diagnostic`, terminated
+with SIGSEGV in CPython 3.13's asynchronous `faulthandler` stack dump before
+completing the workload. The macOS crash report resolves through
+`_PyFrame_SafeGetCode`, `dump_frame` and `faulthandler_user`; the retained
+`crash-assessment.json` records its hash and cleanup of the owned daemon. This
+is a failed diagnostic, even though its sampler summary's `diagnostic_complete`
+field is true. It establishes no throughput or correctness result. A follow-up
+uses ordinary Python thread sampling instead of asynchronous signal dumps.
+
+
+## Instrumented concurrency comparison
+
+The revised Python sampler uses `sys._current_frames()` from an ordinary thread,
+with PostgreSQL waits sampled independently in the parent process. Both runs
+completed their diagnostic, provenance, full-row and ACK checks. The same frozen
+binaries, workload, thresholds and sampling were used, with four versus eight
+table workers. Each admitted all 1,000 warmup and 6,000 measured transactions and
+verified 1,070,000 rows across 100 tables.
+
+| Table workers | Catalog p95 / p99 | Drain | Maximum reader ratio |
+| ---: | ---: | ---: | ---: |
+| 4 | 16,050.124 / 16,205.766 ms | 16.020 s | 1.477 |
+| 8 | 1,580.898 / 1,899.653 ms | 1.250 s | 1.392 |
+
+Evidence is in `target/release36-source-diagnostic-02` and `-03`. Their report
+SHA-256 values are respectively
+`421686dd07a637fa2a6a6e920c5cadab30ce2fc955471447b47e41bf81aebf5f` and
+`df4d4b465c977b944abc2168293b76c1be003a2bf3e931840a95a1fdf778652a`.
+
+The manifests, binary hashes, six harness hashes, wrapper hash and all 100 final
+row digests match. After normalizing fixture namespaces and artifact paths,
+configuration differs only in `table_workers`. Both execute 1,750 ingestion epochs
+of four transactions. The retained `-03/comparison.md` and identity JSON record
+these checks.
+
+The approximately 90% lower p95 with eight workers supports the worker-capacity
+explanation for this workload. Both still fail the one-second p95 and 1.25 reader
+ratio targets. The instrumentation changes overhead, and a serial pair is not
+endurance evidence. Runtime defaults remain unchanged; the failed uninstrumented
+control is not replaced by these diagnostic results.
+
+The four-worker diagnostic captured 13 source transactions over 100 ms, peaking
+at 220.584 ms. Backend samples show COMMIT waiting on `WalSync`/`WALWrite` while
+Python writer stacks wait in psycopg transaction exit. These smaller
+tails have direct backend-wait evidence. No transaction exceeded 250 ms, and
+Python sampling gaps peaked at 175.462 ms, so the original near-second missed-arrival
+bursts did not recur and their cause remains unresolved. No source SQL, WAL policy,
+durability setting or arrival threshold was changed.
+
+The remaining eight-worker tail is predominantly before collapse: the slowest
+5% of measured transactions average 1,698.3 ms from journal to collapse and
+104.6 ms from collapse to catalog. During those earlier intervals, reconstructed
+known occupancy averages 6.91 of eight workers: 3.64 in strict rewrite phases,
+2.44 in ingestion and 0.84 in background phases. This points to transient worker
+congestion involving synchronous maintenance, not background builds occupying
+most slots. The exact queue/refresh/control split is not instrumented, so this
+result does not establish a more specific serialization bottleneck.
+
+
 ## Retained failures and limits
 
 The initial `target/release36-debug-campaign` used disabled data rewrites with

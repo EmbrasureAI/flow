@@ -36,8 +36,11 @@ build scheduling and allows checkpoint rotation with pending catalog work. Its
 155-test Rust gate, 16 Python checks, three debug service cases and 24 frozen
 optimized service phases pass. The new 100-table control preserves accepted data
 but misses 390 source arrivals, so the four/eight-worker comparison stops before
-its second case. The next diagnostic separates backend commit waits from producer
-scheduling delays; runtime defaults and workload thresholds remain unchanged.
+its second case. A separately instrumented pair admits all 7,000 transactions
+and verifies 1,070,000 rows in each case: eight workers lower catalog p95 from
+16.05 s to 1.58 s, but still fail the p95 and reader-ratio targets. Observed
+smaller source tails coincide with backend WAL waits; the original missed-arrival
+bursts remain unexplained. Runtime defaults and workload thresholds stay unchanged.
 
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 
