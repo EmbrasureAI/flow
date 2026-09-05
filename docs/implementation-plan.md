@@ -45,10 +45,16 @@ bursts remain unexplained. Runtime defaults and workload thresholds stay unchang
 The [bounded parallel build candidate](qualification/release37.md) now tests two
 distinct-table lifecycles against that measured maintenance congestion. Its
 two-table service regression passes CDC, exact delete translation, cancellation
-and restart boundaries and fails on release36's single-build limit. Optimized
-correctness and a matched performance comparison must justify adoption before
-moving to further tuning. The separate OSS delivery work remains automatic cost
-input collection, license-policy enforcement and upstream patch packaging.
+and restart boundaries and fails on release36's single-build limit. All 30
+optimized service phases pass. A complete matched cohort meets catalog p95/p99
+at 708/823 ms, but reader amplification worsens. Exact pinned snapshots reproduce
+the reader cost and expose current-snapshot deletion-manifest fanout alongside
+bounded pending L0 work; preserving deletion metadata while packing it more
+compactly is the next code review. The dependency-policy gate passes full
+macOS/Linux notice bundles and rejection checks. The first upstream-ready reader
+patch has a failing unmodified control and 31 passing fixed tests. Automatic cost
+input collection and the remaining upstream transaction primitives are separate
+OSS delivery work.
 
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 
@@ -170,7 +176,7 @@ by bounded-v2; final local watermarks must not be relabeled as that measurement.
 3. Retain the 1,024-row apply default. The coupled and fixed-lookup comparisons reject larger atomic commits; the external-SST comparison also fails to improve total work. Use the release34 end-to-end phase evidence to select any further index change. An unreachable generation is a possible design, not an accepted implementation plan or a reason to repeat component tuning before measuring the current pipeline.
 4. Close the measured 50k, multi-table and reader gaps before endurance qualification. Release34 completes all thirteen workload cases with exact accepted data and ACK, but only wide-1k and append-10k meet every performance gate; 100-table catalog p95/p99 are 39.6/43.5 seconds. Verify periodic metadata/garbage work and bounded resource growth under continuous backlog, then run the required 24-hour dimensions. Qualify index I/O, provider costs, planning/scan amplification and publication latency together.
 5. Extend source-version, reader-version and storage/catalog coverage beyond the recorded gates. Real-source tests cover PostgreSQL 14.24, 15.19, 16.15, 17.11 and 18.6; reader results apply to the exact versions in validation. Extend failure and retention checks to deployment conditions.
-6. Publish accurate OSS support and dependency/license policies, maintain Linux CI/demo checks, and prepare reusable upstream Iceberg patches.
+6. Maintain the enforced dependency/license policy and Linux CI/demo checks. The first upstream reader fix is packaged and tested; prepare the remaining reusable transaction primitives. Keep upstream submission and acceptance distinct from local correctness.
 7. Add low-fan-out partitioning, then v3 behavior only after the specification's preceding qualification gates, with separate interoperable delete/rewrite/recovery validation.
 
 Local integration, independent readers, real service fault injection and performance work are authorized by the follow-up requests. Their remaining gaps are engineering and qualification work, not deferred user requests.
