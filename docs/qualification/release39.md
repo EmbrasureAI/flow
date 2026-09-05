@@ -181,3 +181,28 @@ resolve the multi-second qualification gap.
 The follow-up passes all 155 active Rust tests (one ignored), strict workspace
 Clippy and formatting. Logs are retained under
 `target/prepared-delta-cursor-review/`.
+
+## Pending-window diagnostic
+
+One further run uses the same frozen release39 daemon and reference compactor,
+changing only `pending_transactions` from 256 to 320. The baseline hit its
+256-transaction window in 107 of 157 epochs. The candidate's 123 epochs all stay
+on the memory path, with a maximum retained collapse state of 30,062,970 bytes
+under the unchanged 33,554,432-byte cap. Larger apply batches, memory limits and
+reader-debt thresholds are not introduced.
+
+The run fails qualification: 24,257 of 30,000 measured transactions commit, with
+5,743 missed arrivals; warmup commits 4,808 of 5,000. Every one of the 29,065
+committed transactions is observed, exact final rows match 390,650, and source
+ACK matches materialized LSN `23/BEB4E170` with no pending transactions. Catalog
+p95/p99 are 6.439/6.988 seconds, final drain is 3.482 seconds and source
+response-window throughput is 40,403.33 mutations/s. The reader ratio passes at
+1.104; peak sampled daemon RSS is 479,166,464 bytes and no worker panics occur.
+
+Different accepted cohorts prevent interpreting either the lower latency or
+reader ratio as a controlled improvement over the 256-window run. The default
+stays at 256. The retained report is
+`target/release39-pending320/serial-50k/report.json`, SHA-256
+`ab06b66bab4fc9ba23ce8b64bf0e653f60063c1a42d2a59513d516785fa781f3`.
+`provenance.json` records the exact command, frozen build and harness hashes;
+`comparison.json` verifies unchanged remaining limits and maintenance policy.
