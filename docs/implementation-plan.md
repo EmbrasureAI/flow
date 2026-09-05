@@ -29,6 +29,8 @@ Review every change against this chain. A performance improvement must preserve 
 
 ## Evidence checkpoints
 
+The frozen [release34 gate](qualification/release34.md) is the latest correctness checkpoint: 154 Rust tests, nine Python checks and 35 real service phases. It closes durable cleanup, generation corruption recovery and WAL-health status gaps. The serial release34 workload matrix is the next performance gate.
+
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 
 - [Bootstrap recovery](../target/production-bootstrap-02/report.json) and [DDL between COPY attempts](../target/production-bootstrap-ddl-02/report.json): mid-COPY crash, durable staging reuse, concurrent CDC, index deletion and automatic rebuild.
@@ -146,7 +148,7 @@ by bounded-v2; final local watermarks must not be relabeled as that measurement.
 
 1. Keep release32's split preparation and exact activation as the current base. Its finite 1k/10k matrix passes correctness and catalog latency, while all eight reader ratios remain above 1.25. Preserve exact table/head validation, Prepared ownership, deadline retirement, journal replay and the same measurement thresholds.
 2. Retain release32's current staging path. The external-SST comparison passes its correctness and reopen boundaries but does not improve total work at one million mappings; its tiny install only moves construction out of the activation barrier while the unchanged index apply dominates.
-3. Retain the 1,024-row apply default. The coupled and fixed-lookup comparisons reject larger atomic commits, so do not add a byte cap or rerun the service matrix for those candidates. Preserve the new phase and serialized-batch observations. The next index candidate is an unreachable generation prepared outside the live-index barrier, followed by exact catch-up and one durable active-generation switch; qualify it against the same correctness, recovery, memory, lock-hold and service gates before adoption.
+3. Retain the 1,024-row apply default. The coupled and fixed-lookup comparisons reject larger atomic commits; the external-SST comparison also fails to improve total work. Use the release34 end-to-end phase evidence to select any further index change. An unreachable generation is a possible design, not an accepted implementation plan or a reason to repeat component tuning before measuring the current pipeline.
 4. After maintenance and reader health pass, repeat the 50k and 100-table workloads with the validated disk-backed harness, then run the required 24-hour dimensions. Qualify compaction debt, resource growth, index I/O, provider costs, planning/scan amplification and publication latency together.
 5. Extend source-version, reader-version and storage/catalog coverage beyond the recorded gates. Real-source tests cover PostgreSQL 14.24, 15.19, 16.15, 17.11 and 18.6; reader results apply to the exact versions in validation. Extend failure and retention checks to deployment conditions.
 6. Publish accurate OSS support and dependency/license policies, maintain Linux CI/demo checks, and prepare reusable upstream Iceberg patches.

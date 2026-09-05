@@ -2,6 +2,8 @@
 
 Validation follows the complete path from PostgreSQL commit through durable capture, catalog publication, independent reader visibility, index recovery and source acknowledgement. Passing a component test does not qualify sustained throughput or a deployment. The accepted scope is in [OSS readiness](oss-readiness.md); external compactor reconciliation is included. Z-order, a distributed compaction protocol, HA and global autocompaction are excluded from early functionality.
 
+The latest [release34 gate](qualification/release34.md) passes 154 active Rust tests across 40 binaries, strict Clippy, formatting, nine Python harness tests, and 35 real service phases. Four manual performance profiles remain ignored by the ordinary Rust run. Performance qualification is recorded separately.
+
 ## Reproducible gates
 
 Run `cargo test --locked --workspace --all-targets`, `cargo fmt --all --check`, and `cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings`. Project integration tests use real RocksDB databases, journal segments, Parquet and Avro files, the stock Iceberg Rust reader, scripted wire peers and child-process exits. Vendored Apache source may emit existing upstream warnings. A test count is not an acceptance contract; use the complete gate against the exact revision being released.

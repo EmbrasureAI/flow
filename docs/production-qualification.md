@@ -2,6 +2,8 @@
 
 The implementation has passing local recovery and interoperability gates, but has not met the specification's performance qualification. The target is 50,000 mixed mutations/s with PostgreSQL commit-to-catalog p95 below one second and p99 below two seconds for ordinary transactions. Correct final rows alone do not qualify that target.
 
+The latest [release34 recovery and service qualification](qualification/release34.md) records 154 passing Rust checks and 35 passing local service phases on a frozen release binary. Earlier results below retain their original binary and measurement scope.
+
 ## Environment and measurement
 
 The persistent fixture runs PostgreSQL 18.6, MinIO, and Apache Iceberg REST 1.10.1 with PostgreSQL JDBC 42.7.13. The catalog has its own PostgreSQL database and role on the source server. Named volumes preserve source, catalog and object data across restarts. Source fsync, synchronous commits, full-page writes, logical decoding and commit timestamps are enabled. Additional source conformance runs use PostgreSQL 14.24, 15.19, 16.15 and 17.11.
@@ -12,7 +14,10 @@ After readers05, all 64 retained replication slots were inactive and the fixture
 had reached its configured capacity. With all fixture clients stopped, capacity
 was raised to 128 and PostgreSQL and REST restarted. Volumes, retained slots and
 resource/durability settings were preserved. Later reports use this capacity;
-earlier reports retain their original environment.
+earlier reports retain their original environment. Before release34, 125 of 128 slots
+were retained and inactive; capacity was raised to 256 with the same preservation
+and durability settings. REST was restarted after PostgreSQL to clear stale JDBC
+connections.
 
 The [benchmark](../tests/production/README.md) schedules arrivals independently of completion, counts missed arrivals, and compares sorted final source and Iceberg rows. Publication latency uses source commit timestamps, durable journal events and actual successful catalog response events. Before/after clock calibration preserves raw values and offset uncertainty. Reader visibility is a polling upper bound, reported separately. Read timings include planning and execution and cannot qualify a planning-only target.
 
