@@ -645,3 +645,43 @@ request against 67,108,864 bytes. All ten 512-row source batches recovered:
 4,100-order histories were unchanged; no worker panic was logged. The initial
 `production-boundaries-01` authentication setup failure remains retained
 separately and did not start a daemon or create a source fixture.
+
+## Maintenance fairness under queued CDC
+
+`maintenance_fairness.py` queues 1,025 source transactions while the daemon is
+stopped, then primes a durable backlog behind a held ingest commit. With native
+compaction enabled on restart, every 16-transaction publication page is already
+old enough to be immediately scheduled. The default workload keeps orders hot;
+`--two-hot-tables` also updates accounts on every commit to cover worker contention.
+A 10,000 commits/s diagnostic limit avoids artificial permit gaps. A background build must start before
+the backlog drains, and publication and source ACK must advance while an actual
+input Parquet read is held. DuckDB verifies current and retained historical rows;
+the owned daemon must exit cleanly.
+
+```sh
+uv run tests/production/maintenance_fairness.py \
+  --postgres-url "$FLOW_POSTGRES_URL" \
+  --catalog-uri http://127.0.0.1:58181 \
+  --s3-endpoint http://127.0.0.1:59000 \
+  --binary target/qualification-binaries/release35/embrasure-flow \
+  --artifacts target/production-maintenance-fairness-new
+```
+
+This finite scheduling regression records its diagnostic policy: soft L0 count
+2, hard count 128, raised delete/stable-file limits and two workers.
+The bounded workload fits below those hard limits. Reaching hard pressure or
+starting a build only after draining the backlog fails the test; neither is
+accepted as evidence of fair admission. These settings are not proposed defaults
+or a throughput qualification.
+
+The initial two-table attempt in `target/release34-fairness-negative-01` passed
+on the old release34 binary: a build began at 1.541 seconds with 800 transactions
+pending and orders still behind its final source barrier. It therefore did not
+reproduce starvation and is not a successful negative control. With two tables,
+the bounded shared transaction window can leave one table temporarily empty
+while the other finishes its page. The default one-table case removes that
+opportunity. It fails on release34 in `target/release34-fairness-negative-02`
+because the orders build starts only after its own backlog drains. The same
+fixture passes on the candidate debug build in `target/release35-fairness-debug-01`,
+with 721 transactions still pending when a build is admitted. Release performance
+qualification remains separate.

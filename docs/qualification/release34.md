@@ -121,3 +121,40 @@ Manifest peaks stay below the default trigger of 64. Full samples, snapshot
 cutoffs, report hashes and accounting are retained in
 `target/release34-policy/assessment.{md,json}`. One pair per rate is enough to
 reject this change, not to establish repeat-run performance distributions.
+
+## Default-policy workload matrix
+
+The first nine cases of `target/release34-matrix` use the default compaction
+policy and manifest trigger of 64, with the benchmark's recorded worker, commit
+and disk budgets. The matrix is paused between workloads for a scheduling
+regression; its remaining four cases have not run. Each measured case lasts
+60 seconds after ten seconds warmup. All nine verify exact final source/target
+rows, final source ACK and independent compactor reconciliation.
+
+| Workload | Missed arrivals | Catalog p95 / p99 ms | Worst scan ratio | All bounded gates |
+| --- | ---: | ---: | ---: | --- |
+| Mixed 1k | 0 | 522 / 581 | 1.337 | Fail |
+| Mixed 10k | 0 | 865 / 1,105 | 1.396 | Fail |
+| Mixed 50k | 3,874 | 22,013 / 22,363 | 2.885 | Fail |
+| Wide 16 KiB rows, 1k | 0 | 665 / 783 | 1.003 | Pass |
+| Ten tables, 10k total | 390 | 1,831 / 2,523 | 2.359 | Fail |
+| External compactor, 1k | 0 | 523 / 1,366 | 1.320 | Fail |
+| Append 10k | 0 | 544 / 937 | 1.160 | Pass |
+| Hot updates 10k | 0 | 520 / 1,674 | 1.450 | Fail |
+| 1 KiB rows, 10k | 29 | 789 / 1,078 | 1.229 | Fail |
+
+Percentiles describe committed transactions only. Missed arrivals still fail
+qualification, even when the observed latency and reader gates pass. The 50k
+case admits 43,507 mutations/s during the window and drains in 20.311 seconds.
+All 409,650 final rows match, including after independent compaction. There is
+no evidence of data loss in this failed performance run.
+
+The `50k-assessment.md` beside those reports attributes 22.968 seconds of the
+measured minute to synchronous data rewriting, preparation and publication/apply.
+Ingestion occupies another 34.512 seconds. These are wall-time phases, not CPU
+samples. A continuously ready CDC queue precedes overdue optional maintenance in
+the scheduler, consistent with the observed transition from early background
+builds to nine synchronous rewrites across warmup and drain. Three later
+preparation timeouts occur after final ingestion and cannot explain its latency.
+The next experiment admits overdue background capture under backlog while
+preserving hard debt bounds, exact activation and cheaper delete consolidation.

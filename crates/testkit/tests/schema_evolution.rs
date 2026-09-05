@@ -223,6 +223,24 @@ async fn schema_barrier(memory_bytes: usize) {
                 .commit(catalog.as_ref())
                 .await
                 .unwrap();
+            // Capture sees a fresh catalog schema even when the caller still
+            // holds the prior head. Yield to the schema barrier before starting
+            // another build or changing the row index.
+            let rejected = maintenance
+                .start_compaction(
+                    previous_metadata.as_ref().unwrap(),
+                    &old,
+                    StateStore::open(
+                        temp.path().join("schema-race-build"),
+                        StateStoreOptions::default(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .err()
+                .expect("fresh catalog schema must invalidate stale build capture");
+            assert!(rejected.is::<ReplanRequired>(), "{rejected:#}");
+            assert_eq!(store.table_state(&old.table_id).unwrap(), before);
             assert_ne!(
                 target.metadata().current_schema().schema_id(),
                 next.version as i32

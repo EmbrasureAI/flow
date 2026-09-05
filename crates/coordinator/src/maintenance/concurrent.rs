@@ -249,7 +249,7 @@ impl TableMaintenance {
         let table = self.catalog.load_table(table.identifier()).await?;
         ensure!(
             crate::same_iceberg_schema(table.metadata().current_schema(), &iceberg_schema(schema)?),
-            "source schema differs from Iceberg"
+            ReplanRequired
         );
         let Some(snapshot) = table.metadata().current_snapshot_id() else {
             return Ok(None);

@@ -494,6 +494,11 @@ impl PublishRuntime {
                             }));
                             maintenance_due.remove(&id);
                         }
+                        TableOutcome::ProbeComplete => {
+                            ensure!(reserved_build && transactions.is_empty(), "invalid background build probe");
+                            build_active.remove(&id);
+                            maintenance_due.insert(id, Instant::now() + OPTIONAL_MAINTENANCE_DELAY);
+                        }
                         TableOutcome::Preparation(preparation) => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid background preparation handoff");
                             ensure!(
@@ -758,6 +763,27 @@ impl PublishRuntime {
                             })
                             .min_by_key(|(_, due)| **due)
                             .map(|(id, _)| *id);
+                        // A continuous CDC backlog must not postpone every soft
+                        // build until reader debt requires a synchronous rewrite.
+                        // The probe replaces its slot with a build. At least
+                        // one other actor slot remains reusable for CDC.
+                        let free_workers = config.limits.table_workers.saturating_sub(
+                            running.len() + builds.len() + preparations.len() + retirements.len()
+                        );
+                        let probe = if work.compaction && background_builds
+                            && config.compaction.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
+                            && free_workers >= 1
+                            && build_active.is_empty()
+                            && retiring_builds.is_empty()
+                            && scheduler.next_deadline().is_some_and(|due| due <= now)
+                        {
+                            maintenance_due.iter()
+                                .filter(|(id, due)| **due <= now && !busy.contains(*id) && !fenced_fallback.contains(*id))
+                                .min_by_key(|(_, due)| **due)
+                                .map(|(id, _)| *id)
+                        } else {
+                            None
+                        };
                         let (id, idle, candidate) = if let Some(id) = prepared {
                             (
                                 id,
@@ -774,6 +800,8 @@ impl PublishRuntime {
                                     ready_builds.remove(&id).expect("selected build"),
                                 )),
                             )
+                        } else if let Some(id) = probe {
+                            (id, true, None)
                         } else if let Some(id) = scheduler.take_ready(now) {
                             idle_work.retain(|queued| *queued != id);
                             (id, false, None)
@@ -800,11 +828,23 @@ impl PublishRuntime {
                             scheduler.stall(id, true);
                             continue;
                         }
+                        let probing = probe == Some(id) && candidate.is_none();
+                        if probing {
+                            let overdue_ms = maintenance_due.get(&id)
+                                .map_or(0.0, |due| now.saturating_duration_since(*due).as_secs_f64() * 1000.0);
+                            tracing::info!(event = "compaction_build_probe_admitted", table_id = id.0,
+                                queued_transactions = pending.tables.get(&id).map_or(0, VecDeque::len),
+                                overdue_ms, free_workers,
+                                "admitting overdue background build capture beside ready CDC");
+                        }
                         if idle {
                             maintenance_due.remove(&id);
                             idle_work.retain(|queued| *queued != id);
                         }
-                        let build_admission = if candidate.is_some() {
+                        let build_admission = if probing {
+                            build_active.insert(id);
+                            BuildAdmission::Probe
+                        } else if candidate.is_some() {
                             if candidate.as_ref().is_some_and(CompactionCandidate::is_prepared) {
                                 waiting_for_build.remove(&id);
                             }
@@ -819,7 +859,8 @@ impl PublishRuntime {
                         };
                         let lane_acquired_at = Instant::now();
                         let options = WorkOptions {
-                            build_active: candidate.is_none() && build_active.contains(&id) && build_admission != BuildAdmission::Start,
+                            build_active: candidate.is_none() && build_active.contains(&id)
+                                && !matches!(build_admission, BuildAdmission::Start | BuildAdmission::Probe),
                             build_admission,
                             actor_acquired_at: lane_acquired_at,
                         };
@@ -1219,8 +1260,8 @@ impl PendingWork {
     }
 }
 
-// Optional work may yield to more CDC for this long. Once due, it receives
-// the next available worker; running table operations are never preempted.
+// Once due, background build capture may precede another CDC epoch. Synchronous
+// optional maintenance still waits for a gap; running actors are never preempted.
 const OPTIONAL_MAINTENANCE_DELAY: Duration = Duration::from_secs(1);
 const BUILD_MAX_AGE: Duration = Duration::from_secs(30);
 // Leave enough of the realtime budget for atomic activation and ledger ACK.
@@ -1231,6 +1272,7 @@ enum BuildAdmission {
     Fenced,
     Wait,
     Start,
+    Probe,
 }
 
 #[derive(Clone, Copy)]
@@ -1332,6 +1374,7 @@ enum TableOutcome {
         maintenance_pending: bool,
     },
     Build(Box<StartedBuild>),
+    ProbeComplete,
     Preparation(Box<StartedPreparation>),
     CandidateInvalidated,
     Deferred,
@@ -1582,8 +1625,11 @@ impl TableWork {
         let mut attempt = 0u32;
         let mut repair_cursor = DeleteRepairCursor::default();
         let scratch_path = candidate.as_ref().map(|candidate| candidate.path().clone());
-        let reserved_build =
-            candidate.is_some() || options.build_admission == BuildAdmission::Start;
+        let reserved_build = candidate.is_some()
+            || matches!(
+                options.build_admission,
+                BuildAdmission::Start | BuildAdmission::Probe
+            );
         let result = loop {
             let candidate_context = candidate.as_ref().map(|candidate| {
                 (
@@ -1607,6 +1653,21 @@ impl TableWork {
                 )
                 .await
             {
+                Err(error)
+                    if options.build_admission == BuildAdmission::Probe
+                        && retry_table_work(&error) =>
+                {
+                    tracing::debug!(table = ?schema.table_id, %error,
+                        "background build probe yielded to normal table work");
+                    break Ok(TableCompletion {
+                        id: schema.table_id,
+                        transactions,
+                        outcome: TableOutcome::ProbeComplete,
+                        elapsed: started.elapsed(),
+                        reserved_build,
+                        finalization_lane,
+                    });
+                }
                 Err(error) if candidate_context.is_some() && retry_table_work(&error) => {
                     let (stage, operation_id) =
                         candidate_context.expect("checked candidate context");
@@ -1702,6 +1763,13 @@ impl TableWork {
         repair_cursor: &mut DeleteRepairCursor,
     ) -> Result<TableOutcome> {
         let id = schema.table_id;
+        if options.build_admission == BuildAdmission::Probe {
+            ensure!(
+                transactions.is_empty() && candidate.is_none(),
+                "build probe contains publication work"
+            );
+            return self.probe_build(&table, schema).await;
+        }
         if let Some(operation) = self.store.table_state(&id)?.pending_operation {
             let record = self
                 .store
@@ -1900,6 +1968,51 @@ impl TableWork {
         })
     }
 
+    /// Capture only a soft data build. Recovery, schema changes, dependency
+    /// repair and synchronous maintenance belong to ordinary table work.
+    async fn probe_build(&self, table: &Table, schema: TableSchema) -> Result<TableOutcome> {
+        if !self.compaction {
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        let id = schema.table_id;
+        let indexed = self.store.table_state(&id)?;
+        if indexed.pending_operation.is_some() {
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        let source = SourceId(self.config.source.id.clone());
+        let schema = crate::schema::latest_schema(&self.store, &source, id)?.unwrap_or(schema);
+        let current = self.catalog.load_table(table.identifier()).await?;
+        if indexed.snapshot_id != current.metadata().current_snapshot_id()
+            || indexed.schema_version != schema.version
+            || !flow_coordinator::same_iceberg_schema(
+                current.metadata().current_schema(),
+                &flow_materializer::iceberg_schema(&schema)?,
+            )
+        {
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        let inventory = self.maintenance.inventory(&current, id).await?;
+        crate::observation::table_inventory(id, &inventory);
+        if inventory.debt.pressure != flow_compactor::PublicationPressure::Delay
+            || self.prefers_delete_rewrite(&inventory)
+        {
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        Ok(match self.start_build(&current, &schema).await? {
+            Some(build) => TableOutcome::Build(Box::new(build)),
+            None => TableOutcome::ProbeComplete,
+        })
+    }
+
+    fn prefers_delete_rewrite(&self, inventory: &flow_coordinator::Inventory) -> bool {
+        inventory.delete_file_count >= self.config.compaction.delete_files_soft
+            && (self.config.compaction.data_rewrite_scope != flow_compactor::DataRewriteScope::All
+                || !inventory
+                    .files
+                    .iter()
+                    .any(|file| self.config.compaction.needs_delete_reclamation(file)))
+    }
+
     /// CDC does only mandatory maintenance. Optional work runs in its own job,
     /// after the completed publication has advanced the source ledger.
     async fn maintain(
@@ -1925,16 +2038,7 @@ impl TableWork {
         {
             let before = current.metadata().current_snapshot_id();
             let data_rewrite_scope = self.config.compaction.data_rewrite_scope;
-            let restricted_data_rewrites =
-                data_rewrite_scope != flow_compactor::DataRewriteScope::All;
-            let consolidate_deletes = inventory.delete_file_count
-                >= self.config.compaction.delete_files_soft
-                && (restricted_data_rewrites
-                    || !inventory
-                        .files
-                        .iter()
-                        .any(|file| self.config.compaction.needs_delete_reclamation(file)));
-            let rewritten = if consolidate_deletes {
+            let rewritten = if self.prefers_delete_rewrite(&inventory) {
                 self.compact(&current, schema, CompactionKind::Deletes)
                     .await?
             } else {
