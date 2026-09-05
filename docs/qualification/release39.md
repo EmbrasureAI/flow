@@ -79,6 +79,72 @@ fault cases preserve their separate coverage, including external reconciliation.
 
 The independent compactor requires three supervisor restarts during injected
 outages. These are passing recovery checks, not uninterrupted availability.
-Independent reader and full 50k follow-ups are running separately; their results
-are not yet part of this gate. The original fixture failure remains retained,
-and these service results do not qualify the 50k, reader-health or 24-hour targets.
+The original fixture failure remains retained. These service results do not
+qualify the 50k, reader-health or 24-hour targets.
+
+## Independent readers and external rewrites
+
+All 16 phases pass in `target/release39-followup/readers/report.json` in
+368.472 seconds, on the same frozen daemon. Report SHA-256 is
+`69fb5981d40f85795f7aef9d1c212654c088bab402d6d25f40326e508a69ba24`.
+Spark, Trino and DuckDB verify exact current and historical rows across CRUD,
+independently attributed Java position-delete, data-file and manifest rewrites,
+continued native compaction, subsequent CDC and restart. Keyless duplicate rows
+survive external rewriting and later appends. Final rows match 4,074 orders,
+18 accounts and 533 duplicate rows; retained bases remain 4,096 orders and
+513 duplicates. No worker panics are recorded.
+
+Reader versions are DuckDB 1.5.5 (Iceberg extension `45163a28`), Spark 3.5.6
+with Iceberg Java 1.10.1, and Trino 470. Spark image SHA-256 is
+`599722640c8a42ff5ecca329a3faa5371b3bd5c752b320776d5cdd1eed3441ac`;
+Trino image SHA-256 is
+`a591436ddc20cef15a4424704423326828591727b0e7c40c6ea4165d4564df67`.
+The report retains both Java JAR SHA-512 values and complete reader settings.
+
+The fixture uses 60-second soft and 300-second hard L0 age limits to accommodate
+Java maintenance. This qualifies interoperability under those settings, not
+the default 10/30-second reader-debt behavior or scan latency.
+
+## Full 50k follow-up
+
+The full workload completes with exact accepted data, but fails qualification.
+It uses the unchanged serial generator, one table, four writers, 100-row mixed
+transactions, 256-byte payloads, 100,000 initial rows, ten warmup seconds and
+60 measured seconds. Native maintenance runs during ingestion; the unchanged
+independent compactor produces the final-state reader reference afterward.
+
+| Measure | Release38 | Release39 | Required |
+| --- | ---: | ---: | --- |
+| Measured committed / missed transactions | 24,596 / 5,404 | 28,576 / 1,424 | All 30,000 admitted |
+| Warmup committed / missed transactions | 4,254 / 746 | 5,000 / 0 | All 5,000 admitted |
+| Source response-window mutations/s | 41,120 | 47,448.33 | At least 47,500 |
+| Catalog p95 / p99 | 15.964 / 17.164 s | 9.507 / 9.980 s | Below 1 / 2 s |
+| Final drain | 11.731 s | 9.011 s | No growing steady-state backlog |
+| Reader ratio | 2.710 | 2.434 | At most 1.25 |
+| Exact accepted final rows | 388,500 | 435,760 | Exact source agreement |
+| Background / synchronous rewrites through ingestion | 13 / 4 | 21 / 1 | Diagnostic |
+
+Every one of release39's 33,576 committed transactions is observed. Full source
+and Iceberg rows match, including after reference compaction; PostgreSQL ACK
+matches materialized LSN `23/3EBC3B40` with zero pending transactions.
+`target/release39-performance/comparison-identity.json` verifies equal harnesses,
+normalized configuration/commands, build settings and reference compactor.
+PostgreSQL may have a different postmaster incarnation after the intervening
+fault campaign; no resource or durability settings were changed. The unequal
+accepted cohorts prevent interpreting the lower latencies as a controlled
+speedup. Missed arrivals remain part of the failed result.
+
+The slowest 5% of admitted transactions spend a mean 9.582 seconds between journal
+and collapse, versus 0.198 seconds from collapse to catalog publication. The
+largest completed preparation/activation publication stall is 2.724 seconds.
+These log-derived intervals include I/O waits. Remaining catch-up and activation
+cost needs investigation while preserving exact activation fences; extending
+deadlines again would not remove that work.
+
+The report is `target/release39-performance/serial-50k/report.json`, SHA-256
+`627436a59d4242ef94975d0732233e0e627dae31e516683052193e130a81e8fb`.
+The retained release38 baseline is
+`71fc5b3536095956b1d1f0e712abe29a43263ee9910aa89a99d9c90740ac0ae2`.
+The serial follow-up runner records exit status 1 and complete report identity
+in `target/release39-followup/summary.json`. This is a finite local workload;
+the 50k, reader-health and 24-hour production gates remain unmet.
