@@ -124,12 +124,11 @@ reject this change, not to establish repeat-run performance distributions.
 
 ## Default-policy workload matrix
 
-The first nine cases of `target/release34-matrix` use the default compaction
+All thirteen cases of `target/release34-matrix` use the default compaction
 policy and manifest trigger of 64, with the benchmark's recorded worker, commit
-and disk budgets. The matrix is paused between workloads for a scheduling
-regression; its remaining four cases have not run. Each measured case lasts
-60 seconds after ten seconds warmup. All nine verify exact final source/target
-rows, final source ACK and independent compactor reconciliation.
+and disk budgets. Each measured case lasts 60 seconds after ten seconds warmup.
+All thirteen verify exact final source/target rows, final source ACK, every
+committed observation, independent compactor reconciliation and clean shutdown.
 
 | Workload | Missed arrivals | Catalog p95 / p99 ms | Worst scan ratio | All bounded gates |
 | --- | ---: | ---: | ---: | --- |
@@ -142,6 +141,10 @@ rows, final source ACK and independent compactor reconciliation.
 | Append 10k | 0 | 544 / 937 | 1.160 | Pass |
 | Hot updates 10k | 0 | 520 / 1,674 | 1.450 | Fail |
 | 1 KiB rows, 10k | 29 | 789 / 1,078 | 1.229 | Fail |
+| Large 10,000-row transactions, 10k | 0 | 618 / 701 | 1.735 | Fail |
+| Single-row transactions, 1k | 8,847 | 856 / 951 | 1.085 | Fail |
+| Zipf updates, 10k | 0 | 793 / 1,129 | 1.555 | Fail |
+| 100 tables, 10k total | 0 | 39,622 / 43,519 | 1.388 | Fail |
 
 Percentiles describe committed transactions only. Missed arrivals still fail
 qualification, even when the observed latency and reader gates pass. The 50k
@@ -158,3 +161,13 @@ builds to nine synchronous rewrites across warmup and drain. Three later
 preparation timeouts occur after final ingestion and cannot explain its latency.
 The next experiment admits overdue background capture under backlog while
 preserving hard debt bounds, exact activation and cheaper delete consolidation.
+
+The 100-table case admits all 6,000 measured transactions but fails latency.
+Per-table retained snapshot counts range from 22 to 25 (median 23), manifests
+from 6 to 13 (median 8), and original scan medians from 3.543 to 6.439 ms
+(median 4.409 ms). Snapshot counts include initialization and maintenance.
+The 100-table fixture starts with 10,000 rows per table; the one- and ten-table
+fixtures start with 100,000. These observations do not isolate table-count cost.
+Full distributions, report hashes and actual correctness evidence are in
+`target/release34-matrix/assessment.{md,json}`. Only two of the thirteen cases
+meet every bounded performance gate; none establishes 24-hour qualification.

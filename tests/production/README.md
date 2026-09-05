@@ -29,6 +29,33 @@ database. This preserves volumes and retained slots.
 
 After collecting reports, remove only this disposable project with the same Compose arguments followed by `down --volumes`. This destroys its fixture data; retained files under `target/production-*` remain. The harness itself leaves containers and volumes running for inspection. Measured results and limitations are in [the qualification report](../../docs/production-qualification.md).
 
+## Check source-generator capacity
+
+Run `source_capacity.py` before interpreting a source-limited ingestion benchmark:
+
+```sh
+uv run tests/production/source_capacity.py --writers 4 \
+  --artifacts target/source-capacity-4-writers
+uv run tests/production/source_capacity.py --writers 8 \
+  --artifacts target/source-capacity-8-writers
+```
+
+Set `FLOW_POSTGRES_URL` to the disposable PostgreSQL service. Run these serially
+with other workloads stopped. Both reuse the exact benchmark seed, mixed writer,
+deterministic payloads, bounded SQLite recorder and disk key pools: 100,000 initial
+rows, 256-byte payloads, 100 mutations per transaction, ten seconds of warmup and
+60 measured seconds at 50,000 offered mutations/s. No daemon, replication slot,
+Iceberg catalog, object store or reader connection is created; the source schema
+and seed publication remain for inspection.
+
+Reports separate planned, committed, missed and incomplete source arrivals,
+retain writer phase timings and evidence hashes, and verify every committed
+negative marker plus all surviving row IDs, versions and deterministic payloads.
+PostgreSQL identity and durability settings are recorded before and after the
+run. Exit status is nonzero for an error, incomplete evidence or a source-capacity
+miss. Passing this prerequisite establishes source-generator capacity only; it
+makes no ingestion or catalog-latency claim.
+
 ## Run a measured workload
 
 Freeze optimized binaries and their build manifest before collecting results:

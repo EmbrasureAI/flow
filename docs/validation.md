@@ -2,7 +2,7 @@
 
 Validation follows the complete path from PostgreSQL commit through durable capture, catalog publication, independent reader visibility, index recovery and source acknowledgement. Passing a component test does not qualify sustained throughput or a deployment. The accepted scope is in [OSS readiness](oss-readiness.md); external compactor reconciliation is included. Z-order, a distributed compaction protocol, HA and global autocompaction are excluded from early functionality.
 
-The latest [release34 gate](qualification/release34.md) passes 154 active Rust tests across 40 binaries, strict Clippy, formatting, nine Python harness tests, and 35 real service phases. Four manual performance profiles remain ignored by the ordinary Rust run. Performance qualification is recorded separately.
+The latest [release35 gate](qualification/release35.md) passes 154 active Rust tests across 40 binaries, strict Clippy, formatting, nine Python harness tests, and 29 real service phases. The preceding [release34 gate](qualification/release34.md) includes 35 service phases covering its recovery and health changes. Four manual performance profiles remain ignored by the ordinary Rust run. Performance qualification remains incomplete and is recorded separately.
 
 ## Reproducible gates
 

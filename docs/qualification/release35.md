@@ -82,6 +82,35 @@ historical rows, and stop cleanly without worker panics. Complete command times
 and arguments are recorded in `summary.json`. These ten phases validate the
 scheduling boundary; they do not establish the workload performance targets.
 
+The same frozen binary also passes seven concurrent-compaction phases and twelve
+fault phases, for 29 service phases in this campaign. These cover CDC and translated
+deletes during held reads, hard-debt ACK backpressure, deadline retirement,
+termination/restart, committed-response loss, catalog/object-store/PostgreSQL
+restarts, journal replay, physical-index loss and unchanged TOAST. Independent
+reader and manifest checks pass, with no worker panics. Reports are in
+`target/release35-campaign/{concurrent_compaction,faults}/report.json`.
+The fault fixture restarted its external compactor after three dependency outages;
+correctness and recovery passed, but uninterrupted compactor availability did not.
+
+## Performance limits
+
+All six release35 comparison cases in `target/release35-performance` preserve
+accepted rows, ACK, reader observations and clean shutdown. None meets every
+performance gate. At 1k and 10k, all arrivals are admitted and catalog p95/p99 are
+521/674 ms and 978/1,414 ms, respectively; reader ratios remain 1.543 and 1.454
+against the compacted baseline. Ten tables admit 5,942 of 6,000 transactions,
+with catalog p95/p99 of 3.06/4.87 seconds.
+
+The 50k candidate, release34 control and maintenance-disabled diagnostic all miss
+source arrivals. They admit 14,369, 17,110 and 15,461 of 30,000 measured transactions,
+respectively. Candidate catalog p95/p99 are 8.36/8.76 seconds and its reader ratio
+is 1.658. More background builds and fewer synchronous rewrites establish that
+the scheduler change operates under load; unequal accepted workloads do not
+establish a throughput or latency improvement. The subsequent
+[source-only prerequisite](source-capacity.md) also misses arrivals in three
+serial trials with four/eight/four writers. It rules out treating these as complete
+50k ingestion cohorts; it does not excuse the publication and reader failures.
+
 ## Repository checks
 
 Clippy with warnings denied and nine Python harness checks passed. The final
