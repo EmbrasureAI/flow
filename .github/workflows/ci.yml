@@ -35,8 +35,8 @@ jobs:
         run: |
           python3 -B -m unittest discover -s scripts -p test_license_policy.py -v
           cargo fetch --locked
-          python3 -B scripts/package_licenses.py --target x86_64-unknown-linux-gnu --output target/licenses-x86_64-linux
-          python3 -B scripts/package_licenses.py --target aarch64-unknown-linux-gnu --output target/licenses-aarch64-linux
+          python3 -B scripts/package_licenses.py --target x86_64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-x86_64-linux"
+          python3 -B scripts/package_licenses.py --target aarch64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-aarch64-linux"
       - run: cargo run --locked -p flow-daemon -- --config examples/flow.toml check
   msrv:
     runs-on: ubuntu-latest

@@ -68,17 +68,17 @@ jobs:
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --compactor-binary target/debug/examples/local_compactor
-          --compose-project flow-ci --artifacts target/service-faults
+          --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults"
       - name: Schema, checkpoint and process lifecycle
         run: >-
           uv run tests/production/contracts.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --artifacts target/service-contracts
+          --artifacts "$RUNNER_TEMP/service-contracts"
       - name: Interrupted parallel bootstrap and index reconstruction
         run: >-
           uv run tests/production/bootstrap.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --artifacts target/service-bootstrap --add-column-during-recovery
+          --artifacts "$RUNNER_TEMP/service-bootstrap" --add-column-during-recovery
       - name: Reject incompatible source DDL without changing public data
         if: matrix.postgres == '18.6'
         run: |
@@ -86,7 +86,7 @@ jobs:
           for unsafe_case in column-incarnation non-null-default volatile-default; do
             uv run tests/production/contracts.py \
               --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
-              --unsafe-case "$unsafe_case" --artifacts "target/service-unsafe-${unsafe_case}" || unsafe_status=1
+              --unsafe-case "$unsafe_case" --artifacts "$RUNNER_TEMP/service-unsafe-${unsafe_case}" || unsafe_status=1
           done
           exit "$unsafe_status"
       - name: Hard reader debt and automatic external compactor recovery
@@ -96,35 +96,35 @@ jobs:
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --compactor-binary target/debug/examples/local_compactor
-          --artifacts target/service-pressure
+          --artifacts "$RUNNER_TEMP/service-pressure"
       - name: CDC during held compaction reads and abandoned build recovery
         if: matrix.postgres == '18.6'
         run: >-
           uv run tests/production/concurrent_compaction.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
-          --artifacts target/service-concurrent-compaction
+          --artifacts "$RUNNER_TEMP/service-concurrent-compaction"
       - name: Two-table compaction cancellation and recovery
         if: matrix.postgres == '18.6'
         run: >-
           uv run tests/production/parallel_compaction.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
-          --artifacts target/service-parallel-compaction
+          --artifacts "$RUNNER_TEMP/service-parallel-compaction"
       - name: WAL monitor timeout, readiness and recovery
         if: matrix.postgres == '18.6'
         run: >-
           uv run tests/production/health.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
-          --artifacts target/service-health
+          --artifacts "$RUNNER_TEMP/service-health"
       - name: Background compaction admission under queued CDC
         if: matrix.postgres == '18.6'
         run: >-
           uv run tests/production/maintenance_fairness.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
-          --artifacts target/service-maintenance-fairness
+          --artifacts "$RUNNER_TEMP/service-maintenance-fairness"
       - name: Periodic cleanup with a single shared worker
         if: matrix.postgres == '18.6'
         run: >-
@@ -133,7 +133,7 @@ jobs:
           --binary target/debug/embrasure-flow
           --two-hot-tables --table-workers 1
           --timeout 600
-          --artifacts target/service-periodic-single-worker
+          --artifacts "$RUNNER_TEMP/service-periodic-single-worker"
       - name: Periodic cleanup beside native compaction
         if: matrix.postgres == '18.6'
         run: >-
@@ -142,36 +142,36 @@ jobs:
           --binary target/debug/embrasure-flow
           --two-hot-tables
           --timeout 600
-          --artifacts target/service-periodic-with-builds
+          --artifacts "$RUNNER_TEMP/service-periodic-with-builds"
       - name: Composite keys, index reconstruction and journal quota recovery
         if: matrix.postgres == '18.6'
         run: >-
           uv run tests/production/boundaries.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
-          --artifacts target/service-boundaries
+          --artifacts "$RUNNER_TEMP/service-boundaries"
       - name: Standard readers with native and external maintenance
         if: matrix.postgres == '18.6'
         run: >-
           uv run tests/production/readers.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --network flow-ci_default --artifacts target/service-readers
+          --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers"
           --native-compaction --keyless-duplicates
       - name: Service logs
         if: always()
-        run: docker compose logs --no-color > target/service-containers.log
+        run: docker compose logs --no-color > "$RUNNER_TEMP/service-containers.log"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: services-pg-${{ matrix.postgres }}
           path: |
-            target/service-*/report.json
-            target/service-*/*.log
-            target/service-*/*.jsonl
-            target/service-*/*metadata.json
-            target/service-*/state/status.json
-            target/service-*/state/metrics.prom
-            target/service-containers.log
+            ${{ runner.temp }}/service-*/report.json
+            ${{ runner.temp }}/service-*/*.log
+            ${{ runner.temp }}/service-*/*.jsonl
+            ${{ runner.temp }}/service-*/*metadata.json
+            ${{ runner.temp }}/service-*/state/status.json
+            ${{ runner.temp }}/service-*/state/metrics.prom
+            ${{ runner.temp }}/service-containers.log
       - name: Remove this job's disposable services
         if: always()
         run: docker compose down -v
