@@ -12,10 +12,14 @@ import math
 import os
 from pathlib import Path
 import statistics
+import sys
 import time
 from urllib.parse import urlparse
 
 import duckdb
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
+from duckdb_extensions import load_extensions
 
 
 SCAN_SQL = "SELECT count(*),sum(version),sum(length(payload)) FROM iceberg_scan(?)"
@@ -270,8 +274,7 @@ def main():
                     "SELECT name,value FROM duckdb_settings() WHERE name IN "
                     "('memory_limit','temp_directory','max_temp_directory_size','threads') ORDER BY name"
                 ).fetchall())
-            duck.execute("SET custom_extension_repository = 'https://extensions.duckdb.org'")
-            duck.execute("INSTALL httpfs; LOAD httpfs; INSTALL iceberg; LOAD iceberg")
+            load_extensions(duck)
             duck.execute("SET httpfs_connection_caching = true")
             result["reader_settings"] = dict(duck.execute(READER_SETTINGS_SQL).fetchall())
             quote = lambda value: "'" + str(value).replace("'", "''") + "'"

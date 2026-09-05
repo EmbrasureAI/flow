@@ -31,6 +31,8 @@ import fastavro
 import psycopg
 from psycopg import sql
 
+from duckdb_extensions import load_extensions
+
 
 def lsn(value):
     high, low = value.split("/")
@@ -71,8 +73,7 @@ class Run:
         )
         self.avro_cache = {}
         self.duck = duckdb.connect()
-        self.duck.execute("SET custom_extension_repository = 'https://extensions.duckdb.org'")
-        self.duck.execute("INSTALL httpfs; LOAD httpfs; INSTALL iceberg; LOAD iceberg")
+        load_extensions(self.duck)
         self.duck.execute("SET httpfs_connection_caching = true")
         self.report["reader_settings"] = dict(self.duck.execute(
             "SELECT name, value FROM duckdb_settings() WHERE name IN "
