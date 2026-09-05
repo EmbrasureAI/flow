@@ -528,6 +528,7 @@ impl PublishRuntime {
                                 "table_id" => id.0.to_string(),
                                 "result" => "started"
                             ).increment(1);
+                            let hard_pressure = waiting_for_build.contains(&id);
                             preparations.push(Box::pin(async move {
                                 let StartedPreparation {
                                     running,
@@ -535,8 +536,15 @@ impl PublishRuntime {
                                     started,
                                     activation_stall_started,
                                 } = *preparation;
-                                let remaining = PREPARATION_STALL_LIMIT
-                                    .saturating_sub(activation_stall_started.elapsed());
+                                // Hard debt already prevents CDC publication. Finish the
+                                // existing candidate instead of discarding it and rebuilding
+                                // the same inputs synchronously, within its total age bound.
+                                let remaining = if hard_pressure {
+                                    BUILD_MAX_AGE.saturating_sub(started.elapsed())
+                                } else {
+                                    PREPARATION_STALL_LIMIT
+                                        .saturating_sub(activation_stall_started.elapsed())
+                                };
                                 PreparationCompletion {
                                     id,
                                     path,

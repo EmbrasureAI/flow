@@ -241,11 +241,26 @@ class ConcurrentRun(Run):
             assert self.head() == before, "CDC crossed hard debt while its remedy was held"
             self.alive()
             time.sleep(0.25)
-        self.object_proxy.release_reads.set()
+        # Preparation loads the catalog head after the data worker joins. Hard
+        # debt cannot resume CDC, so retain that work past the optional 750ms
+        # budget instead of throwing it away and rebuilding the same inputs.
+        self.catalog_proxy.delay_seconds = 1.25
+        try:
+            self.object_proxy.release_reads.set()
+            prepared = self.until("hard-pressure preparation was discarded instead of completed", lambda:
+                next((event for event in self.log_fields()
+                      if event.get("event") == "compaction_preparation_ready"
+                      and event.get("operation_id") == build["operation_id"]), None), timeout=8)
+            assert prepared["elapsed_ms"] >= 1000, "fixture did not cross the optional preparation budget"
+            assert not any(event.get("event") == "compaction_preparation_deadline"
+                           and event.get("operation_id") == build["operation_id"] for event in self.log_fields())
+        finally:
+            self.catalog_proxy.delay_seconds = 0
         self.wait_materialized(barrier)
         self.until("hard debt recovery did not ACK", lambda: self.confirmed() >= barrier)
         self.wait_compaction(build)
-        return build | barriers | {"rows_after_release": self.compare("hard-pressure-relieved"),
+        return build | barriers | {"preparation_elapsed_ms": prepared["elapsed_ms"],
+                                   "rows_after_release": self.compare("hard-pressure-relieved"),
                                    "confirmed_lsn": self.confirmed()}
 
     def shutdown_build(self):

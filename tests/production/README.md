@@ -568,7 +568,10 @@ must reach the catalog and source ACK while the soft-pressure read remains held.
 After release, the test checks exact rows through DuckDB, retained history, eight
 translated position deletes, and their sequence relationship to rewritten data.
 A separate phase reaches hard debt and verifies publication and ACK pause until
-the active build completes. The deadline phase holds a selected GET beyond the
+the active build completes. It delays real catalog requests by 1.25 seconds and
+requires the same preparation to survive the optional 750 ms budget, finish
+within the original build-age limit, and commit without rebuilding its inputs.
+The deadline phase holds a selected GET beyond the
 unchanged 30-second build limit. It requires a cancellation-request event with
 verified durable BUILD ownership, keeps the request and scratch held without a
 retirement event, then releases the GET and requires actual join, durable BUILD
