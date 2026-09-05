@@ -25,9 +25,6 @@ jobs:
       COMPOSE_FILE: tests/production/compose.yaml
       FLOW_POSTGRES_IMAGE: postgres:${{ matrix.postgres }}-bookworm
       FLOW_PRODUCTION_PG_CPUS: '2'
-      FLOW_PRODUCTION_PG_PORT: '0'
-      FLOW_PRODUCTION_S3_PORT: '0'
-      FLOW_PRODUCTION_REST_PORT: '0'
       AWS_ACCESS_KEY_ID: demo-access
       AWS_SECRET_ACCESS_KEY: demo-secret-key
       AWS_REGION: us-east-1
@@ -43,6 +40,19 @@ jobs:
       - name: Verify stock reader extensions from an empty cache
         run: uv run tests/local/duckdb_extensions.py
       - run: cargo build --locked -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
+      - name: Select free ports that survive service restarts
+        run: |
+          python3 - <<'PY'
+          import contextlib
+          import os
+          import socket
+
+          with contextlib.ExitStack() as sockets, open(os.environ["GITHUB_ENV"], "a") as env:
+              for service in ("PG", "S3", "REST"):
+                  listener = sockets.enter_context(socket.socket())
+                  listener.bind(("127.0.0.1", 0))
+                  env.write(f"FLOW_PRODUCTION_{service}_PORT={listener.getsockname()[1]}\n")
+          PY
       - name: Start durable services on assigned loopback ports
         run: |
           docker compose up -d --build --wait --wait-timeout 180
