@@ -69,6 +69,258 @@ fn mutation(table: u32, kind: MutationKind) -> Mutation {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_checkpoints_preserve_catalog_recovery_after_physical_index_loss() {
+    use flow_compactor::Policy;
+    use flow_coordinator::{GarbageProtection, TableMaintenance, resolve_catalog_operation};
+    use flow_state_store::ControlStore;
+    use std::time::Duration;
+
+    for partial_apply in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let control_path = temp.path().join("control");
+        let index_path = temp.path().join("index");
+        let options = StateStoreOptions {
+            apply_batch_rows: 2,
+            ..Default::default()
+        };
+        let control = ControlStore::open(&control_path).unwrap();
+        let store = control
+            .initialize_index(&index_path, options.clone())
+            .unwrap();
+        let (mut journal, _) =
+            Journal::open(temp.path().join("journal"), JournalConfig::default()).unwrap();
+        let catalog = Arc::new(LostResponseCatalog::new(
+            catalog(&temp.path().join("warehouse")).await,
+        ));
+        let schema = schema(1);
+        let mut head = table(catalog.as_ref(), &schema).await;
+        let publisher = TablePublisher::new(
+            store.clone(),
+            catalog.clone(),
+            WriterConfig::default(),
+            2,
+            1 << 20,
+        )
+        .unwrap();
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            SourceId("fixture".into()),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        let mut snapshots = Vec::new();
+        for end in [10, 20, 30] {
+            let mutations = if end == 10 {
+                (1..=4)
+                    .map(|id| {
+                        mutation(
+                            1,
+                            MutationKind::Insert {
+                                row: row(id, "initial"),
+                            },
+                        )
+                    })
+                    .collect()
+            } else {
+                (1..=if end == 20 { 1 } else { 3 })
+                    .map(|id| {
+                        mutation(
+                            1,
+                            MutationKind::Update {
+                                old_key: schema.encode_key(&row(id, "initial")).unwrap(),
+                                row: row(id, if end == 20 { "base" } else { "pending" }),
+                            },
+                        )
+                    })
+                    .collect()
+            };
+            let tx = transaction(&mut journal, end, vec![schema.table_id], mutations);
+            ledger.journaled(tx.clone()).unwrap();
+            let epoch = Epoch::new(
+                tx.source_id.clone(),
+                schema.table_id,
+                std::slice::from_ref(&tx),
+            )
+            .unwrap();
+            let collapsed = collapse_epoch(
+                &store,
+                &journal,
+                &head,
+                &schema,
+                &epoch,
+                std::slice::from_ref(&tx),
+                CollapseLimits {
+                    batch_rows: 2,
+                    batch_bytes: 1 << 20,
+                    memory_bytes: 1 << 20,
+                },
+            )
+            .unwrap();
+            if end == 30 {
+                catalog.lose_next_response_and_disconnect();
+                let error = publisher
+                    .publish(&head, &schema, collapsed)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("lost catalog response"));
+                catalog.reconnect();
+                head = catalog.load_table(head.identifier()).await.unwrap();
+                if partial_apply {
+                    let snapshot = head.metadata().current_snapshot().unwrap();
+                    store
+                        .mark_committed(
+                            &epoch.id,
+                            snapshot.snapshot_id(),
+                            snapshot.sequence_number(),
+                        )
+                        .unwrap();
+                    let applied = store.apply_committed_batch(&epoch.id).unwrap();
+                    assert_eq!(applied.applied_rows, 2);
+                    assert!(!applied.complete);
+                }
+            } else {
+                let snapshot = publisher
+                    .publish(&head, &schema, collapsed)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                ledger
+                    .table_materialized(tx.end_lsn, schema.table_id, snapshot)
+                    .unwrap();
+                store.forget_applied(&epoch.id).unwrap();
+                head = catalog.load_table(head.identifier()).await.unwrap();
+            }
+            snapshots.push(head.metadata().current_snapshot_id().unwrap());
+        }
+        assert_eq!(ledger.acknowledgement(), PgLsn(20));
+        let checkpoint = control
+            .checkpoint(&store, temp.path().join("checkpoint"))
+            .unwrap();
+        assert_eq!(checkpoint.pending_operations.len(), 1);
+        let pending = &checkpoint.pending_operations[0];
+        assert_eq!(pending.operation.base_snapshot_id, Some(snapshots[1]));
+        assert_eq!(pending.snapshot_id, partial_apply.then_some(snapshots[2]));
+        assert_eq!(checkpoint.tables[0].1.snapshot_id, Some(snapshots[1]));
+        assert_eq!(checkpoint.tables[0].1.materialized_lsn, PgLsn(20));
+        drop(publisher);
+        drop(ledger);
+        drop(store);
+        drop(control);
+        std::fs::remove_dir_all(&index_path).unwrap();
+
+        let control = ControlStore::open(&control_path).unwrap();
+        assert_eq!(
+            control.checkpoints().unwrap(),
+            std::slice::from_ref(&checkpoint)
+        );
+        let operation = control.pending_operations().unwrap().pop().unwrap();
+        let resolved = resolve_catalog_operation(&operation, catalog.as_ref(), &head, &control)
+            .await
+            .unwrap();
+        assert_eq!(resolved.unwrap().0, snapshots[2]);
+        control
+            .resolve_operation(&operation.operation.id, resolved)
+            .unwrap();
+        let authority = control.table_state(&schema.table_id).unwrap().unwrap();
+        assert_eq!(authority.materialized_lsn, PgLsn(30));
+
+        // Pending checkpoints are not restored by the daemon. Exercise its
+        // existing catalog-scan fallback with the resolved control watermark.
+        let replacement = StateStore::open(temp.path().join("rebuilt"), options.clone()).unwrap();
+        let maintenance = TableMaintenance::new(
+            replacement.clone(),
+            catalog.clone(),
+            Policy::default(),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        let scratch = StateStore::open(temp.path().join("scratch"), options.clone()).unwrap();
+        maintenance
+            .rebuild_index(
+                &head,
+                &schema,
+                replacement.clone(),
+                scratch,
+                authority.materialized_lsn,
+                authority.schema_version,
+            )
+            .await
+            .unwrap();
+        let active = control.activate_rebuilt(&replacement).unwrap();
+        drop(maintenance);
+        drop(replacement);
+        let store = StateStore::open_with_control(&active.path, options, control.clone()).unwrap();
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            SourceId("fixture".into()),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        assert_eq!(ledger.acknowledgement(), PgLsn(20));
+        ledger.reconcile_table_progress().unwrap();
+        assert_eq!(ledger.acknowledgement(), PgLsn(30));
+        assert_eq!(ledger.pending_count(), 0);
+        assert_eq!(journal.durable_lsn(), PgLsn(30));
+        let mut actual = scan(&head, &schema).await.unwrap();
+        actual.sort_by_key(|row| match row[0] {
+            Value::Int64(id) => id,
+            _ => unreachable!(),
+        });
+        assert_eq!(
+            actual,
+            vec![
+                row(1, "pending"),
+                row(2, "pending"),
+                row(3, "pending"),
+                row(4, "initial")
+            ]
+        );
+        for expected in &actual {
+            assert!(
+                store
+                    .lookup(&schema.table_id, &schema.encode_key(expected).unwrap())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let protection =
+            GarbageProtection::from_checkpoints(schema.table_id, &control.checkpoints().unwrap());
+        assert!(protection.operations.contains(&operation.operation.id));
+        assert!(protection.snapshots.contains(&snapshots[1]));
+        let maintenance = TableMaintenance::new(
+            store,
+            catalog.clone(),
+            Policy::default(),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        assert_eq!(
+            maintenance
+                .expire_history(
+                    &head,
+                    schema.table_id,
+                    Duration::from_millis(1),
+                    &protection.snapshots,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let retained = catalog.load_table(head.identifier()).await.unwrap();
+        assert!(retained.metadata().snapshot_by_id(snapshots[0]).is_none());
+        // An unknown committed response records only the old base; retaining
+        // its full successor chain must still protect the operation marker.
+        assert!(retained.metadata().snapshot_by_id(snapshots[1]).is_some());
+        assert!(retained.metadata().snapshot_by_id(snapshots[2]).is_some());
+        assert_eq!(scan(&retained, &schema).await.unwrap().len(), 4);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parquet_mor_recovery_and_source_wide_ack_survive_lost_commit_response() {
     let temp = TempDir::new().unwrap();
     let store = StateStore::open(temp.path().join("index"), StateStoreOptions::default()).unwrap();

@@ -420,6 +420,9 @@ impl PublishRuntime {
         let mut checkpoints = FuturesUnordered::new();
         let mut idle_work = VecDeque::new();
         let mut maintenance_due = BTreeMap::<TableId, Instant>::new();
+        let mut periodic_due = BTreeMap::<TableId, Instant>::new();
+        let mut periodic_active = false;
+        let mut periodic_yield_to_cdc = false;
         let mut checkpoint_at = Instant::now();
         let shutdown = crate::lifecycle::shutdown_signal();
         tokio::pin!(shutdown);
@@ -427,18 +430,22 @@ impl PublishRuntime {
         loop {
             let available = running.len() + builds.len() + preparations.len() + retirements.len()
                 < config.limits.table_workers;
+            let cdc_deadline = scheduler.next_deadline();
+            let periodic_allowed = !periodic_active
+                && !(periodic_yield_to_cdc
+                    && cdc_deadline.is_some_and(|due| due <= Instant::now()));
             let deadline = if !idle_work.is_empty()
                 || ready_builds.keys().any(|id| !busy.contains(id))
                 || ready_preparations.keys().any(|id| !busy.contains(id))
             {
                 Instant::now()
             } else {
-                scheduler
-                    .next_deadline()
+                cdc_deadline
                     .into_iter()
                     .chain(
                         maintenance_due
                             .iter()
+                            .chain(periodic_due.iter().filter(|_| periodic_allowed))
                             .filter(|(id, _)| {
                                 !busy.contains(*id)
                                     && !build_active.contains(*id)
@@ -493,6 +500,15 @@ impl PublishRuntime {
                                 BuildCompletion { id, path, started, result: running.wait().await }
                             }));
                             maintenance_due.remove(&id);
+                        }
+                        TableOutcome::PeriodicComplete { next_due } => {
+                            periodic_active = false;
+                            ensure!(!reserved_build && transactions.is_empty(), "invalid periodic maintenance completion");
+                            if let Some(due) = next_due {
+                                periodic_due.insert(id, due);
+                            } else {
+                                periodic_due.remove(&id);
+                            }
                         }
                         TableOutcome::ProbeComplete => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid background build probe");
@@ -585,7 +601,10 @@ impl PublishRuntime {
                                     metrics_exported,
                                     "source ledger and acknowledgement feedback completed");
                             }
-                            if maintenance_pending {
+                            if maintenance_pending.periodic {
+                                periodic_due.entry(id).or_insert_with(|| Instant::now() + OPTIONAL_MAINTENANCE_DELAY);
+                            }
+                            if maintenance_pending.data {
                                 // Publish the source proof before admitting optional work.
                                 maintenance_due.entry(id).or_insert_with(|| Instant::now() + OPTIONAL_MAINTENANCE_DELAY);
                                 if !transactions.is_empty() && !build_active.contains(&id) && !idle_work.contains(&id) {
@@ -763,6 +782,18 @@ impl PublishRuntime {
                             })
                             .min_by_key(|(_, due)| **due)
                             .map(|(id, _)| *id);
+                        let cdc_ready = scheduler.next_deadline().is_some_and(|due| due <= now);
+                        // One periodic visit at a time; ready CDC must receive a
+                        // dispatch between visits even across different tables.
+                        let periodic = if !periodic_active && !(periodic_yield_to_cdc && cdc_ready) {
+                            periodic_due.iter()
+                                .filter(|(id, due)| **due <= now && !busy.contains(*id)
+                                    && !build_active.contains(*id) && !retiring_builds.contains(*id))
+                                .min_by_key(|(_, due)| **due)
+                                .map(|(id, _)| *id)
+                        } else {
+                            None
+                        };
                         // A continuous CDC backlog must not postpone every soft
                         // build until reader debt requires a synchronous rewrite.
                         // The probe replaces its slot with a build. At least
@@ -800,6 +831,8 @@ impl PublishRuntime {
                                     ready_builds.remove(&id).expect("selected build"),
                                 )),
                             )
+                        } else if let Some(id) = periodic {
+                            (id, true, None)
                         } else if let Some(id) = probe {
                             (id, true, None)
                         } else if let Some(id) = scheduler.take_ready(now) {
@@ -828,7 +861,16 @@ impl PublishRuntime {
                             scheduler.stall(id, true);
                             continue;
                         }
-                        let probing = probe == Some(id) && candidate.is_none();
+                        let periodic_maintenance = periodic == Some(id) && candidate.is_none();
+                        let probing = !periodic_maintenance && probe == Some(id) && candidate.is_none();
+                        if periodic_maintenance {
+                            periodic_active = true;
+                            periodic_yield_to_cdc = true;
+                            tracing::info!(event = "periodic_maintenance_admitted", table_id = id.0,
+                                queued_transactions = pending.tables.get(&id).map_or(0, VecDeque::len),
+                                "admitting overdue metadata and garbage maintenance");
+                            periodic_due.remove(&id);
+                        }
                         if probing {
                             let overdue_ms = maintenance_due.get(&id)
                                 .map_or(0.0, |due| now.saturating_duration_since(*due).as_secs_f64() * 1000.0);
@@ -838,10 +880,14 @@ impl PublishRuntime {
                                 "admitting overdue background build capture beside ready CDC");
                         }
                         if idle {
-                            maintenance_due.remove(&id);
+                            if !periodic_maintenance {
+                                maintenance_due.remove(&id);
+                            }
                             idle_work.retain(|queued| *queued != id);
                         }
-                        let build_admission = if probing {
+                        let build_admission = if periodic_maintenance {
+                            BuildAdmission::Wait
+                        } else if probing {
                             build_active.insert(id);
                             BuildAdmission::Probe
                         } else if candidate.is_some() {
@@ -859,6 +905,7 @@ impl PublishRuntime {
                         };
                         let lane_acquired_at = Instant::now();
                         let options = WorkOptions {
+                            periodic_maintenance,
                             build_active: candidate.is_none() && build_active.contains(&id)
                                 && !matches!(build_admission, BuildAdmission::Start | BuildAdmission::Probe),
                             build_admission,
@@ -867,6 +914,9 @@ impl PublishRuntime {
                         let transactions = if idle { Vec::new() } else { pending.take_epoch(id) };
                         if transactions.is_empty() && !idle {
                             continue;
+                        }
+                        if !idle {
+                            periodic_yield_to_cdc = false;
                         }
                         if !idle && let Some(queue) = pending.tables.get(&id).filter(|queue| !queue.is_empty()) {
                             schedule_transactions(id, queue, &mut scheduler, profiles[&id]);
@@ -902,8 +952,9 @@ impl PublishRuntime {
                     observation.write(config, ledger, capture_goal, true)?;
                     if checkpoints.is_empty()
                         && checkpoint_at.elapsed() >= Duration::from_secs(config.limits.checkpoint_interval_secs)
-                        && store.pending_operations()?.is_empty()
                     {
+                        // Checkpoints capture pending records consistently. Recovery
+                        // may use the full catalog rebuild instead of their index.
                         checkpoints.push(CheckpointTask::start(config, work.control.clone(), store.clone()));
                     }
                     if health_checks.is_empty() {
@@ -1260,8 +1311,8 @@ impl PendingWork {
     }
 }
 
-// Once due, background build capture may precede another CDC epoch. Synchronous
-// optional maintenance still waits for a gap; running actors are never preempted.
+// Once due, build capture or one periodic maintenance visit may precede another
+// CDC epoch. Running table actors are never preempted.
 const OPTIONAL_MAINTENANCE_DELAY: Duration = Duration::from_secs(1);
 const BUILD_MAX_AGE: Duration = Duration::from_secs(30);
 // Leave enough of the realtime budget for atomic activation and ledger ACK.
@@ -1277,6 +1328,7 @@ enum BuildAdmission {
 
 #[derive(Clone, Copy)]
 struct WorkOptions {
+    periodic_maintenance: bool,
     build_active: bool,
     build_admission: BuildAdmission,
     actor_acquired_at: Instant,
@@ -1368,20 +1420,28 @@ impl CompactionCandidate {
     }
 }
 
+struct MaintenancePending {
+    data: bool,
+    periodic: bool,
+}
+
 enum TableOutcome {
     Complete {
         snapshot: Option<i64>,
-        maintenance_pending: bool,
+        maintenance_pending: MaintenancePending,
     },
     Build(Box<StartedBuild>),
     ProbeComplete,
+    PeriodicComplete {
+        next_due: Option<Instant>,
+    },
     Preparation(Box<StartedPreparation>),
     CandidateInvalidated,
     Deferred,
 }
 
 enum MaintenanceOutcome {
-    Complete(Table, bool),
+    Complete(Table, MaintenancePending),
     Build(StartedBuild),
     Deferred,
 }
@@ -1654,6 +1714,28 @@ impl TableWork {
                 .await
             {
                 Err(error)
+                    if options.periodic_maintenance
+                        && retry_table_work(&error)
+                        && self
+                            .store
+                            .table_state(&schema.table_id)?
+                            .pending_operation
+                            .is_none() =>
+                {
+                    tracing::debug!(table = ?schema.table_id, %error,
+                        "periodic maintenance yielded after a transient failure");
+                    break Ok(TableCompletion {
+                        id: schema.table_id,
+                        transactions,
+                        outcome: TableOutcome::PeriodicComplete {
+                            next_due: Some(Instant::now() + OPTIONAL_MAINTENANCE_DELAY),
+                        },
+                        elapsed: started.elapsed(),
+                        reserved_build,
+                        finalization_lane,
+                    });
+                }
+                Err(error)
                     if options.build_admission == BuildAdmission::Probe
                         && retry_table_work(&error) =>
                 {
@@ -1802,7 +1884,10 @@ impl TableWork {
         {
             return Ok(TableOutcome::Complete {
                 snapshot: indexed.snapshot_id,
-                maintenance_pending: true,
+                maintenance_pending: MaintenancePending {
+                    data: true,
+                    periodic: false,
+                },
             });
         }
         let source = SourceId(self.config.source.id.clone());
@@ -1848,6 +1933,26 @@ impl TableWork {
                 flow_coordinator::reconcile_index_schema(&store, &source, &table, &schema)
             })
             .await??;
+        }
+        if options.periodic_maintenance {
+            ensure!(
+                transactions.is_empty() && candidate.is_none(),
+                "periodic maintenance contains publication work"
+            );
+            let inventory = self.maintenance.inventory(&current, id).await?;
+            crate::observation::table_inventory(id, &inventory);
+            let (_, continuation) = self
+                .maintain_metadata(current, id, inventory.manifest_count)
+                .await?;
+            tracing::info!(
+                event = "periodic_maintenance_completed",
+                table_id = id.0,
+                continuation,
+                "metadata and garbage maintenance yielded the table actor"
+            );
+            return Ok(TableOutcome::PeriodicComplete {
+                next_due: continuation.then(Instant::now),
+            });
         }
         if let Some(candidate) = candidate.take() {
             match candidate {
@@ -1902,7 +2007,10 @@ impl TableWork {
                     }
                     return Ok(TableOutcome::Complete {
                         snapshot,
-                        maintenance_pending: true,
+                        maintenance_pending: MaintenancePending {
+                            data: true,
+                            periodic: false,
+                        },
                     });
                 }
             }
@@ -2047,7 +2155,14 @@ impl TableWork {
             if rewritten.is_none() {
                 let soft = pressure == flow_compactor::PublicationPressure::Delay;
                 if soft && options.build_admission == BuildAdmission::Wait {
-                    return Ok(MaintenanceOutcome::Complete(current, true));
+                    let periodic = self.metadata_due(&current, id, inventory.manifest_count)?;
+                    return Ok(MaintenanceOutcome::Complete(
+                        current,
+                        MaintenancePending {
+                            data: true,
+                            periodic,
+                        },
+                    ));
                 }
                 if data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
                     && let Some(build) = self
@@ -2078,23 +2193,56 @@ impl TableWork {
         if pressure == flow_compactor::PublicationPressure::Pause {
             return Err(flow_compactor::Error::MaintenanceRequired.into());
         }
-        let manifests_due = inventory.manifest_count >= self.config.limits.manifest_max_count;
-        let history_due = history_due(&current, self.config.limits.snapshot_retention_secs)?;
-        let garbage_due = self
+        let periodic = self.metadata_due(&current, id, inventory.manifest_count)?;
+        if !optional {
+            return Ok(MaintenanceOutcome::Complete(
+                current,
+                MaintenancePending {
+                    data: self.compaction && pressure == flow_compactor::PublicationPressure::Delay,
+                    periodic,
+                },
+            ));
+        }
+        let (current, continuation) = self
+            .maintain_metadata(current, id, inventory.manifest_count)
+            .await?;
+        Ok(MaintenanceOutcome::Complete(
+            current,
+            MaintenancePending {
+                data: false,
+                periodic: continuation,
+            },
+        ))
+    }
+
+    fn garbage_due(&self, id: TableId) -> Result<bool> {
+        Ok(self
             .garbage_checked
             .lock()
             .map_err(|_| anyhow::anyhow!("maintenance clock lock poisoned"))?
             .get(&id)
             .is_none_or(|checked| {
                 checked.elapsed() >= Duration::from_secs(self.config.limits.garbage_interval_secs)
-            });
-        if !optional {
-            let pending = self.compaction && pressure == flow_compactor::PublicationPressure::Delay
-                || manifests_due
-                || history_due
-                || garbage_due;
-            return Ok(MaintenanceOutcome::Complete(current, pending));
-        }
+            }))
+    }
+
+    fn metadata_due(&self, table: &Table, id: TableId, manifests: usize) -> Result<bool> {
+        Ok(manifests >= self.config.limits.manifest_max_count
+            || history_due(table, self.config.limits.snapshot_retention_secs)?
+            || self.garbage_due(id)?)
+    }
+
+    /// Run on the table actor independently of soft data debt. Garbage collection
+    /// visits one bounded page, then yields before its continuation is admitted.
+    async fn maintain_metadata(
+        &self,
+        mut current: Table,
+        id: TableId,
+        manifests: usize,
+    ) -> Result<(Table, bool)> {
+        let manifests_due = manifests >= self.config.limits.manifest_max_count;
+        let history_due = history_due(&current, self.config.limits.snapshot_retention_secs)?;
+        let garbage_due = self.garbage_due(id)?;
         if manifests_due {
             self.maintenance
                 .rewrite_manifests(
@@ -2161,7 +2309,7 @@ impl TableWork {
             metrics::histogram!("flow_garbage_collection_seconds", "table_id" => id.0.to_string())
                 .record(started.elapsed().as_secs_f64());
         }
-        Ok(MaintenanceOutcome::Complete(current, garbage_pending))
+        Ok((current, garbage_pending))
     }
 }
 

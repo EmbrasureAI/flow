@@ -34,6 +34,24 @@ class S3ReadProxy:
             def setup(self):
                 super().setup()
                 self.connection.settimeout(30)
+                factory = http.client.HTTPSConnection if proxy.upstream.scheme == "https" else http.client.HTTPConnection
+                self.upstream_connection = factory(proxy.upstream.hostname, proxy.upstream.port, timeout=30)
+
+            def finish(self):
+                try:
+                    super().finish()
+                finally:
+                    self.upstream_connection.close()
+
+            def handle_one_request(self):
+                self.raw_requestline = None
+                try:
+                    super().handle_one_request()
+                except ConnectionResetError:
+                    if self.raw_requestline is not None:
+                        raise
+                    # An idle keepalive peer can reset before its next request.
+                    self.close_connection = True
 
             def log_message(self, *_args):
                 pass
@@ -119,7 +137,7 @@ class S3ReadProxy:
         started = time.monotonic()
         event = {"unix_ms": time.time_ns() // 1_000_000, "method": handler.command,
                  "path": handler.path, "range": handler.headers.get("Range")}
-        connection = None
+        connection = handler.upstream_connection
         response_started = False
         hold = False
         try:
@@ -131,8 +149,6 @@ class S3ReadProxy:
                 self.held.set()
                 if not self.release_reads.wait(timeout=60):
                     raise TimeoutError("test did not release selected S3 read within 60 seconds")
-            factory = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
-            connection = factory(self.upstream.hostname, self.upstream.port, timeout=30)
             connection.putrequest(handler.command, handler.path, skip_host=True, skip_accept_encoding=True)
             # Host is signed against this proxy's endpoint. MinIO must receive
             # that exact Host, plus the original path, headers and encoded body.
@@ -143,26 +159,38 @@ class S3ReadProxy:
                 connection.send(data)
             response = connection.getresponse()
             event["status"] = response.status
+            bodyless = handler.command == "HEAD" or response.status in (204, 304) or 100 <= response.status < 200
+            # http.client decodes response chunks. Keep close-delimited framing
+            # for those responses and reuse connections only with a known length.
+            expected_length = response.length
+            if not bodyless and (response.chunked or expected_length is None):
+                handler.close_connection = True
             handler.send_response_only(response.status, response.reason)
             for name, value in response.getheaders():
-                if name.lower() not in ("connection", "transfer-encoding"):
+                if (name.lower() not in ("connection", "transfer-encoding")
+                        and not (response.chunked and name.lower() == "content-length")):
                     handler.send_header(name, value)
-            handler.send_header("Connection", "close")
+            if handler.close_connection:
+                handler.send_header("Connection", "close")
             handler.end_headers()
             response_started = True
+            transferred = 0
             while data := response.read(65536):
                 handler.wfile.write(data)
+                transferred += len(data)
+            if not bodyless and expected_length is not None and transferred != expected_length:
+                raise EOFError("truncated upstream response body")
         except (OSError, EOFError, ValueError, http.client.HTTPException) as error:
             event["error"] = str(error)
+            # Never replay a request after a transport error: writes may commit.
+            handler.close_connection = True
+            connection.close()
             if not response_started:
                 try:
                     handler.send_error(502, "S3 test proxy transport failure")
                 except OSError:
                     pass
         finally:
-            handler.close_connection = True
-            if connection is not None:
-                connection.close()
             event.update(state="complete", held=hold,
                          elapsed_ms=round((time.monotonic() - started) * 1000, 3))
             self.record(event)

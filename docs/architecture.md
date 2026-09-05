@@ -83,10 +83,24 @@ Independent maintenance uses its own idempotency-marker namespace. The local com
 
 ## Latency and reader health
 
-Only pending tables have deadlines. The scheduler subtracts estimated commit time from the publication budget, becomes ready at 10,000 source mutations, 32 MiB of serialized transaction payload or its deadline, and applies a global commit-rate budget. The row count is a readiness trigger, not an admitted-epoch ceiling. When a worker becomes available, it takes the already-queued ordered prefix of ordinary transactions within the 32 MiB payload limit and the existing loaded descriptor window; it never waits to fill that batch. A transaction with more than 10,000 mutations for the table or more than 32 MiB of payload is admitted alone. It may produce many files but still publishes in one snapshot per table. Zero-mutation work still receives a deadline and advances its local watermark without creating an empty snapshot.
+Only tables with pending CDC have publication deadlines. The scheduler subtracts estimated commit time from the publication budget, becomes ready at 10,000 source mutations, 32 MiB of serialized transaction payload or its deadline, and applies a global commit-rate budget. The row count is a readiness trigger, not an admitted-epoch ceiling. When a worker becomes available, it takes the already-queued ordered prefix of ordinary transactions within the 32 MiB payload limit and the existing loaded descriptor window; it never waits to fill that batch. A transaction with more than 10,000 mutations for the table or more than 32 MiB of payload is admitted alone. It may produce many files but still publishes in one snapshot per table. Zero-mutation work still receives a deadline and advances its local watermark without creating an empty snapshot.
 
 New terminals carry exact per-table mutation counts computed from surviving spool chunks, before collapse. Retained older terminals have explicitly unknown counts: they become ready immediately and publish one whole transaction at a time. This preserves compatibility without rereading payloads, at a temporary batching cost while old history drains. Release20 and earlier measurements precede this row-trigger correction.
 
 Compaction debt can delay or stop publication. The source can continue into its bounded durable journal until its own capacity is reached. This preserves row correctness and current-table health at the cost of a visible latency violation.
 
-The scheduler uses observed per-table service times, including preparation and maintenance, to adjust publication deadlines. These estimates do not establish an SLO: the measured runs still fail latency qualification. Longer workloads, reader amplification and provider-level cost qualification remain open; FileIO and REST diagnostics record API operations rather than billed requests.
+Metadata and garbage work has a separate due signal from soft data compaction.
+One periodic table actor may run at a time, and ready CDC receives a dispatch
+between periodic visits. Each visit checks manifest/history debt and scans one
+bounded garbage-registry page; continuation can resume after CDC gets its turn.
+The collector's scan budget is cooperative: retained-artifact checks and in-flight
+storage requests are not a hard wall-clock deadline. Builds, prepared publication
+and checkpoint protection retain their existing ownership rules.
+
+Checkpoint rotation does not wait for all tables to become idle. A checkpoint
+records pending operations consistently with its index and keeps their base and
+successor snapshots protected. Direct restore requires a matching checkpoint
+without pending operations; other checkpoints use the existing catalog-scan
+recovery path. Rotation advances the protected history floor during active writes.
+
+The scheduler uses observed per-table service times, including preparation and maintenance, to adjust publication deadlines. Periodic visits and build probes do not enter CDC service-time estimates. These estimates do not establish an SLO: the measured runs still fail latency qualification. Longer workloads, reader amplification and provider-level cost qualification remain open; FileIO and REST diagnostics record API operations rather than billed requests.

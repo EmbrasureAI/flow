@@ -94,6 +94,7 @@ Parameters expose these workload dimensions:
 | Key selection | `--key-distribution uniform`, `hot` (first 1% of each writer's active keys), or `zipf --zipf-exponent 0.99` |
 | Transaction size | `--transaction-rows 10`, `100`, `1000`, `10000`; append-only also permits one-row transactions |
 | Writer concurrency | `--writers 4` |
+| Daemon table concurrency | `--table-workers 4`; recorded independently from source writers |
 | Runtime batch and queue budgets | `--batch-rows 1024 --pending-transactions 256`; both are recorded in each report |
 | Timing | `--warmup 10 --duration 60 --timeout 180` |
 | Reader polling | `--reader-poll-seconds 1` |
@@ -712,3 +713,28 @@ because the orders build starts only after its own backlog drains. The same
 fixture passes on the candidate debug build in `target/release35-fairness-debug-01`,
 with 721 transactions still pending when a build is admitted. Release performance
 qualification remains separate.
+
+## Periodic maintenance during queued CDC
+
+`periodic_maintenance.py` reuses the durable-backlog fixture to require a manifest
+rewrite, snapshot expiration, and deletion of an owned obsolete manifest list
+before the table's own source backlog drains. A standard Iceberg tag preserves
+an independent historical reader. The test also checks checkpoint rotation,
+exact final updates/deletes/key moves, ACK, and clean shutdown.
+
+```sh
+uv run tests/production/periodic_maintenance.py \
+  --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+  --binary target/debug/embrasure-flow --artifacts target/service-periodic
+```
+
+Use `--two-hot-tables --table-workers 1 --timeout 600` for a shared single worker, or
+`--two-hot-tables --timeout 600` to include competing tables and native background builds.
+Native data rewrites remain enabled so expired file-birth snapshots cannot leave
+unclearable hard L0 age debt. The four-transaction pages, short retention/cleanup
+intervals and 10 ms catalog request delay isolate scheduling and reclamation. These are diagnostic settings,
+not production defaults or a throughput benchmark.
+
+The fault proxies reuse HTTP connections for ordinary requests and close them
+on transport errors or deliberately lost responses. They never replay writes.
+S3 response bodies without safe length framing remain close-delimited.

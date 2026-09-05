@@ -37,6 +37,28 @@ class CatalogProxy:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(30)
+                factory = http.client.HTTPSConnection if proxy.upstream.scheme == "https" else http.client.HTTPConnection
+                self.upstream_connection = factory(proxy.upstream.hostname, proxy.upstream.port, timeout=30)
+
+            def finish(self):
+                try:
+                    super().finish()
+                finally:
+                    self.upstream_connection.close()
+
+            def handle_one_request(self):
+                self.raw_requestline = None
+                try:
+                    super().handle_one_request()
+                except ConnectionResetError:
+                    if self.raw_requestline is not None:
+                        raise
+                    # An idle keepalive peer can reset before its next request.
+                    self.close_connection = True
+
             def log_message(self, *_args):
                 pass
 
@@ -97,7 +119,7 @@ class CatalogProxy:
         if ingestion:
             event["operation_id"] = ingestion.get("summary", {}).get("flow.operation-id")
             event["snapshot_id"] = ingestion.get("snapshot-id")
-        connection = None
+        connection = handler.upstream_connection
         try:
             if self.reject:
                 event["fault"] = "reject-before-upstream"
@@ -111,8 +133,6 @@ class CatalogProxy:
                 self.commit_held.set()
                 if not self.release_commits.wait(timeout=45):
                     raise TimeoutError("test did not release held catalog commit within 45 seconds")
-            factory = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
-            connection = factory(self.upstream.hostname, self.upstream.port, timeout=30)
             headers = {key: value for key, value in handler.headers.items()
                        if key.lower() not in ("host", "connection", "content-length", "transfer-encoding")}
             connection.request(handler.command, self.upstream.path.rstrip("/") + handler.path, body, headers)
@@ -134,29 +154,37 @@ class CatalogProxy:
                 handler.connection.shutdown(socket.SHUT_RDWR)
                 handler.connection.close()
             else:
-                self.respond(handler, response.status, data, response.getheader("Content-Type", "application/json"))
+                self.respond(handler, response.status, data, response.getheader("Content-Type", "application/json"),
+                             response.getheader("Content-Length"))
         except (OSError, http.client.HTTPException, TimeoutError) as error:
             event["transport_error"] = str(error)
+            # A write may already have committed. Close both legs without replay.
+            handler.close_connection = True
+            connection.close()
             try:
                 self.respond(handler, 502, b'{"error":{"message":"catalog proxy transport failure","type":"ServiceUnavailableException","code":502}}')
             except OSError:
                 pass
         finally:
-            if connection is not None:
-                connection.close()
             event["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
             self.record(event)
 
     @staticmethod
-    def respond(handler, status, body, content_type="application/json"):
+    def respond(handler, status, body, content_type="application/json", content_length=None):
         handler.send_response(status)
         handler.send_header("Content-Type", content_type)
-        handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Connection", "close")
+        bodyless = handler.command == "HEAD" or status in (204, 304) or 100 <= status < 200
+        if status != 204 and not 100 <= status < 200:
+            if bodyless:
+                if content_length is not None:
+                    handler.send_header("Content-Length", content_length)
+            else:
+                handler.send_header("Content-Length", str(len(body)))
+        if handler.close_connection:
+            handler.send_header("Connection", "close")
         handler.end_headers()
-        if handler.command != "HEAD":
+        if not bodyless:
             handler.wfile.write(body)
-        handler.close_connection = True
 
 
 def main():

@@ -96,6 +96,24 @@ jobs:
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts target/service-maintenance-fairness
+      - name: Periodic cleanup with a single shared worker
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/periodic_maintenance.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --two-hot-tables --table-workers 1
+          --timeout 600
+          --artifacts target/service-periodic-single-worker
+      - name: Periodic cleanup beside native compaction
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/periodic_maintenance.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --two-hot-tables
+          --timeout 600
+          --artifacts target/service-periodic-with-builds
       - name: Composite keys, index reconstruction and journal quota recovery
         if: matrix.postgres == '18.6'
         run: >-

@@ -31,6 +31,14 @@ Review every change against this chain. A performance improvement must preserve 
 
 The frozen [release34 gate](qualification/release34.md) closes durable cleanup, generation corruption recovery and WAL-health status gaps. The release34 workload matrix exposes starvation of soft maintenance under continuous CDC. [Release35](qualification/release35.md) adds a bounded capture opportunity and passes a service regression that fails on release34, all 154 active Rust tests, nine Python checks and 29 service phases. Its six performance comparisons preserve accepted data but do not qualify throughput or reader health.
 
+[Release36](qualification/release36.md) separates periodic metadata work from data
+build scheduling and allows checkpoint rotation with pending catalog work. Its
+155-test Rust gate and three debug service cases pass; final optimized service and
+performance checks remain in progress. The 100-table trace shows more observed
+actor work than four workers can sustain at the requested rate, so the next
+controlled performance comparison changes only the worker count from four to
+eight. Runtime defaults remain unchanged.
+
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 
 - [Bootstrap recovery](../target/production-bootstrap-02/report.json) and [DDL between COPY attempts](../target/production-bootstrap-ddl-02/report.json): mid-COPY crash, durable staging reuse, concurrent CDC, index deletion and automatic rebuild.

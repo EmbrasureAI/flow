@@ -102,6 +102,7 @@ delete_files_hard = 2000000
 deleted_rows_percent = 100
 '''
         text += f'''[limits]
+table_workers = {self.args.table_workers}
 manifest_max_count = {self.args.manifest_max_count}
 batch_rows = {self.args.batch_rows}
 chunk_bytes = 1048576
@@ -1037,6 +1038,8 @@ def main():
     parser.add_argument("--payload-entropy", choices=("repeated", "high"), default="repeated")
     parser.add_argument("--tables", type=int, default=1)
     parser.add_argument("--writers", type=int, default=4)
+    parser.add_argument("--table-workers", type=int, default=4,
+                        help="daemon table actors; independent of source writer connections")
     parser.add_argument("--seed", type=int, default=20260905)
     parser.add_argument("--profile", choices=("mixed", "append", "update90"), default="mixed")
     parser.add_argument("--key-distribution", choices=("uniform", "hot", "zipf"), default="uniform")
@@ -1059,11 +1062,11 @@ def main():
         parser.error("initial rows per writer must exceed transaction rows")
     if args.duration * args.rate < args.transaction_rows:
         parser.error("measurement window must schedule at least one complete transaction")
-    if (args.pending_transactions <= 0 or args.manifest_max_count < 2
+    if (args.pending_transactions <= 0 or args.table_workers <= 0 or args.manifest_max_count < 2
             or args.reader_baseline_max_input_files <= 0
             or args.reader_baseline_max_input_bytes <= 0
             or args.reader_baseline_timeout <= 0):
-        parser.error("pending transactions, reader-baseline budgets and timeouts must be positive; "
+        parser.error("pending transactions, table workers, reader-baseline budgets and timeouts must be positive; "
                      "manifest max count must be at least two")
     if (args.stable_small_soft_files is None) != (args.stable_small_hard_files is None):
         parser.error("stable-small soft and hard limits must be supplied together")
