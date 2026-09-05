@@ -169,7 +169,11 @@ class HealthRun(Run):
             assert self.catalog_proxy.peak_posts == 1, "table_workers=1 admitted concurrent table publications"
         finally:
             self.catalog_proxy.release_commits.set()
-        self.wait_materialized(barrier)
+        # Status updates on every completion. Metrics can wait for the five-second
+        # idle tick, which coincides with the injected query timeout.
+        self.until("CDC did not finish before the stalled health query timed out",
+            lambda: json.loads((self.directory / "state/status.json").read_text())
+                ["watermarks"]["materialized_lsn"] >= barrier, timeout=3)
         assert self.health.active == 1 and not self.health.completed, \
             "CDC waited for the stalled health query instead of progressing independently"
         result = self.compare("cdc-during-stalled-health")
