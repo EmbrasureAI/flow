@@ -562,21 +562,39 @@ async fn publish(
         "{}/metadata/{nonce}",
         metadata.location().trim_end_matches('/')
     );
+    let mut manifests = Vec::with_capacity(view.manifests.len() + 2);
+    let mut rewritten = Vec::new();
+    let mut removed_data = Vec::new();
+    let mut removed_deletes = Vec::new();
+    for manifest in &view.manifests {
+        let entries = &view.entries_by_manifest[&manifest.manifest_path];
+        let live = entries.iter().filter(|entry| entry.is_alive());
+        let has_removed = live
+            .clone()
+            .any(|entry| publication.removed.contains(entry.file_path()));
+        let has_existing = live
+            .clone()
+            .any(|entry| !publication.removed.contains(entry.file_path()));
+        if !has_removed {
+            if has_existing {
+                manifests.push(manifest.clone());
+            }
+        } else if has_existing {
+            rewritten.push((manifest, entries));
+        } else {
+            // Keep this snapshot's deletions in its new content manifest,
+            // avoiding a separate deletion-only manifest for each input.
+            // SnapshotView already requires one current, unpartitioned spec.
+            match manifest.content {
+                ManifestContentType::Data => removed_data.extend(live),
+                ManifestContentType::Deletes => removed_deletes.extend(live),
+            }
+        }
+    }
     if let Some(tracker) = publication.artifact_tracker {
-        let rewritten = view
-            .manifests
-            .iter()
-            .filter(|manifest| {
-                view.entries_by_manifest[&manifest.manifest_path]
-                    .iter()
-                    .any(|entry| {
-                        entry.is_alive() && publication.removed.contains(entry.file_path())
-                    })
-            })
-            .count();
-        let count = rewritten
-            + usize::from(!publication.added_data.is_empty())
-            + usize::from(!publication.added_deletes.is_empty());
+        let count = rewritten.len()
+            + usize::from(!publication.added_data.is_empty() || !removed_data.is_empty())
+            + usize::from(!publication.added_deletes.is_empty() || !removed_deletes.is_empty());
         tracker
             .register(ArtifactSet::metadata(
                 &root,
@@ -585,20 +603,8 @@ async fn publish(
             ))
             .await?;
     }
-    let mut manifests = Vec::with_capacity(view.manifests.len() + 2);
     let mut manifest_number = 0;
-    for manifest in &view.manifests {
-        let entries = &view.entries_by_manifest[&manifest.manifest_path];
-        if !entries.iter().any(|entry| entry.is_alive()) {
-            continue;
-        }
-        if !entries
-            .iter()
-            .any(|entry| entry.is_alive() && publication.removed.contains(entry.file_path()))
-        {
-            manifests.push(manifest.clone());
-            continue;
-        }
+    for (manifest, entries) in rewritten {
         let mut writer =
             manifest_writer(table, snapshot_id, &root, manifest_number, manifest.content)?;
         manifest_number += 1;
@@ -625,25 +631,36 @@ async fn publish(
         }
         manifests.push(writer.write_manifest_file().await?);
     }
-    for (files, content, sequence) in [
+    for (files, removed, content, sequence) in [
         (
             publication.added_data,
+            removed_data,
             ManifestContentType::Data,
             publication.data_sequence,
         ),
         (
             publication.added_deletes,
+            removed_deletes,
             ManifestContentType::Deletes,
             publication.delete_sequence,
         ),
     ] {
-        if files.is_empty() {
+        if files.is_empty() && removed.is_empty() {
             continue;
         }
         let mut writer = manifest_writer(table, snapshot_id, &root, manifest_number, content)?;
         manifest_number += 1;
         for file in files {
             writer.add_file(file.clone(), sequence)?;
+        }
+        for entry in removed {
+            writer.add_delete_file(
+                entry.data_file.clone(),
+                entry
+                    .sequence_number
+                    .ok_or_else(|| invalid("missing data sequence number"))?,
+                entry.file_sequence_number,
+            )?;
         }
         manifests.push(writer.write_manifest_file().await?);
     }

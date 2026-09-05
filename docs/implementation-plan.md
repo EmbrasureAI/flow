@@ -56,6 +56,13 @@ patch has a failing unmodified control and 31 passing fixed tests. Automatic cos
 input collection and the remaining upstream transaction primitives are separate
 OSS delivery work.
 
+The [manifest-packing candidate](qualification/release38.md) addresses the measured
+metadata fanout in that same publication path. It preserves current deletion
+entries while sharing the new per-content manifests, and passes the workspace
+and recovery regressions; the unmodified control fails the intended output bound.
+Its optimized service/workload gate is next, including the changed independent
+compactor because that fixture uses the same publication library.
+
 [Validation](validation.md) maps each capability to its local report and tested binary. The latest focused evidence includes:
 
 - [Bootstrap recovery](../target/production-bootstrap-02/report.json) and [DDL between COPY attempts](../target/production-bootstrap-ddl-02/report.json): mid-COPY crash, durable staging reuse, concurrent CDC, index deletion and automatic rebuild.

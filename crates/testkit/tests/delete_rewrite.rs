@@ -13,7 +13,10 @@ use flow_model::{FileId, OperationId, PgLsn, Value};
 use flow_state_store::{OperationKind, OperationPhase, PreparedOperation, StateStore};
 use flow_testkit::scan;
 use futures::TryStreamExt;
-use iceberg::{Catalog, spec::DataContentType};
+use iceberg::{
+    Catalog,
+    spec::{DataContentType, ManifestContentType, ManifestStatus},
+};
 use std::collections::BTreeSet;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21,6 +24,15 @@ async fn shared_deletes_preserve_sequences_density_history_and_recover_lost_resp
     let mut f = Fixture::new().await;
     let before = SnapshotView::current(&f.head).await.unwrap();
     let old_snapshot = before.snapshot_id.unwrap();
+    let original_manifests = f
+        .head
+        .manifest_list_reader(f.head.metadata().current_snapshot().unwrap())
+        .load()
+        .await
+        .unwrap()
+        .consume_entries()
+        .into_iter()
+        .collect::<Vec<_>>();
     let maintenance = f.maintenance();
     let density = maintenance
         .inventory(&f.head, f.schema.table_id)
@@ -99,6 +111,67 @@ async fn shared_deletes_preserve_sequences_density_history_and_recover_lost_resp
         snapshot_count
     );
     let after = SnapshotView::current(&committed).await.unwrap();
+    let snapshot = committed.metadata().current_snapshot().unwrap();
+    assert_eq!(snapshot.parent_snapshot_id(), Some(old_snapshot));
+    assert_eq!(snapshot_count, f.head.metadata().snapshots().len() + 1);
+    let manifests = committed
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .unwrap()
+        .consume_entries()
+        .into_iter()
+        .collect::<Vec<_>>();
+    // Both data manifests are reused; all three removed delete files and the
+    // replacement share one new delete manifest in this same publication.
+    assert_eq!(manifests.len(), 3);
+    for manifest in original_manifests
+        .iter()
+        .filter(|manifest| manifest.content == ManifestContentType::Data)
+    {
+        assert!(manifests.contains(manifest));
+    }
+    let new_manifests = manifests
+        .iter()
+        .filter(|manifest| manifest.added_snapshot_id == snapshot.snapshot_id())
+        .collect::<Vec<_>>();
+    assert_eq!(new_manifests.len(), 1);
+    let manifest = new_manifests[0];
+    assert_eq!(manifest.content, ManifestContentType::Deletes);
+    assert_eq!(
+        manifest.partition_spec_id,
+        committed.metadata().default_partition_spec_id()
+    );
+    let loaded = manifest.load_manifest(committed.file_io()).await.unwrap();
+    assert_eq!(loaded.metadata().content, manifest.content);
+    assert_eq!(
+        loaded.metadata().partition_spec.spec_id(),
+        manifest.partition_spec_id
+    );
+    let mut removed = Vec::new();
+    for entry in loaded.entries() {
+        assert_eq!(entry.content_type(), DataContentType::PositionDeletes);
+        assert_eq!(entry.snapshot_id, after.snapshot_id);
+        if entry.status == ManifestStatus::Deleted {
+            let mut expected = before.live_files[entry.file_path()].as_ref().clone();
+            expected.status = ManifestStatus::Deleted;
+            expected.snapshot_id = after.snapshot_id;
+            assert_eq!(entry.as_ref(), &expected);
+            removed.push(entry.file_path().to_owned());
+        } else {
+            assert_eq!(entry.status, ManifestStatus::Added);
+            assert_eq!(entry, &after.live_files[entry.file_path()]);
+        }
+    }
+    removed.sort();
+    let expected_removed = before
+        .live_files
+        .iter()
+        .filter(|(_, entry)| entry.content_type() == DataContentType::PositionDeletes)
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(removed, expected_removed);
+    assert_eq!(loaded.entries().len(), removed.len() + 1);
     let deletes = after
         .live_files
         .values()

@@ -7,8 +7,9 @@ use flow_iceberg_ext::{
 };
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, NestedField,
-    Operation, PrimitiveType, Schema, Struct, Type,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion,
+    ManifestContentType, ManifestStatus, NestedField, Operation, PrimitiveType, Schema, Struct,
+    Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
@@ -221,17 +222,47 @@ async fn rewrite_survives_disjoint_append_and_preserves_sequence_numbers() {
         .commit(&catalog, &empty)
         .await
         .unwrap();
+    // Two fully consumed manifests of each content, plus the initial mixed
+    // manifest (first is removed, second survives).
+    let mut base = initial.table.clone();
+    let mut removed_data = vec![first.file_path().to_owned()];
+    let mut removed_deletes = Vec::new();
+    for index in 0..2 {
+        let file = data(&format!("consumed-{index}"));
+        let tombstone = delete(&format!("consumed-delete-{index}"), &first);
+        removed_data.push(file.file_path().to_owned());
+        removed_deletes.push(tombstone.file_path().to_owned());
+        base = RowDeltaAction::new(&base, format!("input-{index}"))
+            .add_data_files(vec![file])
+            .add_delete_files(vec![tombstone])
+            .validate_data_files_exist([first.file_path().to_owned()])
+            .commit(&catalog, &base)
+            .await
+            .unwrap()
+            .table;
+    }
     let rewritten = data("compacted");
-    let rewrite = RewriteFilesAction::new(&initial.table, "rewrite")
+    let rewrite = RewriteFilesAction::new(&base, "rewrite")
         .with_operation_id_key("other-writer.operation-id")
         .unwrap()
-        .remove_data_files([first.file_path().to_owned()])
+        .remove_data_files(removed_data.clone())
+        .remove_delete_files(removed_deletes.clone())
         .add_data_files(vec![rewritten.clone()]);
-    let unrelated = RowDeltaAction::new(&initial.table, "unrelated")
+    let unrelated = RowDeltaAction::new(&base, "unrelated")
         .add_data_files(vec![data("unrelated")])
-        .commit(&catalog, &initial.table)
+        .commit(&catalog, &base)
         .await
         .unwrap();
+    let before = SnapshotView::current(&unrelated.table).await.unwrap();
+    let original_manifests = unrelated
+        .table
+        .manifest_list_reader(unrelated.table.metadata().current_snapshot().unwrap())
+        .load()
+        .await
+        .unwrap()
+        .consume_entries()
+        .into_iter()
+        .collect::<Vec<_>>();
     let strict = rewrite.clone().require_base_snapshot();
     let strict_attempt = strict
         .commit_with_diagnostics(&catalog, &unrelated.table)
@@ -246,7 +277,7 @@ async fn rewrite_survives_disjoint_append_and_preserves_sequence_numbers() {
     assert!(rewrite_attempt.catalog_update_attempted());
     assert_eq!(rewrite_attempt.already_committed(), Some(false));
     let result = rewrite_attempt.result.unwrap();
-    assert_eq!(result.sequence_number, 3);
+    assert_eq!(result.sequence_number, unrelated.sequence_number + 1);
     assert_eq!(
         result
             .table
@@ -260,13 +291,89 @@ async fn rewrite_survives_disjoint_append_and_preserves_sequence_numbers() {
     let view = SnapshotView::current(&result.table).await.unwrap();
     assert!(!view.live_files.contains_key(first.file_path()));
     let output = &view.live_files[rewritten.file_path()];
-    assert_eq!(output.sequence_number, Some(1));
-    assert_eq!(output.file_sequence_number, Some(3));
+    assert_eq!(output.status, ManifestStatus::Added);
+    assert_eq!(
+        output.sequence_number,
+        Some(base.metadata().last_sequence_number())
+    );
+    assert_eq!(output.file_sequence_number, Some(result.sequence_number));
     let survivor = &view.live_files[second.file_path()];
     assert_eq!(survivor.sequence_number, Some(1));
     assert_eq!(survivor.file_sequence_number, Some(1));
     assert_eq!(survivor.snapshot_id, Some(initial.snapshot_id));
     assert_eq!(view.live_files.len(), 3);
+    let snapshot = result.table.metadata().current_snapshot().unwrap();
+    assert_eq!(snapshot.parent_snapshot_id(), before.snapshot_id);
+    assert_eq!(
+        result.table.metadata().snapshots().len(),
+        unrelated.table.metadata().snapshots().len() + 1
+    );
+    let manifests = result
+        .table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .unwrap()
+        .consume_entries()
+        .into_iter()
+        .collect::<Vec<_>>();
+    // One mixed rewrite, one unchanged manifest, and one group per content.
+    // The delete group must exist even though this rewrite adds no delete file.
+    assert_eq!(manifests.len(), 4);
+    let unchanged = original_manifests
+        .iter()
+        .find(|manifest| manifest.added_snapshot_id == unrelated.snapshot_id)
+        .unwrap();
+    assert!(manifests.contains(unchanged));
+    let mut actual_removed = Vec::new();
+    let mut new_contents = [0, 0];
+    for manifest in &manifests {
+        let loaded = manifest
+            .load_manifest(result.table.file_io())
+            .await
+            .unwrap();
+        assert_eq!(loaded.metadata().content, manifest.content);
+        assert_eq!(
+            loaded.metadata().partition_spec.spec_id(),
+            manifest.partition_spec_id
+        );
+        assert_eq!(
+            manifest.partition_spec_id,
+            base.metadata().default_partition_spec_id()
+        );
+        if manifest.added_snapshot_id == result.snapshot_id {
+            new_contents[manifest.content as usize] += 1;
+        }
+        for entry in loaded.entries() {
+            assert_eq!(
+                entry.content_type() == DataContentType::Data,
+                manifest.content == ManifestContentType::Data
+            );
+            if entry.status == ManifestStatus::Deleted {
+                // Standard removedDataFiles/removedDeleteFiles enumerate changes
+                // from manifests attributed to this publication, not just summaries.
+                assert_eq!(manifest.added_snapshot_id, result.snapshot_id);
+                let mut expected = before.live_files[entry.file_path()].as_ref().clone();
+                expected.status = ManifestStatus::Deleted;
+                expected.snapshot_id = Some(result.snapshot_id);
+                assert_eq!(entry.as_ref(), &expected);
+                actual_removed.push(entry.file_path().to_owned());
+            }
+        }
+    }
+    assert_eq!(new_contents, [2, 1]);
+    let mut expected_removed = removed_data;
+    expected_removed.extend(removed_deletes);
+    expected_removed.sort();
+    actual_removed.sort();
+    assert_eq!(actual_removed, expected_removed);
+    assert_eq!(
+        SnapshotView::load(&result.table, before.snapshot_id.unwrap())
+            .await
+            .unwrap()
+            .live_files,
+        before.live_files
+    );
     let properties = &result
         .table
         .metadata()
@@ -284,7 +391,7 @@ async fn rewrite_survives_disjoint_append_and_preserves_sequence_numbers() {
         .commit(&catalog, &result.table)
         .await
         .unwrap();
-    assert_eq!(later.sequence_number, 4);
+    assert_eq!(later.sequence_number, result.sequence_number + 1);
     let retry_attempt = strict
         .commit_with_diagnostics(&catalog, &initial.table)
         .await;
