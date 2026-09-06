@@ -30,6 +30,8 @@ class S3ReadProxy:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            # Send small response bodies without a delayed-ACK wait after headers.
+            disable_nagle_algorithm = True
 
             def setup(self):
                 super().setup()
