@@ -2,7 +2,8 @@
 //! Capture appends each surviving spool transaction consecutively at commit,
 //! making replay sequential without a second index or one file per transaction.
 
-use crate::{Error, JournalReader, Result, read_frame, segment_path};
+use crate::frame::{CHUNK, HEADER, read_frame};
+use crate::{Error, JournalReader, Result, segment_path};
 use flow_model::{JournalChunkRef, JournalChunks};
 use std::{
     fs::File,
@@ -180,10 +181,10 @@ impl ChunkState {
             };
             segment.offset = segment
                 .offset
-                .checked_add(crate::HEADER as u64 + u64::from(reference.length))
+                .checked_add(HEADER as u64 + u64::from(reference.length))
                 .ok_or(Error::Corrupt)?;
             if self.xid.is_none() {
-                if frame.kind != crate::CHUNK {
+                if frame.kind != CHUNK {
                     return Err(Error::Corrupt);
                 }
                 self.xid = Some(frame.xid);
@@ -191,7 +192,7 @@ impl ChunkState {
             if Some(frame.xid) != self.xid {
                 continue;
             }
-            if frame.kind != crate::CHUNK {
+            if frame.kind != CHUNK {
                 // A terminal record ends this XID incarnation. Never join a
                 // later transaction that happens to reuse the same XID.
                 return Err(Error::Corrupt);

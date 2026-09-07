@@ -25,6 +25,9 @@ checks the packaged service.
 
 ## Changes and review
 
+The [code guide](docs/code-guide.md) maps crate responsibilities, internal
+modules and test locations. Start there when deciding where a change belongs.
+
 Keep changes focused and explain the problem, resulting behavior and relevant
 validation. Prefer integration checks at durable state transitions to tests that
 repeat implementation details. Changes to source acknowledgement, catalog

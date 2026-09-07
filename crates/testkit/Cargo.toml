@@ -11,17 +11,12 @@ rust-version.workspace = true
 [dependencies]
 flow-model.workspace = true
 flow-coordinator.workspace = true
-flow-pg-source.workspace = true
 flow-ingress-journal.workspace = true
 flow-state-store.workspace = true
 flow-materializer.workspace = true
 flow-iceberg-ext.workspace = true
-flow-compactor.workspace = true
-flow-catalog-watch.workspace = true
 iceberg.workspace = true
-tokio.workspace = true
 async-trait.workspace = true
-serde_json.workspace = true
 bincode.workspace = true
 anyhow.workspace = true
 futures.workspace = true
@@ -31,6 +26,10 @@ tempfile.workspace = true
 workspace = true
 
 [dev-dependencies]
+flow-pg-source.workspace = true
+flow-compactor.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true

@@ -1,9 +1,6 @@
-use super::{
-    TableMaintenance,
-    artifacts::{OwnedArtifacts, now_ms, registry_prefix},
-    builds::active_build_protection,
-};
-use crate::publication::{ReplanRequired, blocking};
+use super::{TableMaintenance, builds::active_build_protection};
+use crate::artifacts::{OwnedArtifacts, now_ms, registry_prefix};
+use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
 use flow_iceberg_ext::retained_artifacts;
 use flow_model::{OperationId, TableId};

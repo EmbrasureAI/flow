@@ -1,4 +1,8 @@
-pub(crate) mod artifacts;
+//! Maintain the table's physical layout and reconcile external catalog commits.
+//!
+//! [`TableMaintenance`] shares the caller's single-writer table actor with
+//! [`crate::TablePublisher`]. Background builds leave publication to that actor.
+
 mod builds;
 mod concurrent;
 pub use builds::{BuildRegistration, active_build_protection, discard_abandoned_builds};
@@ -24,7 +28,7 @@ use iceberg::spec::DataContentType;
 use iceberg::{Catalog, table::Table};
 use serde::{Deserialize, Serialize};
 
-use crate::publication::{ReplanRequired, blocking};
+use crate::{artifacts, blocking, publication::ReplanRequired};
 
 mod deletes;
 pub use deletes::{DeleteRepairCursor, DeleteRewritePolicy};

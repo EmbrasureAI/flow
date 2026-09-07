@@ -71,7 +71,7 @@ Partitioning and Iceberg v3 remain planned work. See the full
 - [Architecture](docs/architecture.md) and [compaction protocol](docs/local-compaction.md)
 - [Configuration example](examples/flow.toml) and [observability](docs/observability.md)
 - [Integration tests](tests/production/README.md) and [performance results](docs/performance.md)
-- [Contributing](CONTRIBUTING.md)
+- [Contributing](CONTRIBUTING.md) and [code guide](docs/code-guide.md)
 
 ## License
 

@@ -1,8 +1,9 @@
 //! Durable ownership of speculative compaction, without a table publication
 //! fence. The table actor serializes registration, retirement and retention.
 
-use super::{GarbageProtection, artifacts::WriterRegistration};
-use crate::publication::{ReplanRequired, blocking};
+use super::GarbageProtection;
+use crate::artifacts::WriterRegistration;
+use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
 use bincode::Options;
 use flow_iceberg_ext::ArtifactTracker;

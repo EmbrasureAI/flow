@@ -1493,7 +1493,6 @@ dependencies = [
  "async-trait",
  "bincode",
  "clap",
- "flow-catalog-watch",
  "flow-compactor",
  "flow-coordinator",
  "flow-iceberg-ext",

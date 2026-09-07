@@ -1,6 +1,6 @@
 //! Durable ownership of immutable service outputs. Reservations precede uploads;
 //! ordinal blocks keep source-control writes independent of ordinary file rolls.
-use crate::publication::blocking;
+use crate::blocking;
 use anyhow::{Result, ensure};
 use flow_iceberg_ext::{ArtifactSet, ArtifactTracker, NumberedArtifacts};
 use flow_model::{OperationId, TableId};

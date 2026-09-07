@@ -1,5 +1,6 @@
-use super::{RewriteRecovery, TableMaintenance, artifacts::WriterRegistration};
-use crate::publication::{ReplanRequired, blocking};
+use super::{RewriteRecovery, TableMaintenance};
+use crate::artifacts::WriterRegistration;
+use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
 use flow_compactor::{DeleteReadLimits, Level, PublicationPressure, stage_delete_files};
 use flow_iceberg_ext::{CommitBase, SnapshotView, position_delete_may_apply, write_artifact_plan};

@@ -3,7 +3,8 @@
 //! The index avoids rescanning large transaction payloads during acknowledgement
 //! and keeps retained-transaction memory proportional to segment count.
 
-use crate::{Error, JournalReader, Result, decode_transaction, read_frame, segment_path};
+use crate::frame::{decode_transaction, read_frame};
+use crate::{Error, JournalReader, Result, segment_path};
 use flow_model::{JournalChunkRef, PgLsn, SourceTransaction};
 use std::{
     collections::BTreeMap,

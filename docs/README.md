@@ -10,6 +10,7 @@
 ## Development
 
 - [Contributing](../CONTRIBUTING.md): development setup, tests and dependency changes.
+- [Code guide](code-guide.md): crate ownership, module layout and test locations.
 - [Architecture](architecture.md): transaction identity, durable state and publication.
 - [Compaction protocol](local-compaction.md): background builds, catch-up and activation.
 - [Local tests](../tests/local/README.md) and [service integration](../tests/production/README.md).

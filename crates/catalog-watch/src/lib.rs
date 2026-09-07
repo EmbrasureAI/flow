@@ -1,5 +1,8 @@
-//! Unknown snapshots fence publication until their effect on physical row
-//! identities is understood. Snapshot operation labels are hints, never proof.
+//! Classification and row-identity checks for external Iceberg snapshot changes.
+//!
+//! Callers poll the catalog and pass changes to [`classify`]; this crate does not
+//! run a watcher. Unknown snapshots fence publication until their effect on
+//! physical row identities is understood. Operation labels are hints, never proof.
 
 use flow_model::{FileId, OperationId, PrimaryKey, RowLocation};
 use flow_state_store::{IndexDelta, OperationKind, PreparedOperation, StateStore};

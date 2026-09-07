@@ -1,5 +1,6 @@
-use super::{TableMaintenance, artifacts::OwnedArtifacts};
-use crate::publication::{ReplanRequired, blocking};
+use super::TableMaintenance;
+use crate::artifacts::OwnedArtifacts;
+use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
 use flow_iceberg_ext::{ArtifactSet, ManifestRewritePolicy, RewriteManifestsAction};
 use flow_model::{OperationId, TableId};

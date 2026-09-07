@@ -2,7 +2,7 @@
 //! finalizes completed work; it never waits for a running worker under its fence.
 
 use super::{BuildRegistration, RewriteCommit, TableMaintenance};
-use crate::publication::{ReplanRequired, blocking};
+use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
 use flow_compactor::{BuiltData, CatchUpRejected, Level};
 use flow_iceberg_ext::CommitBase;
