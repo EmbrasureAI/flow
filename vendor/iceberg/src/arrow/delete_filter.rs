@@ -36,6 +36,7 @@ use crate::{Error, ErrorKind, Result};
 enum EqDelState {
     Loading(Arc<Notify>),
     Loaded(Predicate),
+    Failed(Arc<Error>),
 }
 
 /// State tracking for positional delete files.
@@ -143,7 +144,7 @@ impl DeleteFilter {
             .deletes
             .iter()
             .filter(|file| file.file_type == DataContentType::PositionDeletes)
-            .map(|file| file.file_path.clone())
+            .map(FileScanTaskDeleteFile::positional_cache_key)
             .collect::<Vec<_>>();
         inputs.sort_unstable();
         inputs.dedup();
@@ -256,22 +257,27 @@ impl DeleteFilter {
     pub(crate) async fn get_equality_delete_predicate_for_delete_file_path(
         &self,
         file_path: &str,
-    ) -> Option<Predicate> {
-        let notifier = {
-            match self.state.read().unwrap().equality_deletes.get(file_path) {
-                None => return None,
-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
-                Some(EqDelState::Loaded(predicate)) => {
-                    return Some(predicate.clone());
+    ) -> Result<Option<Predicate>> {
+        loop {
+            let notified = {
+                match self.state.read().unwrap().equality_deletes.get(file_path) {
+                    None => return Ok(None),
+                    Some(EqDelState::Loading(notify)) => {
+                        let mut notified = Box::pin(notify.clone().notified_owned());
+                        // Register before releasing the lock to avoid losing completion.
+                        notified.as_mut().enable();
+                        notified
+                    }
+                    Some(EqDelState::Loaded(predicate)) => {
+                        return Ok(Some(predicate.clone()));
+                    }
+                    Some(EqDelState::Failed(error)) => {
+                        return Err(Error::new(error.kind(), "Equality delete load failed")
+                            .with_source(error.clone()));
+                    }
                 }
-            }
-        };
-
-        notifier.notified().await;
-
-        match self.state.read().unwrap().equality_deletes.get(file_path) {
-            Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
-            _ => unreachable!("Cannot be any other state than loaded"),
+            };
+            notified.await;
         }
     }
 
@@ -293,7 +299,7 @@ impl DeleteFilter {
 
             let Some(predicate) = self
                 .get_equality_delete_predicate_for_delete_file_path(&delete.file_path)
-                .await
+                .await?
             else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -321,24 +327,38 @@ impl DeleteFilter {
         delete_file_path: &str,
         eq_del: Receiver<Predicate>,
     ) {
-        let notify = Arc::new(Notify::new());
-        {
+        let notify = {
             let mut state = self.state.write().unwrap();
-            state.equality_deletes.insert(
-                delete_file_path.to_string(),
-                EqDelState::Loading(notify.clone()),
-            );
-        }
+            // Preserve the notifier installed when this load was claimed.
+            if let Some(EqDelState::Loading(notify)) = state.equality_deletes.get(delete_file_path)
+            {
+                notify.clone()
+            } else {
+                let notify = Arc::new(Notify::new());
+                state.equality_deletes.insert(
+                    delete_file_path.to_string(),
+                    EqDelState::Loading(notify.clone()),
+                );
+                notify
+            }
+        };
 
         let state = self.state.clone();
         let delete_file_path = delete_file_path.to_string();
         self.runtime.cpu().spawn(async move {
-            let eq_del = eq_del.await.unwrap();
+            let result = match eq_del.await {
+                Ok(predicate) => EqDelState::Loaded(predicate),
+                Err(error) => EqDelState::Failed(Arc::new(
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Equality delete load did not complete",
+                    )
+                    .with_source(error),
+                )),
+            };
             {
                 let mut state = state.write().unwrap();
-                state
-                    .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                state.equality_deletes.insert(delete_file_path, result);
             }
             notify.notify_waiters();
         });

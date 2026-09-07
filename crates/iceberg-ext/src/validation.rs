@@ -6,7 +6,7 @@ use iceberg::table::Table;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{OPERATION_ID_KEY, SnapshotView, conflict, invalid, position_delete_may_apply};
+use crate::{OPERATION_ID_KEY, SnapshotView, conflict, content_file_id, invalid};
 
 /// Find a committed operation on the current branch, including retained parent
 /// snapshots. A marker on a detached branch is not a successful publication.
@@ -46,10 +46,16 @@ pub(crate) fn find_operation_with_key(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitBase {
     pub uuid: Uuid,
+    #[serde(default = "legacy_format_version")]
+    pub format_version: FormatVersion,
     pub snapshot_id: Option<i64>,
     pub sequence_number: i64,
     pub schema_id: i32,
     pub spec_id: i32,
+}
+
+fn legacy_format_version() -> FormatVersion {
+    FormatVersion::V2
 }
 
 impl CommitBase {
@@ -57,6 +63,7 @@ impl CommitBase {
         let metadata = table.metadata();
         Self {
             uuid: metadata.uuid(),
+            format_version: metadata.format_version(),
             snapshot_id: metadata.current_snapshot_id(),
             sequence_number: metadata
                 .current_snapshot()
@@ -71,8 +78,14 @@ impl CommitBase {
         if metadata.uuid() != self.uuid {
             return Err(conflict("table identity changed"));
         }
-        if metadata.format_version() != FormatVersion::V2 {
-            return Err(invalid("row deltas and rewrites require Iceberg v2"));
+        if metadata.format_version() != self.format_version {
+            return Err(conflict("table format changed since files were prepared"));
+        }
+        if !matches!(
+            metadata.format_version(),
+            FormatVersion::V2 | FormatVersion::V3
+        ) {
+            return Err(invalid("row deltas and rewrites require Iceberg v2 or v3"));
         }
         if !metadata.default_partition_spec().fields().is_empty() {
             return Err(invalid("only unpartitioned tables are supported"));
@@ -169,16 +182,21 @@ pub(crate) fn validate_rewrite(
             )));
         }
     }
-    for path in deletes {
-        let delete = &head.live_files[path];
-        // A shared delete cannot be removed while a surviving file may need it.
-        // Retaining it is safe; residual rewriting is deliberately not guessed.
-        if head.live_files.values().any(|input| {
-            !data.contains(input.file_path()) && position_delete_may_apply(delete, input)
-        }) {
-            return Err(conflict(format!(
-                "shared delete still covers a surviving data file: {path}"
-            )));
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    for input in head.live_files.values().filter(|input| {
+        input.content_type() == DataContentType::Data && !data.contains(input.file_path())
+    }) {
+        // A shared legacy delete may be removed once every surviving target
+        // is covered by its cumulative vector.
+        for delete in head.applicable_deletes(input.file_path())? {
+            let id = content_file_id(delete.data_file());
+            if deletes.contains(&id) {
+                return Err(conflict(format!(
+                    "shared delete still covers a surviving data file: {id}"
+                )));
+            }
         }
     }
     Ok(())

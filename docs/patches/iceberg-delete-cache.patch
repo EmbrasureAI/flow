@@ -17,7 +17,15 @@
  use tokio::sync::oneshot::Receiver;
  
  use crate::delete_vector::DeleteVector;
-@@ -43,13 +46,21 @@
+@@ -33,6 +36,7 @@
+ enum EqDelState {
+     Loading(Arc<Notify>),
+     Loaded(Predicate),
++    Failed(Arc<Error>),
+ }
+ 
+ /// State tracking for positional delete files.
+@@ -43,13 +47,21 @@
      /// The file is currently being loaded by a task.
      /// The notifier allows other tasks to wait for completion.
      Loading(Arc<Notify>),
@@ -42,7 +50,7 @@
      equality_deletes: HashMap<String, EqDelState>,
      positional_deletes: HashMap<String, PosDelState>,
  }
-@@ -63,13 +74,55 @@
+@@ -63,13 +75,55 @@
  /// Action to take when trying to start loading a positional delete file
  pub(crate) enum PosDelLoadAction {
      /// The file is not loaded, the caller should load it.
@@ -100,7 +108,7 @@
  }
  
  impl DeleteFilter {
-@@ -86,18 +139,38 @@
+@@ -86,18 +140,38 @@
          &self,
          file_scan_task: &FileScanTask,
      ) -> Option<Arc<Mutex<DeleteVector>>> {
@@ -151,7 +159,7 @@
      }
  
      pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Arc<Notify>> {
-@@ -126,8 +199,17 @@
+@@ -126,8 +200,17 @@
  
          if let Some(state) = state.positional_deletes.get(file_path) {
              match state {
@@ -171,7 +179,7 @@
              }
          }
  
-@@ -136,16 +218,28 @@
+@@ -136,16 +219,28 @@
              .positional_deletes
              .insert(file_path.to_string(), PosDelState::Loading(notifier));
  
@@ -203,7 +211,59 @@
              {
                  Some(notify)
              } else {
-@@ -222,23 +316,6 @@
+@@ -162,22 +257,27 @@
+     pub(crate) async fn get_equality_delete_predicate_for_delete_file_path(
+         &self,
+         file_path: &str,
+-    ) -> Option<Predicate> {
+-        let notifier = {
+-            match self.state.read().unwrap().equality_deletes.get(file_path) {
+-                None => return None,
+-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
+-                Some(EqDelState::Loaded(predicate)) => {
+-                    return Some(predicate.clone());
++    ) -> Result<Option<Predicate>> {
++        loop {
++            let notified = {
++                match self.state.read().unwrap().equality_deletes.get(file_path) {
++                    None => return Ok(None),
++                    Some(EqDelState::Loading(notify)) => {
++                        let mut notified = Box::pin(notify.clone().notified_owned());
++                        // Register before releasing the lock to avoid losing completion.
++                        notified.as_mut().enable();
++                        notified
++                    }
++                    Some(EqDelState::Loaded(predicate)) => {
++                        return Ok(Some(predicate.clone()));
++                    }
++                    Some(EqDelState::Failed(error)) => {
++                        return Err(Error::new(error.kind(), "Equality delete load failed")
++                            .with_source(error.clone()));
++                    }
+                 }
+-            }
+-        };
+-
+-        notifier.notified().await;
+-
+-        match self.state.read().unwrap().equality_deletes.get(file_path) {
+-            Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
+-            _ => unreachable!("Cannot be any other state than loaded"),
++            };
++            notified.await;
+         }
+     }
+ 
+@@ -199,7 +299,7 @@
+ 
+             let Some(predicate) = self
+                 .get_equality_delete_predicate_for_delete_file_path(&delete.file_path)
+-                .await
++                .await?
+             else {
+                 return Err(Error::new(
+                     ErrorKind::Unexpected,
+@@ -222,46 +322,43 @@
          Ok(Some(bound_predicate))
      }
  
@@ -227,7 +287,55 @@
      pub(crate) fn insert_equality_delete(
          &self,
          delete_file_path: &str,
-@@ -356,12 +433,11 @@
+         eq_del: Receiver<Predicate>,
+     ) {
+-        let notify = Arc::new(Notify::new());
+-        {
++        let notify = {
+             let mut state = self.state.write().unwrap();
+-            state.equality_deletes.insert(
+-                delete_file_path.to_string(),
+-                EqDelState::Loading(notify.clone()),
+-            );
+-        }
++            // Preserve the notifier installed when this load was claimed.
++            if let Some(EqDelState::Loading(notify)) = state.equality_deletes.get(delete_file_path)
++            {
++                notify.clone()
++            } else {
++                let notify = Arc::new(Notify::new());
++                state.equality_deletes.insert(
++                    delete_file_path.to_string(),
++                    EqDelState::Loading(notify.clone()),
++                );
++                notify
++            }
++        };
+ 
+         let state = self.state.clone();
+         let delete_file_path = delete_file_path.to_string();
+         self.runtime.cpu().spawn(async move {
+-            let eq_del = eq_del.await.unwrap();
++            let result = match eq_del.await {
++                Ok(predicate) => EqDelState::Loaded(predicate),
++                Err(error) => EqDelState::Failed(Arc::new(
++                    Error::new(
++                        ErrorKind::Unexpected,
++                        "Equality delete load did not complete",
++                    )
++                    .with_source(error),
++                )),
++            };
+             {
+                 let mut state = state.write().unwrap();
+-                state
+-                    .equality_deletes
+-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
++                state.equality_deletes.insert(delete_file_path, result);
+             }
+             notify.notify_waiters();
+         });
+@@ -356,12 +453,11 @@
              let pos_vals = pos_values.get(n - 1).unwrap();
              let pos_col = Arc::new(Int64Array::from_iter_values(pos_vals.clone()));
  

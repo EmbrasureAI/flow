@@ -17,12 +17,19 @@ such as `config` or `namespaces` do not change endpoint attribution. Changed fil
 `Cargo.toml`, `Cargo.toml.orig`, `README.md`, `src/catalog.rs`, `src/client.rs`,
 `src/lib.rs`; `src/observation.rs` is a local Apache-2.0 addition.
 
+Table creation forwards the typed `TableCreation.format_version` as the reserved
+REST `format-version` property. The typed field wins over a conflicting raw
+property, and unrelated properties are preserved. HTTP request regression cases
+cover default v2, explicit v3, and a conflicting property. This correction changes
+`src/catalog.rs` and `README.md`.
+
 From an extracted crate, apply these repository patches in order (use absolute
 patch paths):
 
 ```sh
 patch -p1 < docs/patches/iceberg-rest-retryable-status.patch
 patch -p3 < docs/patches/iceberg-rest-observability.patch
+patch -p3 < docs/patches/iceberg-rest-format-version.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is

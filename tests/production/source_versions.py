@@ -32,7 +32,6 @@ def main():
             name = "flow-source-" + uuid.uuid4().hex[:12]
             record = {"postgres": version, "passed": False, "suites": []}
             report["versions"].append(record)
-            created = False
             try:
                 subprocess.run(["docker", "run", "--detach", "--name", name, "--cpus=2", "--memory=1g",
                                 "--publish", "127.0.0.1:0:5432", "--env", "POSTGRES_USER=flow",
@@ -40,7 +39,6 @@ def main():
                                 f"postgres:{version}-bookworm", "postgres", "-c", "wal_level=logical",
                                 "-c", "max_replication_slots=8", "-c", "max_wal_senders=8",
                                 "-c", "logical_decoding_work_mem=4MB", "-c", "track_commit_timestamp=on"], check=True, timeout=120)
-                created = True
                 inspection = json.loads(subprocess.check_output(["docker", "inspect", name], timeout=30))[0]
                 record["image"] = inspection["Image"]
                 port = inspection["NetworkSettings"]["Ports"]["5432/tcp"][0]["HostPort"]
@@ -70,10 +68,10 @@ def main():
             except Exception as error:
                 record["error"] = f"{type(error).__name__}: {error}"
             finally:
-                if created:
-                    record["cleanup"] = cleanup_container(name, args.artifacts / f"pg-{version}.log")
-                    if not record["cleanup"]["passed"]:
-                        record["passed"] = False
+                # Docker may create the named container before its client times out.
+                record["cleanup"] = cleanup_container(name, args.artifacts / f"pg-{version}.log")
+                if not record["cleanup"]["passed"]:
+                    record["passed"] = False
                 (args.artifacts / "report.json").write_text(json.dumps(report, indent=2) + "\n")
         report["passed"] = all(record["passed"] for record in report["versions"])
     finally:

@@ -45,7 +45,7 @@ Automatic snapshot expiration defaults to disabled. Set `limits.snapshot_expirat
 
 Current support boundaries:
 
-- Unpartitioned Iceberg v2 with position deletes. Low-fan-out partitions and v3 follow the original specification's v2 correctness and performance gates.
+- Unpartitioned Iceberg v2 position deletes and v3 deletion vectors. Set `format_version = 3` on a table to create a v3 target; see [v3 configuration and compatibility](iceberg-v3.md). Partitioning remains planned work.
 - Mutable tables require a stable primary key and FULL replica identity. Keyless tables support append-only ingestion and equivalent external physical rewrites, including duplicate rows.
 - Automatic DDL supports nullable column additions without a non-null backfill. Unsupported type, key, identity or source-lineage changes fail closed. TRUNCATE is rejected.
 - Initial COPY uses up to four workers. Recovery needs capacity for one additional temporary replication slot. Transaction metadata and row payloads spill to disk; configured journal, spool, message and row-size budgets still apply.

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, MAIN_BRANCH, ManifestContentType,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
     ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
     SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Summary,
 };
@@ -12,7 +12,9 @@ use iceberg::{Catalog, Result, TableCommit, TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use crate::validation::{CommitBase, find_operation_with_key, validate_inputs, validate_rewrite};
-use crate::{ArtifactSet, ArtifactTracker, ManifestCache, SnapshotView, conflict, invalid};
+use crate::{
+    ArtifactSet, ArtifactTracker, ManifestCache, SnapshotView, conflict, content_file_id, invalid,
+};
 
 pub const OPERATION_ID_KEY: &str = "flow.operation-id";
 
@@ -50,7 +52,7 @@ impl CommitAttempt {
     }
 }
 
-/// Atomically add data and position-delete files in one ordinary v2 snapshot.
+/// Atomically add data and position-delete files in one ordinary v2 or v3 snapshot.
 /// All files must be immutable, complete, and durable before calling commit.
 #[derive(Debug, Clone)]
 pub struct RowDeltaAction {
@@ -59,6 +61,7 @@ pub struct RowDeltaAction {
     operation_id: String,
     added_data: Vec<DataFile>,
     added_deletes: Vec<DataFile>,
+    removed_deletes: BTreeSet<String>,
     referenced_data: BTreeSet<String>,
     properties: HashMap<String, String>,
     cache: ManifestCache,
@@ -76,6 +79,7 @@ impl RowDeltaAction {
             operation_id: operation_id.into(),
             added_data: Vec::new(),
             added_deletes: Vec::new(),
+            removed_deletes: BTreeSet::new(),
             referenced_data: BTreeSet::new(),
             properties: HashMap::new(),
             cache: ManifestCache::default(),
@@ -108,6 +112,15 @@ impl RowDeltaAction {
         self.added_deletes.extend(files);
         self
     }
+    /// Replace delete contents by their logical content_file_id. Replacements
+    /// must commit against the exact snapshot whose deletes were read.
+    pub fn remove_delete_files(mut self, files: impl IntoIterator<Item = String>) -> Self {
+        self.removed_deletes.extend(files);
+        if !self.removed_deletes.is_empty() {
+            self.require_base_snapshot = true;
+        }
+        self
+    }
     pub fn validate_data_files_exist(mut self, files: impl IntoIterator<Item = String>) -> Self {
         self.referenced_data.extend(files);
         self
@@ -136,7 +149,10 @@ impl RowDeltaAction {
                 "prepared snapshot changed; reconcile before publication",
             ));
         }
-        if self.added_data.is_empty() && self.added_deletes.is_empty() {
+        if self.added_data.is_empty()
+            && self.added_deletes.is_empty()
+            && self.removed_deletes.is_empty()
+        {
             return Err(invalid("empty row delta"));
         }
         if !self.added_deletes.is_empty() && self.referenced_data.is_empty() {
@@ -165,7 +181,18 @@ impl RowDeltaAction {
                 }
             }
         }
-        validate_additions(&view, &self.added_data, &self.added_deletes)?;
+        validate_inputs(
+            &view,
+            &self.removed_deletes,
+            DataContentType::PositionDeletes,
+        )?;
+        validate_additions(
+            &head,
+            &view,
+            &self.added_data,
+            &self.added_deletes,
+            &self.removed_deletes,
+        )?;
         for file in &self.added_deletes {
             if let Some(path) = file.referenced_data_file()
                 && !self.referenced_data.contains(&path)
@@ -173,7 +200,7 @@ impl RowDeltaAction {
                 return Err(invalid(format!("delete target was not validated: {path}")));
             }
         }
-        let operation = if self.added_deletes.is_empty() {
+        let operation = if self.added_deletes.is_empty() && self.removed_deletes.is_empty() {
             Operation::Append
         } else if self.added_data.is_empty() {
             Operation::Delete
@@ -192,7 +219,7 @@ impl RowDeltaAction {
                 operation,
                 added_data: &self.added_data,
                 added_deletes: &self.added_deletes,
-                removed: &BTreeSet::new(),
+                removed: &self.removed_deletes,
                 data_sequence: -1,
                 delete_sequence: -1,
             },
@@ -382,7 +409,31 @@ impl RewriteFilesAction {
         } else {
             SnapshotView::load_with_cache(&head, base_id, &self.cache).await?
         };
-        validate_additions(&view, &self.added_data, &self.added_deletes)?;
+        let mut removed: BTreeSet<_> = self
+            .removed_data
+            .union(&self.removed_deletes)
+            .cloned()
+            .collect();
+        // Deletion vectors cannot outlive their referenced data file.
+        removed.extend(
+            view.live_files
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.file_format() == DataFileFormat::Puffin
+                        && entry
+                            .data_file()
+                            .referenced_data_file()
+                            .is_some_and(|path| self.removed_data.contains(&path))
+                })
+                .map(|(id, _)| id.clone()),
+        );
+        validate_additions(
+            &head,
+            &view,
+            &self.added_data,
+            &self.added_deletes,
+            &removed,
+        )?;
         if let Some(sequence) = self.delete_sequence {
             if self.removed_deletes.is_empty()
                 || !(0..=self.base.sequence_number).contains(&sequence)
@@ -452,11 +503,6 @@ impl RewriteFilesAction {
                 .snapshot_by_id(id)
                 .and_then(|snapshot| snapshot.parent_snapshot_id());
         }
-        let removed = self
-            .removed_data
-            .union(&self.removed_deletes)
-            .cloned()
-            .collect();
         publish(
             catalog,
             &head,
@@ -490,25 +536,89 @@ fn recovered(table: &Table, operation_id: &str, property: &str) -> Option<Commit
     })
 }
 
-fn validate_additions(view: &SnapshotView, data: &[DataFile], deletes: &[DataFile]) -> Result<()> {
+/// Validate the resulting snapshot, including independent blobs in shared objects.
+pub(crate) fn validate_live_vectors<'a>(
+    files: impl IntoIterator<Item = &'a DataFile>,
+) -> Result<()> {
+    let files: Vec<_> = files.into_iter().collect();
+    let data: HashMap<_, _> = files
+        .iter()
+        .filter(|file| file.content_type() == DataContentType::Data)
+        .map(|file| (file.file_path(), *file))
+        .collect();
+    let mut targets = BTreeSet::new();
+    for file in files
+        .iter()
+        .filter(|file| file.file_format() == DataFileFormat::Puffin)
+    {
+        let target = file
+            .referenced_data_file()
+            .ok_or_else(|| invalid("deletion vector lacks referenced data file"))?;
+        let valid_range = file
+            .content_offset()
+            .zip(file.content_size_in_bytes())
+            .is_some_and(|(offset, size)| {
+                offset >= 4
+                    && size > 0
+                    && offset
+                        .checked_add(size)
+                        .is_some_and(|end| end as u64 <= file.file_size_in_bytes())
+            });
+        if file.content_type() != DataContentType::PositionDeletes
+            || !valid_range
+            || file.record_count() == 0
+        {
+            return Err(invalid("invalid deletion vector content or blob range"));
+        }
+        if !targets.insert(target.clone()) {
+            return Err(invalid(format!(
+                "multiple live deletion vectors for {target}"
+            )));
+        }
+        let input = data
+            .get(target.as_str())
+            .ok_or_else(|| invalid(format!("deletion vector target is not live: {target}")))?;
+        if input.partition() != file.partition() {
+            return Err(invalid("deletion vector partition differs from target"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_additions(
+    table: &Table,
+    view: &SnapshotView,
+    data: &[DataFile],
+    deletes: &[DataFile],
+    removed: &BTreeSet<String>,
+) -> Result<()> {
     let mut paths = BTreeSet::new();
     for (files, content) in [
         (data, DataContentType::Data),
         (deletes, DataContentType::PositionDeletes),
     ] {
+        let format = if content == DataContentType::PositionDeletes
+            && table.metadata().format_version() == FormatVersion::V3
+        {
+            DataFileFormat::Puffin
+        } else {
+            DataFileFormat::Parquet
+        };
         for file in files {
             if file.content_type() != content
-                || file.file_format() != DataFileFormat::Parquet
+                || file.file_format() != format
                 || !file.partition().fields().is_empty()
                 || file.record_count() == 0
                 || file.file_size_in_bytes() == 0
+                || (content == DataContentType::Data && file.first_row_id().is_some())
             {
                 return Err(invalid(format!(
-                    "invalid unpartitioned Parquet artifact: {}",
+                    "invalid added content artifact: {}",
                     file.file_path()
                 )));
             }
-            if !paths.insert(file.file_path()) || view.live_files.contains_key(file.file_path()) {
+            let id = content_file_id(file);
+            if !paths.insert(id.clone()) || view.live_files.contains_key(&id) {
                 return Err(invalid(format!(
                     "duplicate added file: {}",
                     file.file_path()
@@ -525,7 +635,14 @@ fn validate_additions(view: &SnapshotView, data: &[DataFile], deletes: &[DataFil
             "equality deletes require external-maintenance reconciliation",
         ));
     }
-    Ok(())
+    validate_live_vectors(
+        view.live_files
+            .iter()
+            .filter(|(id, _)| !removed.contains(*id))
+            .map(|(_, entry)| entry.data_file())
+            .chain(data)
+            .chain(deletes),
+    )
 }
 
 struct Publication<'a> {
@@ -569,12 +686,16 @@ async fn publish(
     for manifest in &view.manifests {
         let entries = &view.entries_by_manifest[&manifest.manifest_path];
         let live = entries.iter().filter(|entry| entry.is_alive());
-        let has_removed = live
-            .clone()
-            .any(|entry| publication.removed.contains(entry.file_path()));
-        let has_existing = live
-            .clone()
-            .any(|entry| !publication.removed.contains(entry.file_path()));
+        let has_removed = live.clone().any(|entry| {
+            publication
+                .removed
+                .contains(&content_file_id(entry.data_file()))
+        });
+        let has_existing = live.clone().any(|entry| {
+            !publication
+                .removed
+                .contains(&content_file_id(entry.data_file()))
+        });
         if !has_removed {
             if has_existing {
                 manifests.push(manifest.clone());
@@ -612,7 +733,10 @@ async fn publish(
             let sequence = entry
                 .sequence_number
                 .ok_or_else(|| invalid("missing data sequence number"))?;
-            if publication.removed.contains(entry.file_path()) {
+            if publication
+                .removed
+                .contains(&content_file_id(entry.data_file()))
+            {
                 writer.add_delete_file(
                     entry.data_file.clone(),
                     sequence,
@@ -665,13 +789,18 @@ async fn publish(
         manifests.push(writer.write_manifest_file().await?);
     }
     let manifest_list = format!("{root}-list.avro");
-    let mut writer = ManifestListWriter::v2(
-        table.file_io().new_output(&manifest_list)?.writer().await?,
+    let mut writer = manifest_list_writer(
+        table,
+        &manifest_list,
         snapshot_id,
         metadata.current_snapshot_id(),
         sequence_number,
-    );
+    )
+    .await?;
     writer.add_manifests(manifests.into_iter())?;
+    let added_rows = writer
+        .next_row_id()
+        .map(|next| next - metadata.next_row_id());
     writer.close().await?;
     let mut collector = SnapshotSummaryCollector::default();
     for file in publication
@@ -705,7 +834,11 @@ async fn publish(
     for file in view
         .live_files
         .values()
-        .filter(|entry| !publication.removed.contains(entry.file_path()))
+        .filter(|entry| {
+            !publication
+                .removed
+                .contains(&content_file_id(entry.data_file()))
+        })
         .map(|entry| &entry.data_file)
         .chain(publication.added_data)
         .chain(publication.added_deletes)
@@ -753,8 +886,14 @@ async fn publish(
         .with_timestamp_ms(i64::try_from(now).map_err(|_| invalid("timestamp overflow"))?)
         .with_schema_id(metadata.current_schema_id())
         .with_manifest_list(manifest_list)
-        .with_summary(summary)
-        .build();
+        .with_summary(summary);
+    let snapshot = if let Some(added_rows) = added_rows {
+        snapshot
+            .with_row_range(metadata.next_row_id(), added_rows)
+            .build()
+    } else {
+        snapshot.build()
+    };
     commit_snapshot(catalog, table, snapshot, catalog_update_elapsed).await
 }
 
@@ -827,8 +966,32 @@ pub(crate) fn manifest_writer(
         table.metadata().current_schema().clone(),
         table.metadata().default_partition_spec().as_ref().clone(),
     );
-    Ok(match content {
-        ManifestContentType::Data => builder.build_v2_data(),
-        ManifestContentType::Deletes => builder.build_v2_deletes(),
+    Ok(match (table.metadata().format_version(), content) {
+        (FormatVersion::V3, ManifestContentType::Data) => builder.build_v3_data(),
+        (FormatVersion::V3, ManifestContentType::Deletes) => builder.build_v3_deletes(),
+        (_, ManifestContentType::Data) => builder.build_v2_data(),
+        (_, ManifestContentType::Deletes) => builder.build_v2_deletes(),
+    })
+}
+
+/// Snapshot lists assign lineage only at the publication boundary.
+pub(crate) async fn manifest_list_writer(
+    table: &Table,
+    path: &str,
+    snapshot_id: i64,
+    parent: Option<i64>,
+    sequence: i64,
+) -> Result<ManifestListWriter> {
+    let output = table.file_io().new_output(path)?.writer().await?;
+    Ok(if table.metadata().format_version() == FormatVersion::V3 {
+        ManifestListWriter::v3(
+            output,
+            snapshot_id,
+            parent,
+            sequence,
+            Some(table.metadata().next_row_id()),
+        )
+    } else {
+        ManifestListWriter::v2(output, snapshot_id, parent, sequence)
     })
 }

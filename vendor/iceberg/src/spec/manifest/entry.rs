@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -122,6 +123,36 @@ impl ManifestEntry {
         {
             self.file_sequence_number = Some(snapshot_entry.sequence_number);
         }
+    }
+
+    /// Assign row lineage in manifest order, preserving explicit IDs.
+    pub(crate) fn inherit_first_row_id(&mut self, next_row_id: &mut Option<u64>) -> Result<()> {
+        if !self.is_alive()
+            || self.content_type() != DataContentType::Data
+            || self.data_file.first_row_id.is_some()
+        {
+            return Ok(());
+        }
+        if let Some(first) = *next_row_id {
+            self.data_file.first_row_id = Some(i64::try_from(first).map_err(|_| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "First row ID exceeds signed long range",
+                )
+            })?);
+            *next_row_id = Some(
+                first
+                    .checked_add(self.record_count())
+                    .filter(|id| *id <= i64::MAX as u64)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "Row ID overflow during manifest inheritance",
+                        )
+                    })?,
+            );
+        }
+        Ok(())
     }
 
     /// Snapshot id

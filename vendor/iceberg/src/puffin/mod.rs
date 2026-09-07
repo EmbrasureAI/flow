@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -23,6 +24,12 @@ use crate::{Error, ErrorKind, Result};
 
 mod blob;
 pub use blob::{APACHE_DATASKETCHES_THETA_V1, Blob, DELETION_VECTOR_V1};
+
+mod deletion_vector;
+pub use crate::delete_vector::DeleteVector;
+pub use deletion_vector::{
+    DeletionVectorLimits, decode_deletion_vector, encode_deletion_vector, read_deletion_vector,
+};
 
 pub use crate::compression::CompressionCodec;
 

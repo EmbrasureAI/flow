@@ -32,11 +32,12 @@ use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
 use crate::expr::{Predicate, Reference};
 use crate::io::FileIO;
+use crate::puffin::{DeletionVectorLimits, read_deletion_vector};
 use crate::runtime::Runtime;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{
-    DataContentType, Datum, ListType, MapType, NestedField, NestedFieldRef, PartnerAccessor,
-    PrimitiveType, Schema, SchemaRef, SchemaWithPartnerVisitor, StructType, Type,
+    DataContentType, DataFileFormat, Datum, ListType, MapType, NestedField, NestedFieldRef,
+    PartnerAccessor, PrimitiveType, Schema, SchemaRef, SchemaWithPartnerVisitor, StructType, Type,
     visit_schema_with_partner,
 };
 use crate::{Error, ErrorKind, Result};
@@ -53,7 +54,11 @@ pub(crate) struct CachingDeleteFileLoader {
 
 // Intermediate context during processing of a delete file task.
 enum DeleteFileContext {
-    // TODO: Delete Vector loader from Puffin files
+    DeletionVector {
+        load: PosDelLoadGuard,
+        target: String,
+        vector: DeleteVector,
+    },
     ExistingEqDel,
     ExistingPosDel,
     PosDels {
@@ -102,70 +107,10 @@ impl CachingDeleteFileLoader {
         self
     }
 
-    /// Initiates loading of all deletes for all the specified tasks
-    ///
-    /// Returned future completes once all positional deletes and delete vectors
-    /// have loaded. EQ deletes are not waited for in this method but the returned
-    /// DeleteFilter will await their loading when queried for them.
-    ///
-    ///  * Create a single stream of all delete file tasks irrespective of type,
-    ///    so that we can respect the combined concurrency limit
-    ///  * We then process each in two phases: load and parse.
-    ///  * for positional deletes the load phase instantiates an ArrowRecordBatchStream to
-    ///    stream the file contents out
-    ///  * for eq deletes, we first check if the EQ delete is already loaded or being loaded by
-    ///    another concurrently processing data file scan task. If it is, we skip it.
-    ///    If not, the DeleteFilter is updated to contain a notifier to prevent other data file
-    ///    tasks from starting to load the same equality delete file. We spawn a task to load
-    ///    the EQ delete's record batch stream, convert it to a predicate, update the delete filter,
-    ///    and notify any task that was waiting for it.
-    ///  * When this gets updated to add support for delete vectors, the load phase will return
-    ///    a PuffinReader for them.
-    ///  * The parse phase parses each record batch stream according to its associated data type.
-    ///    The result of this is a map of data file paths to delete vectors for the positional
-    ///    delete tasks (and in future for the delete vector tasks). For equality delete
-    ///    file tasks, this results in an unbound Predicate.
-    ///  * The unbound Predicates resulting from equality deletes are sent to their associated oneshot
-    ///    channel to store them in the right place in the delete file managers state.
-    ///  * The results of all of these futures are awaited on in parallel with the specified
-    ///    level of concurrency and collected into a vec. We then combine all the delete
-    ///    vector maps that resulted from any positional delete or delete vector files into a
-    ///    single map and persist it in the state.
-    ///
-    ///
-    ///  Conceptually, the data flow is like this:
-    /// ```none
-    ///                                          FileScanTaskDeleteFile
-    ///                                                     |
-    ///                                             Skip Started EQ Deletes
-    ///                                                     |
-    ///                                                     |
-    ///                                       [load recordbatch stream / puffin]
-    ///                                             DeleteFileContext
-    ///                                                     |
-    ///                                                     |
-    ///                       +-----------------------------+--------------------------+
-    ///                     Pos Del           Del Vec (Not yet Implemented)         EQ Del
-    ///                       |                             |                          |
-    ///              [parse pos del stream]         [parse del vec puffin]       [parse eq del]
-    ///          HashMap<String, RoaringTreeMap> HashMap<String, RoaringTreeMap>   (Predicate, Sender)
-    ///                       |                             |                          |
-    ///                       |                             |                 [persist to state]
-    ///                       |                             |                          ()
-    ///                       |                             |                          |
-    ///                       +-----------------------------+--------------------------+
-    ///                                                     |
-    ///                                             [buffer unordered]
-    ///                                                     |
-    ///                                            [combine del vectors]
-    ///                                        HashMap<String, RoaringTreeMap>
-    ///                                                     |
-    ///                                        [persist del vectors to state]
-    ///                                                    ()
-    ///                                                    |
-    ///                                                    |
-    ///                                                 [join!]
-    /// ```
+    /// Load deletes with bounded concurrency, sharing completed or in-flight loads.
+    /// Positional files and Puffin vectors are fully loaded before completion;
+    /// equality predicates are awaited when the filter requests them. A cancelled
+    /// receiver drops owned loads and publishes errors to their waiting scans.
     pub(crate) fn load_deletes(
         &self,
         delete_file_entries: &[FileScanTaskDeleteFile],
@@ -248,13 +193,72 @@ impl CachingDeleteFileLoader {
     ) -> Result<DeleteFileContext> {
         match task.file_type {
             DataContentType::PositionDeletes => loop {
-                match del_filter.try_start_pos_del_load(&task.file_path) {
+                match del_filter.try_start_pos_del_load(&task.positional_cache_key()) {
                     PosDelLoadAction::AlreadyLoaded => {
                         return Ok(DeleteFileContext::ExistingPosDel);
                     }
                     PosDelLoadAction::Failed(error) => return Err(error),
                     PosDelLoadAction::WaitFor(notify) => notify.await,
                     PosDelLoadAction::Load(mut load) => {
+                        if task.file_format == DataFileFormat::Puffin {
+                            let result = async {
+                                let target =
+                                    task.referenced_data_file.as_deref().ok_or_else(|| {
+                                        Error::new(
+                                            ErrorKind::DataInvalid,
+                                            "Deletion vector missing referenced data file",
+                                        )
+                                    })?;
+                                let offset = task
+                                    .content_offset
+                                    .and_then(|v| u64::try_from(v).ok())
+                                    .ok_or_else(|| {
+                                        Error::new(
+                                            ErrorKind::DataInvalid,
+                                            "Deletion vector missing or invalid content offset",
+                                        )
+                                    })?;
+                                let length = task
+                                    .content_size_in_bytes
+                                    .and_then(|v| u64::try_from(v).ok())
+                                    .ok_or_else(|| {
+                                        Error::new(
+                                            ErrorKind::DataInvalid,
+                                            "Deletion vector missing or invalid content size",
+                                        )
+                                    })?;
+                                let cardinality = task.record_count.ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::DataInvalid,
+                                        "Deletion vector missing cardinality",
+                                    )
+                                })?;
+                                let vector = read_deletion_vector(
+                                    basic_delete_file_loader.file_io(),
+                                    &task.file_path,
+                                    offset,
+                                    length,
+                                    target,
+                                    cardinality,
+                                    DeletionVectorLimits::default(),
+                                )
+                                .await?;
+                                Ok::<_, Error>((target.to_owned(), vector))
+                            }
+                            .await
+                            .map_err(|error| load.fail(error))?;
+                            return Ok(DeleteFileContext::DeletionVector {
+                                load,
+                                target: result.0,
+                                vector: result.1,
+                            });
+                        }
+                        if task.file_format != DataFileFormat::Parquet {
+                            return Err(load.fail(Error::new(
+                                ErrorKind::FeatureUnsupported,
+                                "Unsupported positional delete file format",
+                            )));
+                        }
                         let stream = basic_delete_file_loader
                             .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
                             .await
@@ -302,6 +306,14 @@ impl CachingDeleteFileLoader {
         ctx: DeleteFileContext,
     ) -> Result<ParsedDeleteFileContext> {
         match ctx {
+            DeleteFileContext::DeletionVector {
+                load,
+                target,
+                vector,
+            } => Ok(ParsedDeleteFileContext::DelVecs {
+                load,
+                results: HashMap::from([(target, vector)]),
+            }),
             DeleteFileContext::ExistingEqDel => Ok(ParsedDeleteFileContext::EqDel),
             DeleteFileContext::ExistingPosDel => Ok(ParsedDeleteFileContext::ExistingPosDel),
             DeleteFileContext::PosDels { mut load, stream } => {

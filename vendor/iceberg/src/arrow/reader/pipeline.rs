@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -39,7 +40,7 @@ use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::Datum;
+use crate::spec::{DataContentType, DataFileFormat, Datum};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -103,7 +104,33 @@ struct FileScanTaskReader {
 }
 
 impl FileScanTaskReader {
-    async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
+    async fn process(self, mut task: FileScanTask) -> Result<ArrowRecordBatchStream> {
+        let mut vector_count = 0;
+        for delete in &task.deletes {
+            if delete.file_format == DataFileFormat::Puffin {
+                vector_count += 1;
+                if delete.file_type != DataContentType::PositionDeletes
+                    || delete.referenced_data_file.as_deref() != Some(task.data_file_path())
+                {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Deletion vector must be a positional delete for this exact data file",
+                    ));
+                }
+            }
+        }
+        if vector_count > 1 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "More than one deletion vector applies to a data file",
+            ));
+        }
+        if vector_count == 1 {
+            task.deletes.retain(|delete| {
+                delete.file_type != DataContentType::PositionDeletes
+                    || delete.file_format == DataFileFormat::Puffin
+            });
+        }
         let should_load_page_index =
             (self.row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
         let mut parquet_read_options = self.parquet_read_options;
@@ -361,6 +388,22 @@ impl FileScanTaskReader {
         if let Some(positional_delete_indexes) = positional_delete_indexes {
             let delete_row_selection = {
                 let positional_delete_indexes = positional_delete_indexes.lock().unwrap();
+                if positional_delete_indexes
+                    .bitmap()
+                    .max()
+                    .is_some_and(|position| {
+                        position
+                            >= record_batch_stream_builder
+                                .metadata()
+                                .file_metadata()
+                                .num_rows() as u64
+                    })
+                {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Deleted row position exceeds data file row count",
+                    ));
+                }
 
                 ArrowReader::build_deletes_row_selection(
                     record_batch_stream_builder.metadata().row_groups(),

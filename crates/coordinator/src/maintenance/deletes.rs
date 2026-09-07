@@ -158,18 +158,24 @@ impl TableMaintenance {
             .values()
             .filter(|entry| entry.content_type() == DataContentType::PositionDeletes)
             .filter(|entry| {
-                repair_input
-                    .as_ref()
-                    .is_none_or(|input| entry.file_path() == input.id.0)
+                repair_input.as_ref().is_none_or(|input| {
+                    flow_iceberg_ext::content_file_id(&entry.data_file) == input.id.0
+                })
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|entry| (entry.data_file.file_size_in_bytes(), entry.file_path()));
+        candidates.sort_by_key(|entry| {
+            (
+                flow_iceberg_ext::delete_content_size(&entry.data_file),
+                entry.file_path(),
+            )
+        });
         let mut input_bytes = 0u64;
         let mut input_rows = 0u64;
         let mut sequence = 0;
         let mut selected = BTreeSet::new();
         for entry in candidates {
-            let bytes = input_bytes.saturating_add(entry.data_file.file_size_in_bytes());
+            let bytes =
+                input_bytes.saturating_add(flow_iceberg_ext::delete_content_size(&entry.data_file));
             let rows = input_rows.saturating_add(entry.data_file.record_count());
             if bytes > policy.max_input_bytes || rows > policy.max_input_rows {
                 continue;
@@ -181,21 +187,80 @@ impl TableMaintenance {
             );
             input_bytes = bytes;
             input_rows = rows;
-            selected.insert(FileId(entry.file_path().to_owned()));
+            selected.insert(FileId(flow_iceberg_ext::content_file_id(&entry.data_file)));
             if selected.len() == policy.max_input_files {
                 break;
             }
+        }
+        if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
+            // A new vector must contain the complete effective union for its
+            // target, including positions from unselected legacy shared files.
+            loop {
+                let mut expanded = selected.clone();
+                for (path, entry) in &view.live_files {
+                    if entry.content_type() != DataContentType::Data {
+                        continue;
+                    }
+                    let applicable = view.applicable_deletes(path)?;
+                    if applicable.iter().any(|entry| {
+                        selected
+                            .contains(&FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
+                    }) {
+                        expanded.extend(applicable.iter().map(|entry| {
+                            FileId(flow_iceberg_ext::content_file_id(&entry.data_file))
+                        }));
+                    }
+                }
+                if expanded == selected {
+                    break;
+                }
+                selected = expanded;
+                input_bytes = selected
+                    .iter()
+                    .map(|id| {
+                        flow_iceberg_ext::delete_content_size(&view.live_files[&id.0].data_file)
+                    })
+                    .fold(0u64, u64::saturating_add);
+                input_rows = selected
+                    .iter()
+                    .map(|id| view.live_files[&id.0].data_file.record_count())
+                    .fold(0u64, u64::saturating_add);
+                if selected.len() > policy.max_input_files
+                    || input_bytes > policy.max_input_bytes
+                    || input_rows > policy.max_input_rows
+                {
+                    return Ok(None);
+                }
+            }
+            sequence = selected
+                .iter()
+                .filter_map(|id| view.live_files[&id.0].sequence_number)
+                .max()
+                .unwrap_or(0);
         }
         if selected.len() < policy.min_input_files {
             return Ok(None);
         }
         let input_files = selected.len();
         let removed_deletes: BTreeSet<String> = selected.iter().map(|id| id.0.clone()).collect();
+        let mut retired_objects = selected
+            .iter()
+            .map(|id| view.live_files[&id.0].file_path())
+            .collect::<BTreeSet<_>>();
+        // Shared Puffin objects remain live until every descriptor is removed.
+        // Repacking only some blobs must not count their object as retired.
+        for (id, entry) in &view.live_files {
+            if !removed_deletes.contains(id) {
+                retired_objects.remove(entry.file_path());
+            }
+        }
+        let retired_objects = retired_objects.len();
+        let v3 = table.metadata().format_version() == iceberg::spec::FormatVersion::V3;
         let data_files = view
             .live_files
             .values()
             .filter(|entry| entry.content_type() == DataContentType::Data)
-            .map(|entry| FileId(entry.file_path().to_owned()))
+            .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
             .collect();
         let id = OperationId(format!("delete-rewrite-{}", uuid::Uuid::new_v4()));
         let ownership =
@@ -275,12 +340,13 @@ impl TableMaintenance {
                 if !repair && input_files == 1 && first.is_some() {
                     return Ok((None, scanned_rows, None));
                 }
-                let mut writer = DeleteWriter::new(
+                let mut writer = DeleteWriter::new_for_version(
                     worker_table.file_io().clone(),
                     worker_table.metadata().location(),
                     &worker_id,
                     worker_table.metadata().default_partition_spec_id(),
                     writer_config,
+                    worker_table.metadata().format_version(),
                 )?;
                 let mut batch = Vec::with_capacity(batch_rows);
                 let mut range = None;
@@ -311,14 +377,22 @@ impl TableMaintenance {
                 return false;
             }
             let Some((target, input)) = &isolation else {
-                return files.len() < input_files
-                    && preserves_delete_locality(
-                        &view,
-                        &removed_deletes,
-                        files,
-                        sequence,
-                        &self.policy,
-                    );
+                return (if v3 {
+                    files
+                        .iter()
+                        .map(|file| file.file_path())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        < retired_objects
+                } else {
+                    files.len() < input_files
+                }) && preserves_delete_locality(
+                    &view,
+                    &removed_deletes,
+                    files,
+                    sequence,
+                    &self.policy,
+                );
             };
             let data = &view.live_files[&target.0];
             let original = &view.live_files[&input.0];
@@ -327,12 +401,14 @@ impl TableMaintenance {
             let mut rows = 0u64;
             for entry in view
                 .live_files
-                .values()
-                .filter(|entry| entry.file_path() != input.0)
+                .iter()
+                .filter(|(id, _)| *id != &input.0)
+                .map(|(_, entry)| entry)
             {
                 if position_delete_may_apply(entry, data) {
                     count += 1;
-                    bytes = bytes.saturating_add(entry.data_file.file_size_in_bytes());
+                    bytes = bytes
+                        .saturating_add(flow_iceberg_ext::delete_content_size(&entry.data_file));
                     rows = rows.saturating_add(entry.data_file.record_count());
                 }
             }
@@ -341,7 +417,7 @@ impl TableMaintenance {
                 entry.data_file = file.clone();
                 if position_delete_may_apply(&entry, data) {
                     count += 1;
-                    bytes = bytes.saturating_add(file.file_size_in_bytes());
+                    bytes = bytes.saturating_add(flow_iceberg_ext::delete_content_size(file));
                     rows = rows.saturating_add(file.record_count());
                 }
             }
@@ -399,7 +475,8 @@ impl TableMaintenance {
             .map(|file| file.file_path().to_owned())
             .chain(std::iter::once(path))
             .collect();
-        let reservation = ownership.finish(0, output.len()).await?;
+        let (output_files, output_bytes) = flow_iceberg_ext::physical_file_stats(&output);
+        let reservation = ownership.finish(0, output_files).await?;
         let store = self.store.clone();
         let operation_id = id.clone();
         blocking(move || {
@@ -425,12 +502,9 @@ impl TableMaintenance {
             input_bytes,
             input_rows,
             scanned_rows,
-            output_files = output.len(),
+            output_files,
             output_rows = output.iter().map(|file| file.record_count()).sum::<u64>(),
-            output_bytes = output
-                .iter()
-                .map(|file| file.file_size_in_bytes())
-                .sum::<u64>(),
+            output_bytes,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
             "position-delete files consolidated"
         );
@@ -465,20 +539,21 @@ fn preserves_delete_locality(
         .collect::<Vec<_>>();
     let deletes = view
         .live_files
-        .values()
-        .filter(|entry| entry.content_type() == DataContentType::PositionDeletes)
-        .map(AsRef::as_ref)
+        .iter()
+        .filter(|(_, entry)| entry.content_type() == DataContentType::PositionDeletes)
+        .map(|(id, entry)| (id, entry.as_ref()))
         .collect::<Vec<_>>();
     view.live_files
         .values()
         .filter(|entry| entry.content_type() == DataContentType::Data)
         .all(|data| {
-            !within_delete_budget(deletes.iter().copied(), data, policy)
+            !within_delete_budget(deletes.iter().map(|(_, entry)| *entry), data, policy)
                 || within_delete_budget(
                     deletes
                         .iter()
                         .copied()
-                        .filter(|entry| !removed.contains(entry.file_path()))
+                        .filter(|(id, _)| !removed.contains(*id))
+                        .map(|(_, entry)| entry)
                         .chain(&output),
                     data,
                     policy,
@@ -497,7 +572,8 @@ fn within_delete_budget<'a>(
                 return Some((count, bytes, rows));
             }
             let count = count.checked_add(1)?;
-            let bytes = bytes.checked_add(entry.data_file.file_size_in_bytes())?;
+            let bytes =
+                bytes.checked_add(flow_iceberg_ext::delete_content_size(&entry.data_file))?;
             let rows = rows.checked_add(entry.data_file.record_count())?;
             (count <= policy.max_delete_input_files
                 && bytes <= policy.max_delete_input_bytes
@@ -601,4 +677,69 @@ fn choose_repair_input(
             })
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iceberg::spec::{DataFileBuilder, DataFileFormat, ManifestEntry, ManifestStatus, Struct};
+    use std::sync::Arc;
+
+    #[test]
+    fn vector_replacement_does_not_count_removed_blobs_against_locality_budget() {
+        let mut view = SnapshotView::default();
+        let mut removed = BTreeSet::new();
+        let mut output = Vec::new();
+        for (target, offset) in [("a.parquet", 4), ("b.parquet", 24)] {
+            let data = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_format(DataFileFormat::Parquet)
+                .file_path(target.to_owned())
+                .partition(Struct::empty())
+                .record_count(2)
+                .file_size_in_bytes(100)
+                .build()
+                .unwrap();
+            let vector = |path: &str| {
+                DataFileBuilder::default()
+                    .content(DataContentType::PositionDeletes)
+                    .file_format(DataFileFormat::Puffin)
+                    .file_path(path.to_owned())
+                    .partition(Struct::empty())
+                    .record_count(1)
+                    .file_size_in_bytes(100)
+                    .referenced_data_file(Some(target.to_owned()))
+                    .content_offset(Some(offset))
+                    .content_size_in_bytes(Some(20))
+                    .build()
+                    .unwrap()
+            };
+            let old = vector("old.puffin");
+            removed.insert(flow_iceberg_ext::content_file_id(&old));
+            output.push(vector("new.puffin"));
+            for file in [data, old] {
+                view.live_files.insert(
+                    flow_iceberg_ext::content_file_id(&file),
+                    Arc::new(ManifestEntry {
+                        status: ManifestStatus::Added,
+                        snapshot_id: Some(1),
+                        sequence_number: Some(1),
+                        file_sequence_number: Some(1),
+                        data_file: file,
+                    }),
+                );
+            }
+        }
+        // Each target remains at exactly one logical delete, even though both
+        // targets share the old and new physical Puffin objects.
+        let policy = flow_compactor::Policy {
+            max_delete_input_files: 1,
+            max_delete_input_rows: 1,
+            max_delete_input_bytes: 20,
+            ..Default::default()
+        };
+        assert!(preserves_delete_locality(
+            &view, &removed, &output, 1, &policy
+        ));
+    }
 }

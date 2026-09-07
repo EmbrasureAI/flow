@@ -181,6 +181,52 @@ class BenchmarkLifecycleTest(unittest.TestCase):
                 self.assertEqual(sum(counts), rows)
                 self.assertGreaterEqual(counts[2], 1)  # the reserved immutable insertion
 
+    def test_v3_inventory_counts_shared_puffin_once(self):
+        runner = runner_class("benchmark.py", "Benchmark", object, {"inventory"})
+        instance = runner()
+        instance.args = SimpleNamespace(format_version=3)
+        instance.names = ["events"]
+        instance.table = lambda name: {"metadata": {
+            "format-version": 3, "current-snapshot-id": 1,
+            "snapshots": [{"snapshot-id": 1, "manifest-list": "list", "summary": {}}]}}
+        records = [{"status": 1, "data_file": {
+            "content": 1, "file_path": "shared.puffin", "file_format": "PUFFIN",
+            "file_size_in_bytes": 1024, "record_count": 3,
+            "referenced_data_file": target, "content_offset": offset,
+            "content_size_in_bytes": 100}} for target, offset in (("a.parquet", 4), ("b.parquet", 104))]
+        instance.avro = lambda path: [{"manifest_path": "manifest"}] if path == "list" else records
+        result = instance.inventory()["events"]
+        self.assertEqual((result["deletion_vectors"], result["delete_objects"], result["delete_bytes"],
+                          result["deletion_vector_bytes"]), (2, 1, 1024, 200))
+        records[1]["data_file"]["referenced_data_file"] = "a.parquet"
+        with self.assertRaisesRegex(AssertionError, "multiple DVs"):
+            instance.inventory()
+
+    def test_clock_calibration_brackets_tail_observations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            runner = runner_class("benchmark.py", "Benchmark", object, {"workload"})
+            instance = runner()
+            instance.args = SimpleNamespace(duration=.01, warmup=0, timeout=1, rate=100,
+                                            transaction_rows=1, writers=0, initial_rows=0,
+                                            reader_poll_seconds=.001)
+            instance.directory, instance.names, instance.report = directory, [], {}
+            instance.stop_writers = threading.Event()
+            instance.writer_lock = threading.Lock()
+            instance.writer_connections = []
+            events = []
+            instance.calibrate_clock = lambda: events.append("calibrate") or {}
+            instance.alive = instance.sample_resources = lambda: None
+            instance.observe = lambda cursors: events.append("observe")
+            instance.latencies = lambda: None
+            instance.store = BenchmarkStore(directory / "evidence.sqlite3")
+            instance.store.all_committed_observed = lambda: events.count("observe") == 2
+            try:
+                instance.workload()
+                self.assertEqual(events, ["calibrate", "observe", "observe", "calibrate"])
+            finally:
+                instance.store.close()
+
     def test_clock_drift_and_rtt_cannot_hide_latency_failure(self):
         before = {"postgres_minus_client_us": 0, "roundtrip_us": 200}
         for after, valid in ((before, True),

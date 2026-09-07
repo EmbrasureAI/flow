@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -1237,6 +1238,11 @@ mod tests {
             deletes: vec![FileScanTaskDeleteFile {
                 file_path: pos_del_path.clone(),
                 file_type: DataContentType::PositionDeletes,
+                file_format: DataFileFormat::Parquet,
+                record_count: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
                 partition_spec_id: 0,
                 equality_ids: None,
                 file_size_in_bytes: std::fs::metadata(&pos_del_path).unwrap().len(),

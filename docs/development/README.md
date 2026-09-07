@@ -10,7 +10,7 @@ not published software releases. For current user-facing information, start with
 - [Implementation plan](implementation-plan.md): current work and remaining gates.
 - [Validation](validation.md): integration coverage and exact build attribution.
 - [Qualification history](production-qualification.md): measured results, failures and rejected experiments.
-- [Latest recorded service build](qualification/release39.md) and [source capacity](qualification/source-capacity.md).
+- [V3 deletion-vector benchmark](qualification/v3-deletion-vectors.md), [earlier v2 service build](qualification/release39.md), and [source capacity](qualification/source-capacity.md).
 
 Raw reports, database fixtures and profiler outputs live in the ignored
 repository-root `target/` directory. They are local artifacts, not downloadable

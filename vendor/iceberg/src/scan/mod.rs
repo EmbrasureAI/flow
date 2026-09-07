@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -39,7 +40,9 @@ use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::runtime::Runtime;
-use crate::spec::{DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, NameMapping, SnapshotRef};
+use crate::spec::{
+    DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, DataFileFormat, NameMapping, SnapshotRef,
+};
 use crate::table::Table;
 use crate::util::available_parallelism;
 use crate::{Error, ErrorKind, Result};
@@ -579,6 +582,24 @@ impl TableScan {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 "Encountered an entry for a data file in a delete manifest",
+            ));
+        }
+
+        let file = manifest_entry_context.manifest_entry.data_file();
+        if file.file_format() == DataFileFormat::Puffin
+            && (file.content_type() != DataContentType::PositionDeletes
+                || file
+                    .referenced_data_file
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || file.content_offset().is_none_or(|offset| offset < 4)
+                || file
+                    .content_size_in_bytes()
+                    .is_none_or(|length| length < 20))
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Invalid deletion vector manifest metadata",
             ));
         }
 

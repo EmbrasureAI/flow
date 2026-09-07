@@ -26,7 +26,9 @@ a missed wakeup when a concurrent load completes before the waiter is polled.
 Claimed positional loads own a completion guard that publishes terminal failure
 on I/O/parse errors or cancellation; waiters recheck that result before proceeding.
 The returned receiver also bounds the spawned loader's lifetime, cancelling its
-buffered work when the scan drops it.
+buffered work when the scan drops it. Equality predicate publication records a
+terminal error when its sender is dropped, preserves the claimed load's notifier,
+and wakes registered waiters; current and later readers receive that error.
 Changed files: `src/arrow/delete_filter.rs`,
 `src/arrow/caching_delete_file_loader.rs`, `src/delete_vector.rs`.
 
@@ -43,6 +45,15 @@ recognizes it when converting Arrow schemas back to Iceberg, including list
 elements, map keys/values and struct children. Changed file:
 `src/arrow/schema.rs`. See `docs/patches/iceberg-uuid.patch`.
 
+The v3 patch adds bounded Puffin deletion-vector encoding and reading (including
+LZ4 footers), carries blob descriptors through scan tasks, and scopes shared
+reader state to logical blob identity. Scans apply one cumulative DV per target,
+suppress legacy position deletes for that target, and validate row bounds.
+Manifest loading resolves inherited row IDs before entries are copied into new
+manifests. The patch adds `crc32fast` and `lz4_flex` as direct dependencies;
+both were already dependencies in the workspace lockfile. See
+`docs/patches/iceberg-v3.patch` for the complete file list and changes.
+
 From an extracted crate, apply these repository patches (use absolute patch paths):
 
 ```sh
@@ -50,6 +61,7 @@ patch -p1 < docs/patches/iceberg-table-commit.patch
 patch -p1 < docs/patches/iceberg-delete-cache.patch
 patch -p1 < docs/patches/iceberg-parquet-row-group.patch
 patch -p1 < docs/patches/iceberg-uuid.patch
+patch -p1 < docs/patches/iceberg-v3.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is

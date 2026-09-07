@@ -1409,6 +1409,7 @@ dependencies = [
  "iceberg",
  "moka",
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]
@@ -1971,6 +1972,7 @@ dependencies = [
  "bimap",
  "bytes",
  "chrono",
+ "crc32fast",
  "derive_builder",
  "expect-test",
  "fastnum",
@@ -1978,6 +1980,7 @@ dependencies = [
  "fnv",
  "futures",
  "itertools",
+ "lz4_flex",
  "moka",
  "murmur3",
  "once_cell",

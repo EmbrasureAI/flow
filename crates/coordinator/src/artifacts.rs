@@ -228,7 +228,14 @@ impl WriterRegistration {
                     .into_iter()
                     .map(|kind| NumberedArtifacts {
                         prefix: format!("{location}/data/{}-{kind}-", attempt.0),
-                        suffix: ".parquet".into(),
+                        suffix: if kind == "delete"
+                            && table.metadata().format_version() == iceberg::spec::FormatVersion::V3
+                        {
+                            ".puffin"
+                        } else {
+                            ".parquet"
+                        }
+                        .into(),
                         count: RESERVATION_FILES,
                         digits: 6,
                     })

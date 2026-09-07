@@ -180,6 +180,7 @@ source_namespace = "{self.name}"
 source_table = "{name}"
 target_namespace = ["{self.name}"]
 target_table = "{name}"
+format_version = {self.args.format_version}
 primary_key = [0]
 append_only = {str(self.args.profile == 'append').lower()}
 columns = [
@@ -271,14 +272,21 @@ columns = [
         for name in self.names:
             query = sql.SQL("SELECT id,version,md5(payload) FROM {} ORDER BY id").format(sql.Identifier(name))
             metadata = self.table(name) if pinned_tables is None else pinned_tables[name]
+            actual_version = metadata["metadata"]["format-version"]
+            assert actual_version == self.args.format_version, (
+                f"{name}: expected Iceberg v{self.args.format_version}, got v{actual_version}")
             # COPY is a disk sink; fetchmany on an ordinary result does not bound
             # libpq's result buffer or DuckDB's materialized Python result.
-            path = self.directory / "verification-rows.csv"
+            snapshot_id = metadata["metadata"]["current-snapshot-id"]
+            evidence = self.directory / f"verification-{name}-{snapshot_id}"
+            evidence.with_suffix(".metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+            path = evidence.with_suffix(".csv")
             destination = "'" + str(path).replace("'", "''") + "'"
             self.duck.execute("COPY (SELECT id,version,md5(payload) FROM iceberg_scan(?) ORDER BY id) TO " +
                               destination + " (FORMAT CSV, HEADER false)", [metadata["metadata-location"]])
             count = 0
             digest = hashlib.sha256()
+            verified = False
             try:
                 with path.open(newline="") as rows, self.pg.transaction():
                     self.pg.execute("SET TRANSACTION READ ONLY")
@@ -297,8 +305,10 @@ columns = [
                                 break
                             digest.update(repr(expected).encode())
                             count += len(expected)
+                verified = True
             finally:
-                path.unlink(missing_ok=True)
+                if verified:
+                    path.unlink(missing_ok=True)
             result[name] = {"rows": count, "sha256": digest.hexdigest(), "snapshot": metadata["metadata"]["current-snapshot-id"]}
         return result
 
@@ -535,8 +545,8 @@ columns = [
                                             range(worker + 1, args.initial_rows + 1, args.writers))
             self.report["clock"] = {
                 "before": self.calibrate_clock(),
-                "method": "minimum RTT of five queries immediately before and after writer workload; average offset; raw signed values retained",
-                "assumption": "offset stays within endpoint offsets and RTT uncertainty during the workload",
+                "method": "minimum RTT of five queries before writer workload and after final observation drain; average offset; raw signed values retained",
+                "assumption": "offset stays within endpoint offsets and RTT uncertainty during the workload and observation drain",
             }
             start_mono, start_us = time.monotonic() + .5, micros() + 500000
             writer_deadline = start_mono + args.warmup + args.duration + args.timeout
@@ -558,7 +568,6 @@ columns = [
                     self.sample_resources()
                     next_sample = time.monotonic() + 1
                 time.sleep(args.reader_poll_seconds)
-            self.report["clock"]["after"] = self.calibrate_clock()
             disarm_workload(self.directory)
             self.alive()
             deadline = time.monotonic() + args.timeout
@@ -569,6 +578,7 @@ columns = [
                 if self.store.all_committed_observed():
                     break
                 time.sleep(args.reader_poll_seconds)
+            self.report["clock"]["after"] = self.calibrate_clock()
             finished = True
         finally:
             self.stop_writers.set()
@@ -705,9 +715,14 @@ columns = [
         for name in self.names:
             table = self.table(name) if pinned_tables is None else pinned_tables[name]
             metadata = table["metadata"]
+            assert metadata["format-version"] == self.args.format_version, (
+                f"{name}: expected Iceberg v{self.args.format_version}, got v{metadata['format-version']}")
             current = next(snap for snap in metadata["snapshots"] if snap["snapshot-id"] == metadata["current-snapshot-id"])
             counts = {"manifests": 0, "data_files": 0, "delete_files": 0,
-                      "data_bytes": 0, "delete_bytes": 0, "data_rows": 0, "delete_rows": 0}
+                      "data_bytes": 0, "delete_bytes": 0, "data_rows": 0, "delete_rows": 0,
+                      "deletion_vectors": 0, "deletion_vector_bytes": 0}
+            delete_objects = {}
+            vector_targets = set()
             for manifest in self.avro(current["manifest-list"]):
                 counts["manifests"] += 1
                 for entry in self.avro(manifest["manifest_path"]):
@@ -720,10 +735,22 @@ columns = [
                         counts["data_rows"] += file["record_count"]
                     elif file["content"] == 1:
                         counts["delete_files"] += 1
-                        counts["delete_bytes"] += file["file_size_in_bytes"]
+                        delete_objects[file["file_path"]] = file["file_size_in_bytes"]
                         counts["delete_rows"] += file["record_count"]
+                        if file["file_format"].upper() == "PUFFIN":
+                            assert metadata["format-version"] == 3
+                            target = file["referenced_data_file"]
+                            assert target and target not in vector_targets, "multiple DVs for one data file"
+                            vector_targets.add(target)
+                            assert file["content_offset"] >= 4 and file["content_size_in_bytes"] > 0
+                            assert file["content_offset"] + file["content_size_in_bytes"] <= file["file_size_in_bytes"]
+                            counts["deletion_vectors"] += 1
+                            counts["deletion_vector_bytes"] += file["content_size_in_bytes"]
+            counts["delete_bytes"] = sum(delete_objects.values())
+            counts["delete_objects"] = len(delete_objects)
             result[name] = {
                             **counts,
+                            "format_version": metadata["format-version"],
                             "average_data_file_bytes": counts["data_bytes"] / counts["data_files"] if counts["data_files"] else None,
                             "delete_files_per_data_file": counts["delete_files"] / counts["data_files"] if counts["data_files"] else None,
                             "delete_rows_per_data_row": counts["delete_rows"] / counts["data_rows"] if counts["data_rows"] else None,
@@ -967,7 +994,7 @@ columns = [
                              root / "tests/production/reader_compare.py",
                              root / "tests/production/provenance.py",
                              root / "tests/production/reconciliation.py",
-                             root / "tests/local/run.py")
+                             root / "tests/local/run.py", root / "tests/local/duckdb_extensions.py")
             },
             "binaries": {
                 "daemon": daemon_binary,
@@ -989,7 +1016,7 @@ columns = [
                 } if args.reader_baseline_compactor else None,
             },
         }
-        self.report.update(profile=args.profile, seed=args.seed, initial_rows_per_table=args.initial_rows,
+        self.report.update(format_version=args.format_version, profile=args.profile, seed=args.seed, initial_rows_per_table=args.initial_rows,
                            tables=args.tables, payload_bytes=args.row_bytes, warmup_seconds=args.warmup,
                            measured_seconds=args.duration, transaction_rows=args.transaction_rows, writers=args.writers,
                            key_distribution=args.key_distribution, reader_poll_seconds=args.reader_poll_seconds,
@@ -1075,6 +1102,7 @@ def main():
     parser.add_argument("--s3-endpoint", required=True)
     parser.add_argument("--warehouse", default="s3://warehouse/")
     parser.add_argument("--binary", type=Path, default=Path("target/release/embrasure-flow"))
+    parser.add_argument("--format-version", type=int, choices=(2, 3), default=2)
     parser.add_argument("--build-manifest", type=Path, required=True)
     parser.add_argument("--compactor-binary", type=Path)
     parser.add_argument("--reader-baseline-compactor", type=Path)

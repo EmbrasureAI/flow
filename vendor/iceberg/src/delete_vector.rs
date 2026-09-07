@@ -24,24 +24,37 @@ use roaring::treemap::BitmapIter;
 
 use crate::{Error, ErrorKind, Result};
 
+/// A compressed set of deleted row positions.
 #[derive(Debug, Default)]
 pub struct DeleteVector {
     inner: RoaringTreemap,
 }
 
 impl DeleteVector {
+    /// Size in bytes of this vector encoded as a Puffin `deletion-vector-v1` blob.
+    pub fn serialized_size(&self) -> usize {
+        12 + self.inner.serialized_size()
+    }
+
+    pub(crate) fn bitmap(&self) -> &RoaringTreemap {
+        &self.inner
+    }
+
     #[allow(unused)]
+    /// Construct a delete vector from a portable Roaring treemap.
     pub fn new(roaring_treemap: RoaringTreemap) -> DeleteVector {
         DeleteVector {
             inner: roaring_treemap,
         }
     }
 
+    /// Iterate over deleted row positions in ascending order.
     pub fn iter(&self) -> DeleteVectorIterator<'_> {
         let outer = self.inner.bitmaps();
         DeleteVectorIterator { outer, inner: None }
     }
 
+    /// Insert a deleted row position, returning whether it was newly added.
     pub fn insert(&mut self, pos: u64) -> bool {
         self.inner.insert(pos)
     }
@@ -66,6 +79,7 @@ impl DeleteVector {
     }
 
     #[allow(unused)]
+    /// Number of deleted row positions.
     pub fn len(&self) -> u64 {
         self.inner.len()
     }

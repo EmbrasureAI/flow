@@ -8,6 +8,8 @@ The [dependency-policy gate](../../licenses/README.md) rejects unreviewed licens
 
 ## Reproducible gates
 
+The later [v3 record](qualification/v3-deletion-vectors.md) covers deletion vectors, row lineage, upgrades, recovery, independent readers and six local service benchmarks. Both formats pass accepted-data and acknowledgement checks; v3's 50k throughput/latency and hot-update reader costs remain open performance issues. Earlier release counts below describe their frozen artifacts.
+
 Run `cargo test --locked --workspace --all-targets`, `cargo fmt --all --check`, and `cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings`. Project integration tests use real RocksDB databases, journal segments, Parquet and Avro files, the stock Iceberg Rust reader, scripted wire peers and child-process exits. Vendored Apache source may emit existing upstream warnings. A test count is not an acceptance contract; use the complete gate against the exact revision being released.
 
 The release30 candidate removes owned path and partition allocation while
@@ -521,4 +523,4 @@ The [production qualification report](production-qualification.md) owns measured
 - Qualify FULL-identity WAL overhead, journal/index footprint, maintenance bytes, storage/catalog requests and configurable-price accounting under declared deployment conditions.
 - Retain the 1,024-row state-store apply default. The completed coupled and decoupled screens reject larger commit groups. Qualify any generation-switch replacement against the same atomic forward/reverse/count/cursor, reopen, interruption, memory and lock-hold boundaries before changing the live-index path.
 - Maintain dependency/license and image gates; prepare the reusable Iceberg API changes for upstream review.
-- Add low-fan-out partitioning and v3 only with their own source, standard-reader, delete, maintenance and recovery gates after the original v2 qualification prerequisites. They are subsequent implementation work, not early-scope exclusions.
+- Add low-fan-out partitioning with its own source, standard-reader, delete, maintenance and recovery gates. Extend implemented v3 support beyond its local integration and service evidence to the remaining production gates.

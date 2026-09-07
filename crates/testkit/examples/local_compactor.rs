@@ -138,6 +138,7 @@ async fn compact(
     let view = SnapshotView::current(&table).await?;
     let mut data = BTreeSet::new();
     let mut deletes = BTreeSet::new();
+    let mut physical_files = BTreeSet::new();
     let mut bytes = 0u64;
     for entry in view.live_files.values() {
         match entry.content_type() {
@@ -145,21 +146,23 @@ async fn compact(
                 data.insert(FileId(entry.file_path().to_owned()));
             }
             DataContentType::PositionDeletes => {
-                deletes.insert(entry.file_path().to_owned());
+                deletes.insert(flow_iceberg_ext::content_file_id(&entry.data_file));
             }
             DataContentType::EqualityDeletes => anyhow::bail!("equality deletes are unsupported"),
         }
-        bytes = bytes
-            .checked_add(entry.data_file.file_size_in_bytes())
-            .context("input size overflow")?;
+        if physical_files.insert(entry.file_path()) {
+            bytes = bytes
+                .checked_add(entry.data_file.file_size_in_bytes())
+                .context("input size overflow")?;
+        }
     }
     if data.is_empty() || (data.len() == 1 && deletes.is_empty()) {
         return Ok(());
     }
     ensure!(
-        bytes <= max_input_bytes && view.live_files.len() <= max_input_files,
+        bytes <= max_input_bytes && physical_files.len() <= max_input_files,
         "fixture maintenance budget exceeded: {} files / {} bytes exceeds configured maximum of {} files / {} bytes",
-        view.live_files.len(),
+        physical_files.len(),
         bytes,
         max_input_files,
         max_input_bytes,
@@ -192,6 +195,9 @@ async fn compact(
             ..Default::default()
         },
     )?;
+    if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
+        writer = writer.with_row_lineage()?;
+    }
     let mut rows = 0u64;
     flow_compactor::scan_live_files(
         &table,
@@ -204,7 +210,9 @@ async fn compact(
         &flow_compactor::ReadLimits::default(),
         async |batch| {
             rows += batch.rows.len() as u64;
-            writer.write(&batch.rows, PgLsn(0)).await?;
+            writer
+                .write_with_lineage(&batch.rows, batch.lineage.as_deref(), PgLsn(0))
+                .await?;
             Ok(())
         },
     )

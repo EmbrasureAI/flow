@@ -1,4 +1,4 @@
-//! Validated Iceberg v2 row deltas and physical rewrites.
+//! Validated Iceberg v2/v3 row deltas and physical rewrites.
 //!
 //! All artifacts and catalog updates use Apache Iceberg's public Rust types.
 //! The extension is separate because upstream 0.10.1's transaction action trait
@@ -7,10 +7,13 @@
 
 mod action;
 mod artifacts;
+mod identity;
 mod manifests;
 mod plan;
 mod snapshot;
 mod validation;
+
+pub use identity::{content_file_id, delete_content_size, physical_file_stats};
 
 pub use action::{
     CommitAttempt, CommitResult, OPERATION_ID_KEY, RewriteFilesAction, RowDeltaAction,

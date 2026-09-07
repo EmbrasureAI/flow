@@ -35,3 +35,12 @@ credentials, and does not claim to count SDK-internal retries or billed HTTP
 requests. The daemon enables this feature. The separately recorded local patches
 are `docs/patches/iceberg-rest-retryable-status.patch` and
 `docs/patches/iceberg-rest-observability.patch` at the repository root.
+
+## Local table creation correction
+
+Table creation sends `TableCreation.format_version` in the REST request's
+reserved `format-version` property, including the default v2. The typed field
+takes precedence over a conflicting raw property; other properties are preserved.
+This prevents explicit v3 creation from silently using the catalog's default.
+The correction and HTTP request regression are recorded in
+`docs/patches/iceberg-rest-format-version.patch`.

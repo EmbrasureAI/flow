@@ -5,6 +5,7 @@
 - [Getting started](getting-started.md): build, configuration, initialization, recovery and support boundaries.
 - [Docker demo](../demo/README.md): a complete local stack with standard Trino reads.
 - [Observability](observability.md): status, watermarks, metrics and operational diagnosis.
+- [Iceberg v3](iceberg-v3.md): deletion vectors, upgrades and compatibility checks.
 - [Performance](performance.md): recorded throughput, publication latency and reader overhead.
 
 ## Development

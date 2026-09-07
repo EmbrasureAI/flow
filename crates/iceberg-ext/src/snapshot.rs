@@ -5,22 +5,24 @@ use futures::{StreamExt, TryStreamExt, stream};
 use iceberg::Result;
 use iceberg::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
 use iceberg::spec::{
-    DataContentType, Datum, Manifest, ManifestEntry, ManifestEntryRef, ManifestFile,
-    PrimitiveLiteral,
+    DataContentType, DataFileFormat, Datum, Manifest, ManifestEntry, ManifestEntryRef,
+    ManifestFile, PrimitiveLiteral,
 };
 use iceberg::table::Table;
 use moka::future::Cache;
 use uuid::Uuid;
 
-use crate::invalid;
+use crate::{content_file_id, invalid};
 
 /// Bounded, shared cache of immutable parsed manifests. A table coordinator can
 /// reuse this across actions so publication reads only new manifest objects.
 /// The budget is a conservative decoded-size estimate, not an allocator quota.
 #[derive(Debug, Clone)]
 pub struct ManifestCache {
-    entries: Cache<(Uuid, String, i64, i64), Arc<Manifest>>,
+    entries: Cache<ManifestCacheKey, Arc<Manifest>>,
 }
+
+type ManifestCacheKey = (Uuid, String, i64, i64, Option<u64>);
 
 fn data_file_weight(file: &iceberg::spec::DataFile) -> usize {
     let mut bytes = 512_usize
@@ -79,6 +81,7 @@ impl ManifestCache {
             manifest.manifest_path.clone(),
             manifest.sequence_number,
             manifest.added_snapshot_id,
+            manifest.first_row_id,
         );
         self.entries
             .try_get_with(key, async {
@@ -128,8 +131,11 @@ impl SnapshotView {
         snapshot_id: i64,
         cache: &ManifestCache,
     ) -> Result<Self> {
-        if table.metadata().format_version() != iceberg::spec::FormatVersion::V2 {
-            return Err(invalid("snapshot views currently support Iceberg v2 only"));
+        if !matches!(
+            table.metadata().format_version(),
+            iceberg::spec::FormatVersion::V2 | iceberg::spec::FormatVersion::V3
+        ) {
+            return Err(invalid("snapshot views currently support Iceberg v2 or v3"));
         }
         let snapshot = table
             .metadata()
@@ -166,7 +172,7 @@ impl SnapshotView {
         for (path, entries) in loaded {
             for entry in entries.iter().filter(|entry| entry.is_alive()) {
                 if live_files
-                    .insert(entry.file_path().to_owned(), entry.clone())
+                    .insert(content_file_id(entry.data_file()), entry.clone())
                     .is_some()
                 {
                     return Err(invalid(format!(
@@ -175,13 +181,12 @@ impl SnapshotView {
                     )));
                 }
                 if entry.sequence_number.is_none() || entry.file_sequence_number.is_none() {
-                    return Err(invalid(
-                        "v2 manifest entry lacks inherited sequence numbers",
-                    ));
+                    return Err(invalid("manifest entry lacks inherited sequence numbers"));
                 }
             }
             entries_by_manifest.insert(path, entries);
         }
+        crate::action::validate_live_vectors(live_files.values().map(|entry| entry.data_file()))?;
         let mut deletes_by_target: HashMap<String, Vec<ManifestEntryRef>> = HashMap::new();
         let mut shared_deletes = Vec::new();
         for entry in live_files
@@ -250,7 +255,14 @@ impl SnapshotView {
             .map(AsRef::as_ref)
             .filter(|delete| position_delete_may_apply(delete, data))
             .collect();
-        deletes.sort_unstable_by_key(|entry| entry.file_path());
+        // A cumulative vector supersedes legacy position deletes for its target.
+        if deletes
+            .iter()
+            .any(|entry| entry.file_format() == DataFileFormat::Puffin)
+        {
+            deletes.retain(|entry| entry.file_format() == DataFileFormat::Puffin);
+        }
+        deletes.sort_unstable_by_key(|entry| content_file_id(entry.data_file()));
         Ok(deletes)
     }
 }
@@ -347,8 +359,8 @@ mod tests {
             ))
         };
         let cache = ManifestCache::new(32_768);
-        let small_key = (Uuid::nil(), "small".into(), 1, 1);
-        let large_key = (Uuid::nil(), "large".into(), 1, 1);
+        let small_key = (Uuid::nil(), "small".into(), 1, 1, None);
+        let large_key = (Uuid::nil(), "large".into(), 1, 1, None);
         cache
             .entries
             .insert(small_key.clone(), manifest(small))

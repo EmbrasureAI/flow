@@ -54,7 +54,7 @@ physical rewrites are reconciled before ingestion reuses row locations.
 
 - PostgreSQL initial COPY and logical replication, with transaction replay,
   reconnects and interrupted-bootstrap recovery.
-- Unpartitioned Iceberg v2 tables, an Iceberg REST catalog and S3-compatible storage.
+- Unpartitioned Iceberg v2 position deletes or v3 deletion vectors, an Iceberg REST catalog and S3-compatible storage.
 - Inserts, updates, deletes and primary-key changes; append-only keyless tables.
 - Nullable column additions, durable publication recovery, checkpoints and index rebuilds.
 - Local data/delete compaction, external compactor reconciliation and protected cleanup.
@@ -62,7 +62,7 @@ physical rewrites are reconciled before ingestion reuses row locations.
 Mutable tables require a stable primary key and `REPLICA IDENTITY FULL`.
 TRUNCATE and incompatible schema changes stop capture. Cross-table query
 atomicity, HA, distributed compaction and Z-order compaction are not supported.
-Partitioning and Iceberg v3 remain planned work. See the full
+Partitioning remains planned work. See [v3 configuration](docs/iceberg-v3.md) and the full
 [operating limits](docs/getting-started.md#recovery-and-operational-limits).
 
 ## Documentation and contributions

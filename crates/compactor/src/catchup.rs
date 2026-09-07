@@ -57,7 +57,8 @@ pub async fn catch_up(
                 .is_some_and(|snapshot| snapshot.sequence_number() == base.sequence_number),
         "completed build differs from its captured base"
     );
-    let head = validate_history(table, base, &original, &output, cache).await?;
+    let head =
+        validate_history(table, base, &original, &output, cache, policy, read_limits).await?;
     let deletes = required_deletes(&head, &output.plan.input_files)?;
     ensure!(
         deletes.len() <= policy.max_delete_input_files,
@@ -73,7 +74,7 @@ pub async fn catch_up(
                     .ok_or_else(|| anyhow::anyhow!("delete lacks data sequence"))?;
                 Ok::<_, anyhow::Error>((
                     bytes
-                        .checked_add(entry.data_file.file_size_in_bytes())
+                        .checked_add(flow_iceberg_ext::delete_content_size(&entry.data_file))
                         .ok_or_else(|| anyhow::anyhow!("delete byte overflow"))?,
                     rows.checked_add(entry.data_file.record_count())
                         .ok_or_else(|| anyhow::anyhow!("delete row overflow"))?,
@@ -92,7 +93,7 @@ pub async fn catch_up(
         .live_files
         .values()
         .filter(|entry| entry.content_type() == DataContentType::Data)
-        .map(|entry| FileId(entry.file_path().to_owned()))
+        .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
         .collect();
     let batch_rows = output
         .scratch
@@ -244,11 +245,22 @@ pub async fn catch_up(
     output.plan.delete_input_bytes = bytes;
     output.plan.delete_input_rows = rows;
     output.delete_sequence = sequence;
+    let v3 = table.metadata().format_version() == iceberg::spec::FormatVersion::V3;
+    if v3 {
+        crate::worker::retain_shared_legacy_deletes(&mut output, &head)?;
+    }
     let mapping_finished = Instant::now();
     output.delete_files = crate::worker::write_residual_positions(
         table,
         &output,
-        residual_positions(&output, &late_scan, &output_scan, &data),
+        residual_positions(&output, &late_scan, &output_scan, &data).filter(|position| {
+            !v3 || position.as_ref().map_or(true, |position| {
+                output
+                    .data_files
+                    .iter()
+                    .any(|file| file.file_path() == position.data_file_id.0)
+            })
+        }),
         config,
     )
     .await?;
@@ -258,6 +270,8 @@ pub async fn catch_up(
     let mapping_elapsed = mapping_finished.duration_since(late_scan_finished);
     let mapping_verify = mapping.compute - mapping_lookup - mask_spool;
     let mapping_other = mapping_elapsed + mapping.overlap - mapping.compute - mapping.stage;
+    let (output_delete_files, output_delete_bytes) =
+        flow_iceberg_ext::physical_file_stats(&output.delete_files);
     tracing::info!(
         event = "compaction_catch_up_completed",
         operation_id = %output.operation_id.0,
@@ -275,9 +289,9 @@ pub async fn catch_up(
         output_data_files = output.data_files.len(),
         output_data_rows = output.data_files.iter().map(|file| file.record_count()).sum::<u64>(),
         output_data_bytes = output.data_files.iter().map(|file| file.file_size_in_bytes()).sum::<u64>(),
-        output_delete_files = output.delete_files.len(),
+        output_delete_files,
         output_delete_rows = output.delete_files.iter().map(|file| file.record_count()).sum::<u64>(),
-        output_delete_bytes = output.delete_files.iter().map(|file| file.file_size_in_bytes()).sum::<u64>(),
+        output_delete_bytes,
         inner_elapsed_ms = finished.duration_since(started).as_secs_f64() * 1000.0,
         validation_setup_ms = validation_finished.duration_since(started).as_secs_f64() * 1000.0,
         late_delete_scan_stage_ms = late_scan_finished.duration_since(validation_finished).as_secs_f64() * 1000.0,
@@ -469,16 +483,19 @@ fn required_deletes(view: &SnapshotView, inputs: &BTreeSet<FileId>) -> Result<BT
         .collect::<iceberg::Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        .map(|entry| FileId(entry.file_path().to_owned()))
+        .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn validate_history(
     table: &Table,
     base: &CommitBase,
     original: &SnapshotView,
     output: &WorkerOutput,
     cache: &ManifestCache,
+    policy: &Policy,
+    read_limits: &ReadLimits,
 ) -> Result<SnapshotView> {
     let mut history = Vec::new();
     let mut cursor = table.metadata().current_snapshot_id();
@@ -496,22 +513,85 @@ async fn validate_history(
             .parent_snapshot_id();
     }
     let mut prior = original.clone();
+    let mut checked_bytes = 0u64;
+    let mut checked_rows = 0u64;
     for id in history.into_iter().rev() {
         let next = SnapshotView::load_with_cache(table, id, cache).await?;
         let mut required = output.plan.input_files.clone();
         required.extend(required_deletes(&prior, &output.plan.input_files)?);
         for path in required {
             let before = &prior.live_files[&path.0];
-            let after = next
-                .live_files
-                .get(&path.0)
-                .ok_or(CatchUpRejected("selected input or delete was removed"))?;
+            if let Some(after) = next.live_files.get(&path.0) {
+                ensure!(
+                    before.data_file == after.data_file
+                        && before.sequence_number == after.sequence_number
+                        && before.file_sequence_number == after.file_sequence_number,
+                    CatchUpRejected("selected input or delete identity changed")
+                );
+                continue;
+            }
             ensure!(
-                before.data_file == after.data_file
-                    && before.sequence_number == after.sequence_number
-                    && before.file_sequence_number == after.file_sequence_number,
-                CatchUpRejected("selected input or delete identity changed")
+                before.file_format() == iceberg::spec::DataFileFormat::Puffin,
+                CatchUpRejected("selected input or delete was removed")
             );
+            let target = before
+                .data_file
+                .referenced_data_file()
+                .ok_or_else(|| anyhow::anyhow!("DV lacks target"))?;
+            let replacements = next.applicable_deletes(&target)?;
+            let after = replacements
+                .first()
+                .filter(|entry| entry.file_format() == iceberg::spec::DataFileFormat::Puffin)
+                .ok_or(CatchUpRejected("cumulative deletion vector was removed"))?;
+            let mut vectors = Vec::with_capacity(2);
+            for entry in [before.as_ref(), *after] {
+                let file = &entry.data_file;
+                checked_bytes = checked_bytes
+                    .checked_add(flow_iceberg_ext::delete_content_size(file))
+                    .ok_or(CatchUpRejected("DV history byte overflow"))?;
+                checked_rows = checked_rows
+                    .checked_add(file.record_count())
+                    .ok_or(CatchUpRejected("DV history row overflow"))?;
+                ensure!(
+                    checked_bytes <= policy.max_delete_input_bytes
+                        && checked_rows <= policy.max_delete_input_rows,
+                    CatchUpRejected("DV history exceeds catch-up budget")
+                );
+                vectors.push(
+                    iceberg::puffin::read_deletion_vector(
+                        table.file_io(),
+                        file.file_path(),
+                        u64::try_from(
+                            file.content_offset()
+                                .ok_or_else(|| anyhow::anyhow!("DV lacks offset"))?,
+                        )?,
+                        u64::try_from(
+                            file.content_size_in_bytes()
+                                .ok_or_else(|| anyhow::anyhow!("DV lacks length"))?,
+                        )?,
+                        &target,
+                        file.record_count(),
+                        iceberg::puffin::DeletionVectorLimits {
+                            max_blob_bytes: read_limits
+                                .row_group_uncompressed_bytes
+                                .min(policy.max_delete_input_bytes),
+                            max_footer_bytes: read_limits.footer_bytes,
+                            max_cardinality: policy.max_delete_input_rows,
+                        },
+                    )
+                    .await?,
+                );
+            }
+            let mut newer = vectors[1].iter().peekable();
+            for position in vectors[0].iter() {
+                while newer.peek().is_some_and(|next| *next < position) {
+                    newer.next();
+                }
+                ensure!(
+                    newer.peek() == Some(&position),
+                    CatchUpRejected("replacement DV resurrects an input row")
+                );
+            }
         }
         prior = next;
     }

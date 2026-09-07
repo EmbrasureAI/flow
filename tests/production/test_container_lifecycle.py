@@ -10,11 +10,48 @@ import unittest
 from unittest.mock import Mock, patch
 
 from container_cleanup import cleanup_container
+import source_versions
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
 from run import Run
 
 
 class ContainerLifecycleTests(unittest.TestCase):
+    def test_source_start_timeout_still_removes_named_container(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "flow"
+            binary.write_bytes(b"test binary")
+            artifacts = root / "artifacts"
+            commands = []
+
+            def command(args, **kwargs):
+                commands.append(args)
+                if args[:2] == ["docker", "run"]:
+                    raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+                if args[:2] == ["docker", "logs"]:
+                    return subprocess.CompletedProcess(args, 0, b"startup logs", b"")
+                if args[:2] == ["docker", "rm"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                self.fail(f"unexpected command: {args}")
+
+            argv = ["source_versions.py", "--versions", "14.24", "--catalog-uri", "http://catalog",
+                    "--s3-endpoint", "http://s3", "--binary", str(binary), "--artifacts", str(artifacts)]
+            with patch.object(sys, "argv", argv), patch("source_versions.subprocess.run", side_effect=command):
+                with self.assertRaises(SystemExit) as exited:
+                    source_versions.main()
+            self.assertEqual(exited.exception.code, 1)
+            name = commands[0][commands[0].index("--name") + 1]
+            self.assertEqual(commands[1:], [["docker", "logs", name],
+                                             ["docker", "rm", "--force", "--volumes", name]])
+            report = json.loads((artifacts / "report.json").read_text())
+            self.assertFalse(report["passed"])
+            record = report["versions"][0]
+            self.assertFalse(record["passed"])
+            self.assertIn("TimeoutExpired", record["error"])
+            self.assertTrue(record["cleanup"]["passed"])
+            self.assertEqual(record["cleanup"]["container"], name)
+            self.assertEqual((artifacts / "pg-14.24.log").read_bytes(), b"startup logs")
+
     def test_collection_failures_still_remove_every_owned_container(self):
         for failure in (subprocess.TimeoutExpired("docker logs", 30), OSError("artifact disk full")):
             commands = []

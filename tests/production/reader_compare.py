@@ -30,7 +30,7 @@ READER_SETTINGS_SQL = """
     SELECT name, value FROM duckdb_settings() WHERE name IN (
         'httpfs_connection_caching', 'httpfs_client_implementation', 'http_keep_alive',
         'http_retries', 'http_retry_backoff', 'http_retry_wait_ms', 'http_timeout',
-        'enable_http_metadata_cache'
+        'enable_http_metadata_cache', 'enable_external_file_cache'
     ) ORDER BY name
 """
 

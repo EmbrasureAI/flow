@@ -321,7 +321,7 @@ impl TableMaintenance {
             let id = FileId(file.file_path().to_owned());
             for delete in &deletes {
                 dependencies
-                    .entry(delete.file_path().to_owned())
+                    .entry(flow_iceberg_ext::content_file_id(&delete.data_file))
                     .or_default()
                     .insert(id.clone());
             }
@@ -364,7 +364,9 @@ impl TableMaintenance {
         let deletes = dependencies
             .into_iter()
             .map(|(path, targets)| DeleteDependency {
-                size_bytes: view.live_files[&path].data_file.file_size_in_bytes(),
+                size_bytes: flow_iceberg_ext::delete_content_size(
+                    &view.live_files[&path].data_file,
+                ),
                 row_count: view.live_files[&path].data_file.record_count(),
                 id: FileId(path),
                 targets,
@@ -374,13 +376,24 @@ impl TableMaintenance {
             .live_files
             .values()
             .filter(|entry| entry.content_type() == DataContentType::PositionDeletes)
+            .map(|entry| entry.file_path())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let legacy_delete_count = view
+            .live_files
+            .values()
+            .filter(|entry| {
+                entry.content_type() == DataContentType::PositionDeletes
+                    && entry.file_format() != iceberg::spec::DataFileFormat::Puffin
+            })
             .count();
         let mut debt = self.policy.debt(&files)?;
-        // Dangling delete files still add planning and storage work, even when
-        // no surviving data file contributes to the overlap count.
-        if delete_file_count >= self.policy.delete_files_hard {
+        // Legacy shared/dangling files add planning work across targets. A DV
+        // is scoped to one file; sparse vectors on healthy files are not global
+        // debt. Per-file density still schedules reclamation.
+        if legacy_delete_count >= self.policy.delete_files_hard {
             debt.pressure = flow_compactor::PublicationPressure::Pause;
-        } else if delete_file_count >= self.policy.delete_files_soft {
+        } else if legacy_delete_count >= self.policy.delete_files_soft {
             debt.pressure = debt
                 .pressure
                 .max(flow_compactor::PublicationPressure::Delay);
@@ -717,20 +730,16 @@ impl TableMaintenance {
             .iter()
             .map(|file| file.file_size_in_bytes())
             .sum::<u64>();
-        let output_delete_files = output.delete_files.len();
+        let (output_delete_files, output_delete_bytes) =
+            flow_iceberg_ext::physical_file_stats(&output.delete_files);
         let output_delete_rows = output
             .delete_files
             .iter()
             .map(|file| file.record_count())
             .sum::<u64>();
-        let output_delete_bytes = output
-            .delete_files
-            .iter()
-            .map(|file| file.file_size_in_bytes())
-            .sum::<u64>();
         let reservation = context
             .ownership
-            .finish(output.data_files.len(), output.delete_files.len())
+            .finish(output.data_files.len(), output_delete_files)
             .await?;
         let store = self.store.clone();
         blocking(move || {
@@ -1020,10 +1029,34 @@ impl TableMaintenance {
             let after_data = file_paths(&after, DataContentType::Data);
             let before_deletes = file_paths(&before, DataContentType::PositionDeletes);
             let after_deletes = file_paths(&after, DataContentType::PositionDeletes);
+            let upgrade_range = target.row_range().filter(|_| {
+                before
+                    .snapshot_id
+                    .and_then(|id| head.metadata().snapshot_by_id(id))
+                    .is_some_and(|snapshot| snapshot.row_range().is_none())
+            });
             for (path, previous) in &before.live_files {
                 if let Some(current) = after.live_files.get(path) {
                     ensure!(
-                        previous.data_file == current.data_file
+                        (previous.data_file == current.data_file
+                            || upgrade_range.is_some_and(|(first, count)| {
+                                let Some(id) = current
+                                    .data_file
+                                    .first_row_id()
+                                    .and_then(|id| u64::try_from(id).ok())
+                                else {
+                                    return false;
+                                };
+                                previous.content_type() == DataContentType::Data
+                                    && previous.data_file.first_row_id().is_none()
+                                    && id >= first
+                                    && id
+                                        .checked_add(current.data_file.record_count())
+                                        .zip(first.checked_add(count))
+                                        .is_some_and(|(end, limit)| end <= limit)
+                                    && previous.data_file.clone().with_first_row_id(id as i64)
+                                        == current.data_file
+                            }))
                             && previous.sequence_number == current.sequence_number
                             && previous.file_sequence_number == current.file_sequence_number,
                         "external snapshot reused immutable file identity {path}"
@@ -1309,7 +1342,7 @@ impl TableMaintenance {
             .live_files
             .values()
             .filter(|entry| entry.content_type() == DataContentType::Data)
-            .map(|entry| FileId(entry.file_path().to_owned()))
+            .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
             .collect();
         let worker_table = head.clone();
         let table_id = schema.table_id;
@@ -1395,7 +1428,7 @@ fn file_paths(view: &SnapshotView, content: DataContentType) -> BTreeSet<FileId>
     view.live_files
         .values()
         .filter(|entry| entry.content_type() == content)
-        .map(|entry| FileId(entry.file_path().to_owned()))
+        .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
         .collect()
 }
 

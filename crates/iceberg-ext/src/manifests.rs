@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iceberg::spec::{ManifestContentType, ManifestListWriter, Operation, Snapshot, Summary};
+use iceberg::spec::{
+    FormatVersion, ManifestContentType, ManifestList, Operation, Snapshot, Summary,
+};
 use iceberg::table::Table;
 use iceberg::{Catalog, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::action::{commit_snapshot, manifest_writer};
+use crate::action::{commit_snapshot, manifest_list_writer, manifest_writer};
 use crate::{
     CommitAttempt, CommitBase, CommitResult, ManifestCache, OPERATION_ID_KEY, conflict,
     find_operation, invalid,
@@ -281,16 +283,14 @@ impl RewriteManifestsAction {
                 output.push(writer.write_manifest_file().await?);
             }
         }
-        let mut writer = ManifestListWriter::v2(
-            table
-                .file_io()
-                .new_output(self.manifest_list())?
-                .writer()
-                .await?,
+        let mut writer = manifest_list_writer(
+            table,
+            &self.manifest_list(),
             self.snapshot_id,
             self.base.snapshot_id,
             self.sequence_number,
-        );
+        )
+        .await?;
         writer.add_manifests(
             manifests
                 .into_iter()
@@ -367,8 +367,35 @@ impl RewriteManifestsAction {
             .with_summary(Summary {
                 operation: Operation::Replace,
                 additional_properties: properties,
-            })
-            .build();
+            });
+        let snapshot = if table.metadata().format_version() == FormatVersion::V3 {
+            let first = table.metadata().next_row_id();
+            let bytes = table
+                .file_io()
+                .new_input(self.manifest_list())?
+                .read()
+                .await?;
+            let list = ManifestList::parse_with_version(&bytes, FormatVersion::V3)?;
+            let mut next = first;
+            for manifest in list.entries() {
+                if let Some(start) = manifest.first_row_id.filter(|start| *start >= first) {
+                    let end = start
+                        .checked_add(
+                            manifest
+                                .added_rows_count
+                                .ok_or_else(|| invalid("missing added row count"))?,
+                        )
+                        .and_then(|value| value.checked_add(manifest.existing_rows_count?))
+                        .ok_or_else(|| {
+                            invalid("manifest lineage range overflow or missing row count")
+                        })?;
+                    next = next.max(end);
+                }
+            }
+            snapshot.with_row_range(first, next - first).build()
+        } else {
+            snapshot.build()
+        };
         commit_snapshot(catalog, table, snapshot, Some(catalog_update_elapsed)).await
     }
 }

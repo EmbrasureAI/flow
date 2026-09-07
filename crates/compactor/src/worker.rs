@@ -122,6 +122,10 @@ pub async fn compact(
     )
     .await?;
     let mut output = built.output;
+    if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
+        retain_shared_legacy_deletes(&mut output, &built.base)?;
+        return Ok(output);
+    }
     output.delete_files =
         write_residuals(table, &schema, &output, &output.operation_id.0, config).await?;
     Ok(output)
@@ -188,7 +192,7 @@ pub async fn build_data(
         .collect::<iceberg::Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        .map(|entry| FileId(entry.file_path().to_owned()))
+        .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
         .collect();
     ensure!(
         required_deletes == plan.delete_files,
@@ -231,7 +235,7 @@ pub async fn build_data(
         .live_files
         .values()
         .filter(|entry| entry.content_type() == iceberg::spec::DataContentType::Data)
-        .map(|entry| FileId(entry.file_path().to_owned()))
+        .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
         .collect();
     let scanned_delete_rows = stage_delete_files_inner(
         table,
@@ -271,6 +275,9 @@ pub async fn build_data(
         plan.spec_id,
         config,
     )?;
+    if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
+        writer = writer.with_row_lineage()?;
+    }
     let mut reverse_file = None;
     type ReverseRows<'a> = Box<
         dyn Iterator<Item = flow_state_store::Result<(u64, flow_model::PrimaryKey)>> + Send + 'a,
@@ -341,7 +348,9 @@ pub async fn build_data(
                 originals.push(old);
             }
             check_cancelled(Some(cancelled))?;
-            let written = writer.write(&batch.rows, PgLsn(0)).await?;
+            let written = writer
+                .write_with_lineage(&batch.rows, batch.lineage.as_deref(), PgLsn(0))
+                .await?;
             check_cancelled(Some(cancelled))?;
             let deltas = keys.into_iter().zip(originals).zip(written.locations).map(
                 |((key, original), mut replacement)| {
@@ -408,6 +417,38 @@ pub async fn build_data(
     })
 }
 
+/// Shared v2 files retained after upgrade still protect surviving targets.
+/// Keeping them avoids publishing an incomplete residual vector for a survivor.
+pub(crate) fn retain_shared_legacy_deletes(
+    output: &mut WorkerOutput,
+    view: &SnapshotView,
+) -> Result<()> {
+    let mut retained = BTreeSet::new();
+    for (id, entry) in &view.live_files {
+        if entry.content_type() != iceberg::spec::DataContentType::Data
+            || output.plan.input_files.contains(&FileId(id.clone()))
+        {
+            continue;
+        }
+        for delete in view.applicable_deletes(id)? {
+            if delete.file_format() == iceberg::spec::DataFileFormat::Parquet {
+                retained.insert(FileId(flow_iceberg_ext::content_file_id(&delete.data_file)));
+            }
+        }
+    }
+    output.plan.delete_files.retain(|id| !retained.contains(id));
+    output.delete_sequence = output
+        .plan
+        .delete_files
+        .iter()
+        .map(|id| view.live_files[&id.0].sequence_number)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow::anyhow!("missing delete sequence"))?
+        .into_iter()
+        .max();
+    Ok(())
+}
+
 /// Write staged positions outside the selected data files for a strict build.
 pub(crate) async fn write_residuals(
     table: &Table,
@@ -450,12 +491,13 @@ pub(crate) async fn write_residual_positions(
         .min(config.row_group_rows)
         .max(1);
     config.target_file_bytes = usize::MAX;
-    let mut writer = DeleteWriter::new(
+    let mut writer = DeleteWriter::new_for_version(
         table.file_io().clone(),
         table.metadata().location(),
         &output.operation_id,
         output.plan.spec_id,
         config,
+        table.metadata().format_version(),
     )?;
     let mut batch = Vec::with_capacity(batch_rows);
     let mut total_rows = 0u64;
@@ -488,6 +530,7 @@ pub struct LiveBatch {
     pub file_id: FileId,
     pub rows: Vec<Row>,
     pub positions: Vec<u64>,
+    pub lineage: Option<Vec<flow_materializer::RowLineage>>,
 }
 
 // Charge retained row slots and owned variable-width payloads, plus physical
@@ -571,6 +614,9 @@ async fn scan_staged_live_files(
         let mut position = 0u64;
         let mut rows = Vec::new();
         let mut positions = Vec::new();
+        let v3 = table.metadata().format_version() == iceberg::spec::FormatVersion::V3;
+        let entry = &view.live_files[&file.0];
+        let mut lineage = v3.then(Vec::new);
         let mut owned_bytes = 0u64;
         read_batches(
             table.file_io(),
@@ -581,7 +627,19 @@ async fn scan_staged_live_files(
             async |batch| {
                 check_cancelled(cancelled)?;
                 let all_rows = rows_from_batch(schema, &batch)?;
-                for row in all_rows {
+                let resolved = if v3 {
+                    Some(flow_materializer::read_row_lineage(
+                        &batch,
+                        position,
+                        entry.data_file.first_row_id(),
+                        entry
+                            .sequence_number
+                            .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
+                    )?)
+                } else {
+                    None
+                };
+                for (index, row) in all_rows.into_iter().enumerate() {
                     ensure!(
                         next_delete.is_none_or(|deleted| deleted >= position),
                         "position delete fell behind scan"
@@ -592,7 +650,12 @@ async fn scan_staged_live_files(
                             .transpose()?
                             .map(|location| location.row_position);
                     } else {
-                        let row_bytes = live_row_bytes(&row);
+                        let row_bytes = live_row_bytes(&row)
+                            + if v3 {
+                                std::mem::size_of::<flow_materializer::RowLineage>() as u64
+                            } else {
+                                0
+                            };
                         ensure!(
                             row_bytes <= read_limits.batch_bytes,
                             "owned scan row exceeds batch byte limit"
@@ -606,6 +669,7 @@ async fn scan_staged_live_files(
                                 file_id: file.clone(),
                                 rows: std::mem::take(&mut rows),
                                 positions: std::mem::take(&mut positions),
+                                lineage: lineage.as_mut().map(std::mem::take),
                             })
                             .await?;
                             owned_bytes = 0;
@@ -613,6 +677,9 @@ async fn scan_staged_live_files(
                         owned_bytes += row_bytes;
                         rows.push(row);
                         positions.push(position);
+                        if let (Some(output), Some(resolved)) = (&mut lineage, &resolved) {
+                            output.push(resolved[index]);
+                        }
                     }
                     position += 1;
                 }
@@ -634,6 +701,7 @@ async fn scan_staged_live_files(
                 file_id: file.clone(),
                 rows,
                 positions,
+                lineage,
             })
             .await?;
         }
@@ -660,7 +728,7 @@ pub async fn stage_position_deletes(
         .collect::<iceberg::Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        .map(|entry| FileId(entry.file_path().to_owned()))
+        .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
         .collect();
     stage_delete_files(
         table,
@@ -740,8 +808,11 @@ async fn stage_delete_files_inner(
         "scan batch exceeds scratch budget"
     );
     ensure!(
-        table.metadata().format_version() == iceberg::spec::FormatVersion::V2,
-        "live-row scanner supports only Iceberg v2"
+        matches!(
+            table.metadata().format_version(),
+            iceberg::spec::FormatVersion::V2 | iceberg::spec::FormatVersion::V3
+        ),
+        "live-row scanner requires Iceberg v2 or v3"
     );
     ensure!(
         table
@@ -756,7 +827,7 @@ async fn stage_delete_files_inner(
             entry.content_type(),
             iceberg::spec::DataContentType::Data | iceberg::spec::DataContentType::PositionDeletes
         )),
-        "live-row scanner refuses unsupported equality deletes or deletion vectors"
+        "live-row scanner refuses unsupported equality deletes"
     );
     ensure!(
         files.iter().all(|id| view
@@ -809,10 +880,16 @@ async fn load_deletes(
 ) -> Result<u64> {
     let mut bytes = 0u64;
     let mut rows = 0u64;
+    let vector_targets = view
+        .live_files
+        .values()
+        .filter(|entry| entry.file_format() == iceberg::spec::DataFileFormat::Puffin)
+        .filter_map(|entry| entry.data_file.referenced_data_file())
+        .collect::<BTreeSet<_>>();
     for file in delete_files {
         check_cancelled(cancelled)?;
         let delete_entry = &view.live_files[&file.0];
-        let input = file_io.new_input(&file.0)?;
+        let input = file_io.new_input(delete_entry.file_path())?;
         let metadata = input.metadata().await?;
         check_cancelled(cancelled)?;
         ensure!(
@@ -820,7 +897,9 @@ async fn load_deletes(
             "delete file size differs from manifest"
         );
         bytes = bytes
-            .checked_add(metadata.size)
+            .checked_add(flow_iceberg_ext::delete_content_size(
+                &delete_entry.data_file,
+            ))
             .ok_or_else(|| anyhow::anyhow!("delete input size overflow"))?;
         ensure!(
             bytes <= limits.max_bytes,
@@ -831,10 +910,79 @@ async fn load_deletes(
             declared_rows <= limits.max_rows.saturating_sub(rows),
             "delete scan exceeds input row budget"
         );
+        if delete_entry.data_file.file_format() == iceberg::spec::DataFileFormat::Puffin {
+            let descriptor = &delete_entry.data_file;
+            let target = FileId(
+                descriptor
+                    .referenced_data_file()
+                    .ok_or_else(|| anyhow::anyhow!("DV lacks target"))?,
+            );
+            let data = view
+                .live_files
+                .get(&target.0)
+                .ok_or_else(|| anyhow::anyhow!("DV target is not live"))?;
+            let vector = iceberg::puffin::read_deletion_vector(
+                file_io,
+                descriptor.file_path(),
+                u64::try_from(
+                    descriptor
+                        .content_offset()
+                        .ok_or_else(|| anyhow::anyhow!("DV lacks offset"))?,
+                )?,
+                u64::try_from(
+                    descriptor
+                        .content_size_in_bytes()
+                        .ok_or_else(|| anyhow::anyhow!("DV lacks length"))?,
+                )?,
+                &target.0,
+                declared_rows,
+                iceberg::puffin::DeletionVectorLimits {
+                    max_blob_bytes: read_limits
+                        .row_group_uncompressed_bytes
+                        .min(limits.max_bytes),
+                    max_footer_bytes: read_limits.footer_bytes,
+                    max_cardinality: limits.max_rows.saturating_sub(rows),
+                },
+            )
+            .await?;
+            rows = rows
+                .checked_add(vector.len())
+                .ok_or_else(|| anyhow::anyhow!("delete row count overflow"))?;
+            let mut locations = Vec::with_capacity(batch_rows);
+            for position in vector.iter() {
+                check_cancelled(cancelled)?;
+                ensure!(
+                    position < data.data_file.record_count(),
+                    "delete position exceeds data row count"
+                );
+                if !input_files.contains(&target)
+                    || !flow_iceberg_ext::position_delete_may_apply(delete_entry, data)
+                {
+                    continue;
+                }
+                locations.push(RowLocation {
+                    data_file_id: target.clone(),
+                    row_position: position,
+                    data_sequence_number: data
+                        .sequence_number
+                        .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
+                    spec_id,
+                    partition: Vec::new(),
+                    source_commit_lsn: PgLsn(0),
+                    row_version: 0,
+                    row_fingerprint: [0; 16],
+                });
+                if locations.len() == batch_rows {
+                    scratch.put_position_deletes(scan_id, &schema.table_id, locations.drain(..))?;
+                }
+            }
+            scratch.put_position_deletes(scan_id, &schema.table_id, locations)?;
+            continue;
+        }
         let mut file_rows = 0u64;
         read_batches(
             file_io,
-            &file.0,
+            delete_entry.file_path(),
             Some(&[2147483546, 2147483545]),
             batch_rows,
             read_limits,
@@ -880,7 +1028,7 @@ async fn load_deletes(
                         "invalid null or negative position delete"
                     );
                     let id = FileId(paths.value(idx).to_owned());
-                    if !input_files.contains(&id) {
+                    if !input_files.contains(&id) || vector_targets.contains(&id.0) {
                         continue;
                     }
                     let data = &view.live_files[&id.0];

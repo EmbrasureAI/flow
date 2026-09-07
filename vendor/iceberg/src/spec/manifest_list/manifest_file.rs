@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -191,8 +192,10 @@ impl ManifestFile {
         let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
 
         // Let entries inherit values from the manifest list entry.
+        let mut next_row_id = self.first_row_id;
         for entry in &mut entries {
             entry.inherit_data(self);
+            entry.inherit_first_row_id(&mut next_row_id)?;
         }
 
         Ok(Manifest::new(metadata, entries))

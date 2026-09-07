@@ -183,6 +183,7 @@ pub struct DataWriter {
     row_group: RowGroupBudget,
     files: Vec<DataFile>,
     spec_id: i32,
+    lineage_schema: Option<arrow_schema::SchemaRef>,
 }
 #[derive(Debug)]
 pub struct WrittenBatch {
@@ -219,14 +220,45 @@ impl DataWriter {
             row_group: RowGroupBudget::default(),
             files: Vec::new(),
             spec_id,
+            lineage_schema: None,
         })
     }
+
+    /// Preserve reserved Iceberg row lineage while rewriting existing rows.
+    pub fn with_row_lineage(mut self) -> Result<Self> {
+        ensure!(
+            self.current.is_none() && self.files.is_empty(),
+            "lineage must be configured before writing"
+        );
+        let schema = crate::lineage::writer_schema(&self.schema)?;
+        self.lineage_schema = Some(Arc::new(schema_to_arrow_schema(&schema)?));
+        self.builder = ParquetWriterBuilder::new(self.config.properties()?, Arc::new(schema));
+        Ok(self)
+    }
+
     /// Accept owned or borrowed rows without copying their payloads.
     pub async fn write(
         &mut self,
         rows: &[impl Borrow<Row>],
         source_lsn: PgLsn,
     ) -> Result<WrittenBatch> {
+        self.write_with_lineage(rows, None, source_lsn).await
+    }
+
+    pub async fn write_with_lineage(
+        &mut self,
+        rows: &[impl Borrow<Row>],
+        lineage: Option<&[crate::RowLineage]>,
+        source_lsn: PgLsn,
+    ) -> Result<WrittenBatch> {
+        ensure!(
+            lineage.is_none_or(|values| values.len() == rows.len()),
+            "row lineage length mismatch"
+        );
+        ensure!(
+            lineage.is_none() || self.lineage_schema.is_some(),
+            "writer is not configured for row lineage"
+        );
         if rows.is_empty() {
             return Ok(WrittenBatch { locations: vec![] });
         }
@@ -235,17 +267,27 @@ impl DataWriter {
         for row in rows {
             let row = row.borrow();
             self.schema.validate_row(row)?;
-            self.config.admit_row(row_bytes(&self.schema, row)?)?;
+            self.config.admit_row(
+                row_bytes(&self.schema, row)? + usize::from(self.lineage_schema.is_some()) * 18,
+            )?;
         }
         let mut locations = Vec::with_capacity(rows.len());
         let mut remaining = rows;
         while !remaining.is_empty() {
             let (count, bytes) = bounded_batch(remaining, &self.config, |row| {
-                row_bytes(&self.schema, row.borrow())
+                Ok(row_bytes(&self.schema, row.borrow())?
+                    + usize::from(self.lineage_schema.is_some()) * 18)
             })?;
             let rows = &remaining[..count];
-            self.write_batch(rows, bytes, source_lsn, &mut locations)
-                .await?;
+            let offset = locations.len();
+            self.write_batch(
+                rows,
+                lineage.map(|values| &values[offset..offset + count]),
+                bytes,
+                source_lsn,
+                &mut locations,
+            )
+            .await?;
             remaining = &remaining[count..];
         }
         Ok(WrittenBatch { locations })
@@ -254,6 +296,7 @@ impl DataWriter {
     async fn write_batch(
         &mut self,
         rows: &[impl Borrow<Row>],
+        lineage: Option<&[crate::RowLineage]>,
         bytes: usize,
         source_lsn: PgLsn,
         locations: &mut Vec<RowLocation>,
@@ -286,7 +329,23 @@ impl DataWriter {
         self.row_group
             .prepare(writer, rows.len(), bytes, &self.config)
             .await?;
-        let batch = rows_to_batch(&self.schema, rows)?;
+        let mut batch = rows_to_batch(&self.schema, rows)?;
+        if let Some(schema) = &self.lineage_schema {
+            let mut columns = batch.columns().to_vec();
+            for row_id in [true, false] {
+                let values = (0..rows.len()).map(|index| {
+                    lineage.and_then(|values| {
+                        if row_id {
+                            values[index].row_id
+                        } else {
+                            values[index].last_updated_sequence_number
+                        }
+                    })
+                });
+                columns.push(Arc::new(values.collect::<Int64Array>()));
+            }
+            batch = RecordBatch::try_new(schema.clone(), columns)?;
+        }
         let path = writer.current_file_path();
         let offset = writer.current_row_num() as u64;
         writer.write(&batch).await?;
@@ -325,7 +384,7 @@ impl DataWriter {
 
 /// Streaming position-delete writer. Input must be sorted globally by path and position.
 /// The caller uses the disk-backed sort in the state store, even for large transactions.
-pub struct DeleteWriter {
+pub(crate) struct ParquetDeleteWriter {
     file_io: FileIO,
     builder: ParquetWriterBuilder,
     arrow_schema: arrow_schema::SchemaRef,
@@ -339,7 +398,7 @@ pub struct DeleteWriter {
     file_paths: Option<(String, String)>,
     spec_id: i32,
 }
-impl DeleteWriter {
+impl ParquetDeleteWriter {
     pub fn new(
         file_io: FileIO,
         location: &str,

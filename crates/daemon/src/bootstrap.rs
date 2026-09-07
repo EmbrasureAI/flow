@@ -19,7 +19,7 @@ use flow_pg_source::{
 };
 use flow_state_store::{ControlStore, OperationKind, OperationPhase, StateStore};
 use futures::{StreamExt, TryStreamExt};
-use iceberg::{Catalog, TableCreation, spec::FormatVersion, table::Table};
+use iceberg::{Catalog, TableCreation, table::Table};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -237,16 +237,22 @@ async fn prepare_source(
                 .await?;
         }
         if !catalog.table_exists(&id).await? {
-            catalog
+            let created = catalog
                 .create_table(
                     &id.namespace,
                     TableCreation::builder()
                         .name(id.name.clone())
-                        .format_version(FormatVersion::V2)
+                        .format_version(configured.format_version)
                         .schema(flow_materializer::iceberg_schema(&schema)?)
                         .build(),
                 )
                 .await?;
+            ensure!(
+                created.metadata().format_version() == configured.format_version,
+                "catalog created target with format {}, requested {}",
+                created.metadata().format_version(),
+                configured.format_version,
+            );
         }
         let existing = catalog.load_table(&id).await?;
         ensure!(

@@ -52,19 +52,20 @@ pub async fn write_artifact_plan(
         }
         manifests.push(writer.write_manifest_file().await?);
     }
-    let mut writer = ManifestListWriter::v2(
-        table.file_io().new_output(path)?.writer().await?,
-        0,
-        None,
-        0,
-    );
+    let output = table.file_io().new_output(path)?.writer().await?;
+    // Prepared plans deliberately leave lineage unassigned until publication.
+    let mut writer = if table.metadata().format_version() == FormatVersion::V3 {
+        ManifestListWriter::v3(output, 0, None, 0, None)
+    } else {
+        ManifestListWriter::v2(output, 0, None, 0)
+    };
     writer.add_manifests(manifests.into_iter())?;
     writer.close().await
 }
 
 pub async fn read_artifact_plan(file_io: &FileIO, path: &str) -> Result<ArtifactPlan> {
     let bytes = file_io.new_input(path)?.read().await?;
-    let manifests = ManifestList::parse_with_version(&bytes, FormatVersion::V2)?;
+    let manifests = ManifestList::parse_with_version(&bytes, FormatVersion::V3)?;
     let mut plan = ArtifactPlan {
         added_data: Vec::new(),
         added_deletes: Vec::new(),

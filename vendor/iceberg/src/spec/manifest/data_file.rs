@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -258,6 +259,12 @@ impl DataFile {
     pub fn equality_ids(&self) -> Option<Vec<i32>> {
         self.equality_ids.clone()
     }
+    /// Set the row ID inherited when an existing file first enters a v3 snapshot.
+    pub fn with_first_row_id(mut self, first_row_id: i64) -> Self {
+        self.first_row_id = Some(first_row_id);
+        self
+    }
+
     /// Get the first row id in the data file.
     pub fn first_row_id(&self) -> Option<i64> {
         self.first_row_id

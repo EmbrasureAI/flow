@@ -34,6 +34,8 @@ struct RecoveryPlan {
     base: CommitBase,
     manifest_list: String,
     referenced_data: BTreeSet<String>,
+    #[serde(default)]
+    removed_deletes: BTreeSet<String>,
     properties: HashMap<String, String>,
 }
 
@@ -113,6 +115,9 @@ async fn resolve_ingest_catalog_operation(
         ),
         "proven committed operation is absent from retained current-branch history"
     );
+    if head.metadata().format_version() != plan.base.format_version {
+        return Ok(None);
+    }
     plan.base.validate(&head)?;
     if head.metadata().current_snapshot_id() != plan.base.snapshot_id {
         return Ok(None);
@@ -122,6 +127,7 @@ async fn resolve_ingest_catalog_operation(
         .require_base_snapshot()
         .add_data_files(files.added_data)
         .add_delete_files(files.added_deletes)
+        .remove_delete_files(plan.removed_deletes)
         .validate_data_files_exist(plan.referenced_data)
         .with_properties(plan.properties)
         .with_manifest_cache(cache)
@@ -146,6 +152,9 @@ async fn resolve_ingest_catalog_operation(
                     snapshot.sequence_number(),
                     true,
                 )));
+            }
+            if refreshed.metadata().format_version() != plan.base.format_version {
+                return Ok(None);
             }
             plan.base.validate(&refreshed)?;
             if refreshed.metadata().current_snapshot_id() != plan.base.snapshot_id {
@@ -197,6 +206,70 @@ impl TablePublisher {
             manifest_cache: ManifestCache::default(),
         })
     }
+    async fn merge_previous_deletes(
+        &self,
+        table: &Table,
+        schema: &TableSchema,
+        epoch: &Epoch,
+        referenced: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        if table.metadata().format_version() != iceberg::spec::FormatVersion::V3
+            || referenced.is_empty()
+        {
+            return Ok(BTreeSet::new());
+        }
+        let view =
+            flow_iceberg_ext::SnapshotView::current_with_cache(table, &self.manifest_cache).await?;
+        let files = referenced.iter().cloned().map(flow_model::FileId).collect();
+        let mut removed = BTreeSet::new();
+        for target in referenced {
+            for entry in view.applicable_deletes(target)? {
+                if entry.data_file.file_format() == iceberg::spec::DataFileFormat::Puffin {
+                    removed.insert(flow_iceberg_ext::content_file_id(&entry.data_file));
+                }
+            }
+        }
+        // Keep shared legacy position files for their other targets. A cumulative
+        // DV supersedes their positions only for its own target.
+        let scan_id = format!("{}-prior-deletes", epoch.id.0);
+        let store = self.store.clone();
+        let table = table.clone();
+        let schema = schema.clone();
+        let epoch = epoch.clone();
+        let batch_rows = self.batch_rows;
+        let runtime = tokio::runtime::Handle::current();
+        blocking(move || {
+            let result = runtime.block_on(flow_compactor::stage_position_deletes(
+                &table,
+                &schema,
+                &view,
+                &files,
+                &store,
+                &scan_id,
+                batch_rows,
+                &flow_compactor::ReadLimits::default(),
+            ));
+            let result = result.and_then(|()| {
+                let mut positions = store.position_deletes(&scan_id, &epoch.table);
+                loop {
+                    let batch = positions
+                        .by_ref()
+                        .take(batch_rows)
+                        .collect::<flow_state_store::Result<Vec<_>>>()?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    store.put_position_deletes(&epoch.id.0, &epoch.table, batch)?;
+                }
+                Ok(())
+            });
+            store.discard_transaction(&scan_id)?;
+            result
+        })
+        .await?;
+        Ok(removed)
+    }
+
     /// Builds artifacts, durably seals their plan, then commits. Ambiguous
     /// failures retain the fence; a proven stale attempt returns ReplanRequired.
     pub async fn publish(
@@ -222,7 +295,8 @@ impl TablePublisher {
         let mut data_stage_other = Duration::ZERO;
         let mut delete_write = Duration::ZERO;
         let table = self.catalog.load_table(table.identifier()).await?;
-        if schema != &captured_schema
+        if base.format_version != table.metadata().format_version()
+            || schema != &captured_schema
             || base.uuid != table.metadata().uuid()
             || base.snapshot_id != table.metadata().current_snapshot_id()
             || base.sequence_number
@@ -386,12 +460,16 @@ impl TablePublisher {
                 Ok(())
             }));
         };
-        let mut delete_writer = DeleteWriter::new(
+        let removed_deletes = self
+            .merge_previous_deletes(&table, schema, epoch, &referenced)
+            .await?;
+        let mut delete_writer = DeleteWriter::new_for_version(
             table.file_io().clone(),
             table.metadata().location(),
             &attempt,
             spec_id,
             writer_config.clone(),
+            table.metadata().format_version(),
         )?;
         let mut deletes = self.delete_batches(epoch);
         while let Some(batch) = deletes.recv().await.transpose()? {
@@ -403,9 +481,10 @@ impl TablePublisher {
         let delete_files = delete_writer.close().await?;
         delete_write += write_started.elapsed();
         for (kind, files) in [("data", &data_files), ("delete", &delete_files)] {
-            metrics::counter!("flow_artifact_files_written_total", "table_id" => epoch.table.0.to_string(), "kind" => kind).increment(files.len() as u64);
+            let (objects, bytes) = flow_iceberg_ext::physical_file_stats(files);
+            metrics::counter!("flow_artifact_files_written_total", "table_id" => epoch.table.0.to_string(), "kind" => kind).increment(objects as u64);
             metrics::counter!("flow_artifact_bytes_written_total", "table_id" => epoch.table.0.to_string(), "kind" => kind)
-                .increment(files.iter().map(|file| file.file_size_in_bytes()).sum());
+                .increment(bytes);
         }
         let path = format!(
             "{}/metadata/{}-prepared.avro",
@@ -442,6 +521,7 @@ impl TablePublisher {
             base: CommitBase::new(&table),
             manifest_list: path.clone(),
             referenced_data: referenced,
+            removed_deletes,
             properties,
         };
         let artifacts = data_files
@@ -452,7 +532,10 @@ impl TablePublisher {
             .collect();
         let payload = serde_json::to_vec(&plan)?;
         let reservation = ownership
-            .finish(data_files.len(), delete_files.len())
+            .finish(
+                data_files.len(),
+                flow_iceberg_ext::physical_file_stats(&delete_files).0,
+            )
             .await?;
         let store = self.store.clone();
         let op = epoch.id.clone();

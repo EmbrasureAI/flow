@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -25,7 +26,7 @@ use tokio::sync::Notify;
 
 use crate::runtime::Runtime;
 use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
-use crate::spec::{DataContentType, DataFile, Struct};
+use crate::spec::{DataContentType, DataFile, DataFileFormat, Struct};
 
 /// Index of delete files
 #[derive(Debug, Clone)]
@@ -44,10 +45,6 @@ struct PopulatedDeleteFileIndex {
     global_equality_deletes: Vec<Arc<DeleteFileContext>>,
     eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
     pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
-    // TODO: do we need this?
-    // pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
-
-    // TODO: Deletion Vector support
 }
 
 impl DeleteFileIndex {
@@ -195,21 +192,31 @@ impl PopulatedDeleteFileIndex {
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
 
-        // TODO: the spec states that:
-        //     "The data file's file_path is equal to the delete file's referenced_data_file if it is non-null".
-        //     we're not yet doing that here. The referenced data file's name will also be present in the positional
-        //     delete file's file path column.
         if let Some(deletes) = self.pos_deletes_by_partition.get(data_file.partition()) {
-            deletes
+            let applicable = deletes
                 .iter()
-                // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
-                .filter(|&delete| {
+                .filter(|delete| {
                     seq_num
                         .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
-                        .unwrap_or_else(|| true)
+                        .unwrap_or(true)
                         && data_file.partition_spec_id == delete.partition_spec_id
+                        && delete
+                            .manifest_entry
+                            .data_file
+                            .referenced_data_file
+                            .as_deref()
+                            .is_none_or(|target| target == data_file.file_path())
                 })
-                .for_each(|delete| results.push(delete.as_ref().into()));
+                .collect::<Vec<_>>();
+            let has_vector = applicable
+                .iter()
+                .any(|delete| delete.manifest_entry.file_format() == DataFileFormat::Puffin);
+            for delete in applicable {
+                // A DV incorporates all prior positional deletes for this target.
+                if !has_vector || delete.manifest_entry.file_format() == DataFileFormat::Puffin {
+                    results.push(delete.as_ref().into());
+                }
+            }
         }
 
         results
@@ -416,6 +423,65 @@ mod tests {
         assert!(actual_paths_to_apply_for_different_spec.is_empty());
     }
 
+    #[test]
+    fn deletion_vector_scope_and_legacy_position_replacement() {
+        let data = build_unpartitioned_data_file();
+        let other = build_unpartitioned_data_file();
+        let mut dv = build_unpartitioned_pos_delete();
+        dv.file_format = DataFileFormat::Puffin;
+        dv.referenced_data_file = Some(data.file_path().to_owned());
+        dv.content_offset = Some(4);
+        dv.content_size_in_bytes = Some(42);
+        let positional = build_unpartitioned_pos_delete();
+        let equality = build_unpartitioned_eq_delete();
+        let index = PopulatedDeleteFileIndex::new(vec![
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(5, &dv).into(),
+                partition_spec_id: 0,
+            },
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(7, &positional).into(),
+                partition_spec_id: 0,
+            },
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(7, &equality).into(),
+                partition_spec_id: 0,
+            },
+        ]);
+        let at_same_sequence = index.get_deletes_for_data_file(&data, Some(5));
+        assert_eq!(
+            at_same_sequence
+                .iter()
+                .map(|d| d.file_path.as_str())
+                .collect::<Vec<_>>(),
+            [equality.file_path(), dv.file_path()]
+        );
+        let selected = at_same_sequence.last().unwrap();
+        assert_eq!(selected.content_offset, Some(4));
+        assert_eq!(selected.content_size_in_bytes, Some(42));
+        assert_eq!(selected.record_count, Some(1));
+        for target in [&other, &data] {
+            let sequence = if target.file_path() == data.file_path() {
+                6
+            } else {
+                5
+            };
+            let deletes = index.get_deletes_for_data_file(target, Some(sequence));
+            assert_eq!(
+                deletes
+                    .iter()
+                    .map(|d| d.file_path.as_str())
+                    .collect::<Vec<_>>(),
+                [equality.file_path(), positional.file_path()]
+            );
+        }
+        let mut different_spec = data.clone();
+        different_spec.partition_spec_id = 1;
+        let deletes = index.get_deletes_for_data_file(&different_spec, Some(5));
+        assert_eq!(deletes.len(), 1); // Global equality delete only.
+        assert_eq!(deletes[0].file_path, equality.file_path());
+    }
+
     fn build_unpartitioned_eq_delete() -> DataFile {
         build_partitioned_eq_delete(&Struct::empty(), 0)
     }
@@ -444,7 +510,7 @@ mod tests {
             .file_format(DataFileFormat::Parquet)
             .content(DataContentType::PositionDeletes)
             .record_count(1)
-            .referenced_data_file(Some("/some-data-file.parquet".to_string()))
+            .referenced_data_file(None)
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)

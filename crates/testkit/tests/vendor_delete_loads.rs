@@ -152,3 +152,93 @@ async fn dropping_scan_cancels_owned_delete_io() {
         "delete task outlived its scan"
     );
 }
+
+#[tokio::test]
+async fn shared_equality_load_completes_waiters_on_success_and_cancellation() {
+    for cancel in [false, true] {
+        let (temp, mut tasks) = input().await;
+        let path = temp.path().join("equality.parquet");
+        std::fs::copy(&tasks[0].data_file_path, &path).unwrap();
+        let path = path.to_str().unwrap().to_owned();
+        tasks[0].deletes = vec![
+            FileScanTaskDeleteFile::builder()
+                .with_file_path(path.clone())
+                .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+                .with_file_type(iceberg::spec::DataContentType::EqualityDeletes)
+                .with_equality_ids(Some(vec![1]))
+                .with_partition_spec_id(0)
+                .build(),
+        ];
+        let gate = Arc::new(Gate::default());
+        let io = FileIOBuilder::new(Arc::new(GatedStorage {
+            gate: gate.clone(),
+            owner_path: path,
+            ..Default::default()
+        }))
+        .build();
+        let reader = ArrowReaderBuilder::new(io, Runtime::current()).build();
+        let scan = || {
+            reader
+                .clone()
+                .read(futures::stream::iter(tasks.clone().into_iter().map(Ok)).boxed())
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<_>>()
+        };
+        let owner = tokio::spawn(scan());
+        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let waiter = tokio::spawn(scan());
+        if cancel {
+            owner.abort();
+            assert!(owner.await.unwrap_err().is_cancelled());
+        } else {
+            gate.release.close();
+            let batches = tokio::time::timeout(Duration::from_secs(5), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                0
+            );
+        }
+        let waiting = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("shared equality-delete reader remained blocked")
+            .unwrap();
+        // A later scan must see the same terminal result, without loading again.
+        let later = tokio::time::timeout(Duration::from_secs(5), scan())
+            .await
+            .unwrap();
+        for result in [waiting, later] {
+            if cancel {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Equality delete load")
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .unwrap()
+                        .iter()
+                        .map(|batch| batch.num_rows())
+                        .sum::<usize>(),
+                    0
+                );
+            }
+        }
+        assert_eq!(gate.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            gate.started.available_permits(),
+            0,
+            "shared delete was loaded twice"
+        );
+    }
+}

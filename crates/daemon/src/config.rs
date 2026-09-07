@@ -43,6 +43,9 @@ pub struct Table {
     pub source_table: String,
     pub target_namespace: Vec<String>,
     pub target_table: String,
+    /// Format for newly created targets; existing targets retain their format.
+    #[serde(default = "default_format_version")]
+    pub format_version: iceberg::spec::FormatVersion,
     pub columns: Vec<Column>,
     pub primary_key: Vec<usize>,
     #[serde(default)]
@@ -50,6 +53,10 @@ pub struct Table {
     #[serde(default)]
     pub priority: Priority,
 }
+fn default_format_version() -> iceberg::spec::FormatVersion {
+    iceberg::spec::FormatVersion::V2
+}
+
 impl Table {
     pub fn schema(&self, id: u32) -> TableSchema {
         TableSchema {
@@ -183,6 +190,13 @@ impl Config {
         let mut sources = BTreeMap::new();
         let mut targets = BTreeMap::new();
         for table in &self.tables {
+            ensure!(
+                matches!(
+                    table.format_version,
+                    iceberg::spec::FormatVersion::V2 | iceberg::spec::FormatVersion::V3
+                ),
+                "target format_version must be 2 or 3"
+            );
             ensure!(
                 !table.source_namespace.is_empty()
                     && !table.source_table.is_empty()

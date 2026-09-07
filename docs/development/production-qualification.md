@@ -2,6 +2,8 @@
 
 The implementation has passing local recovery and interoperability gates, but has not met the specification's performance qualification. The target is 50,000 mixed mutations/s with PostgreSQL commit-to-catalog p95 below one second and p99 below two seconds for ordinary transactions. Correct final rows alone do not qualify that target.
 
+The latest [v2/v3 comparison](qualification/v3-deletion-vectors.md) covers six runs with background compaction and identical reader settings. V3 meets the finite 10k publication targets but falls behind at 50k offered load. Direct same-row streaming-layout read comparisons replace the fully compacted layout as the cross-format baseline. Earlier records below retain their original binaries, reader settings and scope.
+
 The [release39 candidate](qualification/release39.md) passes 30 corrected frozen service phases and 16 independent-reader phases with Spark, Trino and DuckDB at the fixture's 60/300-second L0 age limits. Its full 50k follow-up observes all 33,576 committed transactions and verifies 435,760 rows with exact source ACK, but misses 1,424 measured arrivals, records catalog p95/p99 of 9.507/9.980 seconds and fails the reader ratio at 2.434. Release38's corresponding values are 5,404 misses, 15.964/17.164 seconds and 2.710; unequal accepted cohorts prevent a controlled speedup claim. The 50k, reader-health and 24-hour gates remain unmet. Earlier results below retain their original binary and measurement scope.
 
 ## Environment and measurement
@@ -161,7 +163,7 @@ The 7,500 measured journal-sync phases totaled **30.623 s**, a mean of **4.083 m
 
 ## Remaining qualification
 
-The complete workload dimensions, sustained 50k target, 24-hour principal workloads, 100-table capacity, reader scan/planning amplification and provider request/byte costs remain open. Low-fan-out partitioning and v3 follow the original specification's qualified v2 baseline. No local bounded run is a production release certificate.
+The complete workload dimensions, sustained 50k target, 24-hour principal workloads, 100-table capacity, reader scan/planning amplification and provider request/byte costs remain open. Low-fan-out partitioning remains unimplemented; subsequent v3 implementation and finite benchmark evidence are recorded separately above. No local bounded run is a production release certificate.
 
 ## Group commit and batched index reads
 

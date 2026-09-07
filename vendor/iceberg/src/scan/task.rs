@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -34,7 +35,9 @@ pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
 /// Serialization helper that always returns NotImplementedError.
 /// Used for fields that should not be serialized but we want to be explicit about it.
 fn serialize_not_implemented<S, T>(_: &T, _: S) -> std::result::Result<S::Ok, S::Error>
-where S: Serializer {
+where
+    S: Serializer,
+{
     Err(serde::ser::Error::custom(
         "Serialization not implemented for this field",
     ))
@@ -43,7 +46,9 @@ where S: Serializer {
 /// Deserialization helper that always returns NotImplementedError.
 /// Used for fields that should not be deserialized but we want to be explicit about it.
 fn deserialize_not_implemented<'de, D, T>(_: D) -> std::result::Result<T, D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     Err(serde::de::Error::custom(
         "Deserialization not implemented for this field",
     ))
@@ -159,6 +164,11 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             .with_file_path(ctx.manifest_entry.file_path().to_string())
             .with_file_size_in_bytes(ctx.manifest_entry.file_size_in_bytes())
             .with_file_type(ctx.manifest_entry.content_type())
+            .with_file_format(ctx.manifest_entry.file_format())
+            .with_record_count(Some(ctx.manifest_entry.record_count()))
+            .with_referenced_data_file(ctx.manifest_entry.data_file.referenced_data_file())
+            .with_content_offset(ctx.manifest_entry.data_file.content_offset())
+            .with_content_size_in_bytes(ctx.manifest_entry.data_file.content_size_in_bytes())
             .with_partition_spec_id(ctx.partition_spec_id)
             .with_equality_ids(ctx.manifest_entry.data_file.equality_ids.clone())
             .build()
@@ -178,10 +188,57 @@ pub struct FileScanTaskDeleteFile {
     /// delete file type
     pub file_type: DataContentType,
 
+    /// Physical delete file format; Puffin identifies deletion vectors.
+    #[serde(default = "default_delete_file_format")]
+    #[builder(default = DataFileFormat::Parquet)]
+    pub file_format: DataFileFormat,
+
+    /// Delete record count, or the cardinality of a deletion vector.
+    #[serde(default)]
+    #[builder(default)]
+    pub record_count: Option<u64>,
+
+    /// Exact data file location referenced by a deletion vector or positional file.
+    #[serde(default)]
+    #[builder(default)]
+    pub referenced_data_file: Option<String>,
+
+    /// Byte offset of a deletion vector blob in a Puffin file.
+    #[serde(default)]
+    #[builder(default)]
+    pub content_offset: Option<i64>,
+
+    /// Byte length of a deletion vector blob in a Puffin file.
+    #[serde(default)]
+    #[builder(default)]
+    pub content_size_in_bytes: Option<i64>,
+
     /// partition id
     pub partition_spec_id: i32,
 
     /// equality ids for equality deletes (null for anything other than equality-deletes)
     #[builder(default)]
     pub equality_ids: Option<Vec<i32>>,
+}
+
+impl FileScanTaskDeleteFile {
+    pub(crate) fn positional_cache_key(&self) -> String {
+        // Include the requested metadata so a cache hit cannot bypass validation
+        // of another task that points to a different blob or claims another target.
+        format!(
+            "{:?}",
+            (
+                &self.file_path,
+                self.file_format,
+                self.content_offset,
+                self.content_size_in_bytes,
+                &self.referenced_data_file,
+                self.record_count
+            )
+        )
+    }
+}
+
+fn default_delete_file_format() -> DataFileFormat {
+    DataFileFormat::Parquet
 }

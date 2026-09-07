@@ -46,6 +46,8 @@ source_namespace = "public"
 source_table = "orders"
 target_namespace = ["replicated"]
 target_table = "orders"
+# Use 3 for new v3 targets with deletion vectors; existing tables retain their format.
+format_version = 2
 primary_key = [0]
 append_only = false
 columns = [

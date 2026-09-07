@@ -215,6 +215,9 @@ async fn resolve_maintenance_operation_inner(
             true,
         ));
     }
+    if head.metadata().format_version() != base.format_version {
+        return Ok(MaintenanceResolution::new(None, "format_changed", false));
+    }
     base.validate(&head)?;
     if head.metadata().current_snapshot_id() != base.snapshot_id {
         return Ok(MaintenanceResolution::new(None, "base_changed", false));
@@ -251,6 +254,13 @@ async fn resolve_maintenance_operation_inner(
                     path: "commit_error_operation_found",
                     catalog_already_committed: true,
                 });
+            }
+            if refreshed.metadata().format_version() != base.format_version {
+                return Ok(MaintenanceResolution::new(
+                    None,
+                    "commit_error_format_changed",
+                    false,
+                ));
             }
             base.validate(&refreshed)?;
             if refreshed.metadata().current_snapshot_id() != base.snapshot_id {

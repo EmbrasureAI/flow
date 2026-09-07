@@ -8,7 +8,7 @@ The current goal is a production-ready PostgreSQL-to-standard-Iceberg service fo
 
 Keep materialized acknowledgement as the safe default. Journal acknowledgement still requires independently durable storage; concurrent capture during COPY does not by itself permit earlier acknowledgement from an ordinary local disk. Preserve the source-lineage and logical-writer checks. Do not replace unknown values with placeholders or fall back to equality deletes.
 
-V2 is the required interoperability baseline. The original specification places low-fan-out partitioning and v3 after validation of that baseline, and explicitly gates v3 work on the preceding correctness and performance phases. These features remain part of the implementation sequence, not reasons to describe the current narrow implementation as complete.
+V2 remains the default interoperability baseline. The original specification placed low-fan-out partitioning and v3 after baseline qualification; the subsequent explicit request brought v3 implementation forward. [V3 deletion vectors](../iceberg-v3.md) now have integration and local service coverage, while production qualification and low-fan-out partitioning remain incomplete.
 
 ## Work and validation order
 
@@ -18,7 +18,7 @@ V2 is the required interoperability baseline. The original specification places 
 4. **Operational maintenance.** Finish protected orphan deletion, checkpoint retention and restoration, crash-safe index-generation switching, manifest maintenance, and safe external rewrite reconciliation for keyed and keyless append-only tables.
 5. **Performance and observability.** Fix measured hot paths, expose actual transaction and reader-debt progress, implement adaptive scheduling and request/byte cost accounting, and verify steady-state compaction. Latency claims require complete observations and the requested source load.
 6. **OSS delivery.** Run the Linux container demo and PostgreSQL/reader conformance matrix, add reproducible CI/service gates and dependency policy, and prepare reusable Iceberg extensions for upstream review.
-7. **Broader format coverage.** Add low-fan-out partitioning and v3 with their own standard-reader, deletion, rewrite, and recovery gates after the v2 qualification required by the original plan.
+7. **Broader format coverage.** Add low-fan-out partitioning and extend v3 standard-reader, deletion, rewrite and recovery qualification beyond the recorded local checks.
 
 ## Evidence required for completion
 
