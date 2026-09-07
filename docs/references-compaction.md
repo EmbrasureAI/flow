@@ -1,57 +1,16 @@
-# Index and maintenance references
+# Index and maintenance contracts
 
-Reviewed 2026-09-03. Implementations in this repository were written independently.
-Moonlink source code was not copied, translated, or included as a dependency.
+## Storage contracts
 
-| Primary reference | Design consequence |
+| Dependency contract | Implementation requirement |
 | --- | --- |
-| [Moonlink README](https://github.com/Mooncake-Labs/moonlink/tree/401c1d1ad5354f77bf64cbc4f008c4e62a16781d) | A physical row index and asynchronous file compaction address the cost of updates. The freshest public state here is always a standard Iceberg snapshot. |
-| [Moonlink chaos-test design](https://github.com/Mooncake-Labs/moonlink/blob/401c1d1ad5354f77bf64cbc4f008c4e62a16781d/src/moonlink/src/table_handler/README.md) | Exercise transaction state, aborts, reopening durable state, and maintenance interleavings. Our concurrent-delete regression deliberately extends beyond quiescent maintenance tests. |
-| [Moonlink license](https://github.com/Mooncake-Labs/moonlink/blob/401c1d1ad5354f77bf64cbc4f008c4e62a16781d/LICENSE) | BSL 1.1; architecture documentation only. No Moonlink implementation is used. |
 | [Iceberg specification](https://iceberg.apache.org/spec/) | Physical identities are path plus zero-based row ordinal. Position deletes have sequence applicability rules and must remain valid after rewrites. |
 | [Iceberg Java RewriteFiles contract](https://iceberg.apache.org/javadoc/latest/org/apache/iceberg/RewriteFiles.html) | Rewrites preserve the live row set. Validate reads against their base snapshot; surviving input files alone do not prove stale output safe. |
-| [Apache Hudi indexes](https://hudi.apache.org/docs/indexes/) | Resolve changed keys through a durable location index instead of scanning all data. Unlike Hudi file-group identities, Iceberg physical positions change on every rewrite. |
-| [Apache Paimon primary-key tables](https://paimon.apache.org/docs/master/primary-key-table/) and [Iceberg interoperability](https://paimon.apache.org/docs/master/iceberg/primary-key-table/) | Bounded compaction debt is useful, but reader-side key merging is outside our read contract. Every L0 publication already resolves mutations using standard position deletes. |
 | [RocksDB basic operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | One WAL-synced batch publishes forward/reverse index changes and operation progress together. Reads followed by a write batch require serialization to implement CAS. |
 | [RocksDB tuning guide](https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide) | Shared bounded block cache, Bloom filters, bounded memtables, batched writes, and scan cache bypass are initial choices. Hardware-dependent tuning requires measurements. |
 | [RocksDB checkpoints](https://github.com/facebook/rocksdb/wiki/Checkpoints) | Native checkpoints capture all column families consistently and can hard-link SSTs on the same filesystem. |
 
-## Prepared-state activation references
-
-These sources support the boundary between background preparation and exact
-activation; they do not establish benchmark equivalence, and no source code from
-these projects is copied or translated here.
-
-[Moonlink compaction](https://github.com/Mooncake-Labs/moonlink/blob/401c1d1ad5354f77bf64cbc4f008c4e62a16781d/src/moonlink/src/storage/compaction/compactor.rs#L240-L381)
-builds the surviving-row location map and replacement global index as compaction
-output. Its snapshot owner then
-[installs that prepared result and reconciles deletion logs](https://github.com/Mooncake-Labs/moonlink/blob/401c1d1ad5354f77bf64cbc4f008c4e62a16781d/src/moonlink/src/storage/mooncake_table/snapshot_maintenance.rs#L315-L427)
-that arrived after the build. This supports doing physical remapping and index
-construction off the table lane, followed by one owner-controlled catch-up and
-activation boundary. It does not support moving a row-by-row live-index rewrite
-into the activation path.
-
-RisingWave Hummock compaction creates immutable SST outputs. The meta service
-represents activation as a
-[small version delta that removes input SSTs and adds outputs](https://github.com/risingwavelabs/risingwave/blob/c351d73d4a33dacb824287a7d5b839e04dccf838/src/meta/src/hummock/manager/compaction/mod.rs#L147-L194),
-then validates the assignment and compaction-group version and
-[commits the affected metadata together](https://github.com/risingwavelabs/risingwave/blob/c351d73d4a33dacb824287a7d5b839e04dccf838/src/meta/src/hummock/manager/compaction/mod.rs#L821-L1007).
-Readers retain
-[pinned immutable versions](https://github.com/risingwavelabs/risingwave/blob/c351d73d4a33dacb824287a7d5b839e04dccf838/src/storage/src/hummock/local_version/pinned_version.rs#L40-L155)
-while newer state is published. The relevant property for this state store is
-that activation scales with the number of prepared artifacts, rather than the
-number of remapped rows.
-
-Materialize Persist gives each background merge result its
-[exact input identity and output](https://github.com/MaterializeInc/materialize/blob/6cef38c018b3b235e1fd937f493aa498c58c9542/src/persist-client/src/internal/trace.rs#L76-L87).
-Application checks the expected frontier and input range and can classify an
-[exact, subset, stale or invalid result](https://github.com/MaterializeInc/materialize/blob/6cef38c018b3b235e1fd937f493aa498c58c9542/src/persist-client/src/internal/trace.rs#L1184-L1283)
-before a small
-[compare-and-set state transition](https://github.com/MaterializeInc/materialize/blob/6cef38c018b3b235e1fd937f493aa498c58c9542/src/persist-client/src/internal/apply.rs#L357-L499).
-An indeterminate commit preserves an output that may have become referenced
-[until later reconciliation](https://github.com/MaterializeInc/materialize/blob/6cef38c018b3b235e1fd937f493aa498c58c9542/src/persist-client/src/internal/machine.rs#L1055-L1108).
-This is the reference for self-identifying external-compactor artifacts, exact
-base validation, idempotent activation outcomes and conservative orphan cleanup.
+## Index activation constraints
 
 The pinned RocksDB 10.4.2 C++ API documents multi-column-family external-file
 ingestion as all-or-none for manifest recovery, while warning that concurrent
@@ -77,8 +36,7 @@ The next candidate is immutable, generation-prefixed index state prepared under
 an unreachable prefix, followed by exact catch-up and one small durable
 active-generation switch. Old generations must remain pinned for readers and be
 collected only after reconciliation. That larger change requires its own recovery
-and service measurements; results from Hummock, Persist or Moonlink do not qualify
-its performance here.
+tests and service measurements.
 
 ## Decisions
 

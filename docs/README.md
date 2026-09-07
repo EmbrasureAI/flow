@@ -19,6 +19,6 @@
 ## Dependencies and references
 
 - [Licenses and distribution notices](../licenses/README.md).
-- Reference reviews: [PostgreSQL and source capture](references-source.md),
+- Implementation contracts: [PostgreSQL and source capture](references-source.md),
   [Iceberg](references-iceberg.md), and [compaction](references-compaction.md).
 - [Prepared upstream patches](patches/upstream/README.md).

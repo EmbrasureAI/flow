@@ -48,8 +48,7 @@ cloud publication latency. The current results are in [Performance](docs/perform
 
 Contributions use the project's Apache-2.0 license. Preserve upstream notices and
 modification records in `vendor/`; keep reusable Iceberg changes separable from
-the service. Moonlink is a design reference, and its BSL implementation must not
-be copied into this project. Review new dependency terms and the
+the service. Review new dependency terms and the
 [distribution notice policy](licenses/README.md) when updating `Cargo.lock`.
 
 Workspace crates are currently unpublished implementation components. Their

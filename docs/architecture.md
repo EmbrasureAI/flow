@@ -50,12 +50,8 @@ is dropped and the same durable journal prefix is replayed through the disk path
 Initial copies, oversized transactions and legacy descriptors use disk directly.
 Crash recovery always comes from the journal or the existing Prepared operation.
 
-This follows the bounded-intermediate principle described by
-[DuckDB](https://duckdb.org/2024/07/09/memory-management), while replaying the
-already durable input avoids a second spill format. Per-worker retention is
-explicit, as are the concurrency and spill-reservation tradeoffs documented by
-[DataFusion](https://datafusion.apache.org/user-guide/configs.html). These are
-design references, not performance evidence for this implementation.
+Replaying durable input avoids a second spill format. Memory and spill budgets
+are explicit per worker, so total resource use depends on worker concurrency.
 
 ## Compaction and external maintenance
 

@@ -31,7 +31,6 @@ use std::{
 use thiserror::Error;
 use tokio_postgres::{Client, CopyBothDuplex};
 
-pub const AUDITED_ETL_REVISION: &str = "61667c155a907fdd0bfb7089ad2da207ab31e9cb";
 pub const TRANSPORT_REVISION: &str = "c4b8de06aaa99f71800126bedcca6e623d368357";
 
 #[derive(Debug, Error)]

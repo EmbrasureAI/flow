@@ -47,44 +47,15 @@ Do not optimize for theoretical universality. Optimize first for a credible, mea
 * Unmodified Spark, Trino, and DuckDB readers.
 * One authoritative logical writer per replicated table.
 
-## 2. Context and relationship to Moonlink
+## 2. Read and write boundaries
 
-Moonlink is the most relevant prior implementation. It has:
+The freshest published state is a standard Iceberg snapshot. Readers need no
+access to the service's memory, journal, row index, or temporary files.
 
-* PostgreSQL CDC.
-* An Arrow/memory/NVMe write layer.
-* A primary-key and row-position index.
-* Size-tuned Parquet persistence.
-* Deletion vectors.
-* Data and index compaction.
-* Iceberg v3 output.
-
-However, Moonlink separates its freshest state from its ordinary Iceberg snapshot. Its subsecond DuckDB path uses a custom storage extension that connects to Moonlink over a Unix socket, asks for a Moonlink-specific read state, scans returned Parquet files, and applies custom delete filtering.
-
-That read state may include temporary files representing committed-but-not-yet-persisted rows in addition to persisted object-store files, position deletes, and DVs.
-
-Moonlink’s README distinguishes standard Iceberg v3 output from its special real-time DuckDB, Postgres, and DataFusion integrations.
-
-This project’s differentiation is therefore:
-
-```text
-Moonlink freshest read:
-Moonlink state + special adapter
-
-This project’s freshest published read:
-standard Iceberg snapshot + normal Iceberg reader
-```
-
-Study Moonlink’s architecture for concepts, tests, failure modes, index design, and compaction policy. Do **not** copy Moonlink implementation code. Moonlink is currently under the Business Source License rather than an open-source license and restricts managed-service use until its future license change. This implementation must be clean-room and should use Apache-2.0-compatible dependencies.
-
-Useful Moonlink design references include:
-
-* A 500 ms internal snapshot timer.
-* A production Parquet flush target of 128 MiB.
-* Compaction groups of roughly 16–32 files and a final-file target around 512 MiB.
-* A table architecture containing memory state, disk files, deletion vectors, indices, a WAL, Iceberg persistence, and compaction.
-
-Use those as informed starting points, not immutable defaults.
+Initial tuning candidates include a 500 ms publication timer, a 128 MiB Parquet
+flush target, and compaction groups of 16–32 files targeting 512 MiB outputs.
+Validate these against measured latency, reader debt, and resource use before
+choosing defaults.
 
 ---
 
@@ -218,11 +189,11 @@ Use:
 
 ### 5.1 PostgreSQL source implementation
 
-Prefer starting from **Supabase ETL** as the PostgreSQL capture subsystem. It is an Apache-2.0 Rust replication framework with initial-copy handling, ongoing CDC, persistent checkpoints, and custom destination interfaces. Its existing Iceberg destination is irrelevant and should not be reused; use only the source and initial-sync machinery. ([GitHub][5])
+Keep the PostgreSQL transport behind an internal `PostgresSource` trait and pin
+its revision. The source boundary owns initial COPY, pgoutput transaction
+assembly, checkpoints, and the handoff to ongoing capture.
 
-Pin a specific commit and place it behind an internal `PostgresSource` trait.
-
-Before relying on it, add capability tests for:
+Add capability tests for:
 
 * Transaction boundaries.
 * Multi-table transactions.
@@ -485,7 +456,7 @@ Transactions above the threshold must remain correct but are reported separately
 
 A replacement-row Iceberg model requires a complete new row.
 
-Under normal replica identity, unchanged TOASTed column values may be absent from an update event. Debezium documents that it cannot safely fetch these values out-of-band because of race conditions; it emits a placeholder instead. With `REPLICA IDENTITY FULL`, TOAST values are included in the before and after images. ([Debezium][3])
+Under normal replica identity, unchanged TOASTed column values may be absent from an update event. Fetching missing values through a separate query races with concurrent source writes. Mutable capture requires `REPLICA IDENTITY FULL`; unchanged fields must be resolved from the complete old tuple in the same update, never from a later query or a placeholder.
 
 For V1:
 
@@ -722,7 +693,7 @@ This allows workers to scale independently without creating multiple competing a
 
 ## 12. Compaction policy
 
-Use LSM-inspired, debt-driven maintenance rather than an hourly cron.
+Use debt-driven LSM maintenance rather than an hourly cron.
 
 ### 12.1 Levels
 
@@ -1364,7 +1335,7 @@ For 100 continuously active low-volume tables, do not assume the same efficiency
 ### Phase 0: capability audit and repository setup
 
 * Create the Rust workspace.
-* Pin Supabase ETL and Iceberg Rust revisions.
+* Pin PostgreSQL transport and Iceberg Rust revisions.
 * Verify source transaction semantics.
 * Verify current v2 write and read capabilities.
 * Write ADRs for acknowledgement, durability, row identity, and external maintenance.
@@ -1452,7 +1423,7 @@ Add:
 Do not implement in the first version:
 
 * A custom query engine.
-* A Moonlink-style union-read extension.
+* A custom union-read extension.
 * Kafka or Flink as mandatory infrastructure.
 * Multiple independent logical writers.
 * Cross-table atomic Iceberg visibility.
@@ -1527,15 +1498,13 @@ Focus engineering effort in this order:
 
 The project succeeds when it demonstrates:
 
-> Moonlink-like CDC, indexing, and compaction, but with the standard Iceberg snapshot—not a specialized adapter—as the freshest public read plane.
+> CDC, physical-row indexing, and compaction with the standard Iceberg snapshot as the freshest public read plane.
 
 The hardest and most valuable parts are not PostgreSQL decoding or Parquet writing. They are source-wide transaction durability, physical-row indexing, concurrency-safe compaction, adaptive commit economics, and keeping the current Iceberg snapshot healthy under a sustained subsecond publication workload.
 
 [1]: https://iceberg.apache.org/javadoc/1.4.3/org/apache/iceberg/RowDelta.html?utm_source=chatgpt.com "RowDelta"
 [2]: https://www.postgresql.org/docs/current/view-pg-replication-slots.html?utm_source=chatgpt.com "Documentation: 18: 53.20. pg_replication_slots"
-[3]: https://debezium.io/documentation/reference/stable/connectors/postgresql.html?utm_source=chatgpt.com "Debezium connector for PostgreSQL"
 [4]: https://iceberg.apache.org/docs/latest/spark-structured-streaming/?utm_source=chatgpt.com "Spark Structured Streaming - Apache Iceberg"
-[5]: https://github.com/supabase/etl?utm_source=chatgpt.com "supabase/etl: A high-performance Postgres replication ..."
 [6]: https://rust.iceberg.apache.org/api/iceberg/writer/index.html?utm_source=chatgpt.com "iceberg::writer"
 [7]: https://github.com/apache/iceberg-rust/issues/1606/linked_closing_reference?reference_location=REPO_ISSUES_INDEX&utm_source=chatgpt.com "Add `RewriteFiles` support to iceberg-rust · Issue #1607"
 [8]: https://www.postgresql.org/docs/current/logicaldecoding-explanation.html?utm_source=chatgpt.com "Documentation: 18: 47.2. Logical Decoding Concepts"

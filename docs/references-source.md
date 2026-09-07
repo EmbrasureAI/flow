@@ -1,32 +1,13 @@
-# PostgreSQL capture and journal capability audit
+# PostgreSQL capture and journal contracts
 
-## Dependency decision
+## Transport dependency
 
-The audited Supabase ETL revision is
-[`61667c155a907fdd0bfb7089ad2da207ab31e9cb`](https://github.com/supabase/etl/tree/61667c155a907fdd0bfb7089ad2da207ab31e9cb),
-Apache-2.0. It is recorded in `flow-pg-source::AUDITED_ETL_REVISION`; ETL is not a
-runtime dependency. Its existing Iceberg destination is not used.
-
-Two source-level contracts prevent using that revision's high-level pipeline:
-
-* [`Destination::write_events`](https://github.com/supabase/etl/blob/61667c155a907fdd0bfb7089ad2da207ab31e9cb/crates/etl/src/destination/base.rs)
-  explicitly describes per-table ordering and warns that initial-copy handoff
-  can split a source transaction across independently synchronizing tables.
-  That is insufficient for this project's source-wide transaction ledger.
-* [`raw.rs`](https://github.com/supabase/etl/blob/61667c155a907fdd0bfb7089ad2da207ab31e9cb/crates/etl/src/postgres/client/raw.rs)
-  negotiates pgoutput protocol 1. PostgreSQL requires protocol 2 for streaming
-  uncommitted large transactions.
-
-Following the specification's fallback, we reuse **only ETL's low-level
-transport**: the MIT/Apache-2.0 rust-postgres fork at
+The PostgreSQL transport is the MIT/Apache-2.0 rust-postgres fork at
 [`c4b8de06aaa99f71800126bedcca6e623d368357`](https://github.com/iambriccardo/rust-postgres/tree/c4b8de06aaa99f71800126bedcca6e623d368357),
 pinned in `crates/pg-source/Cargo.toml`. It supplies authentication, TLS extension
 points, PostgreSQL framing, binary COPY framing, and `CopyBothDuplex`. Our
 `PostgresSource` boundary owns protocol-2 transaction semantics; changing the
 transport need not change the journal, coordinator, or materializer.
-
-The [Supabase changelog](https://supabase.com/changelog) was checked for relevant
-changes. Product auth, Data API, and dashboard changes do not alter this choice.
 
 ## Standards that determine behavior
 
@@ -51,11 +32,10 @@ changes. Product auth, Data API, and dashboard changes do not alter this choice.
   the server's WAL end is not proof of local receipt, durability, or publication.
   A requested replay LSN is not an ACK proof either. Automatic keepalive replies
   remain at zero until the coordinator supplies verified watermarks.
-* [Debezium's PostgreSQL TOAST discussion](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-toasted-values):
-  fetching missing values through a separate query races with concurrent source
-  writes. Mutable capture requires FULL identity. pgoutput can still mark new
-  tuple fields unchanged; capture reconstructs them only from the validated
-  complete old tuple carried by the same update. Missing, malformed, key-only,
+* TOAST reconstruction: fetching missing values through a separate query races
+  with concurrent source writes. Mutable capture requires FULL identity. pgoutput
+  can still mark new tuple fields unchanged; capture reconstructs them only from
+  the validated complete old tuple carried by the same update. Missing, malformed, key-only,
   or incomplete old tuples stop capture. No current-row query or placeholder is
   used.
 
@@ -207,11 +187,6 @@ over missing transactions, or removes an existing source snapshot.
   message-size check. A pathological single very large row is therefore bounded
   by PostgreSQL/transport limits before our smaller application limit rejects it;
   the current implementation does not claim a strict transport allocation cap.
-
-No Moonlink implementation code was used. Moonlink's architectural comparison
-belongs to the project design references; capture and journal behavior here is
-derived from PostgreSQL's protocol contracts and permissively licensed source
-interfaces.
 
 Journal terminal kind 5 and source-ledger envelope `FLLEDG03` persist these
 counts. Readers explicitly decode older terminal kinds 2 and 4 and ledger
