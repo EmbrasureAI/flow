@@ -362,3 +362,222 @@ async fn guarded_io_rejects_footer_and_coalescing_span_before_fetching() -> Resu
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn missing_size_statistics_coalesce_before_index_lookups_with_physical_positions()
+-> Result<()> {
+    use flow_iceberg_ext::{RowDeltaAction, SnapshotView};
+    use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation};
+    use flow_state_store::{RowIndex, StateStore, StateStoreOptions};
+    use iceberg::{
+        Catalog, CatalogBuilder, NamespaceIdent, TableCreation,
+        memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
+        spec::{DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Struct},
+    };
+    use std::{
+        collections::{BTreeSet, HashMap},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    struct CountIndex {
+        calls: AtomicUsize,
+    }
+    impl RowIndex for CountIndex {
+        fn lookup_many(
+            &self,
+            _: &TableId,
+            keys: &[PrimaryKey],
+        ) -> flow_state_store::Result<Vec<Option<RowLocation>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![None; keys.len()])
+        }
+        fn file_rows<'a>(
+            &'a self,
+            _: &TableId,
+            _: &FileId,
+        ) -> impl Iterator<Item = flow_state_store::Result<(u64, PrimaryKey)>> + Send + 'a {
+            std::iter::empty()
+        }
+    }
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("plain.parquet");
+    let schema = schema(&[ColumnType::Int64, ColumnType::String], &[1, 2]);
+    let rows: Vec<Row> = (0..64)
+        .map(|id| {
+            vec![
+                Value::Int64(id),
+                Value::String(format!("{id:04}{}", "x".repeat(1020))),
+            ]
+        })
+        .collect();
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_compression(Compression::UNCOMPRESSED)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(&path)?,
+        arrow_schema(&schema),
+        Some(properties),
+    )?;
+    writer.write(&rows_to_batch(&schema, &rows)?)?;
+    writer.close()?;
+    remove_decoded_size_statistics(&path)?;
+    let limits = ReadLimits {
+        batch_bytes: 150_000,
+        ..Default::default()
+    };
+    let mut decoder_batches = 0;
+    read_batches(
+        &FileIO::new_with_fs(),
+        path.to_str().unwrap(),
+        None,
+        16,
+        &limits,
+        async |_| {
+            decoder_batches += 1;
+            Ok(())
+        },
+    )
+    .await?;
+    assert!(
+        decoder_batches >= 32,
+        "fixture must force conservative batches of at most two rows"
+    );
+    let catalog = MemoryCatalogBuilder::default()
+        .load(
+            "coalesce",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://coalesce".into())]),
+        )
+        .await?;
+    let ns = NamespaceIdent::new("test".into());
+    catalog.create_namespace(&ns, HashMap::new()).await?;
+    let table = catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name("rows".into())
+                .schema(flow_materializer::iceberg_schema(&schema)?)
+                .format_version(FormatVersion::V2)
+                .build(),
+        )
+        .await?;
+    let data_path = format!("{}/data/plain.parquet", table.metadata().location());
+    let bytes = std::fs::read(path)?;
+    table
+        .file_io()
+        .new_output(&data_path)?
+        .write(bytes.clone().into())
+        .await?;
+    let file = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(data_path.clone())
+        .file_format(DataFileFormat::Parquet)
+        .partition(Struct::empty())
+        .file_size_in_bytes(bytes.len() as u64)
+        .record_count(rows.len() as u64)
+        .build()?;
+    let committed = RowDeltaAction::new(&table, "plain")
+        .add_data_files(vec![file])
+        .commit(&catalog, &table)
+        .await?;
+    let deleted = [3, 17];
+    let mut delete_writer = flow_materializer::DeleteWriter::new(
+        committed.table.file_io().clone(),
+        committed.table.metadata().location(),
+        &OperationId("deletes".into()),
+        0,
+        flow_materializer::WriterConfig::default(),
+    )?;
+    let locations = deleted
+        .iter()
+        .map(|position| RowLocation {
+            data_file_id: FileId(data_path.clone()),
+            row_position: *position,
+            data_sequence_number: committed.sequence_number,
+            spec_id: 0,
+            partition: vec![],
+            source_commit_lsn: PgLsn(1),
+            row_version: 1,
+            row_fingerprint: [0; 16],
+        })
+        .collect::<Vec<_>>();
+    delete_writer.write(&locations).await?;
+    let delete_files = delete_writer.close().await?;
+    let committed = RowDeltaAction::new(&committed.table, "deletes")
+        .add_delete_files(delete_files)
+        .validate_data_files_exist([data_path.clone()])
+        .commit(&catalog, &committed.table)
+        .await?;
+    let view = SnapshotView::current(&committed.table).await?;
+    let scratch = StateStore::open(
+        directory.path().join("scratch"),
+        StateStoreOptions {
+            apply_batch_rows: 64,
+            ..Default::default()
+        },
+    )?;
+    for (scan_id, batch_rows, byte_limit, expected_calls) in
+        [("rows", 16, 150_000, 4), ("bytes", 64, 68_000, 2)]
+    {
+        let limits = ReadLimits {
+            batch_bytes: byte_limit,
+            ..Default::default()
+        };
+        let index = CountIndex {
+            calls: AtomicUsize::new(0),
+        };
+        let mut actual = Vec::new();
+        let mut positions = Vec::new();
+        crate::worker::scan_live_files(
+            &committed.table,
+            &schema,
+            &view,
+            &BTreeSet::from([FileId(data_path.clone())]),
+            &scratch,
+            scan_id,
+            batch_rows,
+            &limits,
+            async |batch| {
+                assert!(batch.rows.len() <= batch_rows);
+                let owned: usize = batch
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        std::mem::size_of::<Row>()
+                            + 8
+                            + row.capacity() * std::mem::size_of::<Value>()
+                            + match &row[1] {
+                                Value::String(s) => s.capacity(),
+                                _ => 0,
+                            }
+                    })
+                    .sum();
+                assert!(owned as u64 <= limits.batch_bytes);
+                let keys = batch
+                    .rows
+                    .iter()
+                    .map(|row| schema.encode_key(row))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                index.lookup_many(&schema.table_id, &keys)?;
+                actual.extend(batch.rows);
+                positions.extend(batch.positions);
+                Ok(())
+            },
+        )
+        .await?;
+        assert_eq!(index.calls.load(Ordering::Relaxed), expected_calls);
+        assert_eq!(
+            actual,
+            rows.iter()
+                .cloned()
+                .enumerate()
+                .filter(|(i, _)| !deleted.contains(&(*i as u64)))
+                .map(|(_, row)| row)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            positions,
+            (0..64).filter(|i| !deleted.contains(i)).collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}

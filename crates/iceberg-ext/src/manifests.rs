@@ -109,6 +109,7 @@ impl RewriteManifestsAction {
             });
             let mut group = Vec::new();
             let mut group_bytes = 0_u64;
+            let mut group_entries = 0_u64;
             for manifest in candidates {
                 if manifest.partition_spec_id != base.spec_id {
                     return Err(invalid(
@@ -130,27 +131,37 @@ impl RewriteManifestsAction {
                 if bytes >= policy.target_bytes {
                     continue;
                 }
+                if group_bytes.saturating_add(bytes) > policy.target_bytes {
+                    if group.len() > 1 {
+                        groups.push(std::mem::take(&mut group));
+                    } else {
+                        input_count -= group.len();
+                        input_bytes -= group_bytes;
+                        input_entries -= group_entries;
+                        group.clear();
+                    }
+                    group_bytes = 0;
+                    group_entries = 0;
+                }
                 if input_count == policy.max_input_manifests
                     || input_bytes.saturating_add(bytes) > policy.max_input_bytes
                     || input_entries.saturating_add(entries) > policy.max_input_entries
                 {
                     break;
                 }
-                if group_bytes.saturating_add(bytes) > policy.target_bytes {
-                    if group.len() > 1 {
-                        groups.push(std::mem::take(&mut group));
-                    }
-                    group.clear();
-                    group_bytes = 0;
-                }
                 group.push(manifest.manifest_path.clone());
                 group_bytes += bytes;
+                group_entries += entries;
                 input_count += 1;
                 input_bytes += bytes;
                 input_entries += entries;
             }
             if group.len() > 1 {
                 groups.push(group);
+            } else {
+                input_count -= group.len();
+                input_bytes -= group_bytes;
+                input_entries -= group_entries;
             }
         }
         if groups.is_empty() {

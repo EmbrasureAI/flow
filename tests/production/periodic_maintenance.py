@@ -23,7 +23,7 @@ class PeriodicRun(FairnessRun):
         super().__init__(args)
         text = self.config.read_text().replace("pending_transactions = 16", "pending_transactions = 4")
         text = text.replace("table_workers = 2", f"table_workers = {args.table_workers}")
-        text = text.replace("snapshot_retention_secs = 3600", "snapshot_retention_secs = 2\n"
+        text = text.replace("snapshot_retention_secs = 3600", "snapshot_retention_secs = 2\nsnapshot_expiration = true\n"
                             "manifest_max_count = 4\ngarbage_interval_secs = 1\norphan_grace_secs = 1\n"
                             "checkpoint_interval_secs = 2\nretained_checkpoints = 2")
         # The finite backlog exceeds the 128-snapshot history trigger. Native

@@ -338,7 +338,9 @@ impl StateStore {
         } else {
             0
         };
-        validate_operation_records(&db)?;
+        // Legacy adoption must preserve readable control records even when
+        // the old row/delta encoding needs rebuilding after authority import.
+        validate_operation_records(&db, !authority_import)?;
         Ok(Self(Arc::new(Inner {
             db,
             writer: Mutex::new(()),
@@ -390,35 +392,7 @@ impl StateStore {
         if record.phase == OperationPhase::Building {
             return Err(Error::InvalidState("delta is not sealed".into()));
         }
-        let mut prefix = operation_prefix(id);
-        prefix.push(0);
-        let cf = self.0.db.cf_handle(DELTAS).expect("opened column family");
-        let mut options = ReadOptions::default();
-        options.fill_cache(false);
-        if let Some(end) = prefix_end(&prefix) {
-            options.set_iterate_upper_bound(end);
-        }
-        let mut records = self.0.db.raw_iterator_cf_opt(&cf, options);
-        records.seek(&prefix);
-        let mut finished = false;
-        Ok(std::iter::from_fn(move || {
-            if finished {
-                return None;
-            }
-            let Some((key, value)) = records.item() else {
-                finished = true;
-                return records.status().err().map(|error| Err(error.into()));
-            };
-            if !key.starts_with(&prefix) {
-                finished = true;
-                return None;
-            }
-            // Decode while the iterator owns the bytes; advancing is safe once
-            // the returned delta owns its fields, without copying key or value.
-            let delta = decode(value);
-            records.next();
-            Some(delta)
-        }))
+        Ok(sealed_deltas(&self.0.db, &record))
     }
 
     pub fn table_state(&self, table: &TableId) -> Result<TableState> {
@@ -1101,8 +1075,8 @@ impl StateStore {
         Ok(())
     }
 
-    /// Verify that every stored key and value is readable with checksum verification.
-    /// This does not establish semantic consistency or catalog authority.
+    /// Verify stored checksums, operation records, and active sealed delta coverage.
+    /// This does not establish catalog authority or full row-index consistency.
     pub fn validate_storage(&self) -> Result<()> {
         let read_options = || {
             let mut options = ReadOptions::default();
@@ -1124,7 +1098,7 @@ impl StateStore {
                 entry?;
             }
         }
-        Ok(())
+        validate_operation_records(&self.0.db, true)
     }
 
     fn require_operation(&self, id: &OperationId) -> Result<OperationRecord> {
@@ -1234,16 +1208,86 @@ impl StateStore {
     }
 }
 
-fn validate_operation_records(db: &DB) -> Result<()> {
+fn validate_operation_records(db: &DB, validate_deltas: bool) -> Result<()> {
     let family = db.cf_handle(OPERATIONS).expect("opened column family");
     let mut options = ReadOptions::default();
     options.fill_cache(false);
     options.set_verify_checksums(true);
     for entry in db.iterator_cf_opt(&family, options, IteratorMode::Start) {
         let (key, value) = entry?;
-        decode_operation_record(&key, &value)?;
+        let record = decode_operation_record(&key, &value)?;
+        if validate_deltas
+            && matches!(
+                record.phase,
+                OperationPhase::Prepared | OperationPhase::Committed
+            )
+        {
+            for delta in sealed_deltas(db, &record) {
+                delta?;
+            }
+        }
     }
     Ok(())
+}
+
+// Share exact, bounded coverage checks between publication reads and startup.
+fn sealed_deltas<'a>(
+    db: &'a DB,
+    record: &OperationRecord,
+) -> impl Iterator<Item = Result<IndexDelta>> + 'a + use<'a> {
+    let mut prefix = operation_prefix(&record.operation.id);
+    prefix.push(0);
+    let mut expected = delta_key(&record.operation.id, 0);
+    let count = record.delta_count;
+    let may_be_pruned = record.phase == OperationPhase::Applied;
+    let cf = db.cf_handle(DELTAS).expect("opened column family");
+    let mut options = ReadOptions::default();
+    options.fill_cache(false);
+    options.set_verify_checksums(true);
+    if let Some(end) = prefix_end(&prefix) {
+        options.set_iterate_upper_bound(end);
+    }
+    let mut records = db.raw_iterator_cf_opt(&cf, options);
+    records.seek(&prefix);
+    let mut cursor = 0u64;
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        if finished {
+            return None;
+        }
+        let item = records.item().filter(|(key, _)| key.starts_with(&prefix));
+        let Some((key, value)) = item else {
+            finished = true;
+            if let Err(error) = records.status() {
+                return Some(Err(error.into()));
+            }
+            // Pruning removes the whole payload atomically after apply. A
+            // nonempty Applied stream must still contain every sealed ordinal.
+            return (cursor != count && !(may_be_pruned && cursor == 0)).then(|| {
+                Err(Error::RecoveryRequired(
+                    "sealed delta stream ended before its recorded count".into(),
+                ))
+            });
+        };
+        expected[prefix.len()..].copy_from_slice(&cursor.to_be_bytes());
+        if cursor >= count || key != expected {
+            finished = true;
+            return Some(Err(Error::RecoveryRequired(
+                "sealed delta ordinal is missing, malformed, or beyond its recorded count".into(),
+            )));
+        }
+        // The returned delta owns its fields before the raw iterator advances.
+        let delta = decode(value).map_err(|error| {
+            Error::RecoveryRequired(format!("sealed delta cannot be decoded: {error}"))
+        });
+        if delta.is_err() {
+            finished = true;
+        } else {
+            cursor += 1;
+            records.next();
+        }
+        Some(delta)
+    })
 }
 
 fn decode_operation_record(key: &[u8], value: &[u8]) -> Result<OperationRecord> {
@@ -1339,6 +1383,112 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damaged_sealed_deltas_fence_apply_copy_and_reopen() {
+        for damage in ["first", "middle", "tail", "malformed", "extra"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+            let id = OperationId("missing-delta".into());
+            let operation = PreparedOperation {
+                id: id.clone(),
+                table_id: TableId(7),
+                kind: OperationKind::Ingest,
+                base_snapshot_id: None,
+                last_lsn: PgLsn(10),
+                schema_version: 1,
+                artifacts: vec![],
+                payload: vec![],
+            };
+            let deltas = (0..3)
+                .map(|key| IndexDelta {
+                    key: PrimaryKey(vec![key]),
+                    expected: None,
+                    replacement: None,
+                })
+                .collect::<Vec<_>>();
+            store.prepare(operation.clone(), deltas.clone()).unwrap();
+            store.mark_committed(&id, 1, 1).unwrap();
+            let family = store.0.db.cf_handle(DELTAS).unwrap();
+            match damage {
+                "first" | "middle" | "tail" => {
+                    let ordinal = match damage {
+                        "first" => 0,
+                        "middle" => 1,
+                        _ => 2,
+                    };
+                    store
+                        .0
+                        .db
+                        .delete_cf(&family, delta_key(&id, ordinal))
+                        .unwrap();
+                }
+                "malformed" => {
+                    let mut key = delta_key(&id, 1);
+                    key.push(0);
+                    store
+                        .0
+                        .db
+                        .put_cf(&family, key, bincode::serialize(&deltas[1]).unwrap())
+                        .unwrap();
+                }
+                _ => store
+                    .0
+                    .db
+                    .put_cf(
+                        &family,
+                        delta_key(&id, 3),
+                        bincode::serialize(&deltas[2]).unwrap(),
+                    )
+                    .unwrap(),
+            }
+            let mut stream = store.prepared_deltas(&id).unwrap();
+            let error = stream.by_ref().collect::<Result<Vec<_>>>().unwrap_err();
+            assert!(error.requires_index_rebuild(), "{damage}: {error}");
+            assert!(stream.next().is_none());
+            drop(stream);
+            let mut copied = operation;
+            copied.id = OperationId("copy".into());
+            copied.table_id = TableId(8);
+            let error = store
+                .prepare_fallible(copied.clone(), store.prepared_deltas(&id).unwrap())
+                .unwrap_err();
+            assert!(error.requires_index_rebuild());
+            assert_eq!(
+                store.operation(&copied.id).unwrap().unwrap().phase,
+                OperationPhase::Building
+            );
+            // Apply detects missing or malformed ordinals before writing this
+            // batch. Extra suffixes are caught by the shared stream/open gate.
+            if damage != "extra" {
+                assert!(
+                    store
+                        .apply_committed(&id)
+                        .unwrap_err()
+                        .requires_index_rebuild()
+                );
+                assert_eq!(store.operation(&id).unwrap().unwrap().applied_count, 0);
+                assert_eq!(
+                    store.table_state(&TableId(7)).unwrap().pending_operation,
+                    Some(id.clone())
+                );
+                assert!(store.index_is_empty(&TableId(7)).unwrap());
+            }
+            assert!(
+                store
+                    .validate_storage()
+                    .unwrap_err()
+                    .requires_index_rebuild()
+            );
+            drop(family);
+            drop(store);
+            let error = match StateStore::open(directory.path(), StateStoreOptions::default()) {
+                Ok(_) => panic!("{damage} delta corruption was accepted on reopen"),
+                Err(error) => error,
+            };
+            assert!(error.requires_index_rebuild());
+        }
+    }
 
     #[test]
     fn index_rebuild_classifier_is_narrow() {

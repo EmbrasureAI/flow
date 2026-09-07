@@ -22,6 +22,13 @@ use tokio::sync::watch;
 const JOURNAL_GROUP_TRANSACTIONS: usize = 32;
 const JOURNAL_GROUP_BYTES: u64 = 4 << 20;
 const JOURNAL_GROUP_DELAY: Duration = Duration::from_millis(5);
+const SOURCE_SQL_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn source_deadline<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(SOURCE_SQL_TIMEOUT, operation)
+        .await
+        .context("PostgreSQL source operation timed out")?
+}
 
 fn spool_config(config: &Config) -> SpoolConfig {
     SpoolConfig {
@@ -102,6 +109,9 @@ pub(crate) async fn connect_owned(
         pg.replication_mode(ReplicationMode::Logical);
     }
     pg.application_name("embrasure-flow");
+    // Include the 25-byte XLogData envelope around one pgoutput message.
+    // The same admission cap protects binary COPY workers before allocation.
+    pg.max_backend_message_bytes(config.limits.source_message_bytes.saturating_add(25));
     pg.connect_timeout(Duration::from_secs(10));
     let tls = postgres_native_tls::MakeTlsConnector::new(native_tls::TlsConnector::new()?);
     let (client, connection) = tokio::time::timeout(Duration::from_secs(30), pg.connect(tls))
@@ -114,7 +124,10 @@ pub(crate) async fn connect_owned(
         }
     })));
     if !replication {
-        client.batch_execute("SET timezone = 'UTC'; SET datestyle = 'ISO, YMD'; SET bytea_output = 'hex'; SET extra_float_digits = 3").await?;
+        source_deadline(async {
+            client.batch_execute("SET timezone = 'UTC'; SET datestyle = 'ISO, YMD'; SET bytea_output = 'hex'; SET extra_float_digits = 3").await?;
+            Ok(())
+        }).await?;
     }
     Ok((client, connection))
 }
@@ -140,9 +153,9 @@ pub(crate) async fn capture_loop(
         loop {
             let connected = tokio::select! {
                 _ = send.closed() => return Ok(()),
-                result = connect(&config, true) => result,
+                result = connect_owned(&config, true) => result,
             };
-            let client = match connected {
+            let (client, replication_connection) = match connected {
                 Ok(client) => client,
                 Err(error) if retryable_connection(&error) => {
                     tracing::warn!(%error, "source reconnect pending");
@@ -152,9 +165,9 @@ pub(crate) async fn capture_loop(
                 }
                 Err(error) => return Err(error),
             };
-            let started: Result<(PgOutputSource, Client, Vec<TableSchema>)> = async {
+            let started = source_deadline(async {
                 verify_source_identity(&client, &config, false).await?;
-                let sql = connect(&config, false).await?;
+                let (sql, sql_connection) = connect_owned(&config, false).await?;
                 validate_slot(&sql, &config, journal.durable_lsn()).await?;
                 let effective_schemas = registry.initialize(&sql, &config.tables).await?;
                 validate_publication_membership(&sql, &config, &effective_schemas).await?;
@@ -167,13 +180,14 @@ pub(crate) async fn capture_loop(
                 )
                 .await?;
                 let initial_progress = *ack.borrow_and_update();
-                source.acknowledge(initial_progress).await?;
-                Ok((source, sql, effective_schemas))
-            }
+                acknowledge_and_reclaim(&mut source, &mut journal, initial_progress).await?;
+                Ok((source, sql, sql_connection, effective_schemas))
+            })
             .await;
-            let (mut source, sql, effective_schemas) = match started {
+            let (mut source, sql, sql_connection, effective_schemas) = match started {
                 Ok(source) => source,
                 Err(error) if retryable_connection(&error) => {
+                    drop(replication_connection);
                     tracing::warn!(%error, "source disconnected during replication setup");
                     tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
                     delay = (delay * 2).min(Duration::from_secs(30));
@@ -207,19 +221,19 @@ pub(crate) async fn capture_loop(
                         // Feedback covers an already durable prefix. Let the
                         // next group fill instead of sealing it for its own ACK.
                         let progress = *ack.borrow_and_update();
-                        match source.acknowledge(progress).await {
-                            Ok(()) => { journal.reclaim(progress.materialized)?; },
-                            Err(flow_pg_source::Error::Postgres(error)) if retryable_postgres(&error) => {
+                        match acknowledge_and_reclaim(&mut source, &mut journal, progress).await {
+                            Ok(()) => {},
+                            Err(error) if retryable_connection(&error) => {
                                 tracing::warn!(%error, "source feedback disconnected"); break;
                             }
-                            Err(error) => return Err(error.into()),
+                            Err(error) => return Err(error),
                         }
                     }
                     _ = feedback_tick.tick() => {
                         // Do not hold a validated group across SQL/network waits.
                         flush_capture(&mut assembler, &mut journal, &send)?;
                         group_deadline = None;
-                        if let Err(error) = registry.initialize(&sql, &config.tables).await {
+                        if let Err(error) = source_deadline(registry.initialize(&sql, &config.tables)).await {
                             if retryable_connection(&error) {
                                 tracing::warn!(%error, "source schema refresh interrupted; reconnecting");
                                 break;
@@ -229,12 +243,12 @@ pub(crate) async fn capture_loop(
                         // Feedback is independent of publication notifications;
                         // the journal quota bounds capture during a long backlog.
                         let progress = *ack.borrow();
-                        match source.acknowledge(progress).await {
+                        match acknowledge_and_reclaim(&mut source, &mut journal, progress).await {
                             Ok(()) => {},
-                            Err(flow_pg_source::Error::Postgres(error)) if retryable_postgres(&error) => {
+                            Err(error) if retryable_connection(&error) => {
                                 tracing::warn!(%error, "source heartbeat disconnected"); break;
                             }
-                            Err(error) => return Err(error.into()),
+                            Err(error) => return Err(error),
                         }
                     }
                     next = source.next() => {
@@ -250,7 +264,7 @@ pub(crate) async fn capture_loop(
                                         group_deadline = None;
                                     }
                                     let started = Instant::now();
-                                    let validated = registry.validate_commit(&sql, *xid, &mut assembler).await;
+                                    let validated = source_deadline(registry.validate_commit(&sql, *xid, &mut assembler)).await;
                                     metrics::histogram!(
                                         "flow_capture_phase_seconds",
                                         "phase" => "schema_validation",
@@ -286,6 +300,8 @@ pub(crate) async fn capture_loop(
             // Earlier validated commits survive a source disconnect. A partial
             // transaction stays in the disposable spool and is replayed.
             flush_capture(&mut assembler, &mut journal, &send)?;
+            drop(sql_connection);
+            drop(replication_connection);
             tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
         }
     };
@@ -301,6 +317,22 @@ pub(crate) async fn capture_loop(
             error: Some(format!("{error:#}")),
         });
     }
+    Ok(())
+}
+
+// Startup and later notifications must reclaim the same proven prefix before
+// capture can append more WAL, including when no new watch notification arrives.
+async fn acknowledge_and_reclaim(
+    source: &mut impl PostgresSource,
+    journal: &mut Journal,
+    progress: Acknowledgement,
+) -> Result<()> {
+    source_deadline(async {
+        source.acknowledge(progress).await?;
+        Ok(())
+    })
+    .await?;
+    journal.reclaim(progress.materialized)?;
     Ok(())
 }
 
@@ -350,6 +382,19 @@ fn flush_capture(
 }
 
 fn retryable_postgres(error: &flow_pg_source::tokio_postgres::Error) -> bool {
+    // Malformed or over-limit advertised frames cannot be repaired by replay.
+    // Treat transport admission failures as fatal rather than reconnecting to
+    // the same unprocessable row forever.
+    let mut cause = std::error::Error::source(error);
+    while let Some(error) = cause {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+        {
+            return false;
+        }
+        cause = error.source();
+    }
     // PostgreSQL sends ErrorResponse before closing an administratively stopped
     // connection. Retry those connection failures, not arbitrary SQL errors such
     // as authentication failures, missing slots, or invalid replication options.
@@ -523,4 +568,103 @@ async fn validate_publication_membership(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_ingress_journal::JournalConfig;
+    use flow_model::{SourceTransaction, TableId, TableMutationCount, TableSchemaVersion};
+
+    struct Feedback;
+    #[async_trait::async_trait]
+    impl PostgresSource for Feedback {
+        async fn next(&mut self) -> flow_pg_source::Result<Option<SourceEvent>> {
+            unreachable!()
+        }
+        async fn acknowledge(&mut self, _: Acknowledgement) -> flow_pg_source::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_initial_ack_reclaims_before_the_next_append_without_watch_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = JournalConfig {
+            segment_bytes: 600,
+            quota_bytes: 16_000,
+            max_frame_bytes: 400,
+            max_open_transactions: 8,
+        };
+        let (mut journal, _) = Journal::open(directory.path(), config.clone()).unwrap();
+        for xid in 1..=6 {
+            journal.append_chunk(xid, &[xid as u8; 300]).unwrap();
+            journal
+                .commit(SourceTransaction {
+                    source_id: SourceId("source".into()),
+                    xid,
+                    begin_lsn: PgLsn(u64::from(xid) * 10 - 2),
+                    commit_lsn: PgLsn(u64::from(xid) * 10),
+                    end_lsn: PgLsn(u64::from(xid) * 10 + 1),
+                    commit_timestamp_micros: 0,
+                    schema_versions: vec![TableSchemaVersion {
+                        table_id: TableId(1),
+                        version: 1,
+                    }],
+                    affected_tables: vec![TableId(1)],
+                    mutation_chunks: journal.transaction_chunks(xid),
+                    table_mutation_counts: Some(vec![TableMutationCount {
+                        table_id: TableId(1),
+                        mutations: 1,
+                    }]),
+                })
+                .unwrap();
+        }
+        config.quota_bytes = journal.bytes_used() + 128;
+        drop(journal);
+        let (mut journal, _) = Journal::open(directory.path(), config).unwrap();
+        assert!(matches!(
+            journal.append_chunk(7, &[7; 300]),
+            Err(flow_ingress_journal::Error::Quota { .. })
+        ));
+        let (_sender, mut ack) = watch::channel(Acknowledgement {
+            received: PgLsn(61),
+            durable: PgLsn(61),
+            materialized: PgLsn(41),
+        });
+        let progress = *ack.borrow_and_update();
+        acknowledge_and_reclaim(&mut Feedback, &mut journal, progress)
+            .await
+            .unwrap();
+        assert!(!ack.has_changed().unwrap());
+        assert_eq!(
+            journal
+                .transactions()
+                .iter()
+                .unwrap()
+                .map(|t| t.unwrap().xid)
+                .collect::<Vec<_>>(),
+            [5, 6]
+        );
+        journal.append_chunk(7, &[7; 300]).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_source_operation_is_retryable_and_its_owned_driver_is_cancelled() {
+        let (closed, observed) = tokio::sync::oneshot::channel::<()>();
+        let driver = tokio::spawn(async move {
+            let _closed = closed;
+            std::future::pending::<()>().await;
+        });
+        let connection = ConnectionTask(Some(driver));
+        let error = source_deadline(std::future::pending::<Result<()>>())
+            .await
+            .unwrap_err();
+        assert!(retryable_connection(&error));
+        drop(connection);
+        assert!(
+            observed.await.is_err(),
+            "driver must release resources on reconnect"
+        );
+    }
 }

@@ -3,7 +3,7 @@ use anyhow::{Result, bail, ensure};
 use arrow_array::{Array, Int64Array, StringArray};
 use flow_iceberg_ext::SnapshotView;
 use flow_materializer::{DataWriter, DeleteWriter, WriterConfig, rows_from_batch};
-use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema};
+use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value};
 use flow_state_store::{IndexDelta, OperationKind, PreparedOperation, RowIndex, StateStore};
 use iceberg::{io::FileIO, spec::DataFile, table::Table};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -490,6 +490,21 @@ pub struct LiveBatch {
     pub positions: Vec<u64>,
 }
 
+// Charge retained row slots and owned variable-width payloads, plus physical
+// positions. This bounds coalescing independently of conservative decoder batches.
+fn live_row_bytes(row: &Row) -> u64 {
+    let slots = std::mem::size_of::<Row>()
+        .saturating_add(std::mem::size_of::<u64>())
+        .saturating_add(row.capacity().saturating_mul(std::mem::size_of::<Value>()));
+    row.iter().fold(slots as u64, |bytes, value| {
+        bytes.saturating_add(match value {
+            Value::String(value) => value.capacity() as u64,
+            Value::Binary(value) => value.capacity() as u64,
+            _ => 0,
+        })
+    })
+}
+
 /// Shared scan path for compaction, external rewrite reconciliation, and full
 /// index reconstruction. Applies all applicable v2 position deletes before
 /// calling the visitor. The scratch namespace must be empty before first use.
@@ -554,6 +569,9 @@ async fn scan_staged_live_files(
             .transpose()?
             .map(|location| location.row_position);
         let mut position = 0u64;
+        let mut rows = Vec::new();
+        let mut positions = Vec::new();
+        let mut owned_bytes = 0u64;
         read_batches(
             table.file_io(),
             &file.0,
@@ -563,8 +581,6 @@ async fn scan_staged_live_files(
             async |batch| {
                 check_cancelled(cancelled)?;
                 let all_rows = rows_from_batch(schema, &batch)?;
-                let mut rows = Vec::with_capacity(all_rows.len());
-                let mut positions = Vec::with_capacity(all_rows.len());
                 for row in all_rows {
                     ensure!(
                         next_delete.is_none_or(|deleted| deleted >= position),
@@ -576,18 +592,29 @@ async fn scan_staged_live_files(
                             .transpose()?
                             .map(|location| location.row_position);
                     } else {
+                        let row_bytes = live_row_bytes(&row);
+                        ensure!(
+                            row_bytes <= read_limits.batch_bytes,
+                            "owned scan row exceeds batch byte limit"
+                        );
+                        if !rows.is_empty()
+                            && (rows.len() >= batch_rows
+                                || row_bytes > read_limits.batch_bytes - owned_bytes)
+                        {
+                            check_cancelled(cancelled)?;
+                            visit(LiveBatch {
+                                file_id: file.clone(),
+                                rows: std::mem::take(&mut rows),
+                                positions: std::mem::take(&mut positions),
+                            })
+                            .await?;
+                            owned_bytes = 0;
+                        }
+                        owned_bytes += row_bytes;
                         rows.push(row);
                         positions.push(position);
                     }
                     position += 1;
-                }
-                if !rows.is_empty() {
-                    visit(LiveBatch {
-                        file_id: file.clone(),
-                        rows,
-                        positions,
-                    })
-                    .await?;
                 }
                 Ok(())
             },
@@ -601,6 +628,15 @@ async fn scan_staged_live_files(
             position == view.live_files[&file.0].data_file.record_count(),
             "data file row count differs from metadata"
         );
+        if !rows.is_empty() {
+            check_cancelled(cancelled)?;
+            visit(LiveBatch {
+                file_id: file.clone(),
+                rows,
+                positions,
+            })
+            .await?;
+        }
     }
     Ok(())
 }

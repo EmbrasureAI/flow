@@ -134,7 +134,7 @@ the real in-memory catalog and Avro readers/writers, including the stale-worker
 regression, recovery markers, sequence inheritance, shared-delete safety,
 expired bases, schema changes, and branch-retention preservation. They do not
 replace the separately versioned [Spark/Trino/DuckDB and live-service
-qualification](production-qualification.md). Each report applies to its recorded
+qualification](development/production-qualification.md). Each report applies to its recorded
 binary; service qualification against the final release artifact remains required.
 
 ## Connected maintenance

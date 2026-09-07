@@ -29,7 +29,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
       - run: cargo test --locked --workspace --all-targets
-      - run: python3 -m unittest discover -s tests/production -p 'test_*.py' -v
+      - uses: astral-sh/setup-uv@v6
+      - name: Python fixture regressions
+        run: >-
+          uv run --with 'psycopg[binary]==3.3.5' --with 'duckdb==1.5.5'
+          --with 'boto3==1.43.88' --with 'fastavro==1.12.2'
+          python -m unittest discover -s tests/production -p 'test_*.py' -v
       - name: Reviewed distribution licenses
         run: |
           python3 -B -m unittest discover -s scripts -p test_license_policy.py -v

@@ -1,9 +1,10 @@
 # Vendored dependencies
 
-This directory contains Apache Iceberg Rust 0.10.1 and its REST catalog. The
-workspace uses them through `[patch.crates-io]` because the service needs changes
-not available through the released extension interfaces.
+This directory contains Apache Iceberg Rust 0.10.1, its REST catalog, and the
+pinned PostgreSQL transport. Cargo patches select these local copies for changes
+not available through their released extension interfaces.
 
+- [PostgreSQL transport changes](tokio-postgres/LOCAL_CHANGES.md)
 - [Iceberg changes](iceberg/LOCAL_CHANGES.md)
 - [REST catalog changes](iceberg-catalog-rest/LOCAL_CHANGES.md)
 - [Reference review and patch inventory](../docs/references-iceberg.md)

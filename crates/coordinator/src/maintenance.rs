@@ -398,6 +398,8 @@ impl TableMaintenance {
     /// Expire metadata snapshots after the reader window. No object deletion is
     /// performed. Call from the table actor and include any active worker bases
     /// or index checkpoints whose descendant history is still needed.
+    /// The caller must coordinate external reference creation and retention-policy
+    /// changes: REST assertions protect existing heads, not the entire reference set.
     pub async fn expire_history(
         &self,
         table: &Table,

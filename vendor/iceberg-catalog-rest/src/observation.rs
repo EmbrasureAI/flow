@@ -23,27 +23,20 @@ fn endpoint(request: &Request, oauth: bool) -> &'static str {
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
-    if parts.last() == Some(&"config") {
-        return "config";
-    }
-    if let Some(namespace) = parts.iter().rposition(|part| *part == "namespaces") {
-        return match &parts[namespace + 1..] {
-            [] => "namespaces",
-            [_] => "namespace",
-            [_, "properties"] => "namespace_properties",
-            [_, "tables"] => "tables",
-            [_, "tables", _] => "table",
-            [_, "tables", _, "metrics"] => "table_metrics",
-            [_, "register"] => "register_table",
-            _ => "other",
-        };
-    }
-    if parts.ends_with(&["tables", "rename"]) {
-        "rename_table"
-    } else if parts.ends_with(&["transactions", "commit"]) {
-        "commit_transaction"
-    } else {
-        "other"
+    // Match whole route suffixes, most specific first. Identifier segments
+    // must never be searched for structural words such as `namespaces`.
+    match parts.as_slice() {
+        [.., "namespaces", _, "tables", _, "metrics"] => "table_metrics",
+        [.., "namespaces", _, "tables", _] => "table",
+        [.., "namespaces", _, "properties"] => "namespace_properties",
+        [.., "namespaces", _, "tables"] => "tables",
+        [.., "namespaces", _, "register"] => "register_table",
+        [.., "tables", "rename"] => "rename_table",
+        [.., "transactions", "commit"] => "commit_transaction",
+        [.., "v1", "config"] => "config",
+        [.., "namespaces", _] => "namespace",
+        [.., "namespaces"] => "namespaces",
+        _ => "other",
     }
 }
 

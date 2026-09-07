@@ -3,7 +3,7 @@
 //! The index avoids rescanning large transaction payloads during acknowledgement
 //! and keeps retained-transaction memory proportional to segment count.
 
-use crate::frame::{decode_transaction, read_frame};
+use crate::frame::{HEADER, decode_transaction, read_frame};
 use crate::{Error, JournalReader, Result, segment_path};
 use flow_model::{JournalChunkRef, PgLsn, SourceTransaction};
 use std::{
@@ -182,6 +182,7 @@ struct CurrentSegment {
     id: u64,
     index: BufReader<File>,
     journal: BufReader<File>,
+    journal_offset: u64,
     remaining: u64,
 }
 pub struct TransactionIter {
@@ -220,6 +221,7 @@ impl TransactionIter {
                 64 << 10,
                 File::open(segment_path(&self.reader.root, id))?,
             ),
+            journal_offset: 0,
             remaining: segment.bytes / ENTRY_BYTES - low,
         });
         Ok(true)
@@ -243,11 +245,20 @@ impl TransactionIter {
             if record.end_lsn > self.through {
                 return Ok(None);
             }
-            current.journal.seek(SeekFrom::Start(record.offset))?;
+            let delta = i128::from(record.offset) - i128::from(current.journal_offset);
+            if let Ok(delta) = i64::try_from(delta) {
+                current.journal.seek_relative(delta)?;
+            } else {
+                current.journal.seek(SeekFrom::Start(record.offset))?;
+            }
             let frame = read_frame(&mut current.journal, self.reader.max_frame_bytes)?;
             if frame.payload.len() != record.length as usize {
                 return Err(Error::Corrupt);
             }
+            current.journal_offset = record
+                .offset
+                .checked_add(HEADER as u64 + frame.payload.len() as u64)
+                .ok_or(Error::Corrupt)?;
             let txn = decode_transaction(frame.kind, &frame.payload, self.reader.max_frame_bytes)?;
             if txn.xid != frame.xid
                 || txn.end_lsn != record.end_lsn
@@ -304,4 +315,60 @@ fn read_record(reader: &mut impl Read) -> Result<Record> {
         length: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
         first_segment: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Journal, JournalConfig};
+    use flow_model::{JournalChunks, SourceId};
+
+    #[test]
+    fn adjacent_terminals_reuse_read_ahead() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut journal, _) = Journal::open(directory.path(), JournalConfig::default()).unwrap();
+        for xid in 1..=1000 {
+            journal
+                .stage_commit(SourceTransaction {
+                    source_id: SourceId("buffered-terminals".into()),
+                    xid,
+                    begin_lsn: PgLsn(u64::from(xid)),
+                    commit_lsn: PgLsn(u64::from(xid)),
+                    end_lsn: PgLsn(u64::from(xid) + 1),
+                    commit_timestamp_micros: 0,
+                    affected_tables: vec![],
+                    schema_versions: vec![],
+                    mutation_chunks: JournalChunks::default(),
+                    table_mutation_counts: Some(vec![]),
+                })
+                .unwrap();
+        }
+        journal.flush_commits().unwrap();
+        let mut transactions = journal.reader().transactions_after(PgLsn(0)).unwrap();
+        assert_eq!(transactions.next().unwrap().unwrap().xid, 1);
+        let position = transactions
+            .current
+            .as_mut()
+            .unwrap()
+            .journal
+            .get_mut()
+            .stream_position()
+            .unwrap();
+        assert_eq!(position, 64 << 10);
+        for xid in 2..=100 {
+            assert_eq!(transactions.next().unwrap().unwrap().xid, xid);
+            assert_eq!(
+                transactions
+                    .current
+                    .as_mut()
+                    .unwrap()
+                    .journal
+                    .get_mut()
+                    .stream_position()
+                    .unwrap(),
+                position
+            );
+        }
+        assert_eq!(transactions.collect::<Result<Vec<_>>>().unwrap().len(), 900);
+    }
 }

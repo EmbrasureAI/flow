@@ -31,6 +31,9 @@ services:
       POSTGRES_USER: flow
       POSTGRES_PASSWORD: local-test-password
       POSTGRES_DB: flow
+      # Keep PG14–17 out of their nested anonymous /var/lib/postgresql/data volume.
+      # This default preserves existing PG18 fixture volumes.
+      PGDATA: ${FLOW_PRODUCTION_PGDATA:-/var/lib/postgresql/18/docker}
     ports: ["127.0.0.1:${FLOW_PRODUCTION_PG_PORT:?set a free PostgreSQL port}:5432"]
     volumes:
       - postgres:/var/lib/postgresql

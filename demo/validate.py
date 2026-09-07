@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
 import traceback
 
@@ -146,16 +147,31 @@ COMMIT;""")
             self.report["traceback"] = traceback.format_exc()
             raise
         finally:
+            failure_in_flight = sys.exc_info()[0] is not None
             if self.created:
-                logs = self.run([*self.compose, "logs", "--no-color"], check=False)
-                (self.directory / "compose.log").write_text(logs.stdout + logs.stderr)
-                (self.directory / "containers.json").write_text(self.run([*self.compose, "ps", "-a", "--format", "json"], check=False).stdout)
-                cleanup = self.run([*self.compose, "down", "--volumes", "--remove-orphans"], check=False)
-                (self.directory / "cleanup.log").write_text(cleanup.stdout + cleanup.stderr)
-                self.report["cleanup_exit_code"] = cleanup.returncode
-                if cleanup.returncode:
+                try:
+                    logs = self.run([*self.compose, "logs", "--no-color"], check=False)
+                    (self.directory / "compose.log").write_text(logs.stdout + logs.stderr)
+                    (self.directory / "containers.json").write_text(self.run([*self.compose, "ps", "-a", "--format", "json"], check=False).stdout)
+                except Exception as error:
+                    self.report["collection_error"] = str(error)
                     self.report["passed"] = False
-            write_json(self.directory / "report.json", self.report)
+                finally:
+                    try:
+                        cleanup = self.run([*self.compose, "down", "--volumes", "--remove-orphans"], check=False)
+                        self.report["cleanup_exit_code"] = cleanup.returncode
+                        if cleanup.returncode:
+                            self.report["passed"] = False
+                        (self.directory / "cleanup.log").write_text(cleanup.stdout + cleanup.stderr)
+                    except Exception as error:
+                        self.report["cleanup_error"] = str(error)
+                        self.report["passed"] = False
+            try:
+                write_json(self.directory / "report.json", self.report)
+            except OSError as error:
+                if not failure_in_flight:
+                    raise
+                print(f"Could not save failure report: {error}", file=sys.stderr)
 
 
 def main():

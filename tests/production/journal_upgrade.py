@@ -11,10 +11,13 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
+import subprocess
 import traceback
 
 from proxy import CatalogProxy
 from upgrade import UpgradeRun, dump, lsn
+from legacy_evidence import legacy_journal_evidence
 
 
 TABLES = ("orders", "accounts")
@@ -25,8 +28,8 @@ class JournalUpgradeRun(UpgradeRun):
         self.release_on_start = False
         super().__init__(args)
         self.report.pop("index_formats")
-        self.report["formats"] = {"journal_terminal": [4, 5], "ledger": ["FLLEDG02", "FLLEDG03"],
-                                  "index": "unchanged format 3"}
+        self.report["expected_formats"] = {"journal_terminal": [4, 5], "ledger": ["FLLEDG02", "FLLEDG03"],
+                                           "index": "unchanged format 3"}
         self.report["profile"] = {"roles": ["ingest", "coordinator"], "priority": "balanced",
                                   "oldest_l0_soft_ms": 3600000, "oldest_l0_hard_ms": 7200000}
         self.proxy = CatalogProxy(args.catalog_uri, self.directory / "catalog-proxy.jsonl")
@@ -141,6 +144,23 @@ class JournalUpgradeRun(UpgradeRun):
         self.stop(crash=True)
         assert old_process.returncode == -signal.SIGKILL
         assert not self.proxy.release_commits.is_set(), "held request escaped before the crash"
+        expected = {item["xid"]: lsn(item["end_lsn"]) for item in transactions}
+        journal = legacy_journal_evidence(self.directory / "state" / "journal", self.name, expected)
+        # Opening RocksDB may recover its WAL. Inspect an offline copy so format
+        # admission cannot alter the actual state handed to the new binary.
+        copied_control = self.directory / "legacy-control-evidence"
+        shutil.copytree(self.directory / "state" / "control", copied_control)
+        inspection = subprocess.run([str(self.args.ledger_inspector.resolve()), str(copied_control), self.name,
+                                     *map(str, expected.values())], capture_output=True, text=True, timeout=30)
+        (self.directory / "legacy-ledger-inspector.log").write_text(inspection.stdout + inspection.stderr)
+        inspection.check_returncode()
+        ledger = json.loads(inspection.stdout)
+        assert {(item["xid"], item["end_lsn"]) for item in ledger} == set(expected.items()), "ledger backlog identities differ"
+        assert all(item["format"] == "FLLEDG02" for item in ledger), \
+            "legacy-format precondition: expected FLLEDG02 backlog ledger entries"
+        evidence["observed_legacy_formats"] = {"journal": journal, "ledger": ledger}
+        self.report["formats"] = evidence["observed_legacy_formats"]
+        dump(self.directory / "report.json", self.report)
         self.args.binary, self.binary_digest = self.next_binary, self.next_digest
         self.report["binary"] = self.report["upgrade_binary"].copy()
         self.release_on_start = True
@@ -262,6 +282,8 @@ def main():
     parser.add_argument("--warehouse", default="s3://warehouse/")
     parser.add_argument("--previous-binary", type=Path, default=Path("target/qualification-binaries/embrasure-flow-release20"))
     parser.add_argument("--binary", type=Path, default=Path("target/qualification-binaries/embrasure-flow-release21"))
+    parser.add_argument("--ledger-inspector", type=Path, default=Path("target/debug/examples/inspect_legacy_ledger"),
+                        help="offline testkit example built with cargo build -p flow-testkit --example inspect_legacy_ledger")
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()

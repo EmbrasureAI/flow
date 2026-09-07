@@ -502,7 +502,20 @@ impl TablePublisher {
                 id.0
             ),
             OperationPhase::Applied => return Ok(record.snapshot_id),
-            OperationPhase::Committed => {}
+            OperationPhase::Committed => {
+                ensure!(
+                    record.operation.kind == OperationKind::Ingest,
+                    "rewrite recovery requires the rewrite coordinator"
+                );
+                resolve_ingest_catalog_operation(
+                    &record,
+                    self.catalog.as_ref(),
+                    table,
+                    self.manifest_cache.clone(),
+                    None,
+                )
+                .await?;
+            }
             OperationPhase::Prepared => {
                 ensure!(
                     record.operation.kind == OperationKind::Ingest,

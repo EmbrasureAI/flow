@@ -1,0 +1,413 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -6,17 +6,13 @@
+ license = "MIT OR Apache-2.0"
+ description = "A native, asynchronous PostgreSQL client"
+ repository = "https://github.com/rust-postgres/rust-postgres"
+-readme = "../README.md"
++readme = "README.md"
+ keywords = ["database", "postgres", "postgresql", "sql", "async"]
+ categories = ["database"]
+ rust-version = "1.85"
+ 
+ [lib]
+ test = false
+-
+-[[bench]]
+-name = "bench"
+-harness = false
+ 
+ [package.metadata.docs.rs]
+ all-features = true
+@@ -61,8 +57,8 @@
+ percent-encoding = "2.0"
+ pin-project-lite = "0.2.11"
+ phf = "0.13"
+-postgres-protocol = { version = "0.6.12", path = "../postgres-protocol" }
+-postgres-types = { version = "0.2.14", path = "../postgres-types" }
++postgres-protocol = { version = "0.6.12", git = "https://github.com/iambriccardo/rust-postgres", rev = "c4b8de06aaa99f71800126bedcca6e623d368357" }
++postgres-types = { version = "0.2.14", git = "https://github.com/iambriccardo/rust-postgres", rev = "c4b8de06aaa99f71800126bedcca6e623d368357" }
+ serde = { version = "1.0", features = ["derive"], optional = true }
+ tokio = { version = "1.27", features = ["io-util"] }
+ tokio-util = { version = "0.7", features = ["codec"] }
+@@ -72,34 +68,3 @@
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ socket2 = { version = "0.6", features = ["all"] }
+ 
+-[dev-dependencies]
+-futures-util = { version = "0.3", default-features = false, features = [
+-  "async-await-macro",
+-] }
+-futures-executor = "0.3"
+-criterion = "0.7"
+-env_logger = "0.11"
+-tokio = { version = "1.0", features = [
+-  "macros",
+-  "net",
+-  "rt",
+-  "rt-multi-thread",
+-  "time",
+-] }
+-
+-bit-vec-06 = { version = "0.6", package = "bit-vec" }
+-bit-vec-07 = { version = "0.7", package = "bit-vec" }
+-bit-vec-08 = { version = "0.8", package = "bit-vec" }
+-bit-vec-09 = { version = "0.9", package = "bit-vec" }
+-chrono-04 = { version = "0.4", package = "chrono", default-features = false }
+-eui48-1 = { version = "1.0", package = "eui48", default-features = false }
+-geo-types-06 = { version = "0.6", package = "geo-types" }
+-geo-types-07 = { version = "0.7", package = "geo-types" }
+-jiff-01 = { version = "0.1", package = "jiff" }
+-jiff-02 = { version = "0.2", package = "jiff" }
+-serde_json-1 = { version = "1.0", package = "serde_json" }
+-smol_str-01 = { version = "0.1", package = "smol_str" }
+-uuid-08 = { version = "0.8", package = "uuid" }
+-uuid-1 = { version = "1.0", package = "uuid" }
+-time-02 = { version = "0.2", package = "time" }
+-time-03 = { version = "0.3", package = "time", features = ["parsing"] }
+--- a/README.md
++++ b/README.md
+@@ -0,0 +1,34 @@
++# Materialize fork of Rust-Postgres
++
++This repo serves as a staging area for Materialize patches to the
++[rust-postgres] client before they are accepted upstream.
++
++There are no releases from this fork. The [MaterializeInc/materialize]
++repository simply pins a recent commit from the `master` branch. Other projects
++are welcome to do the same. The `master` branch is never force pushed. Upstream
++changes are periodically into `master` via `git merge`.
++
++## Adding a new patch
++
++Develop your patch against the master branch of the upstream [rust-postgres]
++project. Open a PR with your changes. If your PR is not merged quickly, open the
++same PR against this repository and request a review from a Materialize
++engineer.
++
++The long-term goal is to get every patch merged upstream.
++
++## Integrating upstream changes
++
++```shell
++git clone https://github.com/MaterializeInc/rust-postgres.git
++git remote add upstream https://github.com/sfackler/rust-postgres.git
++git checkout master
++git pull
++git checkout -b integrate-upstream
++git fetch upstream
++git merge upstream/master
++# Resolve any conflicts, then open a PR against this repository with the merge commit.
++```
++
++[rust-postgres]: https://github.com/sfackler/rust-postgres
++[MaterializeInc/materialize]: https://github.com/MaterializeInc/materialize
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -1,6 +1,6 @@
+ #[cfg(feature = "runtime")]
+ use crate::Socket;
+-use crate::codec::{BackendMessages, FrontendMessage};
++use crate::codec::{BackendMessageLimit, BackendMessages, FrontendMessage};
+ use crate::config::{SslMode, SslNegotiation};
+ use crate::connection::{Request, RequestMessages};
+ use crate::copy_both::{CopyBothDuplex, CopyBothReceiver};
+@@ -40,6 +40,7 @@
+ use tokio::io::{AsyncRead, AsyncWrite};
+ 
+ pub struct Responses {
++    message_limit: BackendMessageLimit,
+     receiver: mpsc::Receiver<BackendMessages>,
+     cur: BackendMessages,
+ }
+@@ -60,7 +61,7 @@
+ 
+             match ready!(self.receiver.poll_next_unpin(cx)) {
+                 Some(messages) => self.cur = messages,
+-                None => return Poll::Ready(Err(Error::closed())),
++                None => return Poll::Ready(Err(self.message_limit.closed_error())),
+             }
+         }
+     }
+@@ -102,6 +103,7 @@
+ }
+ 
+ pub struct InnerClient {
++    pub(crate) message_limit: BackendMessageLimit,
+     sender: mpsc::UnboundedSender<Request>,
+     cached_typeinfo: Mutex<CachedTypeInfo>,
+ 
+@@ -123,9 +125,10 @@
+         let request = Request { messages, sender };
+         self.sender
+             .unbounded_send(request)
+-            .map_err(|_| Error::closed())?;
++            .map_err(|_| self.message_limit.closed_error())?;
+ 
+         Ok(Responses {
++            message_limit: self.message_limit.clone(),
+             receiver,
+             cur: BackendMessages::empty(),
+         })
+@@ -137,6 +140,7 @@
+         let (sink_sender, sink_receiver) = mpsc::channel(16);
+ 
+         let responses = Responses {
++            message_limit: self.message_limit.clone(),
+             receiver,
+             cur: BackendMessages::empty(),
+         };
+@@ -149,7 +153,7 @@
+         let request = Request { messages, sender };
+         self.sender
+             .unbounded_send(request)
+-            .map_err(|_| Error::closed())?;
++            .map_err(|_| self.message_limit.closed_error())?;
+ 
+         Ok(CopyBothHandles {
+             stream_receiver,
+@@ -246,9 +250,11 @@
+         ssl_negotiation: SslNegotiation,
+         process_id: i32,
+         secret_key: i32,
++        message_limit: BackendMessageLimit,
+     ) -> Client {
+         Client {
+             inner: Arc::new(InnerClient {
++                message_limit,
+                 sender,
+                 cached_typeinfo: Default::default(),
+                 buffer: Default::default(),
+--- a/src/codec.rs
++++ b/src/codec.rs
+@@ -3,6 +3,10 @@
+ use postgres_protocol::message::backend;
+ use postgres_protocol::message::frontend::CopyData;
+ use std::io;
++use std::sync::{
++    Arc,
++    atomic::{AtomicBool, Ordering},
++};
+ use tokio_util::codec::{Decoder, Encoder};
+ 
+ pub enum FrontendMessage {
+@@ -35,7 +39,41 @@
+     }
+ }
+ 
+-pub struct PostgresCodec;
++// Connection errors normally reach the driver only. Preserve admission errors
++// for user response handles when dropping that driver closes their channels.
++#[derive(Clone, Default)]
++pub(crate) struct BackendMessageLimit(Arc<AtomicBool>);
++
++impl BackendMessageLimit {
++    pub(crate) fn exceeded(&self) -> bool {
++        self.0.load(Ordering::Relaxed)
++    }
++
++    fn error() -> io::Error {
++        io::Error::new(
++            io::ErrorKind::InvalidData,
++            "PostgreSQL backend message exceeds configured byte limit",
++        )
++    }
++
++    fn reject(&self) -> io::Error {
++        self.0.store(true, Ordering::Relaxed);
++        Self::error()
++    }
++
++    pub(crate) fn closed_error(&self) -> crate::Error {
++        if self.exceeded() {
++            crate::Error::io(Self::error())
++        } else {
++            crate::Error::closed()
++        }
++    }
++}
++
++pub struct PostgresCodec {
++    pub max_backend_message_bytes: Option<usize>,
++    pub(crate) message_limit: BackendMessageLimit,
++}
+ 
+ impl Encoder<FrontendMessage> for PostgresCodec {
+     type Error = io::Error;
+@@ -59,6 +97,13 @@
+         let mut request_complete = false;
+ 
+         while let Some(header) = backend::Header::parse(&src[idx..])? {
++            let payload_len = header.len() as usize - 4;
++            if self
++                .max_backend_message_bytes
++                .is_some_and(|limit| payload_len > limit)
++            {
++                return Err(self.message_limit.reject());
++            }
+             let len = header.len() as usize + 1;
+             if src[idx..].len() < len {
+                 break;
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -260,6 +260,7 @@
+     pub(crate) hostaddr: Vec<IpAddr>,
+     pub(crate) port: Vec<u16>,
+     pub(crate) connect_timeout: Option<Duration>,
++    pub(crate) max_backend_message_bytes: Option<usize>,
+     pub(crate) tcp_user_timeout: Option<Duration>,
+     pub(crate) keepalives: bool,
+     #[cfg(not(target_arch = "wasm32"))]
+@@ -294,6 +295,7 @@
+             hostaddr: vec![],
+             port: vec![],
+             connect_timeout: None,
++            max_backend_message_bytes: None,
+             tcp_user_timeout: None,
+             keepalives: true,
+             #[cfg(not(target_arch = "wasm32"))]
+@@ -504,6 +506,15 @@
+     /// Gets the ports that have been added to the configuration with `port`.
+     pub fn get_ports(&self) -> &[u16] {
+         &self.port
++    }
++
++    /// Limit each backend message payload, excluding its tag and four-byte length.
++    ///
++    /// Oversized advertised lengths fail the connection before the codec waits
++    /// for the payload. By default backend message sizes are not limited.
++    pub fn max_backend_message_bytes(&mut self, bytes: usize) -> &mut Config {
++        self.max_backend_message_bytes = Some(bytes);
++        self
+     }
+ 
+     /// Sets the timeout applied to socket-level connection attempts.
+@@ -923,6 +934,7 @@
+             .field("hostaddr", &self.hostaddr)
+             .field("port", &self.port)
+             .field("connect_timeout", &self.connect_timeout)
++            .field("max_backend_message_bytes", &self.max_backend_message_bytes)
+             .field("tcp_user_timeout", &self.tcp_user_timeout)
+             .field("keepalives", &self.keepalives);
+ 
+--- a/src/connect_raw.rs
++++ b/src/connect_raw.rs
+@@ -98,8 +98,15 @@
+     )
+     .await?;
+ 
++    let message_limit = crate::codec::BackendMessageLimit::default();
+     let mut stream = StartupStream {
+-        inner: Framed::new(stream, PostgresCodec),
++        inner: Framed::new(
++            stream,
++            PostgresCodec {
++                max_backend_message_bytes: config.max_backend_message_bytes,
++                message_limit: message_limit.clone(),
++            },
++        ),
+         buf: BackendMessages::empty(),
+         delayed: VecDeque::new(),
+     };
+@@ -120,6 +127,7 @@
+         config.ssl_negotiation,
+         process_id,
+         secret_key,
++        message_limit,
+     );
+     let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
+ 
+--- a/src/copy_both.rs
++++ b/src/copy_both.rs
+@@ -1,5 +1,5 @@
+ use crate::client::{InnerClient, Responses};
+-use crate::codec::FrontendMessage;
++use crate::codec::{BackendMessageLimit, FrontendMessage};
+ use crate::{Error, simple_query};
+ use bytes::{Buf, BufMut, Bytes, BytesMut};
+ use futures_channel::mpsc;
+@@ -252,6 +252,7 @@
+     /// }
+     /// ```
+     pub struct CopyBothDuplex<T> {
++        message_limit: BackendMessageLimit,
+         #[pin]
+         sink_sender: mpsc::Sender<FrontendMessage>,
+         #[pin]
+@@ -267,10 +268,12 @@
+     type Item = Result<Bytes, Error>;
+ 
+     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+-        Poll::Ready(match ready!(self.project().stream_receiver.poll_next(cx)) {
++        let this = self.project();
++        Poll::Ready(match ready!(this.stream_receiver.poll_next(cx)) {
+             Some(Ok(Message::CopyData(body))) => Some(Ok(body.into_bytes())),
+             Some(Ok(_)) => Some(Err(Error::unexpected_message())),
+             Some(Err(err)) => Some(Err(err)),
++            None if this.message_limit.exceeded() => Some(Err(this.message_limit.closed_error())),
+             None => None,
+         })
+     }
+@@ -283,10 +286,10 @@
+     type Error = Error;
+ 
+     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+-        self.project()
+-            .sink_sender
++        let this = self.project();
++        this.sink_sender
+             .poll_ready(cx)
+-            .map_err(|_| Error::closed())
++            .map_err(|_| this.message_limit.closed_error())
+     }
+ 
+     fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Error> {
+@@ -310,23 +313,26 @@
+         let data = CopyData::new(data).map_err(Error::encode)?;
+         this.sink_sender
+             .start_send(FrontendMessage::CopyData(data))
+-            .map_err(|_| Error::closed())
++            .map_err(|_| this.message_limit.closed_error())
+     }
+ 
+     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+         let mut this = self.project();
+ 
+         if !this.buf.is_empty() {
+-            ready!(this.sink_sender.as_mut().poll_ready(cx)).map_err(|_| Error::closed())?;
++            ready!(this.sink_sender.as_mut().poll_ready(cx))
++                .map_err(|_| this.message_limit.closed_error())?;
+             let data: Box<dyn Buf + Send> = Box::new(this.buf.split().freeze());
+             let data = CopyData::new(data).map_err(Error::encode)?;
+             this.sink_sender
+                 .as_mut()
+                 .start_send(FrontendMessage::CopyData(data))
+-                .map_err(|_| Error::closed())?;
++                .map_err(|_| this.message_limit.closed_error())?;
+         }
+ 
+-        this.sink_sender.poll_flush(cx).map_err(|_| Error::closed())
++        this.sink_sender
++            .poll_flush(cx)
++            .map_err(|_| this.message_limit.closed_error())
+     }
+ 
+     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+@@ -354,14 +360,16 @@
+         .sink_sender
+         .send(FrontendMessage::Raw(buf))
+         .await
+-        .map_err(|_| Error::closed())?;
++        .map_err(|_| client.message_limit.closed_error())?;
+ 
+     match handles.stream_receiver.next().await.transpose()? {
+         Some(Message::CopyBothResponse(_)) => {}
++        None if client.message_limit.exceeded() => return Err(client.message_limit.closed_error()),
+         _ => return Err(Error::unexpected_message()),
+     }
+ 
+     Ok(CopyBothDuplex {
++        message_limit: client.message_limit.clone(),
+         stream_receiver: handles.stream_receiver,
+         sink_sender: handles.sink_sender,
+         buf: BytesMut::new(),

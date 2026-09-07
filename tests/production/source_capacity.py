@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 import traceback
@@ -20,16 +21,26 @@ import psycopg
 from psycopg import sql
 
 from benchmark import Benchmark, micros
-from benchmark_store import BenchmarkStore, DenseKeys, PAGE_ROWS, write_array
+from benchmark_store import BenchmarkStore, DenseKeys, PAGE_ROWS, write_array, mutation_counts
+from process_lifecycle import arm_workload, disarm_workload, run_supervised, write_report
 from provenance import machine_identity, repository_identity, sha256_file
 
 
 class SourceCapacity(Benchmark):
     def __init__(self, args):
+        try:
+            self.initialize_source(args)
+        except BaseException as error:
+            if hasattr(self, "report"):
+                self.close_run(error)
+            raise
+
+    def initialize_source(self, args):
         # Deliberately bypass Run's daemon, object store and DuckDB initialization.
         self.args = args
         self.directory = args.artifacts.resolve()
         self.directory.mkdir(parents=True, exist_ok=False)
+        self.report = {"phases": [], "passed": False}
         self.name = "flow_source_" + uuid.uuid4().hex[:12]
         self.names = ["events_0"]
         self.errors = []
@@ -72,7 +83,7 @@ class SourceCapacity(Benchmark):
     def harness_hashes():
         directory = Path(__file__).resolve().parent
         return {name: sha256_file(directory / name) for name in (
-            "source_capacity.py", "benchmark.py", "benchmark_store.py", "provenance.py", "../local/run.py")}
+            "source_capacity.py", "benchmark.py", "benchmark_store.py", "process_lifecycle.py", "provenance.py", "../local/run.py")}
 
     def source_workload(self):
         args = self.args
@@ -93,6 +104,8 @@ class SourceCapacity(Benchmark):
         self.threads = [threading.Thread(target=self.writer, args=(worker, start_mono, start_us, scheduled))
                         for worker in range(args.writers)]
         deadline = start_mono + args.warmup + args.duration + args.timeout
+        write_report(self.directory / "report.json", self.report)
+        arm_workload(self.directory, deadline)
         failure = None
         try:
             for thread in self.threads:
@@ -110,6 +123,7 @@ class SourceCapacity(Benchmark):
         finally:
             try:
                 self.join_writers()
+                disarm_workload(self.directory)
             except BaseException as error:
                 if failure is None:
                     raise
@@ -133,12 +147,12 @@ class SourceCapacity(Benchmark):
                 connection.cancel_safe(timeout=5)
             except psycopg.Error as error:
                 self.report.setdefault("cleanup_errors", []).append(str(error))
-        deadline = time.monotonic() + 45
+        # The CLI supervisor enforces the armed workload deadline even if a
+        # native socket call or cancellation never returns. Keep owned key files
+        # and the recorder open until workers finish or that process is killed.
         for thread in self.threads:
             if thread.ident is not None:
-                thread.join(timeout=max(0, deadline - time.monotonic()))
-        if any(thread.is_alive() for thread in self.threads):
-            raise TimeoutError("source writer did not stop; key files and evidence remain open")
+                thread.join()
 
     def source_summary(self):
         self.store.flush()
@@ -207,8 +221,7 @@ class SourceCapacity(Benchmark):
                             owner = (key - 1) % self.args.writers
                             if key > self.args.initial_rows:
                                 origin, offset = divmod(key - self.args.initial_rows - 1, self.args.transaction_rows)
-                                if offset >= (self.args.transaction_rows - int(self.args.transaction_rows * .7)
-                                              - int(self.args.transaction_rows * .1) - 1) or version <= origin:
+                                if offset >= mutation_counts(self.args.profile, self.args.transaction_rows)[2] - 1 or version <= origin:
                                     raise AssertionError("inserted key has invalid origin or version")
                                 sequences.add(origin)
                                 owner = origin % self.args.writers
@@ -255,7 +268,10 @@ class SourceCapacity(Benchmark):
             self.report.update(failure=str(error), traceback=traceback.format_exc())
         finally:
             try:
-                self.join_writers()
+                try:
+                    self.join_writers()
+                except BaseException as error:
+                    cleanup_failed(error)
                 for pools in self.key_pools:
                     for keys in pools.values():
                         try:
@@ -281,11 +297,15 @@ class SourceCapacity(Benchmark):
                 cleanup_failed(error)
             finally:
                 try:
+                    self.store.close()
+                except BaseException as error:
+                    cleanup_failed(error)
+                try:
                     self.pg.close()
                 except BaseException as error:
                     cleanup_failed(error)
                 try:
-                    (self.directory / "report.json").write_text(json.dumps(self.report, indent=2) + '\n')
+                    write_report(self.directory / "report.json", self.report)
                 except BaseException as error:
                     cleanup_failed(error)
 
@@ -306,6 +326,9 @@ def main():
     parser.add_argument("--row-bytes", type=int, choices=(256, 1024, 16384), default=256)
     parser.add_argument("--max-start-delay-ms", type=float, default=250)
     parser.add_argument("--timeout", type=float, default=45)
+    parser.add_argument("--setup-timeout", type=float, default=600,
+                        help="finite setup/verification allowance in addition to workload budget")
+    parser.add_argument("--supervised-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=20260905)
     parser.set_defaults(tables=1, transaction_rows=100, profile="mixed", key_distribution="uniform", payload_entropy="repeated")
     args = parser.parse_args()
@@ -314,8 +337,15 @@ def main():
     if (args.rate <= 0 or args.duration <= 0 or args.warmup < 0 or args.timeout <= 0
             or args.max_start_delay_ms <= 0
             or args.initial_rows // args.writers < args.transaction_rows * .8
-            or not all(math.isfinite(v) for v in (args.duration, args.warmup, args.timeout, args.max_start_delay_ms))):
+            or not all(math.isfinite(v) for v in (args.duration, args.warmup, args.timeout, args.setup_timeout, args.max_start_delay_ms))):
         parser.error("positive finite workload limits and enough owned keys are required")
+    if args.setup_timeout <= 0:
+        parser.error("setup timeout must be positive")
+    if not args.supervised_worker:
+        completed = run_supervised([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:],
+                                    "--supervised-worker"], args.artifacts,
+                                   args.setup_timeout + args.warmup + args.duration + args.timeout)
+        raise SystemExit(completed.returncode)
     passed = SourceCapacity(args).execute()
     print(f"{'PASS' if passed else 'SOURCE CAPACITY NOT MET'}: {args.artifacts.resolve() / 'report.json'}", flush=True)
     raise SystemExit(0 if passed else 1)

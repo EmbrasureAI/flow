@@ -20,6 +20,8 @@ import uuid
 
 import psycopg
 from psycopg import sql
+from process_lifecycle import run_supervised, write_report
+from container_cleanup import cleanup_container
 
 
 IMAGE = "postgres:18.6-bookworm"
@@ -266,9 +268,33 @@ def comparisons(cases):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--supervised-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--container-name", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not args.supervised_worker:
+        if args.artifacts.exists():
+            raise FileExistsError(args.artifacts)
+        name = "flow-wal-" + uuid.uuid4().hex[:12]
+        result = None
+        try:
+            result = run_supervised([sys.executable, __file__, "--artifacts", str(args.artifacts),
+                                     "--supervised-worker", "--container-name", name], args.artifacts, args.timeout)
+        finally:
+            # Container ownership stays with the deadline owner, so even killing
+            # a worker blocked inside libpq cannot bypass fixture removal.
+            cleanup = cleanup_container(name)
+            cleanup_failed = not cleanup["passed"]
+            args.artifacts.mkdir(parents=True, exist_ok=True)
+            path = args.artifacts / "report.json"
+            report = json.loads(path.read_text()) if path.exists() else {"passed": False}
+            report["cleanup"] = cleanup
+            if cleanup_failed:
+                report["passed"] = False
+            write_report(path, report)
+        return result.returncode or int(cleanup_failed)
     args.artifacts.mkdir(parents=True, exist_ok=False)
-    name = "flow-wal-" + uuid.uuid4().hex[:12]
+    name = args.container_name
     password = uuid.uuid4().hex
     report = {"passed": False, "container": name, "cases": [], "references": REFERENCES,
               "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -288,13 +314,13 @@ def main():
                    "--env", "POSTGRES_DB=flow", IMAGE, "postgres"]
         for key, value in SETTINGS.items():
             command += ["-c", f"{key}={value}"]
-        container_id = subprocess.check_output(command, text=True).strip()
-        subprocess.run(["docker", "start", container_id], check=True, capture_output=True)
-        inspection = json.loads(subprocess.check_output(["docker", "inspect", container_id]))[0]
+        container_id = subprocess.check_output(command, text=True, timeout=60).strip()
+        subprocess.run(["docker", "start", container_id], check=True, capture_output=True, timeout=30)
+        inspection = json.loads(subprocess.check_output(["docker", "inspect", container_id], timeout=30))[0]
         report["image_id"] = inspection["Image"]
         port = inspection["NetworkSettings"]["Ports"]["5432/tcp"][0]["HostPort"]
         report["host_port"] = int(port)
-        dsn = f"postgres://flow:{password}@127.0.0.1:{port}/flow?connect_timeout=2"
+        dsn = f"postgres://flow:{password}@127.0.0.1:{port}/flow?connect_timeout=2&options=-c%20statement_timeout%3D30000"
         deadline = time.monotonic() + 60
         while True:
             try:
@@ -331,19 +357,18 @@ def main():
         report.update(error=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
     finally:
         if container_id:
-            if not report["passed"]:
-                with (args.artifacts / "failed-source.sql").open("wb") as source:
-                    dumped = subprocess.run(["docker", "exec", container_id, "pg_dump", "-U", "flow",
-                                             "-d", "flow", "--no-owner", "--no-privileges", "-t", "public.events"],
-                                            stdout=source, stderr=subprocess.PIPE)
-                report["failure_dump"] = {"returncode": dumped.returncode,
-                                          "stderr": dumped.stderr.decode(errors="replace")}
-            logs = subprocess.run(["docker", "logs", container_id], capture_output=True)
-            (args.artifacts / "postgres.log").write_bytes(logs.stdout + logs.stderr)
-            removed = subprocess.run(["docker", "rm", "--force", "--volumes", container_id], capture_output=True, text=True)
-            report["cleanup"] = {"container_id": container_id, "returncode": removed.returncode,
-                                 "stdout": removed.stdout, "stderr": removed.stderr}
-            if removed.returncode:
+            try:
+                if not report["passed"]:
+                    with (args.artifacts / "failed-source.sql").open("wb") as source:
+                        dumped = subprocess.run(["docker", "exec", container_id, "pg_dump", "-U", "flow",
+                                                 "-d", "flow", "--no-owner", "--no-privileges", "-t", "public.events"],
+                                                stdout=source, stderr=subprocess.PIPE, timeout=30)
+                    report["failure_dump"] = {"returncode": dumped.returncode,
+                                              "stderr": dumped.stderr.decode(errors="replace")}
+                logs = subprocess.run(["docker", "logs", container_id], capture_output=True, timeout=30)
+                (args.artifacts / "postgres.log").write_bytes(logs.stdout + logs.stderr)
+            except Exception as error:
+                report["collection_error"] = f"{type(error).__name__}: {error}"
                 report["passed"] = False
         save(args.artifacts / "report.json", report)
     print(f"{'PASS' if report['passed'] else 'FAIL'}: {args.artifacts / 'report.json'}")

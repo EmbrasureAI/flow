@@ -564,3 +564,29 @@ class BenchmarkStore:
                 self.closed = True
                 self.db.close()
             self.check()
+
+def mutation_counts(profile, rows):
+    updates = rows * {"mixed": 7, "update90": 9, "append": 0}[profile] // 10
+    deletes = rows // 10 if profile == "mixed" else 0
+    return updates, deletes, rows - updates - deletes  # includes one immutable probe
+
+
+def clock_assessment(before, after, max_uncertainty_us):
+    change = after["postgres_minus_client_us"] - before["postgres_minus_client_us"]
+    # The average correction can err by half the observed drift plus the worst
+    # endpoint's RTT/2. This bounds endpoint uncertainty, not arbitrary unseen
+    # excursions between samples, which remain an explicit protocol assumption.
+    uncertainty = abs(change) / 2 + max(before["roundtrip_us"], after["roundtrip_us"]) / 2
+    valid = (all(math.isfinite(v) for sample in (before, after) for v in
+                 (sample["postgres_minus_client_us"], sample["roundtrip_us"]))
+             and min(before["roundtrip_us"], after["roundtrip_us"]) >= 0
+             and uncertainty <= max_uncertainty_us)
+    return {"correction_us": (before["postgres_minus_client_us"] + after["postgres_minus_client_us"]) / 2,
+            "offset_change_us": change, "uncertainty_us": uncertainty,
+            "max_uncertainty_us": max_uncertainty_us, "latency_qualification_available": valid}
+
+
+def catalog_slo_met(percentiles, clock, p95_ms, p99_ms):
+    return clock["latency_qualification_available"] and all(
+        percentiles.get(name + "_ms", math.inf) + clock["uncertainty_us"] / 1000 < limit
+        for name, limit in (("p95", p95_ms), ("p99", p99_ms)))

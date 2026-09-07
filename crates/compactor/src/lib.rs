@@ -280,11 +280,12 @@ impl Policy {
         // Under delete pressure, retiring effective positions can remove more
         // residual files than another small L0 rewrite. Hard L0 limits retain
         // their existing ordering so reclamation cannot postpone that debt.
+        let hard_l0_debt = debt.l0_files >= self.l0_hard_files
+            || debt.l0_bytes >= self.l0_hard_bytes
+            || debt.oldest_l0_ms >= self.oldest_l0_hard_ms;
         let prioritize_reclamation = (deletes.len() >= self.delete_files_soft
             || debt.max_delete_files >= self.delete_files_soft)
-            && debt.l0_files < self.l0_hard_files
-            && debt.l0_bytes < self.l0_hard_bytes
-            && debt.oldest_l0_ms < self.oldest_l0_hard_ms;
+            && !hard_l0_debt;
         let mut eligible: Vec<_> = files
             .iter()
             .filter(|file| {
@@ -307,8 +308,9 @@ impl Policy {
             })
             .collect();
         eligible.sort_by(|a, b| {
-            needs_delete_rewrite(b)
-                .cmp(&needs_delete_rewrite(a))
+            (hard_l0_debt && b.level == Level::L0)
+                .cmp(&(hard_l0_debt && a.level == Level::L0))
+                .then_with(|| needs_delete_rewrite(b).cmp(&needs_delete_rewrite(a)))
                 .then_with(|| needs_small_file_rewrite(b).cmp(&needs_small_file_rewrite(a)))
                 .then_with(|| {
                     if prioritize_reclamation && needs_delete_rewrite(a) && needs_delete_rewrite(b)
@@ -400,7 +402,9 @@ impl Policy {
             if !limited {
                 selected.insert(seed.id.clone());
                 for file in companions.clone() {
-                    if selected.len() >= self.max_group_files || total >= target_file_bytes {
+                    if selected.len() >= self.max_group_files
+                        || total >= target_file_bytes && useful(selected.len(), total)
+                    {
                         break;
                     }
                     let Some(next_total) = total
@@ -441,7 +445,9 @@ impl Policy {
                 let mut count = 1;
                 let mut bytes = seed.size_bytes;
                 for file in companions {
-                    if count >= self.max_group_files || bytes >= target_file_bytes {
+                    if count >= self.max_group_files
+                        || bytes >= target_file_bytes && useful(count, bytes)
+                    {
                         break;
                     }
                     if let Some(next) = bytes

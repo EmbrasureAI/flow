@@ -49,6 +49,7 @@ enum PosDelState {
     /// Vectors remain scoped to their input delete file. Applicability to a
     /// data file was decided by the scan planner, including sequence numbers.
     Loaded(HashMap<String, DeleteVector>),
+    Failed(Arc<Error>),
 }
 
 #[derive(Debug)]
@@ -73,13 +74,55 @@ pub(crate) struct DeleteFilter {
 /// Action to take when trying to start loading a positional delete file
 pub(crate) enum PosDelLoadAction {
     /// The file is not loaded, the caller should load it.
-    Load,
+    Load(PosDelLoadGuard),
+    /// The previous owner failed or was cancelled.
+    Failed(Error),
     /// The file is already loaded, nothing to do.
     AlreadyLoaded,
     /// The file is currently being loaded by another task.
     /// The caller *must* wait for this notifier to ensure data availability
     /// before returning, as subsequent access (get_delete_vector) is synchronous.
     WaitFor(Pin<Box<OwnedNotified>>),
+}
+
+/// Owns a claimed positional load through opening, parsing and publication.
+/// Dropping a buffered future or cancelling its scan must also complete waiters.
+pub(crate) struct PosDelLoadGuard {
+    filter: DeleteFilter,
+    file_path: String,
+    finished: bool,
+}
+
+impl PosDelLoadGuard {
+    pub(crate) fn finish(mut self, vectors: HashMap<String, DeleteVector>) {
+        self.filter.finish_pos_del_load(&self.file_path, vectors);
+        self.finished = true;
+    }
+
+    pub(crate) fn fail(&mut self, error: Error) -> Error {
+        let error = Arc::new(error);
+        self.filter
+            .finish_pos_del_state(&self.file_path, PosDelState::Failed(error.clone()));
+        self.finished = true;
+        positional_load_error(error)
+    }
+}
+
+impl Drop for PosDelLoadGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.fail(Error::new(
+                ErrorKind::Unexpected,
+                "Positional delete load cancelled",
+            ));
+        }
+    }
+}
+
+fn positional_load_error(error: Arc<Error>) -> Error {
+    Error::new(error.kind(), "Positional delete load failed")
+        .with_retryable(error.retryable())
+        .with_source(error)
 }
 
 impl DeleteFilter {
@@ -157,6 +200,9 @@ impl DeleteFilter {
         if let Some(state) = state.positional_deletes.get(file_path) {
             match state {
                 PosDelState::Loaded(_) => return PosDelLoadAction::AlreadyLoaded,
+                PosDelState::Failed(error) => {
+                    return PosDelLoadAction::Failed(positional_load_error(error.clone()));
+                }
                 PosDelState::Loading(notify) => {
                     let mut notified = Box::pin(notify.clone().notified_owned());
                     // Register while holding the state lock so completion
@@ -172,7 +218,11 @@ impl DeleteFilter {
             .positional_deletes
             .insert(file_path.to_string(), PosDelState::Loading(notifier));
 
-        PosDelLoadAction::Load
+        PosDelLoadAction::Load(PosDelLoadGuard {
+            filter: self.clone(),
+            file_path: file_path.to_owned(),
+            finished: false,
+        })
     }
 
     /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
@@ -181,11 +231,15 @@ impl DeleteFilter {
         file_path: &str,
         vectors: HashMap<String, DeleteVector>,
     ) {
+        self.finish_pos_del_state(file_path, PosDelState::Loaded(vectors));
+    }
+
+    fn finish_pos_del_state(&self, file_path: &str, result: PosDelState) {
         let notify = {
             let mut state = self.state.write().unwrap();
             if let Some(PosDelState::Loading(notify)) = state
                 .positional_deletes
-                .insert(file_path.to_string(), PosDelState::Loaded(vectors))
+                .insert(file_path.to_string(), result)
             {
                 Some(notify)
             } else {

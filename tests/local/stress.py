@@ -13,10 +13,12 @@
 import argparse
 from collections import Counter
 import hashlib
+import math
 from pathlib import Path
 import os
 import random
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -25,6 +27,9 @@ import psycopg
 from psycopg import sql
 
 from run import Run, dump
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+from process_lifecycle import arm_workload, disarm_workload, run_supervised
 
 
 COHORT = 8
@@ -49,6 +54,8 @@ class Writers:
         self.stopping = False
         self.active = 0
         self.errors = []
+        self.connections = {}
+        self.cancel_requested = set()
         self.counts = [Counter() for _ in range(run.args.workers)]
         self.threads = [threading.Thread(target=self.write, args=(worker,), name=f"writer-{worker}")
                         for worker in range(run.args.workers)]
@@ -76,11 +83,29 @@ class Writers:
         with self.condition:
             self.stopping = True
             self.condition.notify_all()
+            connections = dict(self.connections)
+            self.cancel_requested.update(connections)
+        # Native socket calls can outlive their Python timeout. Keep a process
+        # deadline armed until every non-daemon writer has actually joined.
+        arm_workload(self.run.directory, time.monotonic() + 3 * len(connections) + 15)
+        cancellation_errors = []
+        for worker, connection in connections.items():
+            try:
+                connection.cancel_safe(timeout=3)
+            except psycopg.Error as error:
+                cancellation_errors.append({"worker": worker, "error": str(error)})
+        deadline = time.monotonic() + 10
         for thread in self.threads:
-            thread.join(timeout=30)
-            if thread.is_alive():
-                raise TimeoutError(f"{thread.name} did not stop")
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+        unjoined = [thread.name for thread in self.threads if thread.is_alive()]
+        shutdown = self.run.report.setdefault("writer_shutdown", {"cancellation_errors": []})
+        shutdown["cancellation_errors"].extend(cancellation_errors)
+        shutdown.update(joined=not unjoined, unjoined=unjoined)
+        if not unjoined:
+            disarm_workload(self.run.directory)
         self.check()
+        if unjoined:
+            raise TimeoutError(f"source writers did not stop: {unjoined}")
 
     def totals(self):
         with self.condition:
@@ -92,9 +117,14 @@ class Writers:
         first = base(worker)
         generation = 0
         try:
-            with psycopg.connect(self.run.args.postgres_url, autocommit=True) as pg:
+            with psycopg.connect(self.run.args.postgres_url, autocommit=True, connect_timeout=5,
+                                  options="-c statement_timeout=20000") as pg:
+                with self.condition:
+                    # stop() may have run while this connection was opening.
+                    if self.stopping:
+                        return
+                    self.connections[worker] = pg
                 pg.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(self.run.name)))
-                pg.execute("SET statement_timeout = '20s'")
                 while True:
                     with self.condition:
                         self.condition.wait_for(lambda: self.stopping or not self.paused)
@@ -164,9 +194,14 @@ class Writers:
                             self.active -= 1
                             self.condition.notify_all()
                     time.sleep(rng.uniform(0.25, 0.55))
-        except BaseException:
+        except BaseException as error:
             with self.condition:
-                self.errors.append(traceback.format_exc())
+                if not (worker in self.cancel_requested and isinstance(error, psycopg.errors.QueryCanceled)):
+                    self.errors.append(traceback.format_exc())
+                self.condition.notify_all()
+        finally:
+            with self.condition:
+                self.connections.pop(worker, None)
                 self.condition.notify_all()
 
 
@@ -354,10 +389,22 @@ class StressRun(Run):
             self.report["traceback"] = traceback.format_exc()
             raise
         finally:
+            original_failure = sys.exc_info()[1]
+            writer_cleanup_error = None
+            dump(self.directory / "report.json", self.report)
             try:
                 if self.writers is not None:
                     self.writers.stop()
+            except BaseException as error:
+                writer_cleanup_error = error
+                self.report["passed"] = False
+                self.report.setdefault("cleanup_errors", []).append(str(error))
+                self.report.setdefault("failure", str(error))
             finally:
+                # Bound compactor/daemon shutdown too, after successful writer
+                # join has disarmed its more specific deadline.
+                if self.writers is None or not any(thread.is_alive() for thread in self.writers.threads):
+                    arm_workload(self.directory, time.monotonic() + 60)
                 if self.compactor is not None:
                     self.compactor.terminate()
                     try:
@@ -370,6 +417,10 @@ class StressRun(Run):
                 dump(self.directory / "report.json", self.report)
                 self.pg.close()
                 self.duck.close()
+                if writer_cleanup_error is None:
+                    disarm_workload(self.directory)
+            if writer_cleanup_error is not None and original_failure is None:
+                raise writer_cleanup_error
 
 
 def main():
@@ -385,11 +436,17 @@ def main():
     parser.add_argument("--duration", type=float, default=120, help="active concurrent-writer seconds, excluding checkpoints")
     parser.add_argument("--seed", type=int, default=20260904)
     parser.add_argument("--workers", type=int, default=3)
+    parser.add_argument("--supervised-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not args.postgres_url:
         parser.error("provide --postgres-url or FLOW_POSTGRES_URL")
-    if args.workers < 1 or args.duration < 20:
-        parser.error("--workers must be positive and --duration must be at least 20 seconds")
+    if (args.workers < 1 or not math.isfinite(args.duration) or args.duration < 20
+            or not math.isfinite(args.timeout) or args.timeout <= 0):
+        parser.error("--workers and --timeout must be positive, --duration at least 20 seconds, and times finite")
+    if not args.supervised_worker:
+        result = run_supervised([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--supervised-worker"],
+                                args.artifacts, timeout=args.duration + 16 * args.timeout + 120)
+        raise SystemExit(result.returncode)
     StressRun(args).execute()
     print(f"PASS: {args.artifacts.resolve() / 'report.json'}", flush=True)
 

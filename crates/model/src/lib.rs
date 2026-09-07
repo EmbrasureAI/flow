@@ -3,7 +3,7 @@
 //! Timestamps are microseconds since the Unix epoch; dates are days since it.
 //! PostgreSQL's epoch conversion belongs at the source boundary.
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::HashSet, fmt};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -392,20 +392,23 @@ impl SourceTransaction {
     }
 
     pub fn validate_mutation_counts(&self) -> Result<(), ModelError> {
-        if let Some(counts) = &self.table_mutation_counts
-            && (counts.len() != self.affected_tables.len()
+        if let Some(counts) = &self.table_mutation_counts {
+            let affected: HashSet<_> = self.affected_tables.iter().copied().collect();
+            if counts.len() != self.affected_tables.len()
+                || affected.len() != self.affected_tables.len()
                 || counts
                     .windows(2)
                     .any(|pair| pair[0].table_id >= pair[1].table_id)
                 || counts
                     .iter()
-                    .any(|count| !self.affected_tables.contains(&count.table_id))
+                    .any(|count| !affected.contains(&count.table_id))
                 || counts
                     .iter()
                     .try_fold(0u64, |total, count| total.checked_add(count.mutations))
-                    .is_none())
-        {
-            return Err(ModelError::InvalidMutationCounts);
+                    .is_none()
+            {
+                return Err(ModelError::InvalidMutationCounts);
+            }
         }
         Ok(())
     }

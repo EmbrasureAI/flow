@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from provenance import sha256_file
+from process_lifecycle import run_supervised
 
 
 MODES = (
@@ -53,6 +54,7 @@ def main():
     parser.add_argument("--reader-baseline-compactor", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=60)
+    parser.add_argument("--setup-timeout", type=float, default=600)
     parser.add_argument("--warmup", type=float, default=10)
     parser.add_argument("--baseline-max-input-files", type=int, default=16384)
     parser.add_argument("--baseline-max-input-bytes", type=int, default=512 << 20)
@@ -68,6 +70,8 @@ def main():
             f"and at least {conservative_file_bound} baseline input files for this workload"
         )
 
+    if not all(math.isfinite(value) for value in (args.setup_timeout, args.duration, args.warmup)) or args.setup_timeout <= 0:
+        parser.error("setup timeout and workload durations must be finite, with positive setup timeout")
     args.artifacts.mkdir(parents=True, exist_ok=False)
     results = []
     benchmark = Path(__file__).with_name("benchmark.py")
@@ -94,6 +98,7 @@ def main():
                 "--artifacts", str(output),
                 "--duration", str(args.duration),
                 "--warmup", str(args.warmup),
+                "--setup-timeout", str(args.setup_timeout), "--supervised-worker",
                 "--rate", str(rate),
                 "--maintenance-mode", mode,
                 # Hold manifest rewrites constant to isolate data/delete maintenance.
@@ -101,7 +106,10 @@ def main():
             ]
             print(f"[{name}]", flush=True)
             with (args.artifacts / f"{name}.log").open("w") as log:
-                completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+                completed = run_supervised(command, output,
+                                           args.setup_timeout + args.warmup + args.duration + 360
+                                           + 2 * args.baseline_timeout,
+                                           stdout=log, stderr=subprocess.STDOUT)
             report_path = output / "report.json"
             report = json.loads(report_path.read_text()) if report_path.exists() else {}
             result = {

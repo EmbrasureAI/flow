@@ -311,6 +311,16 @@ impl SchemaRegistry {
 
 pub(crate) use flow_coordinator::latest_source_schema as latest_schema;
 
+/// Reload a target without adopting a replacement under the same catalog name.
+pub(crate) async fn refresh_table(catalog: &dyn Catalog, table: &Table) -> Result<Table> {
+    let refreshed = catalog.load_table(table.identifier()).await?;
+    ensure!(
+        refreshed.metadata().uuid() == table.metadata().uuid(),
+        "Iceberg target UUID changed; resynchronization is required"
+    );
+    Ok(refreshed)
+}
+
 /// Add only the exact nullable suffix, checking upstream-assigned field IDs.
 /// A lost response is resolved by reloading the exact resulting public schema.
 pub(crate) async fn ensure_table_schema(
@@ -351,13 +361,17 @@ pub(crate) async fn ensure_table_schema(
     let updated = match action.apply(transaction)?.commit(catalog).await {
         Ok(table) => table,
         Err(error) => {
-            let refreshed = catalog.load_table(table.identifier()).await?;
+            let refreshed = refresh_table(catalog, table).await?;
             if !same_iceberg_schema(refreshed.metadata().current_schema(), &expected) {
                 return Err(error.into());
             }
             refreshed
         }
     };
+    ensure!(
+        updated.metadata().uuid() == table.metadata().uuid(),
+        "Iceberg target UUID changed during schema update"
+    );
     ensure!(
         same_iceberg_schema(updated.metadata().current_schema(), &expected),
         "catalog schema differs from the validated source schema"
@@ -381,4 +395,93 @@ fn verify_storage(record: &SchemaRecord, metadata: &flow_pg_source::TableMetadat
         "source column was dropped or replaced; resynchronization is required"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod target_identity_tests {
+    use super::*;
+    use flow_model::{Column, ColumnType};
+    use iceberg::{
+        CatalogBuilder, NamespaceIdent, TableCreation,
+        memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
+        spec::FormatVersion,
+    };
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn replacement_schema_does_not_resolve_an_original_tables_failed_commit() {
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "identity",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://identity".into())]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("test".into());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let mut schema = TableSchema {
+            table_id: TableId(1),
+            version: 0,
+            columns: vec![Column {
+                field_id: 1,
+                name: "id".into(),
+                data_type: ColumnType::Int64,
+                nullable: false,
+            }],
+            primary_key: vec![0],
+            append_only: false,
+        };
+        let original = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("rows".into())
+                    .format_version(FormatVersion::V2)
+                    .schema(iceberg_schema(&schema).unwrap())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        schema.version = 1;
+        schema.columns.push(Column {
+            field_id: 2,
+            name: "value".into(),
+            data_type: ColumnType::String,
+            nullable: true,
+        });
+        catalog.drop_table(original.identifier()).await.unwrap();
+        let replacement = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("rows".into())
+                    .format_version(FormatVersion::V2)
+                    .schema(iceberg_schema(&schema).unwrap())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(replacement.metadata().uuid(), original.metadata().uuid());
+        assert!(
+            refresh_table(&catalog, &original)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("UUID changed")
+        );
+        // The replacement already has the expected schema, but is no proof of
+        // the failed original table's schema transaction.
+        assert!(
+            ensure_table_schema(&catalog, &original, &schema)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("UUID changed")
+        );
+        let after = catalog.load_table(original.identifier()).await.unwrap();
+        assert_eq!(after.metadata(), replacement.metadata());
+    }
 }

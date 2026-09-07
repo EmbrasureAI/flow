@@ -258,6 +258,8 @@ pub struct ParquetWriter {
 struct MinMaxColAggregator {
     lower_bounds: HashMap<i32, Datum>,
     upper_bounds: HashMap<i32, Datum>,
+    missing_lower: std::collections::HashSet<i32>,
+    missing_upper: std::collections::HashSet<i32>,
     schema: SchemaRef,
 }
 
@@ -267,6 +269,8 @@ impl MinMaxColAggregator {
         Self {
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
+            missing_lower: std::collections::HashSet::new(),
+            missing_upper: std::collections::HashSet::new(),
             schema,
         }
     }
@@ -311,6 +315,15 @@ impl MinMaxColAggregator {
             ));
         };
 
+        // A file bound must cover every non-null row group. Omitting an
+        // inexact group from aggregation can turn a safe predicate into a
+        // false negative, so omit the file bound instead.
+        if !value.min_is_exact() {
+            self.missing_lower.insert(field_id);
+        }
+        if !value.max_is_exact() {
+            self.missing_upper.insert(field_id);
+        }
         if value.min_is_exact() {
             let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, &value)? else {
                 return Err(Error::new(
@@ -337,7 +350,11 @@ impl MinMaxColAggregator {
     }
 
     /// Returns lower and upper bounds
-    fn produce(self) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
+    fn produce(mut self) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
+        self.lower_bounds
+            .retain(|field, _| !self.missing_lower.contains(field));
+        self.upper_bounds
+            .retain(|field, _| !self.missing_upper.contains(field));
         (self.lower_bounds, self.upper_bounds)
     }
 }
@@ -434,7 +451,14 @@ impl ParquetWriter {
                             *per_col_null_val_num.entry(field_id).or_insert(0) += null_count;
                         }
 
-                        min_max_agg.update(field_id, statistics.clone())?;
+                        if statistics.null_count_opt()
+                            != Some(column_chunk_metadata.num_values() as u64)
+                        {
+                            min_max_agg.update(field_id, statistics.clone())?;
+                        }
+                    } else {
+                        min_max_agg.missing_lower.insert(field_id);
+                        min_max_agg.missing_upper.insert(field_id);
                     }
                 }
             }
@@ -1059,9 +1083,10 @@ mod tests {
                 ordered,
             )
         }) as ArrayRef;
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col0, col1, col2, col3, col4, col5,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![col0, col1, col2, col3, col4, col5],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -1248,10 +1273,13 @@ mod tests {
                 .with_precision_and_scale(38, 5)
                 .unwrap(),
         ) as ArrayRef;
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12, col13,
-            col14, col15, col16,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12,
+                col13, col14, col15, col16,
+            ],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -1840,10 +1868,10 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            struct_float_field_col,
-            struct_nested_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![struct_float_field_col, struct_nested_float_field_col],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -1998,11 +2026,14 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            list_float_field_col,
-            struct_list_float_field_col,
-            // large_list_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                list_float_field_col,
+                struct_list_float_field_col,
+                // large_list_float_field_col,
+            ],
+        )
         .expect("Could not form record batch");
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2180,10 +2211,10 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            map_array,
-            struct_list_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![map_array, struct_list_float_field_col],
+        )
         .expect("Could not form record batch");
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),

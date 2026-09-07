@@ -120,3 +120,135 @@ async fn keepalive_cannot_ack_requested_replay_position_and_disconnect_reconnect
     }
     peer.await.unwrap();
 }
+
+// Send only an oversized advertised length. A post-delivery check would hang
+// waiting for the missing body; admission in the transport must fail promptly.
+async fn oversized_advertised_frame(replication: bool) {
+    use futures::StreamExt;
+    use std::time::Duration;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (admit, admitted) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let length = socket.read_u32().await.unwrap();
+        let mut startup = vec![0; (length - 4) as usize];
+        socket.read_exact(&mut startup).await.unwrap();
+        backend(&mut socket, b'R', &0u32.to_be_bytes()).await;
+        backend(&mut socket, b'S', b"client_encoding\0UTF8\0").await;
+        backend(&mut socket, b'S', b"server_version\x0018.0\0").await;
+        backend(&mut socket, b'Z', b"I").await;
+        let (tag, _) = frontend(&mut socket).await;
+        assert_eq!(tag, b'Q');
+        if replication {
+            backend(&mut socket, b'C', b"SET\0").await;
+            backend(&mut socket, b'Z', b"I").await;
+            let (tag, _) = frontend(&mut socket).await;
+            assert_eq!(tag, b'Q');
+        }
+        backend(
+            &mut socket,
+            if replication { b'W' } else { b'H' },
+            &[0, 0, 0],
+        )
+        .await;
+        let mut payload = BytesMut::new();
+        if replication {
+            payload.put_u8(b'w');
+            payload.put_u64(100);
+            payload.put_u64(100);
+            payload.put_i64(0);
+            payload.put_u8(b'B');
+            payload.put_u64(100);
+            payload.put_i64(0);
+            payload.put_u32(42);
+        } else {
+            payload.resize(46, b'x');
+        }
+        assert_eq!(payload.len(), 46);
+        backend(&mut socket, b'd', &payload).await;
+        admitted.await.unwrap();
+        socket.write_u8(b'd').await.unwrap();
+        socket.write_u32(1 << 30).await.unwrap();
+        // Keep the peer open until the client rejects the header and closes it.
+        let mut tail = Vec::new();
+        socket.read_to_end(&mut tail).await.unwrap();
+    });
+    let mut config = Config::new();
+    config
+        .host("127.0.0.1")
+        .port(port)
+        .user("source")
+        .dbname("source")
+        .ssl_mode(SslMode::Disable)
+        .max_backend_message_bytes(46);
+    if replication {
+        config.replication_mode(ReplicationMode::Logical);
+    }
+    let (client, connection) = config.connect(NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    if replication {
+        let mut source = PgOutputSource::start(&client, "slot", "publication", PgLsn(100), 21)
+            .await
+            .unwrap();
+        assert!(matches!(
+            source.next().await.unwrap(),
+            Some(SourceEvent::Begin { xid: 42, .. })
+        ));
+        admit.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), source.next())
+            .await
+            .unwrap()
+            .unwrap_err();
+        let flow_pg_source::Error::Postgres(error) = error else {
+            panic!("admission error must preserve transport InvalidData");
+        };
+        assert_admission_error(&error);
+        let error = source
+            .acknowledge(Acknowledgement::default())
+            .await
+            .unwrap_err();
+        let flow_pg_source::Error::Postgres(error) = error else {
+            panic!("feedback must preserve transport InvalidData too");
+        };
+        assert_admission_error(&error);
+    } else {
+        let stream = client
+            .copy_out_simple("COPY fixture TO STDOUT")
+            .await
+            .unwrap();
+        futures::pin_mut!(stream);
+        assert_eq!(stream.next().await.unwrap().unwrap().len(), 46);
+        admit.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_admission_error(&error);
+    }
+    let error = tokio::time::timeout(Duration::from_secs(2), driver)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_admission_error(&error);
+    peer.await.unwrap();
+}
+
+fn assert_admission_error(error: &flow_pg_source::tokio_postgres::Error) {
+    let cause = std::error::Error::source(error).unwrap();
+    let io = cause.downcast_ref::<std::io::Error>().unwrap();
+    assert_eq!(io.kind(), std::io::ErrorKind::InvalidData);
+    assert!(io.to_string().contains("exceeds configured byte limit"));
+}
+
+#[tokio::test]
+async fn copy_rejects_oversized_header_without_reading_body() {
+    oversized_advertised_frame(false).await;
+}
+
+#[tokio::test]
+async fn replication_rejects_oversized_header_without_reading_body() {
+    oversized_advertised_frame(true).await;
+}

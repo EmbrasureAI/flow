@@ -499,3 +499,64 @@ fn delete_pressure_prioritizes_effective_reclamation_unless_l0_is_hard_limited()
         );
     }
 }
+
+#[test]
+fn target_size_waits_for_minimum_group_even_under_hard_debt() {
+    let policy = Policy {
+        min_group_files: 8,
+        ..Default::default()
+    };
+    let files = (0..32)
+        .map(|id| {
+            let mut candidate = file(id, 120 << 20);
+            candidate.level = Level::L1;
+            candidate.age_ms = 24 * 60 * 60 * 1000;
+            candidate
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        policy.debt(&files).unwrap().pressure,
+        PublicationPressure::Pause
+    );
+    let plan = policy.plan(4, 1, &files, &[]).unwrap().unwrap();
+    assert_eq!(plan.input_files.len(), 8);
+    assert_eq!(plan.input_bytes, 960 << 20);
+    let deletes = files
+        .iter()
+        .map(|file| DeleteDependency {
+            id: FileId(format!("delete-{}", file.id.0)),
+            size_bytes: 1,
+            row_count: 1,
+            targets: BTreeSet::from([file.id.clone()]),
+        })
+        .collect::<Vec<_>>();
+    let limited = Policy {
+        max_delete_input_files: 1,
+        ..policy
+    };
+    assert!(matches!(
+        limited.plan(4, 1, &files, &deletes),
+        Err(Error::DependencyBudget)
+    ));
+}
+
+#[test]
+fn hard_l0_relief_precedes_dense_stable_rewrites() {
+    let policy = Policy::default();
+    let mut files = (0..32).map(|id| file(id, 1 << 20)).collect::<Vec<_>>();
+    let l0 = files
+        .iter()
+        .map(|file| file.id.clone())
+        .collect::<BTreeSet<_>>();
+    for id in 32..40 {
+        let mut stable = file(id, 512 << 20);
+        stable.level = Level::L2;
+        stable.deleted_rows = 80;
+        files.push(stable);
+    }
+    let plan = policy.plan(4, 1, &files, &[]).unwrap().unwrap();
+    assert_eq!(plan.input_files, l0);
+    assert_eq!(plan.output_level, Level::L1);
+    files.reverse();
+    assert_eq!(policy.plan(4, 1, &files, &[]).unwrap().unwrap(), plan);
+}

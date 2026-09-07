@@ -10,7 +10,11 @@ are retained.
 - Upstream tree: `crates/iceberg`
 
 Exposes the typed table-commit builder, snapshot-reference accessors, and explicit
-snapshot-retention protection. Changed files: `src/catalog/mod.rs`,
+snapshot-retention protection. Protection takes precedence over explicit head
+validation. Expiration asserts every observed reference to detect concurrent head
+moves/removals and replan. These REST requirements are not metadata CAS: callers
+must exclude concurrent reference creation and retention-policy mutations through
+catalog permissions or coordination. Changed files: `src/catalog/mod.rs`,
 `src/spec/table_metadata.rs`, `src/transaction/expire_snapshots.rs`.
 
 The separate reader correctness patch scopes cached delete vectors to each input
@@ -19,13 +23,25 @@ checks cached membership, unions borrowed bitmaps without cloning each vector,
 publishes loaded position vectors atomically, and registers completion notification
 while holding the loader state lock. This prevents cross-file delete leakage and
 a missed wakeup when a concurrent load completes before the waiter is polled.
+Claimed positional loads own a completion guard that publishes terminal failure
+on I/O/parse errors or cancellation; waiters recheck that result before proceeding.
+The returned receiver also bounds the spawned loader's lifetime, cancelling its
+buffered work when the scan drops it.
 Changed files: `src/arrow/delete_filter.rs`,
 `src/arrow/caching_delete_file_loader.rs`, `src/delete_vector.rs`.
 
 The separate Parquet writer patch exposes `flush_row_group()` without closing the
 file. Callers can bound logical input bytes before appending another batch,
-independently of the writer's encoded-size estimate. Changed file:
+independently of the writer's encoded-size estimate. File statistics omit a bound
+when any non-null row group has missing or inexact statistics; short exact groups
+cannot mask longer values in truncated groups. Existing files must be rewritten
+to correct previously published bounds. Changed file:
 `src/writer/file_writer/parquet_writer.rs`.
+
+The separate UUID schema patch preserves Arrow UUID extension metadata and
+recognizes it when converting Arrow schemas back to Iceberg, including list
+elements, map keys/values and struct children. Changed file:
+`src/arrow/schema.rs`. See `docs/patches/iceberg-uuid.patch`.
 
 From an extracted crate, apply these repository patches (use absolute patch paths):
 
@@ -33,6 +49,7 @@ From an extracted crate, apply these repository patches (use absolute patch path
 patch -p1 < docs/patches/iceberg-table-commit.patch
 patch -p1 < docs/patches/iceberg-delete-cache.patch
 patch -p1 < docs/patches/iceberg-parquet-row-group.patch
+patch -p1 < docs/patches/iceberg-uuid.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is

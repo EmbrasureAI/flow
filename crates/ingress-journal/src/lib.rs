@@ -90,6 +90,10 @@ pub enum Error {
         "unsupported journal record kind {0}; use a compatible binary without modifying this journal"
     )]
     RecordKind(u8),
+    #[error(
+        "stored journal frame has {length} bytes, exceeding configured limit {limit}; increase the frame limit to reopen this journal"
+    )]
+    FrameLimit { length: u32, limit: u32 },
     #[error("journal frame is corrupt")]
     Corrupt,
     #[error("journal writer experienced an IO failure; reopen it to resolve the durable prefix")]
@@ -184,7 +188,7 @@ impl Journal {
     pub fn open(path: impl AsRef<Path>, config: JournalConfig) -> Result<(Self, Recovery)> {
         config.validate()?;
         let root = path.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
+        create_dir_all_durable(&root, &mut sync_dir)?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -230,7 +234,11 @@ impl Journal {
                     Err(Error::Io(e)) if e.kind() != io::ErrorKind::UnexpectedEof => {
                         return Err(e.into());
                     }
-                    Err(error @ (Error::Version(_) | Error::RecordKind(_))) => return Err(error),
+                    Err(
+                        error @ (Error::Version(_)
+                        | Error::RecordKind(_)
+                        | Error::FrameLimit { .. }),
+                    ) => return Err(error),
                     Err(_) => {
                         damaged = true;
                         break;
@@ -676,7 +684,10 @@ impl Journal {
                 + HEADER as u64 * (self.pending.len() as u64 + 2)
                 + transactions::ENTRY_BYTES
         } else {
-            0
+            // A terminal releases its own pending-XID reserve, but must leave
+            // enough room to abort every other orphan during recovery.
+            HEADER as u64
+                * (self.pending.len() - usize::from(self.pending.contains_key(&xid))) as u64
         };
         if self
             .bytes
@@ -736,6 +747,43 @@ impl Journal {
 fn segment_path(root: &Path, id: u64) -> PathBuf {
     root.join(format!("{id:020}.segment"))
 }
+// Persist each new directory's entry in its parent before creating descendants.
+fn create_dir_all_durable(
+    path: &Path,
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            // A previous attempt may have created this entry but failed its
+            // parent barrier. Existing paths must retry that barrier too.
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            return sync(parent);
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "journal path is not a directory",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_dir_all_durable(parent, sync)?;
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+        Err(error) => return Err(error),
+    }
+    sync(parent)
+}
+
 fn sync_dir(root: &Path) -> io::Result<()> {
     File::open(root)?.sync_all()
 }
@@ -794,6 +842,63 @@ fn write_checkpoint(root: &Path, lsn: PgLsn) -> Result<()> {
 mod sync_failure_tests {
     use super::*;
     use flow_model::SourceId;
+
+    #[test]
+    fn new_nested_directories_sync_each_parent_and_propagate_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let nested = first.join("journal");
+        let mut synced = Vec::new();
+        create_dir_all_durable(&nested, &mut |path| {
+            // The child entry exists at its parent barrier; descendants have
+            // not yet been created at the outer barrier.
+            if path == root.path() {
+                assert!(first.is_dir());
+                assert!(!nested.exists());
+            } else if path == first {
+                assert!(nested.is_dir());
+            }
+            sync_dir(path)?;
+            synced.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            &synced[synced.len() - 2..],
+            [root.path().to_path_buf(), first]
+        );
+        let failed = root.path().join("failed");
+        assert!(
+            create_dir_all_durable(&failed.join("journal"), &mut |path| {
+                if path == root.path() {
+                    Err(io::Error::other("directory sync failed"))
+                } else {
+                    sync_dir(path)
+                }
+            })
+            .is_err()
+        );
+        assert!(failed.is_dir());
+        assert!(!failed.join("journal").exists());
+        let mut retry = Vec::new();
+        create_dir_all_durable(&failed.join("journal"), &mut |path| {
+            sync_dir(path)?;
+            retry.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            retry.contains(&root.path().to_path_buf()),
+            "retry must persist the existing parent entry"
+        );
+        let mut existing = Vec::new();
+        create_dir_all_durable(&failed.join("journal"), &mut |path| {
+            existing.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(existing, [failed]);
+    }
 
     #[test]
     fn failed_group_sync_keeps_reader_frontier_private_and_poisoned_until_reopen() {

@@ -3,10 +3,13 @@
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
+
+from process_lifecycle import run_supervised
 
 
 CASES = {
@@ -37,6 +40,7 @@ def main():
     parser.add_argument("--reader-baseline-compactor", type=Path)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=60)
+    parser.add_argument("--setup-timeout", type=float, default=600)
     parser.add_argument("--warmup", type=float, default=10)
     parser.add_argument("--case", choices=CASES, action="append")
     args = parser.parse_args()
@@ -45,6 +49,8 @@ def main():
         parser.error("provide PostgreSQL URL, positive duration and nonnegative warmup")
     if "external-compactor-1k" in selected and args.compactor_binary is None:
         parser.error("--compactor-binary is required for external-compactor-1k")
+    if not all(math.isfinite(value) for value in (args.setup_timeout, args.duration, args.warmup)) or args.setup_timeout <= 0:
+        parser.error("setup timeout and workload durations must be finite, with positive setup timeout")
     args.artifacts.mkdir(parents=True, exist_ok=False)
     results = []
     for name in selected:
@@ -54,14 +60,18 @@ def main():
                    "--s3-endpoint", args.s3_endpoint, "--binary", str(args.binary),
                    "--build-manifest", str(args.build_manifest),
                    "--artifacts", str(directory), "--duration", str(args.duration),
-                   "--warmup", str(args.warmup), *CASES[name]]
+                   "--warmup", str(args.warmup), "--setup-timeout", str(args.setup_timeout),
+                   "--supervised-worker", *CASES[name]]
         if name == "external-compactor-1k":
             command += ["--compactor-binary", str(args.compactor_binary)]
         if args.reader_baseline_compactor:
             command += ["--reader-baseline-compactor", str(args.reader_baseline_compactor)]
         print(f"[{name}]", flush=True)
         with (args.artifacts / f"{name}.log").open("w") as output:
-            completed = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT)
+            completed = run_supervised(command, directory,
+                                       args.setup_timeout + args.warmup + args.duration + 360
+                                       + (360 if args.reader_baseline_compactor else 0),
+                                       stdout=output, stderr=subprocess.STDOUT)
         path = directory / "report.json"
         report = json.loads(path.read_text()) if path.exists() else {}
         results.append({"case": name, "exit_code": completed.returncode,

@@ -74,10 +74,14 @@ pub fn arrow_schema(schema: &TableSchema) -> SchemaRef {
                         DataType::Decimal128(precision, scale as i8)
                     }
                 };
-                Field::new(&col.name, kind, col.nullable).with_metadata(HashMap::from([(
-                    PARQUET_FIELD_ID_META_KEY.into(),
-                    col.field_id.to_string(),
-                )]))
+                let field = Field::new(&col.name, kind, col.nullable).with_metadata(HashMap::from(
+                    [(PARQUET_FIELD_ID_META_KEY.into(), col.field_id.to_string())],
+                ));
+                if col.data_type == ColumnType::Uuid {
+                    field.with_extension_type(arrow_schema::extension::Uuid)
+                } else {
+                    field
+                }
             })
             .collect::<Vec<_>>(),
     ))
@@ -178,6 +182,31 @@ pub fn rows_from_batch(schema: &TableSchema, batch: &RecordBatch) -> Result<Vec<
             None => bail!("scan lacks required Iceberg field {}", col.field_id),
         };
         let array = batch.column(index);
+        let compatible = match (&col.data_type, array.data_type()) {
+            (ColumnType::Bool, DataType::Boolean)
+            | (ColumnType::Int32, DataType::Int32)
+            | (ColumnType::Int64, DataType::Int64)
+            | (ColumnType::Float64, DataType::Float64)
+            | (ColumnType::String, DataType::Utf8)
+            | (ColumnType::Binary, DataType::Binary | DataType::LargeBinary)
+            | (ColumnType::Date, DataType::Date32)
+            | (ColumnType::Uuid, DataType::FixedSizeBinary(16))
+            | (ColumnType::TimestampMicros, DataType::Timestamp(TimeUnit::Microsecond, None))
+            | (
+                ColumnType::TimestampTzMicros,
+                DataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+            ) => true,
+            (ColumnType::Decimal { scale, .. }, DataType::Decimal128(_, actual_scale)) => {
+                i8::try_from(*scale).ok() == Some(*actual_scale)
+            }
+            _ => false,
+        };
+        ensure!(
+            compatible,
+            "scan type mismatch for {}: {:?}",
+            col.name,
+            array.data_type()
+        );
         for (i, row) in rows.iter_mut().enumerate() {
             if array.is_null(i) {
                 ensure!(col.nullable, "null in required field {}", col.name);
@@ -244,4 +273,84 @@ pub fn rows_from_batch(schema: &TableSchema, batch: &RecordBatch) -> Result<Vec<
         }
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_model::{Column, TableId};
+
+    #[test]
+    fn scan_rejects_decimal_scale_and_timestamp_timezone_mismatches_including_nulls() {
+        let types = [
+            (
+                ColumnType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                DataType::Decimal128(10, 1),
+            ),
+            (
+                ColumnType::TimestampMicros,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            (
+                ColumnType::TimestampTzMicros,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+        ];
+        for (expected, actual) in types {
+            let schema = TableSchema {
+                table_id: TableId(1),
+                version: 0,
+                columns: vec![Column {
+                    field_id: 1,
+                    name: "value".into(),
+                    data_type: expected.clone(),
+                    nullable: true,
+                }],
+                primary_key: vec![],
+                append_only: true,
+            };
+            for is_null in [false, true] {
+                let array: ArrayRef = match actual {
+                    DataType::Decimal128(p, s) => Arc::new(
+                        Decimal128Array::from(vec![(!is_null).then_some(123)])
+                            .with_precision_and_scale(p, s)
+                            .unwrap(),
+                    ),
+                    DataType::Timestamp(_, ref tz) => Arc::new(
+                        TimestampMicrosecondArray::from(vec![(!is_null).then_some(123)])
+                            .with_timezone_opt(tz.clone()),
+                    ),
+                    _ => unreachable!(),
+                };
+                let field = arrow_schema(&schema)
+                    .field(0)
+                    .clone()
+                    .with_data_type(actual.clone());
+                let batch =
+                    RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
+                assert!(rows_from_batch(&schema, &batch).is_err());
+                let value = if is_null {
+                    Value::Null
+                } else {
+                    match expected {
+                        ColumnType::Decimal { scale, .. } => Value::Decimal {
+                            unscaled: 123,
+                            scale,
+                        },
+                        ColumnType::TimestampMicros => Value::TimestampMicros(123),
+                        ColumnType::TimestampTzMicros => Value::TimestampTzMicros(123),
+                        _ => unreachable!(),
+                    }
+                };
+                let rows = vec![vec![value]];
+                assert_eq!(
+                    rows_from_batch(&schema, &rows_to_batch(&schema, &rows).unwrap()).unwrap(),
+                    rows
+                );
+            }
+        }
+    }
 }

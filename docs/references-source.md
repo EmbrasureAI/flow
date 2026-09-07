@@ -4,7 +4,7 @@
 
 The PostgreSQL transport is the MIT/Apache-2.0 rust-postgres fork at
 [`c4b8de06aaa99f71800126bedcca6e623d368357`](https://github.com/iambriccardo/rust-postgres/tree/c4b8de06aaa99f71800126bedcca6e623d368357),
-pinned in `crates/pg-source/Cargo.toml`. It supplies authentication, TLS extension
+pinned in `crates/pg-source/Cargo.toml` with a [local frame-admission patch](../vendor/tokio-postgres/LOCAL_CHANGES.md). It supplies authentication, TLS extension
 points, PostgreSQL framing, binary COPY framing, and `CopyBothDuplex`. Our
 `PostgresSource` boundary owns protocol-2 transaction semantics; changing the
 transport need not change the journal, coordinator, or materializer.
@@ -159,8 +159,12 @@ over missing transactions, or removes an existing source snapshot.
   dates/timestamps and special numeric values fail closed. No decimal float
   conversion or silent rounding is used.
 * Snapshot copy uses the verified current publication projection. Publication row
-  filters, incompatible DDL and TRUNCATE are unsupported and must be rejected during
-  setup/operation. A failed initial-copy slot is retained for operator diagnosis.
+  filters are rejected at setup/reconnect. Keep publication membership, published
+  operations and column/filter settings fixed from slot creation through capture;
+  pgoutput can omit changes after publication DDL without notifying the consumer.
+  A contract violation requires coordinated resynchronization, even if the settings
+  are restored. Incompatible table DDL and received TRUNCATE stop capture.
+  A failed initial-copy slot is retained for operator diagnosis.
   Publication must include TRUNCATE messages so such a source operation pauses
   capture rather than disappearing silently.
 * The daemon persists an `IDENTIFY_SYSTEM` proof before initial copy and verifies
@@ -183,10 +187,11 @@ over missing transactions, or removes an existing source snapshot.
   additional local write bandwidth to make aborted-subtransaction filtering and
   durable terminal ownership simple. Revisit bypassing spool for ordinary small
   transactions only after profiling shows this path is material.
-* The transport receives a complete PostgreSQL message before our application
-  message-size check. A pathological single very large row is therefore bounded
-  by PostgreSQL/transport limits before our smaller application limit rejects it;
-  the current implementation does not claim a strict transport allocation cap.
+* All source connections reject an oversized advertised PostgreSQL frame after
+  reading its header, before buffering the complete payload. This applies to COPY
+  and replication traffic; the transport allowance includes protocol overhead.
+  Decoded logical messages and retained chunks have separate admission checks.
+  These limits bound individual frames and batches, not total process memory.
 
 Journal terminal kind 5 and source-ledger envelope `FLLEDG03` persist these
 counts. Readers explicitly decode older terminal kinds 2 and 4 and ledger

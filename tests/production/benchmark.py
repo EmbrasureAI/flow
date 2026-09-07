@@ -30,12 +30,14 @@ import psycopg
 from psycopg import sql
 
 from reader_compare import compare_snapshots
-from benchmark_store import BenchmarkStore, DenseKeys, LATENCIES, PAGE_ROWS, QUEUE_ITEMS, bounded_lines, zipf_sample
+from benchmark_store import (BenchmarkStore, DenseKeys, LATENCIES, PAGE_ROWS, QUEUE_ITEMS,
+                             bounded_lines, zipf_sample, mutation_counts, clock_assessment, catalog_slo_met)
+from process_lifecycle import arm_workload, disarm_workload, run_supervised, write_report
 from provenance import load_build_manifest, machine_identity, repository_identity, sha256_file, verified_binary
 from reconciliation import scan_reconciliation_events
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
-from run import Run, dump, lsn  # noqa: E402
+from run import Run, lsn  # noqa: E402
 
 
 def micros():
@@ -43,6 +45,63 @@ def micros():
 
 
 class Benchmark(Run):
+    def __init__(self, args):
+        try:
+            super().__init__(args)
+        except BaseException as error:
+            # Run may fail before configure(), or configure may have already
+            # acquired a recorder. Only touch a directory this run created.
+            if hasattr(self, "report"):
+                self.close_run(error)
+            raise
+
+    def phase(self, name, action):
+        self.report["active_phase"] = name
+        write_report(self.directory / "report.json", self.report)
+        started = time.monotonic()
+        print(f"[{name}]", flush=True)
+        details = action()
+        self.report["phases"].append({"name": name, "seconds": round(time.monotonic() - started, 3), "details": details})
+        self.report.pop("active_phase")
+        write_report(self.directory / "report.json", self.report)
+
+    def close_run(self, failure=None):
+        if failure is not None:
+            self.report.update(passed=False, failure=str(failure))
+            self.report.setdefault("traceback", traceback.format_exc())
+        actions = []
+        if getattr(self, "compactor", None) is not None:
+            actions.append(("compactor", self.stop_compactor))
+        if getattr(self, "process", None) is not None:
+            actions.append(("daemon", self.stop))
+        for name in ("store", "pg", "duck"):
+            resource = getattr(self, name, None)
+            if resource is not None:
+                actions.append((name, resource.close))
+        for name, action in actions:
+            try:
+                action()
+            except BaseException as error:
+                self.report.setdefault("cleanup_errors", []).append({"resource": name, "error": str(error)})
+                self.report.update(passed=False)
+                if failure is None:
+                    failure = error
+                    self.report["failure"] = str(error)
+        try:
+            self.report["state_bytes"] = {
+                name: sum(path.stat().st_size for path in (self.directory / "state" / name).rglob("*") if path.is_file())
+                for name in ("index", "journal", "spool")}
+        except BaseException as error:
+            self.report.setdefault("cleanup_errors", []).append({"resource": "state inventory", "error": str(error)})
+            self.report.update(passed=False)
+            if failure is None:
+                failure = error
+                self.report["failure"] = str(error)
+        finally:
+            write_report(self.directory / "report.json", self.report)
+        if failure is not None:
+            raise failure
+
     def payload_expression(self, key):
         # Expressions are internal SQL fragments; workload inputs remain bind parameters.
         if self.args.payload_entropy == "high":
@@ -347,9 +406,7 @@ columns = [
                     key_prepare_started_ns = time.monotonic_ns()
                     name, marker = record["table"], -(sequence + 1)
                     active = keys[name]
-                    updates = int(args.transaction_rows * {"mixed": .7, "update90": .9, "append": 0}[args.profile])
-                    deletes = int(args.transaction_rows * .1) if args.profile == "mixed" else 0
-                    inserts = args.transaction_rows - updates - deletes
+                    updates, deletes, inserts = mutation_counts(args.profile, args.transaction_rows)
                     # One ordinary insertion per tx is reserved as an immutable visibility probe.
                     if args.key_distribution == "zipf":
                         selected = zipf_sample(rng, range(len(active)), updates + deletes, args.zipf_exponent)
@@ -476,7 +533,15 @@ columns = [
                 for name in self.names:
                     pools[name] = DenseKeys(self.directory / f"keys-{worker}-{name}.bin",
                                             range(worker + 1, args.initial_rows + 1, args.writers))
+            self.report["clock"] = {
+                "before": self.calibrate_clock(),
+                "method": "minimum RTT of five queries immediately before and after writer workload; average offset; raw signed values retained",
+                "assumption": "offset stays within endpoint offsets and RTT uncertainty during the workload",
+            }
             start_mono, start_us = time.monotonic() + .5, micros() + 500000
+            writer_deadline = start_mono + args.warmup + args.duration + args.timeout
+            write_report(self.directory / "report.json", self.report)
+            arm_workload(self.directory, writer_deadline)
             self.measured_start_us = start_us + int(args.warmup * 1e6)
             self.measured_end_us = self.measured_start_us + int(args.duration * 1e6)
             threads = [threading.Thread(target=self.writer, args=(worker, start_mono, start_us, scheduled)) for worker in range(args.writers)]
@@ -485,12 +550,16 @@ columns = [
             cursors = {}
             next_sample = time.monotonic()
             while any(thread.is_alive() for thread in threads):
+                if time.monotonic() >= writer_deadline:
+                    raise TimeoutError("writers exceeded the workload deadline")
                 self.alive()
                 self.observe(cursors)
                 if time.monotonic() >= next_sample:
                     self.sample_resources()
                     next_sample = time.monotonic() + 1
                 time.sleep(args.reader_poll_seconds)
+            self.report["clock"]["after"] = self.calibrate_clock()
+            disarm_workload(self.directory)
             self.alive()
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
@@ -510,17 +579,17 @@ columns = [
                     connection.cancel_safe(timeout=5)
                 except psycopg.Error as error:
                     self.report.setdefault("writer_cancellation_errors", []).append(str(error))
-            # Cancellation requests do not release a worker's files/recorder.
-            # The owned connection must finish or fail, and every thread joins.
+            # Keep the deadline armed until joins complete. If a native call or
+            # cancellation stalls, the supervising process terminates this group.
             for thread in threads:
                 thread.join()
+            disarm_workload(self.directory)
             for pools in self.key_pools:
                 for keys in pools.values():
                     keys.close()
             if not finished:
                 self.store.export(self.directory)
         try:
-            self.report["clock"]["after"] = self.calibrate_clock()
             return self.latencies()
         finally:
             enriched = self.store.db.execute("SELECT 1 FROM sqlite_master WHERE name='analysis'").fetchone() is not None
@@ -539,10 +608,8 @@ columns = [
     def latencies(self):
         self.store.import_logs(sorted(self.directory.glob("daemon-*.log")), self.name)
         clock = self.report["clock"]
-        offset = (clock["before"]["postgres_minus_client_us"] + clock["after"]["postgres_minus_client_us"]) / 2
-        clock["correction_us"] = offset
-        clock["offset_change_us"] = clock["after"]["postgres_minus_client_us"] - clock["before"]["postgres_minus_client_us"]
-        self.store.analyze(self.oids, offset)
+        clock.update(clock_assessment(clock["before"], clock["after"], self.args.max_clock_uncertainty_ms * 1000))
+        self.store.analyze(self.oids, clock["correction_us"])
         db = self.store.db
         summary = db.execute("""
             SELECT count(*) AS scheduled, count(t.commit_response_at_micros) AS completed,
@@ -604,8 +671,10 @@ columns = [
                 "scheduled_cohort_mutations_per_second": totals["mutations"] / self.args.duration,
                 "commits_after_measurement_window": summary["late_commits"],
                 "latency": percentiles,
-                "catalog_latency_slo_met": (percentiles["commit_to_catalog"].get("p95_ms", float("inf")) < self.args.catalog_p95_ms and
-                                            percentiles["commit_to_catalog"].get("p99_ms", float("inf")) < self.args.catalog_p99_ms),
+                "catalog_latency_slo_met": catalog_slo_met(percentiles["commit_to_catalog"], clock,
+                                                          self.args.catalog_p95_ms, self.args.catalog_p99_ms),
+                "catalog_latency_qualification_available": clock["latency_qualification_available"],
+                "catalog_latency_slo_uncertainty_ms": clock["uncertainty_us"] / 1000,
                 "catalog_latency_slo_ms": {"p95": self.args.catalog_p95_ms, "p99": self.args.catalog_p99_ms},
                 "scheduled_to_reader_including_failures": requested,
                 "writer_timing": self.store.writer_timing_summary(),
@@ -844,7 +913,7 @@ columns = [
                                    "compactor": stopped_compactor}}
         self.report["verified_reader_baseline"] = baseline
         self.check_worker_panics()
-        dump(self.directory / "report.json", self.report)
+        write_report(self.directory / "report.json", self.report)
         comparison = compare_snapshots(
             self.duck,
             {name: previous[name]["metadata_location"] for name in self.names},
@@ -855,6 +924,16 @@ columns = [
                 "quiescence": baseline["quiescence"]}
 
     def execute(self):
+        failure = None
+        try:
+            self.execute_phases()
+        except BaseException as error:
+            failure = error
+            self.report["traceback"] = traceback.format_exc()
+        finally:
+            self.close_run(failure)
+
+    def execute_phases(self):
         args = self.args
         self.report["measurement_protocol"] = {
             "version": "disk-evidence-paged-probes-v3",
@@ -884,6 +963,7 @@ columns = [
             "harness_sha256": {
                 str(path.relative_to(root)): sha256_file(path)
                 for path in (Path(__file__).resolve(), root / "tests/production/benchmark_store.py",
+                             root / "tests/production/process_lifecycle.py",
                              root / "tests/production/reader_compare.py",
                              root / "tests/production/provenance.py",
                              root / "tests/production/reconciliation.py",
@@ -948,64 +1028,44 @@ columns = [
                 "scope": "independent writer/table populations; no shared-key writer contention",
                 "proposal_limit": "max(1024, 128 * (updates + deletes)); exhaustion fails the run without a fallback distribution",
             }
-        try:
-            self.report["clock"] = {"before": self.calibrate_clock(),
-                                    "method": "minimum RTT of five server clock queries before and after; average offset correction; raw negative values retained"}
-            self.phase("seed", self.seed)
-            self.phase("initial-copy-and-full-row-check", self.initialize)
-            self.phase("baseline-reader", self.scans)
-            self.start()
-            self.start_compactor()
-            self.phase("open-loop-workload", self.workload)
-            self.phase("post-drain-source-acknowledgement", self.source_acknowledgement)
-            self.phase("full-source-target-verification", self.verify)
-            self.phase("post-workload-inventory", self.inventory)
-            self.phase("post-workload-reader", self.scans)
-            self.phase("resource-and-cost-observations", self.resource_summary)
-            if args.reader_baseline_compactor:
-                previous = next(phase["details"] for phase in self.report["phases"]
-                                if phase["name"] == "post-workload-reader")
-                self.phase("same-final-state-compacted-reader", lambda: self.compacted_reader_baseline(previous))
-            performance = next(phase["details"] for phase in self.report["phases"] if phase["name"] == "open-loop-workload")
-            self.report["correctness_passed"] = performance["all_committed_transactions_observed"]
-            self.report["performance_qualified"] = performance["target_arrival_rate_sustained"] and performance["catalog_latency_slo_met"]
-            self.report["reader_scan_qualified"] = None
-            if args.reader_baseline_compactor:
-                comparison = next(phase["details"] for phase in self.report["phases"]
-                                  if phase["name"] == "same-final-state-compacted-reader")
-                self.report["reader_scan_qualified"] = comparison["reader_scan_qualified"]
-                self.report["performance_qualified"] &= self.report["reader_scan_qualified"]
-            workload_compactor_stop = self.stop_compactor()
-            if workload_compactor_stop is not None:
-                assert not workload_compactor_stop["forced_kill"] \
-                    and workload_compactor_stop["returncode"] == 0, \
-                    "workload compactor did not stop gracefully"
-                self.report["workload_compactor_shutdown"] = workload_compactor_stop
-            daemon_stop = self.stop()
-            if daemon_stop is not None:
-                assert not daemon_stop["forced_kill"] and daemon_stop["returncode"] == 0, \
-                    "daemon did not stop gracefully"
-            self.check_worker_panics()
-            self.report["passed"] = self.report["correctness_passed"] and self.report["performance_qualified"]
-            if not self.report["passed"]:
-                raise AssertionError("correctness or performance qualification failed; see report")
-        except BaseException as error:
-            self.report.update(failure=str(error), traceback=traceback.format_exc())
-            raise
-        finally:
-            self.stop_compactor()
-            self.stop()
-            self.report["state_bytes"] = {name: sum(path.stat().st_size for path in (self.directory / "state" / name).rglob("*") if path.is_file())
-                                          for name in ("index", "journal", "spool")}
-            try:
-                self.store.close()
-            except BaseException as error:
-                self.report.update(passed=False, storage_close_failure=str(error))
-                raise
-            finally:
-                dump(self.directory / "report.json", self.report)
-                self.pg.close()
-                self.duck.close()
+        self.phase("seed", self.seed)
+        self.phase("initial-copy-and-full-row-check", self.initialize)
+        self.phase("baseline-reader", self.scans)
+        self.start()
+        self.start_compactor()
+        self.phase("open-loop-workload", self.workload)
+        self.phase("post-drain-source-acknowledgement", self.source_acknowledgement)
+        self.phase("full-source-target-verification", self.verify)
+        self.phase("post-workload-inventory", self.inventory)
+        self.phase("post-workload-reader", self.scans)
+        self.phase("resource-and-cost-observations", self.resource_summary)
+        if args.reader_baseline_compactor:
+            previous = next(phase["details"] for phase in self.report["phases"]
+                            if phase["name"] == "post-workload-reader")
+            self.phase("same-final-state-compacted-reader", lambda: self.compacted_reader_baseline(previous))
+        performance = next(phase["details"] for phase in self.report["phases"] if phase["name"] == "open-loop-workload")
+        self.report["correctness_passed"] = performance["all_committed_transactions_observed"]
+        self.report["performance_qualified"] = performance["target_arrival_rate_sustained"] and performance["catalog_latency_slo_met"]
+        self.report["reader_scan_qualified"] = None
+        if args.reader_baseline_compactor:
+            comparison = next(phase["details"] for phase in self.report["phases"]
+                              if phase["name"] == "same-final-state-compacted-reader")
+            self.report["reader_scan_qualified"] = comparison["reader_scan_qualified"]
+            self.report["performance_qualified"] &= self.report["reader_scan_qualified"]
+        workload_compactor_stop = self.stop_compactor()
+        if workload_compactor_stop is not None:
+            assert not workload_compactor_stop["forced_kill"] \
+                and workload_compactor_stop["returncode"] == 0, \
+                "workload compactor did not stop gracefully"
+            self.report["workload_compactor_shutdown"] = workload_compactor_stop
+        daemon_stop = self.stop()
+        if daemon_stop is not None:
+            assert not daemon_stop["forced_kill"] and daemon_stop["returncode"] == 0, \
+                "daemon did not stop gracefully"
+        self.check_worker_panics()
+        self.report["passed"] = self.report["correctness_passed"] and self.report["performance_qualified"]
+        if not self.report["passed"]:
+            raise AssertionError("correctness or performance qualification failed; see report")
 
 
 def main():
@@ -1029,6 +1089,9 @@ def main():
     parser.add_argument("--manifest-max-count", type=int, default=64)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--setup-timeout", type=float, default=600,
+                        help="finite setup/verification allowance, in addition to workload and drain budgets")
+    parser.add_argument("--supervised-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--duration", type=float, default=60)
     parser.add_argument("--warmup", type=float, default=10)
     parser.add_argument("--rate", type=int, default=1000)
@@ -1049,6 +1112,7 @@ def main():
     parser.add_argument("--reader-poll-seconds", type=float, default=1)
     parser.add_argument("--batch-rows", type=int, default=1024)
     parser.add_argument("--pending-transactions", type=int, default=256)
+    parser.add_argument("--max-clock-uncertainty-ms", type=float, default=50)
     parser.add_argument("--catalog-p95-ms", type=float, default=1000)
     parser.add_argument("--catalog-p99-ms", type=float, default=2000)
     args = parser.parse_args()
@@ -1077,6 +1141,17 @@ def main():
             parser.error("stable-small limits must be positive with soft at most hard")
     if args.key_distribution == "zipf" and (not math.isfinite(args.zipf_exponent) or not 0 < args.zipf_exponent <= 2):
         parser.error("Zipf exponent must be finite and greater than zero, at most two")
+    if not all(math.isfinite(value) and value > 0 for value in (
+            args.setup_timeout, args.timeout, args.duration, args.reader_baseline_timeout,
+            args.max_clock_uncertainty_ms, args.catalog_p95_ms, args.catalog_p99_ms)) or not math.isfinite(args.warmup):
+        parser.error("time and clock uncertainty budgets must be finite and positive")
+    if not args.supervised_worker:
+        timeout = args.setup_timeout + args.warmup + args.duration + 2 * args.timeout
+        if args.reader_baseline_compactor:
+            timeout += 2 * args.reader_baseline_timeout
+        completed = run_supervised([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:],
+                                    "--supervised-worker"], args.artifacts, timeout)
+        raise SystemExit(completed.returncode)
     Benchmark(args).execute()
     print(f"PASS: {args.artifacts.resolve() / 'report.json'}", flush=True)
 

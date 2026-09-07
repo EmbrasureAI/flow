@@ -33,12 +33,13 @@ impl Default for DeleteRewritePolicy {
     }
 }
 
-/// Remembers nonviable inputs at one immutable catalog head. Keep this cursor
+/// Remembers nonviable input/target pairs at one immutable catalog head. Keep this cursor
 /// across maintenance retries; a refreshed head automatically clears it.
 #[derive(Default)]
 pub struct DeleteRepairCursor {
     head: Option<(uuid::Uuid, Option<i64>)>,
-    attempted: BTreeSet<FileId>,
+    // None exhausts an input whose remaining targets all fail exact row/count limits.
+    attempted: BTreeSet<(FileId, Option<FileId>)>,
 }
 
 struct RepairTarget {
@@ -357,7 +358,9 @@ impl TableMaintenance {
             let store = self.store.clone();
             blocking(move || Ok(store.discard_uncommitted(&id)?)).await?;
             if let (Some(cursor), Some(input)) = (cursor, attempted_input) {
-                cursor.attempted.insert(input);
+                cursor
+                    .attempted
+                    .insert((input, isolation.map(|(target, _)| target)));
             }
             return Ok(None);
         };
@@ -548,13 +551,16 @@ fn choose_repair_input(
             input.targets.len() > 1
                 && input.row_count <= policy.max_delete_input_rows
                 && input.size_bytes <= policy.max_delete_input_bytes
-                && !cursor.attempted.contains(&input.id)
+                && !cursor.attempted.contains(&(input.id.clone(), None))
         })
         .filter_map(|input| {
             let priority = targets
                 .iter()
                 .filter(|(file, rows, bytes, count)| {
                     input.targets.contains(&file.id)
+                        && !cursor
+                            .attempted
+                            .contains(&(input.id.clone(), Some(file.id.clone())))
                         && rows.saturating_sub(input.row_count) <= policy.max_delete_input_rows
                         && bytes.saturating_sub(input.size_bytes) <= policy.max_delete_input_bytes
                         && count - 1 <= policy.max_delete_input_files
@@ -583,6 +589,9 @@ fn choose_repair_input(
             .into_iter()
             .filter(|(file, _, bytes, _)| {
                 input.targets.contains(&file.id)
+                    && !cursor
+                        .attempted
+                        .contains(&(input.id.clone(), Some(file.id.clone())))
                     && bytes.saturating_sub(input.size_bytes) <= policy.max_delete_input_bytes
             })
             .map(|(file, rows, _, count)| RepairTarget {

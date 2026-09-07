@@ -145,6 +145,26 @@ async fn supported_types_round_trip_through_parquet_manifests_and_stock_iceberg_
     let files = writer.close().await.unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].record_count(), rows.len() as u64);
+    let bytes = empty
+        .file_io()
+        .new_input(files[0].file_path())
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let parquet =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let uuid = parquet.parquet_schema().column(10);
+    assert_eq!(
+        uuid.physical_type(),
+        parquet::basic::Type::FIXED_LEN_BYTE_ARRAY
+    );
+    assert_eq!(uuid.type_length(), 16);
+    assert_eq!(
+        uuid.logical_type_ref(),
+        Some(&parquet::basic::LogicalType::Uuid)
+    );
+    assert_eq!(uuid.self_type().get_basic_info().id(), 11);
     for column in &schema.columns {
         assert_eq!(files[0].value_counts().get(&column.field_id), Some(&4));
         assert_eq!(
@@ -199,4 +219,137 @@ async fn supported_types_round_trip_through_parquet_manifests_and_stock_iceberg_
             }
         }
     }
+}
+
+#[tokio::test]
+async fn truncated_row_group_bounds_cannot_hide_string_or_binary_matches() {
+    use iceberg::{expr::Reference, spec::Datum};
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = flow_testkit::catalog(temp.path()).await;
+    let mut schema = flow_testkit::schema(73);
+    schema.columns.push(Column {
+        field_id: 3,
+        name: "bytes".into(),
+        data_type: ColumnType::Binary,
+        nullable: true,
+    });
+    let table = flow_testkit::table(&catalog, &schema).await;
+    // Both orderings must invalidate bounds: the exact group can precede or
+    // follow an inexact group. NULL groups do not invalidate exact non-null bounds.
+    for (case, values) in [
+        vec!["m".to_owned(), "a".repeat(100), "z".repeat(100)],
+        vec!["z".repeat(100), "a".repeat(100), "m".to_owned()],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rows = values
+            .iter()
+            .enumerate()
+            .map(|(id, value)| {
+                vec![
+                    Value::Int64(id as i64),
+                    Value::String(value.clone()),
+                    Value::Binary(value.as_bytes().to_vec()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut writer = DataWriter::new(
+            table.file_io().clone(),
+            table.metadata().location(),
+            &OperationId(format!("bounds-{case}")),
+            schema.clone(),
+            0,
+            WriterConfig {
+                row_group_rows: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write(&rows, PgLsn(1)).await.unwrap();
+        let files = writer.close().await.unwrap();
+        assert_eq!(files.len(), 1);
+        for id in [2, 3] {
+            assert!(!files[0].lower_bounds().contains_key(&id));
+            assert!(!files[0].upper_bounds().contains_key(&id));
+        }
+        let head = catalog.load_table(table.identifier()).await.unwrap();
+        let committed = RowDeltaAction::new(&head, format!("bounds-{case}"))
+            .add_data_files(files)
+            .commit(&catalog, &head)
+            .await
+            .unwrap()
+            .table;
+        for value in [&values[0], &values[1], &values[2]] {
+            for predicate in [
+                Reference::new("value").equal_to(Datum::string(value)),
+                Reference::new("bytes").equal_to(Datum::binary(value.bytes())),
+            ] {
+                let mut stream = committed
+                    .scan()
+                    .with_filter(predicate)
+                    .build()
+                    .unwrap()
+                    .to_arrow()
+                    .await
+                    .unwrap();
+                let mut actual = Vec::new();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    actual.extend(rows_from_batch(&schema, &batch).unwrap());
+                }
+                assert_eq!(actual.len(), case + 1);
+                assert!(
+                    actual
+                        .iter()
+                        .all(|row| row[1] == Value::String(value.clone()))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_uuid_schema_round_trip_preserves_ids_docs_and_fixed_binary() {
+    use iceberg::{
+        arrow::{arrow_schema_to_schema, schema_to_arrow_schema},
+        spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type},
+    };
+    use std::sync::Arc;
+    let uuid = Type::Primitive(PrimitiveType::Uuid);
+    let schema = Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::required(
+                1,
+                "ids",
+                Type::List(ListType {
+                    element_field: Arc::new(
+                        NestedField::list_element(2, uuid.clone(), false).with_doc("UUID element"),
+                    ),
+                }),
+            )),
+            Arc::new(NestedField::required(
+                3,
+                "map",
+                Type::Map(MapType {
+                    key_field: Arc::new(NestedField::map_key_element(4, uuid.clone())),
+                    value_field: Arc::new(NestedField::map_value_element(5, uuid.clone(), false)),
+                }),
+            )),
+            Arc::new(NestedField::required(
+                6,
+                "record",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::optional(7, "id", uuid)),
+                    Arc::new(NestedField::optional(
+                        8,
+                        "opaque",
+                        Type::Primitive(PrimitiveType::Fixed(16)),
+                    )),
+                ])),
+            )),
+        ])
+        .build()
+        .unwrap();
+    let arrow = schema_to_arrow_schema(&schema).unwrap();
+    assert_eq!(arrow_schema_to_schema(&arrow).unwrap(), schema);
 }

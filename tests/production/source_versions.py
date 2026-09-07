@@ -10,6 +10,8 @@ import subprocess
 import time
 import uuid
 
+from container_cleanup import cleanup_container
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -37,15 +39,15 @@ def main():
                                 "--env", "POSTGRES_PASSWORD=local-test-password", "--env", "POSTGRES_DB=flow",
                                 f"postgres:{version}-bookworm", "postgres", "-c", "wal_level=logical",
                                 "-c", "max_replication_slots=8", "-c", "max_wal_senders=8",
-                                "-c", "logical_decoding_work_mem=4MB", "-c", "track_commit_timestamp=on"], check=True)
+                                "-c", "logical_decoding_work_mem=4MB", "-c", "track_commit_timestamp=on"], check=True, timeout=120)
                 created = True
-                inspection = json.loads(subprocess.check_output(["docker", "inspect", name]))[0]
+                inspection = json.loads(subprocess.check_output(["docker", "inspect", name], timeout=30))[0]
                 record["image"] = inspection["Image"]
                 port = inspection["NetworkSettings"]["Ports"]["5432/tcp"][0]["HostPort"]
                 record["host_port"] = int(port)
                 deadline = time.monotonic() + 60
                 while subprocess.run(["docker", "exec", name, "pg_isready", "-U", "flow", "-d", "flow"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode:
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"PostgreSQL {version} did not become ready")
                     time.sleep(0.25)
@@ -69,11 +71,9 @@ def main():
                 record["error"] = f"{type(error).__name__}: {error}"
             finally:
                 if created:
-                    logs = subprocess.run(["docker", "logs", name], capture_output=True)
-                    (args.artifacts / f"pg-{version}.log").write_bytes(logs.stdout + logs.stderr)
-                    # This name was generated and created by this run; no existing
-                    # service or occupied host port is reused.
-                    subprocess.run(["docker", "rm", "--force", "--volumes", name], check=True)
+                    record["cleanup"] = cleanup_container(name, args.artifacts / f"pg-{version}.log")
+                    if not record["cleanup"]["passed"]:
+                        record["passed"] = False
                 (args.artifacts / "report.json").write_text(json.dumps(report, indent=2) + "\n")
         report["passed"] = all(record["passed"] for record in report["versions"])
     finally:

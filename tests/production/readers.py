@@ -21,6 +21,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
 from run import Run, dump
+from container_cleanup import cleanup_container
 
 SPARK_IMAGE = "apache/spark:3.5.6@sha256:599722640c8a42ff5ecca329a3faa5371b3bd5c752b320776d5cdd1eed3441ac"
 TRINO_IMAGE = "trinodb/trino:470@sha256:a591436ddc20cef15a4424704423326828591727b0e7c40c6ea4165d4564df67"
@@ -93,7 +94,7 @@ columns = [
 
     def command(self, command):
         result = super().command(command)
-        if command == "run" and not self.args.native_compaction:
+        if command == "run" and (not self.args.native_compaction or getattr(self, "protect_delete_inputs", False)):
             result += ["--roles", "ingest,coordinator"]
         return result
 
@@ -287,6 +288,30 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
             return None
         return self.until(f"native compaction did not rewrite {table} after sequence {after_sequence}", completed)
 
+    def prepare_delete_rewrite(self):
+        # Joining the native owner fences its in-flight work before new deletes
+        # are produced. Keep this role set until Spark has consumed the inputs.
+        if self.args.native_compaction:
+            self.stop()
+            self.protect_delete_inputs = True
+            self.start()
+        barrier = self.transaction(["UPDATE orders SET payload='fresh-spark-delete-input' WHERE id BETWEEN 200 AND 207"])
+        self.wait_materialized(barrier)
+        metadata = self.table("orders")["metadata"]
+        snapshot = next(item for item in metadata["snapshots"]
+                        if item["snapshot-id"] == metadata["current-snapshot-id"])
+        deletes = [entry["data_file"] for manifest in self.avro(snapshot["manifest-list"])
+                   for entry in self.avro(manifest["manifest_path"])
+                   if entry["status"] != 2 and entry["data_file"]["content"] == 1]
+        assert sum(file["record_count"] for file in deletes) > 0, "fresh cohort produced no live position deletes"
+        return {"barrier": barrier, "snapshot": snapshot["snapshot-id"], "protected_delete_files": deletes}
+
+    def restore_native(self):
+        if self.args.native_compaction and getattr(self, "protect_delete_inputs", False):
+            self.stop()
+            self.protect_delete_inputs = False
+            self.start()
+
     def rewrite(self, procedure, table="orders"):
         before = self.table(table)
         before_ids = {snapshot["snapshot-id"] for snapshot in before["metadata"]["snapshots"]}
@@ -362,7 +387,10 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
                                if snapshot["snapshot-id"] == self.initial_metadata["metadata"]["current-snapshot-id"])
                 self.phase("native-compaction-before-external", lambda: self.wait_native_compaction("orders", initial["sequence-number"]))
             for number, procedure in enumerate(("rewrite_position_delete_files", "rewrite_data_files", "rewrite_manifests"), 1):
+                if procedure == "rewrite_position_delete_files":
+                    self.phase("fresh-protected-delete-inputs", self.prepare_delete_rewrite)
                 self.phase(procedure, lambda procedure=procedure: self.rewrite(procedure))
+                self.restore_native()
                 self.phase(f"cdc-after-{procedure}", lambda number=number: self.followup(number, restart=number == 3))
             if self.args.keyless_duplicates:
                 self.phase("keyless-external-data-rewrite", lambda: self.rewrite("rewrite_data_files", "duplicates"))
@@ -375,15 +403,23 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
             self.report["traceback"] = traceback.format_exc()
             raise
         finally:
-            self.stop()
-            for container in (self.spark_container, self.trino_container):
-                if container:
-                    logs = subprocess.run(["docker", "logs", container], capture_output=True, text=True)
-                    (self.directory / f"{container}.log").write_text(logs.stdout + logs.stderr)
-                    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
-            dump(self.directory / "report.json", self.report)
+            original_failure = sys.exc_info()[0] is not None
+            try:
+                self.stop()
+            except Exception as error:
+                self.report.update(passed=False, cleanup_error=str(error))
+            self.report["container_cleanup"] = [
+                cleanup_container(container, self.directory / f"{container}.log")
+                for container in (self.spark_container, self.trino_container) if container]
+            failed = self.report.get("cleanup_error") or any(not item["passed"] for item in self.report["container_cleanup"])
+            if failed:
+                self.report["passed"] = False
             self.pg.close()
             self.duck.close()
+            dump(self.directory / "report.json", self.report)
+            if failed and not original_failure:
+                raise RuntimeError("reader fixture cleanup failed; see report.json")
+
 
 
 def main():

@@ -188,6 +188,12 @@ columns = [\n'''
                 self.process.wait(timeout=10)
         self.process = None
         self.log.close()
+        try:
+            self.check_worker_panics()
+        except Exception:
+            self.report["passed"] = False
+            dump(self.directory / "report.json", self.report)
+            raise
 
     def check_worker_panics(self):
         """Check joined processes: a blocking-worker panic can leave exit code zero."""

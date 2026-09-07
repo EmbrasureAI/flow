@@ -41,6 +41,8 @@ The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,c
 
 Keep snapshot history covering unfinished prepared operations, reader retention windows and useful checkpoints. The garbage collector protects retained snapshots, checkpoints and in-flight operations, and deletes only registered service-owned artifacts after a grace period. Index loss does not impair reads; startup restores a matching checkpoint or scans standard data and deletes, then atomically activates the rebuilt generation before restoring writes. Source lineage or unexplained external logical changes stop publication.
 
+Automatic snapshot expiration defaults to disabled. Set `limits.snapshot_expiration = true` only when external branch/tag creation and retention-policy changes are excluded or coordinated with this service's expiration. Coordinate catalog retention-policy changes with ingestion and maintenance commits too: a policy-only update does not move a snapshot head. Standard Iceberg REST cannot atomically assert the complete reference set and its policies; assertions on existing reference heads alone do not cover newly created tags. With expiration disabled, retained history and its files accumulate; arrange catalog-side coordinated expiration if automatic cleanup is required. Data compaction, manifest rewriting and collection of unreferenced owned artifacts still run.
+
 Current support boundaries:
 
 - Unpartitioned Iceberg v2 with position deletes. Low-fan-out partitions and v3 follow the original specification's v2 correctness and performance gates.
@@ -49,3 +51,5 @@ Current support boundaries:
 - Initial COPY uses up to four workers. Recovery needs capacity for one additional temporary replication slot. Transaction metadata and row payloads spill to disk; configured journal, spool, message and row-size budgets still apply.
 - Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor for process failures and startup failures. Local fault tests do not establish independent-host durability.
 - Compaction supports unsorted layouts. Z-order-aware compaction, distributed compaction protocols, HA and global autocompaction are outside the early release scope. External compactor reconciliation is included and tested with actual Spark maintenance.
+
+Keep the source publication's table membership, operation flags, column lists and row filters fixed from initialization through streaming. Coordinate changes by stopping capture and resynchronizing the affected source before resuming. PostgreSQL may silently omit changes under an altered publication, so restoring its settings or restarting the service cannot prove that no rows were missed.

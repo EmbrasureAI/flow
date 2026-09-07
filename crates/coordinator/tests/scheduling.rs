@@ -3,6 +3,38 @@ use flow_model::TableId;
 use std::time::{Duration, Instant};
 
 #[test]
+fn overdue_tables_progress_under_continuous_realtime_arrivals() {
+    let start = Instant::now();
+    let mut scheduler = Scheduler::new(1, 1024, 10, start).unwrap();
+    let efficient = TableId(1);
+    let realtime = TableId(2);
+    scheduler.push(
+        efficient,
+        Some(0),
+        0,
+        Priority::Efficient,
+        Duration::ZERO,
+        start,
+    );
+    for tick in 0..150 {
+        let now = start + Duration::from_millis(tick * 100);
+        scheduler.push(
+            realtime,
+            Some(1),
+            1,
+            Priority::Realtime,
+            Duration::ZERO,
+            now,
+        );
+        if scheduler.take_ready(now) == Some(efficient) {
+            assert!(tick >= 147, "respect the table's initial batching deadline");
+            return;
+        }
+    }
+    panic!("realtime arrivals starved an overdue table");
+}
+
+#[test]
 fn measured_service_time_backlog_age_and_global_permits_control_publication() {
     let start = Instant::now();
     let realtime = TableId(1);
@@ -114,5 +146,27 @@ fn mutation_threshold_legacy_work_and_zero_rows_preserve_deadlines() {
     assert_eq!(
         scheduler.take_ready(now + Duration::from_millis(400)),
         Some(empty)
+    );
+}
+
+#[test]
+fn continued_arrivals_and_force_preserve_overdue_order() {
+    let start = Instant::now();
+    let mut scheduler = Scheduler::new(1, 1024, 10, start).unwrap();
+    for (table, tick) in [(1, 0), (2, 1), (1, 2)] {
+        scheduler.push(
+            TableId(table),
+            Some(1),
+            1,
+            Priority::Realtime,
+            Duration::ZERO,
+            start + Duration::from_millis(tick),
+        );
+    }
+    scheduler.force(TableId(1), start + Duration::from_millis(3));
+    assert_eq!(scheduler.next_deadline(), Some(start));
+    assert_eq!(
+        scheduler.take_ready(start + Duration::from_millis(3)),
+        Some(TableId(1))
     );
 }

@@ -48,7 +48,10 @@ pub(super) fn read_frame(file: &mut impl Read, max_bytes: u32) -> Result<Frame> 
     }
     let length = u32::from_le_bytes(header[8..12].try_into().unwrap());
     if length > max_bytes {
-        return Err(Error::Corrupt);
+        return Err(Error::FrameLimit {
+            length,
+            limit: max_bytes,
+        });
     }
     let mut payload = vec![0; length as usize];
     file.read_exact(&mut payload)?;

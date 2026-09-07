@@ -1,3 +1,82 @@
+--- a/vendor/iceberg-catalog-rest/src/client.rs
++++ b/vendor/iceberg-catalog-rest/src/client.rs
+@@ -143,11 +143,10 @@
+             http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+         );
+         let auth_url = auth_req.url().clone();
+-        let auth_resp = self.client.execute(auth_req).await?;
++        let auth_resp = self.send(auth_req, true).await?;
+ 
+         let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
+-            let text = auth_resp
+-                .bytes()
++            let text = response_bytes(auth_resp)
+                 .await
+                 .map_err(|err| err.with_url(auth_url.clone()))?;
+             Ok(serde_json::from_slice(&text).map_err(|e| {
+@@ -163,8 +162,7 @@
+         } else {
+             let code = auth_resp.status();
+             let retryable = retryable_status(code);
+-            let text = auth_resp
+-                .bytes()
++            let text = response_bytes(auth_resp)
+                 .await
+                 .map_err(|err| err.with_url(auth_url.clone()))?;
+             let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
+@@ -256,7 +254,18 @@
+     /// Executes the given `Request` and returns a `Response`.
+     pub async fn execute(&self, mut request: Request) -> Result<Response> {
+         request.headers_mut().extend(self.extra_headers.clone());
+-        Ok(self.client.execute(request).await?)
++        self.send(request, false).await
++    }
++
++    async fn send(&self, request: Request, _oauth: bool) -> Result<Response> {
++        #[cfg(feature = "metrics")]
++        {
++            Ok(crate::observation::execute(&self.client, request, _oauth).await?)
++        }
++        #[cfg(not(feature = "metrics"))]
++        {
++            Ok(self.client.execute(request).await?)
++        }
+     }
+ 
+     // Queries the Iceberg REST catalog after authentication with the given `Request` and
+@@ -270,6 +279,14 @@
+     pub(crate) fn disable_header_redaction(&self) -> bool {
+         self.disable_header_redaction
+     }
++}
++
++#[cfg(feature = "metrics")]
++use crate::observation::response_bytes;
++
++#[cfg(not(feature = "metrics"))]
++async fn response_bytes(response: Response) -> reqwest::Result<bytes::Bytes> {
++    response.bytes().await
+ }
+ 
+ /// Deserializes a catalog response into the given [`DeserializedOwned`] type.
+@@ -278,7 +295,7 @@
+ pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
+     response: Response,
+ ) -> Result<R> {
+-    let bytes = response.bytes().await?;
++    let bytes = response_bytes(response).await?;
+ 
+     serde_json::from_slice::<R>(&bytes).map_err(|e| {
+         Error::new(
+@@ -356,7 +373,7 @@
+         format_headers_redacted(response.headers(), disable_header_redaction),
+     );
+ 
+-    let bytes = match response.bytes().await {
++    let bytes = match response_bytes(response).await {
+         Ok(bytes) => bytes,
+         Err(err) => return err.into(),
+     };
 --- a/vendor/iceberg-catalog-rest/Cargo.toml
 +++ b/vendor/iceberg-catalog-rest/Cargo.toml
 @@ -1,3 +1,4 @@
@@ -61,85 +140,6 @@
 +requests. The daemon enables this feature. The separately recorded local patches
 +are `docs/patches/iceberg-rest-retryable-status.patch` and
 +`docs/patches/iceberg-rest-observability.patch` at the repository root.
---- a/vendor/iceberg-catalog-rest/src/client.rs
-+++ b/vendor/iceberg-catalog-rest/src/client.rs
-@@ -143,11 +143,10 @@
-             http::HeaderValue::from_static("application/x-www-form-urlencoded"),
-         );
-         let auth_url = auth_req.url().clone();
--        let auth_resp = self.client.execute(auth_req).await?;
-+        let auth_resp = self.send(auth_req, true).await?;
- 
-         let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
--            let text = auth_resp
--                .bytes()
-+            let text = response_bytes(auth_resp)
-                 .await
-                 .map_err(|err| err.with_url(auth_url.clone()))?;
-             Ok(serde_json::from_slice(&text).map_err(|e| {
-@@ -162,8 +161,7 @@
-             })?)
-         } else {
-             let code = auth_resp.status();
--            let text = auth_resp
--                .bytes()
-+            let text = response_bytes(auth_resp)
-                 .await
-                 .map_err(|err| err.with_url(auth_url.clone()))?;
-             let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
-@@ -254,7 +252,18 @@
-     /// Executes the given `Request` and returns a `Response`.
-     pub async fn execute(&self, mut request: Request) -> Result<Response> {
-         request.headers_mut().extend(self.extra_headers.clone());
--        Ok(self.client.execute(request).await?)
-+        self.send(request, false).await
-+    }
-+
-+    async fn send(&self, request: Request, _oauth: bool) -> Result<Response> {
-+        #[cfg(feature = "metrics")]
-+        {
-+            Ok(crate::observation::execute(&self.client, request, _oauth).await?)
-+        }
-+        #[cfg(not(feature = "metrics"))]
-+        {
-+            Ok(self.client.execute(request).await?)
-+        }
-     }
- 
-     // Queries the Iceberg REST catalog after authentication with the given `Request` and
-@@ -268,6 +277,14 @@
-     pub(crate) fn disable_header_redaction(&self) -> bool {
-         self.disable_header_redaction
-     }
-+}
-+
-+#[cfg(feature = "metrics")]
-+use crate::observation::response_bytes;
-+
-+#[cfg(not(feature = "metrics"))]
-+async fn response_bytes(response: Response) -> reqwest::Result<bytes::Bytes> {
-+    response.bytes().await
- }
- 
- /// Deserializes a catalog response into the given [`DeserializedOwned`] type.
-@@ -276,7 +293,7 @@
- pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
-     response: Response,
- ) -> Result<R> {
--    let bytes = response.bytes().await?;
-+    let bytes = response_bytes(response).await?;
- 
-     serde_json::from_slice::<R>(&bytes).map_err(|e| {
-         Error::new(
-@@ -350,7 +367,7 @@
-         format_headers_redacted(response.headers(), disable_header_redaction),
-     );
- 
--    let bytes = match response.bytes().await {
-+    let bytes = match response_bytes(response).await {
-         Ok(bytes) => bytes,
-         Err(err) => return err.into(),
-     };
 --- a/vendor/iceberg-catalog-rest/src/lib.rs
 +++ b/vendor/iceberg-catalog-rest/src/lib.rs
 @@ -1,3 +1,4 @@
@@ -154,9 +154,9 @@
 +
 +#[cfg(feature = "metrics")]
 +mod observation;
---- /dev/null
+--- a/vendor/iceberg-catalog-rest/src/observation.rs
 +++ b/vendor/iceberg-catalog-rest/src/observation.rs
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,93 @@
 +// Local addition by Embrasure Flow; see LOCAL_CHANGES.md.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -182,27 +182,20 @@
 +        .split('/')
 +        .filter(|part| !part.is_empty())
 +        .collect();
-+    if parts.last() == Some(&"config") {
-+        return "config";
-+    }
-+    if let Some(namespace) = parts.iter().rposition(|part| *part == "namespaces") {
-+        return match &parts[namespace + 1..] {
-+            [] => "namespaces",
-+            [_] => "namespace",
-+            [_, "properties"] => "namespace_properties",
-+            [_, "tables"] => "tables",
-+            [_, "tables", _] => "table",
-+            [_, "tables", _, "metrics"] => "table_metrics",
-+            [_, "register"] => "register_table",
-+            _ => "other",
-+        };
-+    }
-+    if parts.ends_with(&["tables", "rename"]) {
-+        "rename_table"
-+    } else if parts.ends_with(&["transactions", "commit"]) {
-+        "commit_transaction"
-+    } else {
-+        "other"
++    // Match whole route suffixes, most specific first. Identifier segments
++    // must never be searched for structural words such as `namespaces`.
++    match parts.as_slice() {
++        [.., "namespaces", _, "tables", _, "metrics"] => "table_metrics",
++        [.., "namespaces", _, "tables", _] => "table",
++        [.., "namespaces", _, "properties"] => "namespace_properties",
++        [.., "namespaces", _, "tables"] => "tables",
++        [.., "namespaces", _, "register"] => "register_table",
++        [.., "tables", "rename"] => "rename_table",
++        [.., "transactions", "commit"] => "commit_transaction",
++        [.., "v1", "config"] => "config",
++        [.., "namespaces", _] => "namespace",
++        [.., "namespaces"] => "namespaces",
++        _ => "other",
 +    }
 +}
 +

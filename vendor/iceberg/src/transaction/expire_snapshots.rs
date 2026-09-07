@@ -35,6 +35,11 @@ use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 /// Physical file cleanup is the responsibility of a higher-level maintenance operation built on
 /// top of this action.
 ///
+/// Concurrent moves/removals of observed references conflict and are replanned.
+/// The standard REST requirements cannot guard creation of unknown references or
+/// retention-policy changes with an unchanged head. Callers must exclude those
+/// mutations during expiration through catalog permissions or coordination.
+///
 /// Selection follows Java `RemoveSnapshots`:
 /// - Explicit ids ([`expire_snapshot_ids`](Self::expire_snapshot_ids)) and age-based expiry are
 ///   combined: a snapshot is expired if it is named explicitly *or* selected by age.
@@ -49,7 +54,7 @@ use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 ///   `max_ref_age_ms` (defaulting to `history.expire.max-ref-age-ms`) is removed, and snapshots only
 ///   that ref retained then become expirable.
 /// - Heads of retained refs (including the current snapshot) are never expired, and naming one
-///   explicitly is an error, since
+///   explicitly is an error unless protected, since
 ///   [`remove_snapshots`](crate::spec::TableMetadataBuilder::remove_snapshots) would otherwise
 ///   drop the ref silently.
 pub struct ExpireSnapshotsAction {
@@ -80,7 +85,7 @@ impl ExpireSnapshotsAction {
     ///
     /// Ids accumulate across calls (like [`add_data_files`](crate::transaction::Transaction::fast_append)).
     /// An id that is still referenced by a branch or tag cannot be expired and causes
-    /// [`commit`](TransactionAction::commit) to fail.
+    /// [`commit`](TransactionAction::commit) to fail, unless explicitly protected.
     pub fn expire_snapshot_ids(mut self, snapshot_ids: impl IntoIterator<Item = i64>) -> Self {
         self.explicit_ids_to_remove.extend(snapshot_ids);
         self
@@ -117,6 +122,15 @@ impl ExpireSnapshotsAction {
     pub fn protect_newer_than_ms(mut self, timestamp_ms: i64) -> Self {
         self.protected_since_ms = Some(timestamp_ms);
         self
+    }
+
+    fn is_protected(&self, metadata: &TableMetadata, id: i64) -> bool {
+        self.protected_ids.contains(&id)
+            || self.protected_since_ms.is_some_and(|cutoff| {
+                metadata
+                    .snapshot_by_id(id)
+                    .is_some_and(|snapshot| snapshot.timestamp_ms() >= cutoff)
+            })
     }
 
     /// Resolves the snapshots and refs to remove, following Java `RemoveSnapshots.internalApply`.
@@ -165,6 +179,9 @@ impl ExpireSnapshotsAction {
         let existing_ids: HashSet<i64> = metadata.snapshots().map(|s| s.snapshot_id()).collect();
         let mut expiring_ids: HashSet<i64> = HashSet::new();
         for id in &self.explicit_ids_to_remove {
+            if self.is_protected(metadata, *id) {
+                continue;
+            }
             if ref_head_ids.contains(id) {
                 return Err(Self::reference_error(metadata, *id));
             }
@@ -229,11 +246,10 @@ impl ExpireSnapshotsAction {
             }
         }
 
-        let mut ids_to_remove: Vec<i64> = expiring_ids.into_iter().filter(|id| {
-            !self.protected_ids.contains(id)
-                && !self.protected_since_ms.is_some_and(|cutoff| metadata.snapshot_by_id(*id)
-                    .is_some_and(|snapshot| snapshot.timestamp_ms() >= cutoff))
-        }).collect();
+        let mut ids_to_remove: Vec<i64> = expiring_ids
+            .into_iter()
+            .filter(|id| !self.is_protected(metadata, *id))
+            .collect();
         ids_to_remove.sort_unstable();
         removed_ref_names.sort();
         Ok(ExpirePlan {
@@ -373,17 +389,26 @@ impl TransactionAction for ExpireSnapshotsAction {
         }
         updates.extend(stats_updates);
 
-        // The ref assertion closes the race where a concurrent writer advances `main` between
-        // selection and commit, which could orphan a snapshot whose parent we are about to remove.
-        Ok(ActionCommit::new(updates, vec![
-            TableRequirement::UuidMatch {
-                uuid: metadata.uuid(),
-            },
+        // Assert every observed reference, including refs selected for removal.
+        // REST requirements cannot assert absence of unknown new refs or unchanged
+        // retention policies. Callers must exclude those mutations during expiry
+        // through catalog permissions/coordination; these assertions are not metadata CAS.
+        let mut requirements = vec![TableRequirement::UuidMatch {
+            uuid: metadata.uuid(),
+        }];
+        requirements.extend(metadata.refs.iter().map(|(name, reference)| {
             TableRequirement::RefSnapshotIdMatch {
+                r#ref: name.clone(),
+                snapshot_id: Some(reference.snapshot_id),
+            }
+        }));
+        if !metadata.refs.contains_key(MAIN_BRANCH) {
+            requirements.push(TableRequirement::RefSnapshotIdMatch {
                 r#ref: MAIN_BRANCH.to_string(),
                 snapshot_id: metadata.current_snapshot_id(),
-            },
-        ]))
+            });
+        }
+        Ok(ActionCommit::new(updates, requirements))
     }
 }
 
@@ -617,12 +642,15 @@ mod tests {
             .metadata()
             .clone()
             .into_builder(None)
-            .set_ref("history-tag", SnapshotReference {
-                snapshot_id: OLD_SNAPSHOT,
-                retention: SnapshotRetention::Tag {
-                    max_ref_age_ms: None,
+            .set_ref(
+                "history-tag",
+                SnapshotReference {
+                    snapshot_id: OLD_SNAPSHOT,
+                    retention: SnapshotRetention::Tag {
+                        max_ref_age_ms: None,
+                    },
                 },
-            })
+            )
             .unwrap()
             .build()
             .unwrap()

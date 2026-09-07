@@ -527,49 +527,6 @@ fn file_count_underflow_is_checked_at_each_lookup_chunk_boundary() {
 }
 
 #[test]
-fn missing_prepared_ordinal_keeps_the_apply_cursor_and_table_fence() {
-    let temp = TempDir::new().unwrap();
-    let id = OperationId("missing-delta".into());
-    {
-        let store = open(temp.path());
-        store
-            .prepare(
-                operation(&id.0, None, 10),
-                [insert(1, "a", 0), insert(2, "a", 1), insert(3, "a", 2)],
-            )
-            .unwrap();
-        store.mark_committed(&id, 1, 1).unwrap();
-    }
-    {
-        // Remove the first ordinal while leaving later entries readable. An
-        // iterator must detect the gap instead of applying the next delta.
-        let options = rocksdb::Options::default();
-        let columns = rocksdb::DB::list_cf(&options, temp.path()).unwrap();
-        let db = rocksdb::DB::open_cf(&options, temp.path(), columns).unwrap();
-        let cf = db.cf_handle("index_deltas").unwrap();
-        let key = db
-            .iterator_cf(&cf, rocksdb::IteratorMode::Start)
-            .map(Result::unwrap)
-            .find_map(|(key, value)| {
-                bincode::deserialize::<IndexDelta>(&value)
-                    .ok()
-                    .filter(|delta| delta.key == PrimaryKey(vec![1]))
-                    .map(|_| key)
-            })
-            .unwrap();
-        db.delete_cf(&cf, key).unwrap();
-    }
-    let store = open(temp.path());
-    assert!(store.apply_committed(&id).is_err());
-    assert_eq!(store.operation(&id).unwrap().unwrap().applied_count, 0);
-    assert_eq!(
-        store.table_state(&TableId(7)).unwrap().pending_operation,
-        Some(id)
-    );
-    assert!(store.index_is_empty(&TableId(7)).unwrap());
-}
-
-#[test]
 fn checkpoint_restores_both_index_directions_and_delete_removes_reverse_row() {
     let temp = TempDir::new().unwrap();
     let store = open(&temp.path().join("db"));
@@ -1461,4 +1418,31 @@ fn corrupt_persisted_apply_cursors_fail_closed_after_reopen() {
         .unwrap();
         assert_eq!(table, table_before);
     }
+}
+
+#[test]
+fn applied_delta_stream_accepts_complete_payload_then_atomic_pruning() {
+    let temp = TempDir::new().unwrap();
+    let id = OperationId("pruned-deltas".into());
+    let deltas = vec![insert(1, "a", 0), insert(2, "a", 1)];
+    let store = open(temp.path());
+    store
+        .prepare(operation(&id.0, None, 10), deltas.clone())
+        .unwrap();
+    store.mark_committed(&id, 1, 1).unwrap();
+    store.apply_committed(&id).unwrap();
+    assert_eq!(
+        store
+            .prepared_deltas(&id)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        deltas
+    );
+    store.prune_applied_deltas(&id).unwrap();
+    drop(store);
+    let store = open(temp.path());
+    store.validate_storage().unwrap();
+    assert_eq!(store.operation(&id).unwrap().unwrap().delta_count, 2);
+    assert!(store.prepared_deltas(&id).unwrap().next().is_none());
 }

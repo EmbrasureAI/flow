@@ -35,13 +35,47 @@
  // Licensed to the Apache Software Foundation (ASF) under one
  // or more contributor license agreements.  See the NOTICE file
  // distributed with this work for additional information
-@@ -340,6 +341,9 @@
+@@ -161,19 +162,21 @@
+             })?)
+         } else {
+             let code = auth_resp.status();
++            let retryable = retryable_status(code);
+             let text = auth_resp
+                 .bytes()
+                 .await
+                 .map_err(|err| err.with_url(auth_url.clone()))?;
+             let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
+                 Error::new(ErrorKind::Unexpected, "Received unexpected response")
++                    .with_retryable(retryable)
+                     .with_context("code", code.to_string())
+                     .with_context("operation", "auth")
+                     .with_context("url", auth_url.to_string())
+                     .with_context("json", String::from_utf8_lossy(&text))
+                     .with_source(e)
+             })?;
+-            Err(Error::from(e))
++            Err(Error::from(e).with_retryable(retryable))
+         }?;
+         Ok(auth_res.access_token)
+     }
+@@ -331,6 +334,12 @@
+     format!("{redacted:?}")
+ }
+ 
++fn retryable_status(status: StatusCode) -> bool {
++    status.is_server_error()
++        || status == StatusCode::TOO_MANY_REQUESTS
++        || status == StatusCode::REQUEST_TIMEOUT
++}
++
+ /// Deserializes a unexpected catalog response into an error.
+ pub(crate) async fn deserialize_unexpected_catalog_error(
+     response: Response,
+@@ -340,6 +349,7 @@
          ErrorKind::Unexpected,
          "Received response with unexpected status code",
      )
-+    .with_retryable(response.status().is_server_error()
-+        || response.status() == StatusCode::TOO_MANY_REQUESTS
-+        || response.status() == StatusCode::REQUEST_TIMEOUT)
++    .with_retryable(retryable_status(response.status()))
      .with_context("status", response.status().to_string())
      .with_context(
          "headers",

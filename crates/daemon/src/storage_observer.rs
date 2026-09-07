@@ -408,4 +408,133 @@ mod rest_tests {
         );
         assert!(!text.contains("private-") && !text.contains(&address.to_string()));
     }
+    #[tokio::test]
+    async fn oauth_transient_status_survives_json_and_proxy_errors() {
+        for (status, body, transient) in [
+            (
+                "429 Too Many Requests",
+                r#"{"error":{"message":"busy","type":"Busy","code":429}}"#,
+                true,
+            ),
+            ("503 Service Unavailable", "<html>unavailable</html>", true),
+            (
+                "400 Bad Request",
+                r#"{"error":{"message":"invalid credential","type":"BadRequest","code":400}}"#,
+                false,
+            ),
+            ("401 Unauthorized", "", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..read]).starts_with("POST /v1/oauth/tokens ")
+                );
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let catalog = RestCatalogBuilder::default()
+                .with_client(
+                    reqwest::Client::builder()
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .unwrap(),
+                )
+                .load(
+                    "test",
+                    HashMap::from([
+                        ("uri".into(), format!("http://{address}")),
+                        ("credential".into(), "client:secret".into()),
+                    ]),
+                )
+                .await
+                .unwrap();
+            let error = catalog.list_namespaces(None).await.unwrap_err();
+            assert_eq!(
+                crate::retry::transient(&anyhow::Error::new(error)),
+                transient,
+                "{status}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_endpoint_labels_ignore_reserved_words_in_identifiers() {
+        use iceberg::TableIdent;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let (status, body) = if request.starts_with("GET /v1/config ") {
+                    (
+                        "200 OK",
+                        r#"{"defaults":{},"overrides":{"prefix":"warehouse"}}"#,
+                    )
+                } else {
+                    assert!(
+                        request.starts_with("HEAD /v1/warehouse/namespaces/"),
+                        "{request}"
+                    );
+                    ("404 Not Found", "")
+                };
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let catalog = RestCatalogBuilder::default()
+            .load(
+                "test",
+                HashMap::from([("uri".into(), format!("http://{address}"))]),
+            )
+            .await
+            .unwrap();
+        for (namespace, table) in [
+            ("db", "config"),
+            ("db", "namespaces"),
+            ("namespaces", "config"),
+        ] {
+            assert!(
+                !catalog
+                    .table_exists(&TableIdent::new(
+                        NamespaceIdent::new(namespace.into()),
+                        table.into()
+                    ))
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            !catalog
+                .namespace_exists(&NamespaceIdent::new("namespaces".into()))
+                .await
+                .unwrap()
+        );
+        server.await.unwrap();
+        let text = handle.render();
+        assert!(
+            text.contains("flow_catalog_http_requests_total{endpoint=\"table\",method=\"HEAD\"} 3"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "flow_catalog_http_requests_total{endpoint=\"namespace\",method=\"HEAD\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("flow_catalog_http_requests_total{endpoint=\"config\",method=\"GET\"} 1"),
+            "{text}"
+        );
+    }
 }

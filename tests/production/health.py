@@ -38,13 +38,18 @@ def receive(sock, size):
 class HealthProxy:
     """Plaintext PostgreSQL relay, restricted to this disposable test connection."""
 
-    def __init__(self, connection, trace):
+    def __init__(self, connection, trace, query_fragments=None):
         settings = conninfo_to_dict(connection)
         upstream = (settings.get("host", "127.0.0.1"), int(settings.get("port", 5432)))
         self.trace = trace
+        self.query_fragments = tuple(query_fragments) if query_fragments is not None else (
+            b"pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)",)
+        if not self.query_fragments or any(not fragment for fragment in self.query_fragments):
+            raise ValueError("query hold requires nonempty SQL fragments")
         self.lock = threading.Lock()
         self.active = self.peak = self.started = 0
         self.completed = []
+        self.query_held = threading.Event()
         self.stopped = threading.Event()
         self.stall_health = threading.Event()
         self.stall_health.set()
@@ -76,12 +81,13 @@ class HealthProxy:
                             header = receive(self.request, 4)
                             body = receive(self.request, struct.unpack("!I", header)[0] - 4)
                             if (proxy.stall_health.is_set() and kind in (b"P", b"Q")
-                                    and b"pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)" in body):
+                                    and all(fragment in body for fragment in proxy.query_fragments)):
                                 held = time.monotonic()
                                 with proxy.lock:
                                     proxy.started += 1
                                     proxy.active += 1
                                     proxy.peak = max(proxy.peak, proxy.active)
+                                proxy.query_held.set()
                                 # Keep this query unsent until its client cancels. Other
                                 # connections, including replication, remain untouched.
                                 while not proxy.stopped.is_set():

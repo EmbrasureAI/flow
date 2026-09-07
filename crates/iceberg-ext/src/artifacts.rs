@@ -87,11 +87,10 @@ pub async fn retained_artifacts(
     cache: &crate::ManifestCache,
 ) -> Result<std::collections::BTreeSet<String>> {
     let mut protected = std::collections::BTreeSet::new();
-    let data_prefix = format!(
-        "{}/data/",
-        table.metadata().location().trim_end_matches('/')
-    );
-    let has_data = candidates.iter().any(|path| path.starts_with(&data_prefix));
+    let mut visited = std::collections::HashSet::new();
+    if candidates.is_empty() {
+        return Ok(protected);
+    }
     for snapshot in table.metadata().snapshots() {
         if candidates.contains(snapshot.manifest_list()) {
             protected.insert(snapshot.manifest_list().to_owned());
@@ -100,7 +99,11 @@ pub async fn retained_artifacts(
             if candidates.contains(&manifest.manifest_path) {
                 protected.insert(manifest.manifest_path.clone());
             }
-            if !has_data {
+            if !visited.insert((
+                manifest.manifest_path.clone(),
+                manifest.sequence_number,
+                manifest.added_snapshot_id,
+            )) {
                 continue;
             }
             let entries = cache.load(table, manifest).await?;

@@ -973,3 +973,120 @@ fn replay_cursor_reopens_after_a_partial_frame_read_error() {
         vec![7; 70_000]
     );
 }
+
+#[test]
+fn reduced_frame_limit_leaves_retained_segments_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut journal, _) = Journal::open(dir.path(), config()).unwrap();
+    let chunk = journal.append_chunk(1, &[7; 300]).unwrap();
+    let txn = transaction(1, 10, vec![chunk.clone()]);
+    journal.commit(txn.clone()).unwrap();
+    journal.commit(transaction(2, 20, vec![])).unwrap();
+    drop(journal);
+    let segments = || {
+        let mut files = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "segment"))
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    };
+    let before = segments();
+    assert!(before.len() > 1);
+    let mut smaller = config();
+    smaller.max_frame_bytes = 250;
+    assert!(matches!(
+        Journal::open(dir.path(), smaller),
+        Err(Error::FrameLimit {
+            length: 300,
+            limit: 250
+        })
+    ));
+    assert_eq!(segments(), before);
+    let (journal, recovered) = Journal::open(dir.path(), config()).unwrap();
+    assert_eq!(recovered.transactions.len(), 2);
+    assert_eq!(
+        recovered
+            .transactions
+            .iter()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap(),
+        txn
+    );
+    assert_eq!(journal.read_chunk(&chunk).unwrap(), vec![7; 300]);
+}
+
+#[test]
+fn empty_commits_preserve_other_transactions_recovery_abort_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut limited = config();
+    limited.quota_bytes = 1050;
+    let (mut journal, _) = Journal::open(dir.path(), limited.clone()).unwrap();
+    journal.append_chunk(1, &[0; 100]).unwrap();
+    let mut accepted = 0;
+    for xid in 2..=7 {
+        let mut txn = transaction(xid, u64::from(xid) * 10, vec![]);
+        txn.source_id = SourceId("s".into());
+        txn.affected_tables.clear();
+        txn.schema_versions.clear();
+        txn.table_mutation_counts = Some(vec![]);
+        match journal.commit(txn) {
+            Ok(()) => accepted += 1,
+            Err(Error::Quota { .. }) => break,
+            Err(error) => panic!("unexpected commit failure: {error}"),
+        }
+    }
+    assert_eq!(accepted, 5);
+    drop(journal);
+    let (journal, recovered) = Journal::open(dir.path(), limited).unwrap();
+    assert_eq!(recovered.transactions.len(), accepted);
+    assert!(journal.transaction_chunks(1).is_empty());
+}
+
+#[test]
+fn commit_can_spend_its_own_pending_abort_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let txn = transaction(
+        1,
+        100,
+        vec![JournalChunkRef {
+            segment: 0,
+            offset: 0,
+            length: 100,
+        }],
+    );
+    let mut empty = transaction(2, 20, vec![]);
+    empty.source_id = SourceId("s".into());
+    empty.affected_tables.clear();
+    empty.schema_versions.clear();
+    empty.table_mutation_counts = Some(vec![]);
+    let mut limited = config();
+    limited.quota_bytes = 128
+        + 3 * (28 + bincode::serialized_size(&empty).unwrap() + 32)
+        + 28
+        + bincode::serialized_size(&txn).unwrap()
+        + 32;
+    let (mut journal, _) = Journal::open(dir.path(), limited.clone()).unwrap();
+    let chunk = journal.append_chunk(1, &[0; 100]).unwrap();
+    assert_eq!(transaction(1, 100, vec![chunk]), txn);
+    for xid in 2..=4 {
+        empty.xid = xid;
+        empty.commit_lsn = PgLsn(u64::from(xid) * 10);
+        empty.end_lsn = PgLsn(empty.commit_lsn.0 + 1);
+        journal.commit(empty.clone()).unwrap();
+    }
+    journal.commit(txn).unwrap();
+    assert_eq!(journal.bytes_used(), limited.quota_bytes);
+    drop(journal);
+    let (_, recovered) = Journal::open(dir.path(), limited).unwrap();
+    assert_eq!(recovered.transactions.len(), 4);
+}

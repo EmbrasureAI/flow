@@ -785,3 +785,88 @@ async fn protected_bases_and_reader_windows_override_expiration() {
         3
     );
 }
+
+#[tokio::test]
+async fn discarded_data_singletons_leave_budget_for_delete_manifest_merge() {
+    use flow_iceberg_ext::{ManifestCache, ManifestRewritePolicy, RewriteManifestsAction};
+    let (catalog, mut table) = setup().await;
+    for index in 0..2 {
+        let mut state = index + 123u64;
+        let metadata = (0..8192)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(format!("memory://warehouse/budget-{index}.parquet"))
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .file_size_in_bytes(128)
+            .record_count(10)
+            .key_metadata(Some(metadata))
+            .build()
+            .unwrap();
+        table = RowDeltaAction::new(&table, format!("budget-{index}"))
+            .add_data_files(vec![file.clone()])
+            .commit(&catalog, &table)
+            .await
+            .unwrap()
+            .table;
+        table = RowDeltaAction::new(&table, format!("budget-delete-{index}"))
+            .add_delete_files(vec![delete(&format!("budget-delete-{index}"), &file)])
+            .validate_data_files_exist([file.file_path().to_owned()])
+            .commit(&catalog, &table)
+            .await
+            .unwrap()
+            .table;
+    }
+    let list = table
+        .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+        .load()
+        .await
+        .unwrap();
+    let data_sizes = list
+        .entries()
+        .iter()
+        .filter(|m| m.content == ManifestContentType::Data)
+        .map(|m| m.manifest_length as u64)
+        .collect::<Vec<_>>();
+    let delete_bytes: u64 = list
+        .entries()
+        .iter()
+        .filter(|m| m.content == ManifestContentType::Deletes)
+        .map(|m| m.manifest_length as u64)
+        .sum();
+    let target = data_sizes.iter().max().unwrap() + 1;
+    assert!(data_sizes.iter().sum::<u64>() > target && delete_bytes < target);
+    let before = SnapshotView::current(&table).await.unwrap();
+    let policy = ManifestRewritePolicy {
+        min_manifest_count: 2,
+        max_input_manifests: 2,
+        target_bytes: target,
+        ..Default::default()
+    };
+    let rewrite = RewriteManifestsAction::plan(&table, "refund-singletons", &policy)
+        .await
+        .unwrap()
+        .expect("eligible delete pair must retain its budget");
+    rewrite
+        .write_artifacts(&table, &ManifestCache::default())
+        .await
+        .unwrap();
+    let result = rewrite.commit(&catalog, &table).await.unwrap();
+    let after = SnapshotView::current(&result.table).await.unwrap();
+    assert_eq!(after.manifest_count(), 3);
+    assert_eq!(after.live_files.len(), before.live_files.len());
+    for (path, original) in &before.live_files {
+        let current = &after.live_files[path];
+        assert_eq!(current.data_file, original.data_file);
+        assert_eq!(current.snapshot_id, original.snapshot_id);
+        assert_eq!(current.sequence_number, original.sequence_number);
+        assert_eq!(current.file_sequence_number, original.file_sequence_number);
+    }
+}

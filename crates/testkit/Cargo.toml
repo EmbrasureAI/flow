@@ -26,6 +26,9 @@ tempfile.workspace = true
 workspace = true
 
 [dev-dependencies]
+parquet.workspace = true
+bytes.workspace = true
+typetag = "0.2"
 flow-pg-source.workspace = true
 flow-compactor.workspace = true
 tokio.workspace = true

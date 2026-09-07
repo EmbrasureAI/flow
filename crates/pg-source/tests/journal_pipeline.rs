@@ -253,6 +253,7 @@ fn exact_source_types_agree_between_copy_binary_and_cdc_text() {
         ("id", ColumnType::Uuid, 2950),
         ("b", ColumnType::Binary, 17),
         ("f", ColumnType::Float64, 700),
+        ("ts", ColumnType::TimestampMicros, 1114),
     ];
     let schema = TableSchema {
         table_id: TableId(1),
@@ -296,6 +297,7 @@ fn exact_source_types_agree_between_copy_binary_and_cdc_text() {
         "00000000-0000-0000-0000-000000000001",
         "\\x00aaff",
         "0.1",
+        "2000-01-01 00:00:00.000001",
     ]
     .into_iter()
     .map(|s| Cell::Text(Bytes::from_static(s.as_bytes())))
@@ -310,6 +312,7 @@ fn exact_source_types_agree_between_copy_binary_and_cdc_text() {
         Cell::Binary(Bytes::copy_from_slice(&1u128.to_be_bytes())),
         Cell::Binary(Bytes::from_static(&[0, 170, 255])),
         Cell::Binary(Bytes::copy_from_slice(&0.1f32.to_be_bytes())),
+        Cell::Binary(Bytes::copy_from_slice(&1i64.to_be_bytes())),
     ];
     let expected = decode_row(&schema, &relation, &text).unwrap();
     assert_eq!(
@@ -322,6 +325,69 @@ fn exact_source_types_agree_between_copy_binary_and_cdc_text() {
     assert_eq!(expected[2], Value::TimestampTzMicros(946_684_800_000_001));
     assert_eq!(expected[5], Value::Float64(f64::from(0.1f32)));
     assert_eq!(decode_row(&schema, &relation, &binary).unwrap(), expected);
+    for (date, year, month, day, bc) in [
+        ("10000-01-01", 10000, 1, 1, false),
+        ("0001-01-01", 0, 1, 1, true),
+        ("2024-02-29", 2024, 2, 29, false),
+    ] {
+        let era = if bc { " BC" } else { "" };
+        let civil = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        let pg_days = i32::try_from(civil.signed_duration_since(epoch).num_days()).unwrap();
+        let pg_micros = i64::from(pg_days) * 86_400_000_000 + 1;
+        let mut wide_text = text.clone();
+        wide_text[1] = Cell::Text(Bytes::from(format!("{date}{era}")));
+        wide_text[2] = Cell::Text(Bytes::from(format!("{date} 00:00:00.000001+00{era}")));
+        wide_text[6] = Cell::Text(Bytes::from(format!("{date} 00:00:00.000001{era}")));
+        let mut wide_binary = binary.clone();
+        wide_binary[1] = Cell::Binary(Bytes::copy_from_slice(&pg_days.to_be_bytes()));
+        wide_binary[2] = Cell::Binary(Bytes::copy_from_slice(&pg_micros.to_be_bytes()));
+        wide_binary[6] = wide_binary[2].clone();
+        assert_eq!(
+            decode_row(&schema, &relation, &wide_text).unwrap(),
+            decode_row(&schema, &relation, &wide_binary).unwrap(),
+            "{date}{era}"
+        );
+    }
+    // The finite PostgreSQL date range extends well beyond chrono's calendar.
+    for (date, pg_days) in [
+        ("4714-11-24 BC", -2_451_545i32),
+        ("5874897-12-31", 2_145_031_948),
+    ] {
+        let mut wide_text = text.clone();
+        wide_text[1] = Cell::Text(Bytes::from(date));
+        let mut wide_binary = binary.clone();
+        wide_binary[1] = Cell::Binary(Bytes::copy_from_slice(&pg_days.to_be_bytes()));
+        assert_eq!(
+            decode_row(&schema, &relation, &wide_text).unwrap(),
+            decode_row(&schema, &relation, &wide_binary).unwrap()
+        );
+    }
+    // A finite timestamp beyond chrono's maximum year must also survive CDC.
+    let mut far_text = text.clone();
+    far_text[2] = Cell::Text(Bytes::from_static(b"280000-01-01 00:00:00+00"));
+    far_text[6] = Cell::Text(Bytes::from_static(b"280000-01-01 00:00:00"));
+    let mut far_binary = binary.clone();
+    let pg_micros = 101_537_415i64 * 86_400_000_000;
+    far_binary[2] = Cell::Binary(Bytes::copy_from_slice(&pg_micros.to_be_bytes()));
+    far_binary[6] = far_binary[2].clone();
+    assert_eq!(
+        decode_row(&schema, &relation, &far_text).unwrap(),
+        decode_row(&schema, &relation, &far_binary).unwrap()
+    );
+    // Infinity and finite timestamps whose Unix conversion overflows must be
+    // rejected in both representations, even though PostgreSQL can store them.
+    for (date, pg_micros) in [
+        ("infinity", i64::MAX),
+        ("294276-12-31 23:59:59.999999", 9_223_371_331_199_999_999),
+    ] {
+        let mut bad_text = text.clone();
+        bad_text[6] = Cell::Text(Bytes::from(date));
+        let mut bad_binary = binary.clone();
+        bad_binary[6] = Cell::Binary(Bytes::copy_from_slice(&pg_micros.to_be_bytes()));
+        assert!(decode_row(&schema, &relation, &bad_text).is_err());
+        assert!(decode_row(&schema, &relation, &bad_binary).is_err());
+    }
     let mut incompatible_numeric = relation.clone();
     incompatible_numeric.columns[0].type_modifier = 4 + (20 << 16) + 5;
     assert!(decode_row(&schema, &incompatible_numeric, &text).is_err());

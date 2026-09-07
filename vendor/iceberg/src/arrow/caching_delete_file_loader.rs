@@ -24,7 +24,7 @@ use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
-use super::delete_filter::{DeleteFilter, PosDelLoadAction};
+use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
@@ -57,7 +57,7 @@ enum DeleteFileContext {
     ExistingEqDel,
     ExistingPosDel,
     PosDels {
-        file_path: String,
+        load: PosDelLoadGuard,
         stream: ArrowRecordBatchStream,
     },
     FreshEqDel {
@@ -71,7 +71,7 @@ enum DeleteFileContext {
 // results are fully merged into the DeleteFileManager's state
 enum ParsedDeleteFileContext {
     DelVecs {
-        file_path: String,
+        load: PosDelLoadGuard,
         results: HashMap<String, DeleteVector>,
     },
     EqDel,
@@ -171,7 +171,7 @@ impl CachingDeleteFileLoader {
         delete_file_entries: &[FileScanTaskDeleteFile],
         schema: SchemaRef,
     ) -> Receiver<Result<DeleteFilter>> {
-        let (tx, rx) = channel();
+        let (mut tx, rx) = channel();
 
         let stream_items = delete_file_entries
             .iter()
@@ -213,17 +213,28 @@ impl CachingDeleteFileLoader {
 
                 while let Some(item) = results_stream.next().await {
                     let item = item?;
-                    if let ParsedDeleteFileContext::DelVecs { file_path, results } = item {
+                    if let ParsedDeleteFileContext::DelVecs { load, results } = item {
                         // Mark the positional delete file as fully loaded so waiters can proceed
-                        del_filter.finish_pos_del_load(&file_path, results);
+                        load.finish(results);
                     }
                 }
 
                 Ok(del_filter)
-            }
-            .await;
+            };
 
-            let _ = tx.send(result);
+            // The receiver owns this task's lifetime, including while its caller
+            // opens the data file. Dropping a scan cancels all buffered loads.
+            let result = {
+                let closed = tx.closed();
+                futures::pin_mut!(closed, result);
+                match futures::future::select(closed, result).await {
+                    futures::future::Either::Left(_) => None,
+                    futures::future::Either::Right((result, _)) => Some(result),
+                }
+            };
+            if let Some(result) = result {
+                let _ = tx.send(result);
+            }
         });
 
         rx
@@ -236,24 +247,22 @@ impl CachingDeleteFileLoader {
         schema: SchemaRef,
     ) -> Result<DeleteFileContext> {
         match task.file_type {
-            DataContentType::PositionDeletes => {
+            DataContentType::PositionDeletes => loop {
                 match del_filter.try_start_pos_del_load(&task.file_path) {
-                    PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
-                    PosDelLoadAction::WaitFor(notify) => {
-                        // Positional deletes are accessed synchronously by ArrowReader.
-                        // We must wait here to ensure the data is ready before returning,
-                        // otherwise ArrowReader might get an empty/partial result.
-                        notify.await;
-                        Ok(DeleteFileContext::ExistingPosDel)
+                    PosDelLoadAction::AlreadyLoaded => {
+                        return Ok(DeleteFileContext::ExistingPosDel);
                     }
-                    PosDelLoadAction::Load => Ok(DeleteFileContext::PosDels {
-                        file_path: task.file_path.clone(),
-                        stream: basic_delete_file_loader
+                    PosDelLoadAction::Failed(error) => return Err(error),
+                    PosDelLoadAction::WaitFor(notify) => notify.await,
+                    PosDelLoadAction::Load(mut load) => {
+                        let stream = basic_delete_file_loader
                             .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
-                            .await?,
-                    }),
+                            .await
+                            .map_err(|error| load.fail(error))?;
+                        return Ok(DeleteFileContext::PosDels { load, stream });
+                    }
                 }
-            }
+            },
 
             DataContentType::EqualityDeletes => {
                 let Some(notify) = del_filter.try_start_eq_del_load(&task.file_path) else {
@@ -295,10 +304,12 @@ impl CachingDeleteFileLoader {
         match ctx {
             DeleteFileContext::ExistingEqDel => Ok(ParsedDeleteFileContext::EqDel),
             DeleteFileContext::ExistingPosDel => Ok(ParsedDeleteFileContext::ExistingPosDel),
-            DeleteFileContext::PosDels { file_path, stream } => {
-                let del_vecs = Self::parse_positional_deletes_record_batch_stream(stream).await?;
+            DeleteFileContext::PosDels { mut load, stream } => {
+                let del_vecs = Self::parse_positional_deletes_record_batch_stream(stream)
+                    .await
+                    .map_err(|error| load.fail(error))?;
                 Ok(ParsedDeleteFileContext::DelVecs {
-                    file_path,
+                    load,
                     results: del_vecs,
                 })
             }

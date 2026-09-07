@@ -22,29 +22,46 @@ pub struct ManifestCache {
     entries: Cache<(Uuid, String, i64, i64), Arc<Manifest>>,
 }
 
+fn data_file_weight(file: &iceberg::spec::DataFile) -> usize {
+    let mut bytes = 512_usize
+        .saturating_add(file.file_path().len())
+        .saturating_add(
+            (file.column_sizes().len()
+                + file.value_counts().len()
+                + file.null_value_counts().len()
+                + file.nan_value_counts().len())
+            .saturating_mul(48),
+        )
+        .saturating_add(file.key_metadata().map_or(0, <[u8]>::len))
+        .saturating_add(
+            file.split_offsets()
+                .map_or(0, |v| v.len().saturating_mul(8)),
+        )
+        .saturating_add(file.equality_ids().map_or(0, |v| v.len().saturating_mul(4)))
+        .saturating_add(file.referenced_data_file().as_ref().map_or(0, String::len));
+    for bound in file
+        .lower_bounds()
+        .values()
+        .chain(file.upper_bounds().values())
+    {
+        let payload = match bound.literal() {
+            PrimitiveLiteral::String(value) => value.capacity(),
+            PrimitiveLiteral::Binary(value) => value.capacity(),
+            _ => 0,
+        };
+        bytes = bytes.saturating_add(128).saturating_add(payload);
+    }
+    bytes
+}
+
 impl ManifestCache {
     pub fn new(estimated_bytes: u64) -> Self {
         Self {
             entries: Cache::builder()
                 .max_capacity(estimated_bytes)
                 .weigher(|_, manifest: &Arc<Manifest>| {
-                    // Metadata includes many small heap allocations beyond its Avro size.
-                    // Count paths and metric maps explicitly, then reserve their overhead.
                     let bytes = manifest.entries().iter().fold(4096_usize, |bytes, entry| {
-                        let file = entry.data_file();
-                        bytes
-                            .saturating_add(512)
-                            .saturating_add(file.file_path().len())
-                            .saturating_add(
-                                (file.column_sizes().len()
-                                    + file.value_counts().len()
-                                    + file.null_value_counts().len()
-                                    + file.nan_value_counts().len())
-                                    * 48,
-                            )
-                            .saturating_add(
-                                (file.lower_bounds().len() + file.upper_bounds().len()) * 128,
-                            )
+                        bytes.saturating_add(data_file_weight(entry.data_file()))
                     });
                     u32::try_from(bytes).unwrap_or(u32::MAX)
                 })
@@ -263,4 +280,87 @@ pub fn position_delete_may_apply(delete: &ManifestEntry, data: &ManifestEntry) -
             .upper_bounds()
             .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
             .is_some_and(|upper| upper < &path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iceberg::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion,
+        ManifestContentType, ManifestMetadata, ManifestStatus, NestedField, PartitionSpec,
+        PrimitiveType, Schema, Struct, Type,
+    };
+
+    fn bounded_file(size: usize) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("memory://warehouse/data/metrics.parquet".into())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .file_size_in_bytes(1)
+            .record_count(1)
+            .lower_bounds(HashMap::from([
+                (1, Datum::string("x".repeat(size))),
+                (2, Datum::binary(vec![0; size])),
+            ]))
+            .upper_bounds(HashMap::from([
+                (1, Datum::string("z".repeat(size))),
+                (2, Datum::binary(vec![255; size])),
+            ]))
+            .key_metadata(Some(vec![0; size]))
+            .split_offsets(Some(vec![0; size]))
+            .equality_ids(Some(vec![1; size]))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cache_charges_variable_metric_payloads_and_evicts_oversized_manifests() {
+        let small = bounded_file(1);
+        let large = bounded_file(16_384);
+        assert!(data_file_weight(&large) - data_file_weight(&small) >= (16_384 - 1) * 17);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "value",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let manifest = |file| {
+            Arc::new(Manifest::new(
+                ManifestMetadata {
+                    schema: schema.clone(),
+                    schema_id: 0,
+                    partition_spec: PartitionSpec::unpartition_spec(),
+                    format_version: FormatVersion::V2,
+                    content: ManifestContentType::Data,
+                },
+                vec![
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(file)
+                        .build(),
+                ],
+            ))
+        };
+        let cache = ManifestCache::new(32_768);
+        let small_key = (Uuid::nil(), "small".into(), 1, 1);
+        let large_key = (Uuid::nil(), "large".into(), 1, 1);
+        cache
+            .entries
+            .insert(small_key.clone(), manifest(small))
+            .await;
+        cache.entries.run_pending_tasks().await;
+        assert!(cache.entries.get(&small_key).await.is_some());
+        cache
+            .entries
+            .insert(large_key.clone(), manifest(large))
+            .await;
+        cache.entries.run_pending_tasks().await;
+        assert!(cache.entries.get(&large_key).await.is_none());
+        assert!(cache.entries.weighted_size() <= 32_768);
+    }
 }

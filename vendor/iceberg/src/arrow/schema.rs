@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by Embrasure Flow: preserve UUID logical types through Arrow schemas.
+
 //! Conversion between Arrow schema and Iceberg schema.
 
 use std::collections::HashMap;
@@ -315,7 +317,7 @@ impl ArrowSchemaConverter {
         let mut results = Vec::with_capacity(fields.len());
         for i in 0..fields.len() {
             let field = &fields[i];
-            let field_type = &field_results[i];
+            let field_type = field_type_with_extension(field, field_results[i].clone());
             let id = self.get_field_id(field)?;
             let doc = get_field_doc(field);
             let nested_field = NestedField {
@@ -323,7 +325,7 @@ impl ArrowSchemaConverter {
                 doc,
                 name: field.name().clone(),
                 required: !field.is_nullable(),
-                field_type: Box::new(field_type.clone()),
+                field_type: Box::new(field_type),
                 initial_default: None,
                 write_default: None,
             };
@@ -366,8 +368,11 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
 
         let id = self.get_field_id(element_field)?;
         let doc = get_field_doc(element_field);
-        let mut element_field =
-            NestedField::list_element(id, value.clone(), !element_field.is_nullable());
+        let mut element_field = NestedField::list_element(
+            id,
+            field_type_with_extension(element_field, value),
+            !element_field.is_nullable(),
+        );
         if let Some(doc) = doc {
             element_field = element_field.with_doc(doc);
         }
@@ -391,7 +396,10 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
 
                     let key_id = self.get_field_id(key_field)?;
                     let key_doc = get_field_doc(key_field);
-                    let mut key_field = NestedField::map_key_element(key_id, key_value.clone());
+                    let mut key_field = NestedField::map_key_element(
+                        key_id,
+                        field_type_with_extension(key_field, key_value),
+                    );
                     if let Some(doc) = key_doc {
                         key_field = key_field.with_doc(doc);
                     }
@@ -401,7 +409,7 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
                     let value_doc = get_field_doc(value_field);
                     let mut value_field = NestedField::map_value_element(
                         value_id,
-                        value.clone(),
+                        field_type_with_extension(value_field, value),
                         !value_field.is_nullable(),
                     );
                     if let Some(doc) = value_doc {
@@ -490,6 +498,14 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
     }
 }
 
+fn field_type_with_extension(field: &Field, physical: Type) -> Type {
+    if field.has_valid_extension_type::<arrow_schema::extension::Uuid>() {
+        Type::Primitive(PrimitiveType::Uuid)
+    } else {
+        physical
+    }
+}
+
 struct ToArrowSchemaConverter;
 
 enum ArrowSchemaOrFieldOrType {
@@ -532,9 +548,17 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         } else {
             HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string())])
         };
-        Ok(ArrowSchemaOrFieldOrType::Field(
-            Field::new(field.name.clone(), ty, !field.required).with_metadata(metadata),
-        ))
+        let arrow_field =
+            Field::new(field.name.clone(), ty, !field.required).with_metadata(metadata);
+        let arrow_field = if matches!(
+            field.field_type.as_ref(),
+            Type::Primitive(PrimitiveType::Uuid)
+        ) {
+            arrow_field.with_extension_type(arrow_schema::extension::Uuid)
+        } else {
+            arrow_field
+        };
+        Ok(ArrowSchemaOrFieldOrType::Field(arrow_field))
     }
 
     fn r#struct(
@@ -561,21 +585,6 @@ impl SchemaVisitor for ToArrowSchemaConverter {
             ArrowSchemaOrFieldOrType::Field(field) => field,
             _ => unreachable!(),
         };
-        let meta = if let Some(doc) = &list.element_field.doc {
-            HashMap::from([
-                (
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    list.element_field.id.to_string(),
-                ),
-                (ARROW_FIELD_DOC_KEY.to_string(), doc.clone()),
-            ])
-        } else {
-            HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                list.element_field.id.to_string(),
-            )])
-        };
-        let field = field.with_metadata(meta);
         Ok(ArrowSchemaOrFieldOrType::Type(DataType::List(Arc::new(
             field,
         ))))
@@ -1704,7 +1713,8 @@ mod tests {
             ),
             simple_field("map", map, false, "16"),
             simple_field("struct", r#struct, false, "17"),
-            simple_field("uuid", DataType::FixedSizeBinary(16), false, "30"),
+            simple_field("uuid", DataType::FixedSizeBinary(16), false, "30")
+                .with_extension_type(arrow_schema::extension::Uuid),
         ])
     }
 

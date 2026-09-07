@@ -447,3 +447,49 @@ fn corrupt_control_operation_stops_before_index_rebuild() {
         Err(Error::AuthorityCorruption(_))
     ));
 }
+
+#[test]
+fn missing_sealed_tail_requires_rebuild_and_preserves_control_outcome() {
+    let temp = TempDir::new().unwrap();
+    let index_path = temp.path().join("index");
+    let control_path = temp.path().join("control");
+    let id = OperationId("sealed-tail".into());
+    {
+        let control = ControlStore::open(&control_path).unwrap();
+        let index = control.initialize_index(&index_path, options()).unwrap();
+        index
+            .prepare(
+                operation(&id.0, None, 10),
+                [delta("a", 1, 10), delta("a", 2, 10)],
+            )
+            .unwrap();
+    }
+    {
+        let options = rocksdb::Options::default();
+        let families = rocksdb::DB::list_cf(&options, &index_path).unwrap();
+        let db = rocksdb::DB::open_cf(&options, &index_path, families).unwrap();
+        let mut key = (id.0.len() as u64).to_be_bytes().to_vec();
+        key.extend_from_slice(id.0.as_bytes());
+        key.push(0);
+        key.extend_from_slice(&1u64.to_be_bytes());
+        db.delete_cf(&db.cf_handle("index_deltas").unwrap(), key)
+            .unwrap();
+    }
+    let control = ControlStore::open(control_path).unwrap();
+    let error = match StateStore::open_with_control(index_path, options(), control.clone()) {
+        Ok(_) => panic!("missing prepared tail was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.requires_index_rebuild());
+    let record = control.operation(&id).unwrap().unwrap();
+    assert_eq!(record.phase, OperationPhase::Prepared);
+    assert_eq!(record.delta_count, 2);
+    assert_eq!(record.operation.artifacts, ["sealed-tail.parquet"]);
+    // Catalog outcome can still be resolved using the durable control record.
+    control.resolve_operation(&id, Some((1, 1))).unwrap();
+    assert!(control.operation(&id).unwrap().is_none());
+    let table = control.table_state(&TableId(7)).unwrap().unwrap();
+    assert_eq!(table.snapshot_id, Some(1));
+    assert_eq!(table.materialized_lsn, PgLsn(10));
+    assert!(table.pending_operation.is_none());
+}

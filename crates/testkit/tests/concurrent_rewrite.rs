@@ -1,5 +1,9 @@
 #[path = "common/rewrite.rs"]
 mod fixture;
+#[path = "common/gated_storage.rs"]
+mod gated_storage;
+#[path = "common/storage_catalog.rs"]
+mod storage_catalog;
 use fixture::{Fixture, options, row, sorted};
 use flow_compactor::Policy;
 use flow_coordinator::{
@@ -557,7 +561,6 @@ async fn preparation_deadline_allows_cdc_before_join_and_retires_scratch_ownersh
     let scratch_name = "deadline-preparation-build";
     let scratch_path = f.temp.path().join(scratch_name);
     let scratch = f.scratch(scratch_name);
-    let scratch_lock = scratch.clone();
     let ready = maintenance
         .start_compaction(&base, &f.schema, scratch)
         .await
@@ -571,43 +574,74 @@ async fn preparation_deadline_allows_cdc_before_join_and_retires_scratch_ownersh
     cdc(&mut f, 100, vec![(10, Change::Update(updated(10)))]).await;
     let late = f.head.clone();
 
-    // Hold the scratch writer after the data build so the background catch-up
-    // cannot finish before the zero-duration deadline is observed.
-    let (entered_lock, lock_entered) = std::sync::mpsc::channel();
-    let (release_lock, lock_released) = std::sync::mpsc::channel();
-    let table_id = f.schema.table_id;
-    let held_location = f.locations[0].clone();
-    let holding_lock = tokio::task::spawn_blocking(move || {
-        scratch_lock.put_position_deletes(
-            "deadline-test-lock",
-            &table_id,
-            std::iter::once_with(move || {
-                let _ = entered_lock.send(());
-                let _ = lock_released.recv();
-                held_location
-            }),
-        )
-    });
-    tokio::task::spawn_blocking(move || lock_entered.recv_timeout(Duration::from_secs(5)))
+    // This delete is read by catch-up only after its immutable index capture.
+    // Waiting for the storage gate avoids racing CDC with that initial capture.
+    let late_delete = SnapshotView::current(&late)
         .await
         .unwrap()
-        .unwrap();
+        .live_files
+        .values()
+        .find(|entry| {
+            entry.content_type() == DataContentType::PositionDeletes
+                && entry.sequence_number == Some(late.metadata().last_sequence_number())
+        })
+        .unwrap()
+        .file_path()
+        .to_owned();
+    let gate = std::sync::Arc::new(gated_storage::Gate::default());
+    let file_io =
+        iceberg::io::FileIOBuilder::new(std::sync::Arc::new(gated_storage::GatedStorage {
+            gate: gate.clone(),
+            owner_path: late_delete,
+            sibling_path: String::new(),
+            fail: false,
+        }))
+        .build();
+    let maintenance = TableMaintenance::new(
+        f.index.clone(),
+        std::sync::Arc::new(storage_catalog::StorageCatalog {
+            inner: f.catalog.clone(),
+            file_io,
+        }),
+        compaction_policy(),
+        WriterConfig::default(),
+    )
+    .unwrap();
     let preparing = maintenance
         .start_compaction_preparation(&late, &f.schema, ready)
         .await
         .unwrap();
-    let retiring = match preparing.wait_for(Duration::ZERO).await.unwrap() {
+    let captured = tokio::time::timeout(Duration::from_secs(5), gate.started.acquire()).await;
+    if captured.is_err() {
+        gate.release.close();
+        if let PreparationWait::Deadline(retiring) =
+            preparing.wait_for(Duration::ZERO).await.unwrap()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(5), retiring.wait()).await;
+        }
+        panic!("preparation never reached its read after index capture");
+    }
+    captured.unwrap().unwrap().forget();
+    let retiring = match preparing.wait_for(Duration::from_millis(10)).await.unwrap() {
         PreparationWait::Deadline(retiring) => retiring,
         PreparationWait::Ready(prepared) => {
-            let _ = release_lock.send(());
-            holding_lock.await.unwrap().unwrap();
+            gate.release.close();
             prepared.discard().await.unwrap();
-            panic!("zero preparation budget unexpectedly completed the blocking worker")
+            panic!("preparation completed while its storage read was held")
         }
     };
     let operation = retiring.operation_id().clone();
 
-    cdc(&mut f, 110, vec![(14, Change::Delete)]).await;
+    let continued = tokio::time::timeout(
+        Duration::from_secs(5),
+        cdc(&mut f, 110, vec![(14, Change::Delete)]),
+    )
+    .await;
+    if continued.is_err() {
+        gate.release.close();
+        let _ = tokio::time::timeout(Duration::from_secs(5), retiring.wait()).await;
+        panic!("CDC waited for background preparation");
+    }
     let advanced = f.head.clone();
     let advanced_state = f.index.table_state(&f.schema.table_id).unwrap();
     let advanced_rows = sorted(scan(&advanced, &f.schema).await.unwrap());
@@ -619,8 +653,7 @@ async fn preparation_deadline_allows_cdc_before_join_and_retires_scratch_ownersh
         "retirement must retain build ownership until its worker is joined"
     );
 
-    release_lock.send(()).unwrap();
-    holding_lock.await.unwrap().unwrap();
+    gate.release.close();
     tokio::time::timeout(Duration::from_secs(5), retiring.wait())
         .await
         .unwrap()

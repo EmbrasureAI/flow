@@ -596,7 +596,7 @@ impl TableWork {
                 "journal schema is newer than durable source registry"
             );
         }
-        let mut current = self.catalog.load_table(table.identifier()).await?;
+        let mut current = crate::schema::refresh_table(self.catalog.as_ref(), &table).await?;
         current =
             crate::schema::ensure_table_schema(self.catalog.as_ref(), &current, &schema).await?;
         let indexed = self.store.table_state(&id)?;
@@ -617,7 +617,7 @@ impl TableWork {
             let cleanup = std::fs::remove_dir_all(path);
             result?;
             cleanup?;
-            current = self.catalog.load_table(table.identifier()).await?;
+            current = crate::schema::refresh_table(self.catalog.as_ref(), &table).await?;
         }
         if indexed.schema_version != schema.version {
             let store = self.store.clone();
@@ -783,7 +783,7 @@ impl TableWork {
         }
         let source = SourceId(self.config.source.id.clone());
         let schema = crate::schema::latest_schema(&self.store, &source, id)?.unwrap_or(schema);
-        let current = self.catalog.load_table(table.identifier()).await?;
+        let current = crate::schema::refresh_table(self.catalog.as_ref(), table).await?;
         if indexed.snapshot_id != current.metadata().current_snapshot_id()
             || indexed.schema_version != schema.version
             || !flow_coordinator::same_iceberg_schema(
@@ -922,7 +922,8 @@ impl TableWork {
 
     fn metadata_due(&self, table: &Table, id: TableId, manifests: usize) -> Result<bool> {
         Ok(manifests >= self.config.limits.manifest_max_count
-            || history_due(table, self.config.limits.snapshot_retention_secs)?
+            || self.config.limits.snapshot_expiration
+                && history_due(table, self.config.limits.snapshot_retention_secs)?
             || self.garbage_due(id)?)
     }
 
@@ -935,7 +936,8 @@ impl TableWork {
         manifests: usize,
     ) -> Result<(Table, bool)> {
         let manifests_due = manifests >= self.config.limits.manifest_max_count;
-        let history_due = history_due(&current, self.config.limits.snapshot_retention_secs)?;
+        let history_due = self.config.limits.snapshot_expiration
+            && history_due(&current, self.config.limits.snapshot_retention_secs)?;
         let garbage_due = self.garbage_due(id)?;
         if manifests_due {
             self.maintenance

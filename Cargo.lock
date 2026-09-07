@@ -295,6 +295,10 @@ name = "arrow-schema"
 version = "58.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21ca356ad6425cecb6eb7b28e4f659f1ee7880fbb1a16127de7dd62901efee9e"
+dependencies = [
+ "serde_core",
+ "serde_json",
+]
 
 [[package]]
 name = "arrow-select"
@@ -1400,6 +1404,7 @@ dependencies = [
 name = "flow-iceberg-ext"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "iceberg",
  "moka",
@@ -1441,7 +1446,6 @@ dependencies = [
 name = "flow-model"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "blake3",
  "proptest",
  "serde",
@@ -1492,6 +1496,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "bytes",
  "clap",
  "flow-compactor",
  "flow-coordinator",
@@ -1505,11 +1510,13 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "parquet",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "toml",
+ "typetag",
  "uuid",
 ]
 
@@ -4428,7 +4435,6 @@ dependencies = [
 [[package]]
 name = "tokio-postgres"
 version = "0.7.18"
-source = "git+https://github.com/iambriccardo/rust-postgres?rev=c4b8de06aaa99f71800126bedcca6e623d368357#c4b8de06aaa99f71800126bedcca6e623d368357"
 dependencies = [
  "async-trait",
  "byteorder",

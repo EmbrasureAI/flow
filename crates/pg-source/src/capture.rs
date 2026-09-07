@@ -1,5 +1,5 @@
 use crate::{Cell, Error, Relation, Result, SourceEvent, TransactionSpool, Tuple};
-use chrono::{DateTime, NaiveDate, NaiveDateTime};
+use chrono::{NaiveTime, Timelike};
 use flow_ingress_journal::Journal;
 use flow_model::{
     ColumnType, Mutation, MutationKind, PgLsn, Row, SourceId, SourceTransaction, TableId,
@@ -531,6 +531,109 @@ fn invalid(kind: &ColumnType) -> Error {
     Error::Value(format!("invalid or unsupported {kind:?} representation"))
 }
 
+fn postgres_era(text: &str) -> (&str, bool) {
+    text.strip_suffix(" BC")
+        .map_or((text, false), |date| (date, true))
+}
+
+// PostgreSQL emits unsigned wide years and a BC suffix. Integer Gregorian
+// arithmetic covers its full finite range, beyond chrono's calendar range.
+fn postgres_days(date: &str, bc: bool) -> Option<i64> {
+    let mut parts = date.split('-');
+    let year = parts.next()?;
+    if !year.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    let year = year.parse::<i32>().ok()?;
+    if year <= 0 {
+        return None;
+    }
+    let year = if bc {
+        1 - i64::from(year)
+    } else {
+        i64::from(year)
+    };
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if day == 0 || day > max_day || parts.next().is_some() {
+        return None;
+    }
+    // March-based Gregorian eras; subtract the March-based day of 2000-01-01.
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month + 2) / 5 + i64::from(day) - 1;
+    Some(
+        era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+            - 730_425,
+    )
+}
+
+fn postgres_offset(offset: &str) -> Option<i64> {
+    let sign = match offset.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let mut parts = offset[1..].split(':');
+    let hours = parts.next()?.parse::<u32>().ok()?;
+    let minutes = parts
+        .next()
+        .map(str::parse::<u32>)
+        .transpose()
+        .ok()?
+        .unwrap_or(0);
+    let seconds = parts
+        .next()
+        .map(str::parse::<u32>)
+        .transpose()
+        .ok()?
+        .unwrap_or(0);
+    if hours > 15 || minutes > 59 || seconds > 59 || parts.next().is_some() {
+        return None;
+    }
+    Some(sign * i64::from(hours * 3600 + minutes * 60 + seconds))
+}
+
+// These are PostgreSQL's IS_VALID_DATE / IS_VALID_TIMESTAMP finite bounds.
+// Both wire formats also require that conversion to the model epoch fits.
+fn date_value(days: i64, kind: &ColumnType) -> Result<Value> {
+    if !(-2_451_545..2_145_031_949).contains(&days) {
+        return Err(invalid(kind));
+    }
+    Ok(Value::Date(
+        i32::try_from(days + 10_957).map_err(|_| invalid(kind))?,
+    ))
+}
+
+fn timestamp_value(micros: i64, kind: &ColumnType) -> Result<Value> {
+    if !(-211_813_488_000_000_000..9_223_371_331_200_000_000).contains(&micros) {
+        return Err(invalid(kind));
+    }
+    let timestamp = micros
+        .checked_add(946_684_800_000_000)
+        .ok_or_else(|| invalid(kind))?;
+    Ok(if matches!(kind, ColumnType::TimestampTzMicros) {
+        Value::TimestampTzMicros(timestamp)
+    } else {
+        Value::TimestampMicros(timestamp)
+    })
+}
+
 fn decode_text(kind: &ColumnType, oid: u32, bytes: &[u8]) -> Result<Value> {
     let text = std::str::from_utf8(bytes).map_err(|_| invalid(kind))?;
     Ok(match kind {
@@ -571,29 +674,29 @@ fn decode_text(kind: &ColumnType, oid: u32, bytes: &[u8]) -> Result<Value> {
             Value::Binary(bytes)
         }
         ColumnType::Date => {
-            let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| invalid(kind))?;
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            Value::Date(
-                i32::try_from(date.signed_duration_since(epoch).num_days())
-                    .map_err(|_| invalid(kind))?,
-            )
+            let (text, bc) = postgres_era(text);
+            date_value(postgres_days(text, bc).ok_or_else(|| invalid(kind))?, kind)?
         }
         ColumnType::TimestampMicros | ColumnType::TimestampTzMicros => {
-            let timestamp = if matches!(kind, ColumnType::TimestampTzMicros) {
-                DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z")
-                    .map_err(|_| invalid(kind))?
-                    .timestamp_micros()
+            let (text, bc) = postgres_era(text);
+            let (date, time) = text.split_once(' ').ok_or_else(|| invalid(kind))?;
+            let days = postgres_days(date, bc).ok_or_else(|| invalid(kind))?;
+            let (time, offset_seconds) = if matches!(kind, ColumnType::TimestampTzMicros) {
+                let index = time.find(['+', '-']).ok_or_else(|| invalid(kind))?;
+                let (time, offset) = time.split_at(index);
+                (time, postgres_offset(offset).ok_or_else(|| invalid(kind))?)
             } else {
-                NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-                    .map_err(|_| invalid(kind))?
-                    .and_utc()
-                    .timestamp_micros()
+                (time, 0)
             };
-            if matches!(kind, ColumnType::TimestampTzMicros) {
-                Value::TimestampTzMicros(timestamp)
-            } else {
-                Value::TimestampMicros(timestamp)
+            let time = NaiveTime::parse_from_str(time, "%H:%M:%S%.f").map_err(|_| invalid(kind))?;
+            if time.nanosecond() >= 1_000_000_000 || time.nanosecond() % 1_000 != 0 {
+                return Err(invalid(kind));
             }
+            let micros = i128::from(days) * 86_400_000_000
+                + i128::from(i64::from(time.num_seconds_from_midnight()) - offset_seconds)
+                    * 1_000_000
+                + i128::from(time.nanosecond() / 1_000);
+            timestamp_value(i64::try_from(micros).map_err(|_| invalid(kind))?, kind)?
         }
         ColumnType::Uuid => Value::Uuid(
             *uuid::Uuid::parse_str(text)
@@ -661,26 +764,12 @@ pub(crate) fn decode_binary(kind: &ColumnType, oid: u32, bytes: &[u8]) -> Result
                 .to_owned(),
         ),
         (ColumnType::Binary, _, _) => Value::Binary(bytes.to_vec()),
-        (ColumnType::Date, _, 4) => {
-            let days = i32::from_be_bytes(bytes.try_into().unwrap());
-            if days == i32::MIN || days == i32::MAX {
-                return Err(invalid(kind));
-            }
-            Value::Date(days.checked_add(10_957).ok_or_else(|| invalid(kind))?)
-        }
+        (ColumnType::Date, _, 4) => date_value(
+            i64::from(i32::from_be_bytes(bytes.try_into().unwrap())),
+            kind,
+        )?,
         (ColumnType::TimestampMicros | ColumnType::TimestampTzMicros, _, 8) => {
-            let micros = i64::from_be_bytes(bytes.try_into().unwrap());
-            if micros == i64::MIN || micros == i64::MAX {
-                return Err(invalid(kind));
-            }
-            let timestamp = micros
-                .checked_add(946_684_800_000_000)
-                .ok_or_else(|| invalid(kind))?;
-            if matches!(kind, ColumnType::TimestampTzMicros) {
-                Value::TimestampTzMicros(timestamp)
-            } else {
-                Value::TimestampMicros(timestamp)
-            }
+            timestamp_value(i64::from_be_bytes(bytes.try_into().unwrap()), kind)?
         }
         (ColumnType::Uuid, _, 16) => Value::Uuid(bytes.try_into().unwrap()),
         (ColumnType::Decimal { scale, .. }, _, length) if length >= 8 && length % 2 == 0 => {

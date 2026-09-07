@@ -10,7 +10,10 @@ are retained.
 - Upstream tree: `crates/catalog/rest`
 
 Marks HTTP 408, 429, and server failures as retryable, while retaining ambiguous
-commit-state errors. Adds opt-in bounded-label REST metrics. Changed files:
+commit-state errors. OAuth errors retain this classification for both catalog JSON
+and empty/proxy responses; bad-credential responses remain permanent. Adds opt-in
+bounded-label REST metrics with structural route matching so identifier values
+such as `config` or `namespaces` do not change endpoint attribution. Changed files:
 `Cargo.toml`, `Cargo.toml.orig`, `README.md`, `src/catalog.rs`, `src/client.rs`,
 `src/lib.rs`; `src/observation.rs` is a local Apache-2.0 addition.
 

@@ -1358,3 +1358,161 @@ async fn repair_checks_alternate_targets_inputs_and_exhaustion_without_repeating
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byte_failed_target_does_not_exhaust_a_shared_delete_input() {
+    use iceberg::spec::{DataFile, DataFileBuilder};
+    // Unreferenced padding before the footer leaves every column/page offset
+    // intact. Charge the actual resulting size, rather than fabricated metadata.
+    fn pad(file: DataFile, size: u64) -> DataFile {
+        let mut bytes = std::fs::read(file.file_path()).unwrap();
+        assert!(size as usize > bytes.len());
+        let footer = u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+            as usize;
+        let start = bytes.len() - 8 - footer;
+        let padding = size as usize - bytes.len();
+        bytes.splice(start..start, std::iter::repeat_n(0, padding));
+        std::fs::write(file.file_path(), &bytes).unwrap();
+        DataFileBuilder::default()
+            .content(file.content_type())
+            .file_path(file.file_path().to_owned())
+            .file_format(file.file_format())
+            .partition(file.partition().clone())
+            .record_count(file.record_count())
+            .file_size_in_bytes(size)
+            .lower_bounds(file.lower_bounds().clone())
+            .upper_bounds(file.upper_bounds().clone())
+            .build()
+            .unwrap()
+    }
+    let mut f = Fixture::new().await;
+    f.maintenance()
+        .compact_deletes(
+            &f.head,
+            &f.schema,
+            f.scratch("union"),
+            &DeleteRewritePolicy {
+                min_input_files: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(f.head.identifier()).await.unwrap();
+    let before = SnapshotView::current(&f.head).await.unwrap();
+    let shared = before
+        .live_files
+        .values()
+        .find(|entry| entry.content_type() == DataContentType::PositionDeletes)
+        .unwrap();
+    let shared_bytes = shared.data_file.file_size_in_bytes();
+    let isolated_a = delete(&f.head, "measure-a", f.locations[..3].to_vec()).await;
+    let isolated_b = delete(&f.head, "measure-b", f.locations[7..9].to_vec()).await;
+    let budget = 64 << 10;
+    let a_bytes = isolated_a[0].file_size_in_bytes();
+    let b_bytes = isolated_b[0].file_size_in_bytes();
+    assert!(shared_bytes > b_bytes + 1);
+    let a = pad(
+        delete(&f.head, "other-a", vec![f.locations[0].clone()])
+            .await
+            .remove(0),
+        budget - a_bytes + 1,
+    );
+    let b = pad(
+        delete(&f.head, "other-b", vec![f.locations[7].clone()])
+            .await
+            .remove(0),
+        budget - b_bytes - 1,
+    );
+    let commit = RowDeltaAction::new(&f.head, "duplicate-effective-deletes")
+        .add_delete_files(vec![a, b])
+        .validate_data_files_exist([
+            f.locations[0].data_file_id.0.clone(),
+            f.locations[7].data_file_id.0.clone(),
+        ])
+        .commit(f.catalog.as_ref(), &f.head)
+        .await
+        .unwrap();
+    // These extra physical deletes duplicate already deleted positions.
+    assert_eq!(
+        sorted(scan(&commit.table, &f.schema).await.unwrap()),
+        f.expected
+    );
+    let id = OperationId("unchanged-row-index".into());
+    f.index
+        .prepare(
+            PreparedOperation {
+                id: id.clone(),
+                table_id: f.schema.table_id,
+                kind: OperationKind::Rewrite,
+                base_snapshot_id: f.head.metadata().current_snapshot_id(),
+                last_lsn: PgLsn(80),
+                schema_version: f.schema.version,
+                artifacts: vec![],
+                payload: vec![],
+            },
+            [],
+        )
+        .unwrap();
+    f.index
+        .mark_committed(&id, commit.snapshot_id, commit.sequence_number)
+        .unwrap();
+    f.index.apply_committed(&id).unwrap();
+    f.index.forget_applied(&id).unwrap();
+    f.head = commit.table;
+    let policy = Policy {
+        max_delete_input_bytes: budget,
+        min_file_age_ms: 0,
+        ..Default::default()
+    };
+    let maintenance = TableMaintenance::new(
+        f.index.clone(),
+        f.catalog.clone(),
+        policy.clone(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let mut cursor = DeleteRepairCursor::default();
+    assert!(
+        maintenance
+            .repair_delete_dependencies(&f.head, &f.schema, f.scratch("first-target"), &mut cursor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(f.index.pending_operations().unwrap().is_empty());
+    assert!(
+        maintenance
+            .repair_delete_dependencies(&f.head, &f.schema, f.scratch("second-target"), &mut cursor)
+            .await
+            .unwrap()
+            .is_some(),
+        "the second target must remain eligible after the first output exceeds its byte budget"
+    );
+    let repaired = f.catalog.load_table(f.head.identifier()).await.unwrap();
+    let inventory = maintenance
+        .inventory(&repaired, f.schema.table_id)
+        .await
+        .unwrap();
+    let plan = policy
+        .plan(
+            repaired.metadata().current_snapshot_id().unwrap(),
+            repaired.metadata().current_schema_id(),
+            &inventory.files,
+            &inventory.deletes,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(plan.input_files.contains(&f.locations[7].data_file_id));
+    assert!(
+        maintenance
+            .compact(&repaired, &f.schema, f.scratch("unblocked-data"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let head = f.catalog.load_table(f.head.identifier()).await.unwrap();
+    assert_eq!(sorted(scan(&head, &f.schema).await.unwrap()), f.expected);
+    assert_eq!(sorted(scan(&f.head, &f.schema).await.unwrap()), f.expected);
+}

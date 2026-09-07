@@ -161,18 +161,20 @@ impl HttpClient {
             })?)
         } else {
             let code = auth_resp.status();
+            let retryable = retryable_status(code);
             let text = response_bytes(auth_resp)
                 .await
                 .map_err(|err| err.with_url(auth_url.clone()))?;
             let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
                 Error::new(ErrorKind::Unexpected, "Received unexpected response")
+                    .with_retryable(retryable)
                     .with_context("code", code.to_string())
                     .with_context("operation", "auth")
                     .with_context("url", auth_url.to_string())
                     .with_context("json", String::from_utf8_lossy(&text))
                     .with_source(e)
             })?;
-            Err(Error::from(e))
+            Err(Error::from(e).with_retryable(retryable))
         }?;
         Ok(auth_res.access_token)
     }
@@ -349,6 +351,12 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
     format!("{redacted:?}")
 }
 
+fn retryable_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+}
+
 /// Deserializes a unexpected catalog response into an error.
 pub(crate) async fn deserialize_unexpected_catalog_error(
     response: Response,
@@ -358,9 +366,7 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
         ErrorKind::Unexpected,
         "Received response with unexpected status code",
     )
-    .with_retryable(response.status().is_server_error()
-        || response.status() == StatusCode::TOO_MANY_REQUESTS
-        || response.status() == StatusCode::REQUEST_TIMEOUT)
+    .with_retryable(retryable_status(response.status()))
     .with_context("status", response.status().to_string())
     .with_context(
         "headers",

@@ -25,6 +25,7 @@ jobs:
       COMPOSE_FILE: tests/production/compose.yaml
       FLOW_POSTGRES_IMAGE: postgres:${{ matrix.postgres }}-bookworm
       FLOW_PRODUCTION_PG_CPUS: '2'
+      FLOW_PRODUCTION_PGDATA: /var/lib/postgresql/flow
       AWS_ACCESS_KEY_ID: demo-access
       AWS_SECRET_ACCESS_KEY: demo-secret-key
       AWS_REGION: us-east-1
@@ -74,6 +75,12 @@ jobs:
           uv run tests/production/contracts.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --artifacts "$RUNNER_TEMP/service-contracts"
+      - name: Snapshot inheritance and row-security contracts
+        run: >-
+          uv run tests/production/source_snapshot_contracts.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-snapshot-contracts"
       - name: Interrupted parallel bootstrap and index reconstruction
         run: >-
           uv run tests/production/bootstrap.py

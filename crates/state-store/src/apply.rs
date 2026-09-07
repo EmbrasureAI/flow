@@ -182,11 +182,11 @@ impl StateStore {
             for offset in cursor..chunk_end {
                 let Some((key, value)) = records.item() else {
                     records.status()?;
-                    return Err(Error::InvalidState("prepared delta is missing".into()));
+                    return Err(Error::RecoveryRequired("prepared delta is missing".into()));
                 };
                 expected[ordinal_start..].copy_from_slice(&offset.to_be_bytes());
                 if key != expected {
-                    return Err(Error::InvalidState(
+                    return Err(Error::RecoveryRequired(
                         "prepared delta ordinal is missing".into(),
                     ));
                 }

@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import random
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 
@@ -189,7 +190,7 @@ class BenchmarkStorageTest(unittest.TestCase):
                 store.close()
             # Final evidence is reusable without loading a JSON array or running
             # another service. SQLite verifies the actual closed file as well.
-            with sqlite3.connect(directory / "evidence.sqlite3") as reopened:
+            with closing(sqlite3.connect(directory / "evidence.sqlite3")) as reopened:
                 self.assertEqual(reopened.execute("PRAGMA integrity_check").fetchone()[0], "ok")
                 self.assertEqual(reopened.execute("SELECT count(*) FROM transactions WHERE measured=1").fetchone()[0], 9)
 

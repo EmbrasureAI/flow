@@ -105,7 +105,7 @@ impl Scheduler {
         pending.bytes = pending.bytes.saturating_add(bytes);
         pending.ready_at = pending.ready_at.min(pending.first + delay);
         if rows.is_none() || pending.rows >= self.max_rows || pending.bytes >= self.max_bytes {
-            pending.ready_at = now;
+            pending.ready_at = pending.ready_at.min(now);
         }
     }
     /// Include artifact preparation and local maintenance in the estimate: both
@@ -124,7 +124,7 @@ impl Scheduler {
     }
     pub fn force(&mut self, table: TableId, now: Instant) {
         if let Some(p) = self.pending.get_mut(&table) {
-            p.ready_at = now;
+            p.ready_at = p.ready_at.min(now);
         }
     }
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -142,7 +142,7 @@ impl Scheduler {
             .pending
             .iter()
             .filter(|(_, p)| !p.stalled && p.ready_at <= now)
-            .min_by_key(|(_, p)| (p.priority, p.ready_at))
+            .min_by_key(|(_, p)| (p.ready_at, p.priority))
             .map(|(id, _)| *id)?;
         self.pending.remove(&id);
         self.next_permit = now + self.min_commit_interval;

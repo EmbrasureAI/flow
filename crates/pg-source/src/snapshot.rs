@@ -170,7 +170,7 @@ impl<'a> SnapshotSession<'a> {
             .await?;
         transaction
             .batch_execute(&format!(
-                "SET TRANSACTION SNAPSHOT {}",
+                "SET TRANSACTION SNAPSHOT {}; SET LOCAL row_security = off",
                 quote_literal(snapshot_name)
             ))
             .await?;
@@ -200,7 +200,7 @@ impl<'a> SnapshotSession<'a> {
     pub async fn lock_table(&self, namespace: &str, table: &str) -> Result<()> {
         self.transaction
             .batch_execute(&format!(
-                "LOCK TABLE {}.{} IN ACCESS SHARE MODE",
+                "LOCK TABLE ONLY {}.{} IN ACCESS SHARE MODE",
                 quote_identifier(namespace),
                 quote_identifier(table)
             ))
@@ -235,7 +235,7 @@ impl<'a> SnapshotSession<'a> {
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "COPY (SELECT {projection} FROM {}.{}) TO STDOUT (FORMAT BINARY)",
+            "COPY (SELECT {projection} FROM ONLY {}.{}) TO STDOUT (FORMAT BINARY)",
             quote_identifier(namespace),
             quote_identifier(table)
         );

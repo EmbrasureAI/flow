@@ -21,6 +21,8 @@ docker compose --env-file target/production-local/ports.env \
 
 The fixture keeps PostgreSQL and MinIO data in named volumes, enables PostgreSQL durability, and sets explicit CPU/memory budgets. The REST catalog uses a separate database on the same PostgreSQL server. Its image adds a checksum-pinned PostgreSQL JDBC driver to the Apache fixture. Consequently, a PostgreSQL restart also interrupts catalog storage; this is one machine's recovery test, not independent database failover.
 
+`FLOW_PRODUCTION_PGDATA` defaults to `/var/lib/postgresql/18/docker`, preserving existing PostgreSQL 18 volumes. Older-version fixtures can set it to `/var/lib/postgresql/flow`; keep it outside `/var/lib/postgresql/data`, which PostgreSQL 14–17 images mount as a separate anonymous volume. Use a separate project and volume for each major version; changing PGDATA is not a database upgrade.
+
 Each retained run keeps a replication slot. The default capacity is 32; set
 `FLOW_PRODUCTION_REPLICATION_SLOTS=128` in the local environment file when keeping
 more runs for inspection, then apply Compose again with all fixture clients
@@ -77,7 +79,7 @@ uv run tests/production/benchmark.py \
   --rate 1000 --duration 60 --warmup 10
 ```
 
-The endpoints are examples; configure the actual disposable deployment. Leave PostgreSQL durability enabled: `fsync`, `full_page_writes`, and synchronous commit. The older correctness-only [local Compose fixture](../local/README.md) disables these settings and must not be used unchanged for performance qualification. Do not compare release and profiling builds as equivalent results. Every artifact directory must be new. Directory names are labels, not run identity. Each report embeds the build manifest and records its hash, source commit/tree/dirty-diff digest, exact binary hashes by process role, build-time Rust toolchain/profile/target/features/environment, harness/config hashes, run-time toolchain, machine capacity, and compactor topology. The harness rejects a binary that does not match the manifest and rechecks each executable immediately before spawning it. The harness retains logs and durable state and stops only processes it started; it does not delete service data or replication slots.
+The endpoints are examples; configure the actual disposable deployment. Leave PostgreSQL durability enabled: `fsync`, `full_page_writes`, and synchronous commit. The [local Compose fixture](../local/README.md) also retains PostgreSQL durability defaults; use this production fixture for explicit resource budgets and persistent service state. Do not compare release and profiling builds as equivalent results. Every artifact directory must be new. Directory names are labels, not run identity. Each report embeds the build manifest and records its hash, source commit/tree/dirty-diff digest, exact binary hashes by process role, build-time Rust toolchain/profile/target/features/environment, harness/config hashes, run-time toolchain, machine capacity, and compactor topology. The harness rejects a binary that does not match the manifest and rechecks each executable immediately before spawning it. The harness retains logs and durable state and stops only processes it started; it does not delete service data or replication slots.
 
 The default workload seeds 100,000 rows in one table, then uses four connections and 100 mutations per transaction: 70 updates, 20 inserts, and 10 deletes. Each transaction includes one immutable negative-key visibility probe among its 20 inserts, so probes are counted in the requested mutation rate. Writers have disjoint key ownership to avoid artificial row-lock contention. Updates and deletes assert the actual affected row counts. The complete final `(id, version, md5(payload))` stream must match PostgreSQL in sorted order, including probes.
 
@@ -455,11 +457,13 @@ checks cover a counted insert/delete no-op without an empty snapshot, a streamed
 restart, ACK progress and stopped worker panic checks.
 
 ```sh
+cargo build -p flow-testkit --example inspect_legacy_ledger
 uv run tests/production/journal_upgrade.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
   --previous-binary target/qualification-binaries/embrasure-flow-release20 \
   --binary target/qualification-binaries/embrasure-flow-release21 \
+  --ledger-inspector target/debug/examples/inspect_legacy_ledger \
   --artifacts target/production-journal-upgrade-new
 ```
 
@@ -469,9 +473,12 @@ held ACK/frontier evidence and proxy requests. This functional test records bala
 priority, ingest/coordinator roles and one-hour/two-hour L0 age limits to isolate
 format recovery while compaction is disabled; it makes no latency claim. It uses a
 free loopback proxy port and stops only its own processes, leaving service data
-and the original replication slot intact. Rust integration tests separately verify
-the old/new serialized headers and decoders; the Python gate does not parse state
-files or convert their formats itself.
+and the original replication slot intact. After joining the old binary, the gate
+checks journal frame headers and CRCs for each retained backlog transaction and
+requires terminal kind 4. The offline inspector opens a copy of the control store,
+decodes the matching ledger identities, and requires FLLEDG02 entries. Observed
+formats are retained in the report; two distinct current-format binaries fail this
+legacy precondition. The original recovery state is never rewritten by inspection.
 
 Journal-upgrade-01 (`target/production-journal-upgrade-01/report.json`, local artifact) passed
 all nine phases from release20 to release21. Both original six-transaction
