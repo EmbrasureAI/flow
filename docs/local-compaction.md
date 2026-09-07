@@ -1,9 +1,9 @@
 # Local concurrent data compaction
 
-Status: core integration and the live concurrency/deadline gates pass. The
-release31 maintenance matrix is the baseline; workload qualification of this
-new split prepare/activate path is pending. It introduces no distributed workers,
-HA, global compaction service or sort/Z-order requirement.
+The live concurrency, deadline and recovery gates pass. Sustained throughput,
+publication latency and reader-health qualification remain incomplete; see
+[Performance](performance.md). The implementation uses local workers without
+distributed coordination, HA or sort/Z-order requirements.
 
 The existing strict rewrite remains the fallback. Optional data builds can run
 while the table continues publishing CDC. Delete-only, manifest and retention
@@ -48,8 +48,10 @@ work retain their existing paths.
    ambiguous-outcome recovery applies. Never redo catch-up after an unknown
    commit outcome.
 7. Remove BUILD only after Prepared is durable, or after a failed/cancelled worker
-   has actually finished. A 750 ms end-to-end preparation budget releases the
-   same-table CDC gate; a timed-out blocking worker retains BUILD, scratch and a
+   has actually finished. Optional preparation has a 750 ms budget. If hard debt
+   already pauses publication at handoff, preparation may use the remaining
+   original 30-second build age. Expiry releases the same-table CDC gate;
+   a timed-out blocking worker retains BUILD, scratch and a
    worker slot while it joins and retires asynchronously. It no longer counts as
    a viable candidate for foreground pressure decisions. Dropping a blocking-task
    handle is not proof of join.
@@ -57,18 +59,25 @@ work retain their existing paths.
    resume, leaving registered artifacts for existing protected GC and grace. Startup
    also removes abandoned UUID scratch stores after durable operation recovery.
 
-The daemon admits one local build globally within the configured table worker
-budget, keeping its reservation through finalization. With only one table worker,
-it uses the strict path. Library callers must serialize one build per table.
+The daemon admits up to two local builds within the configured table worker
+budget, leaving at least one worker for table actors and keeping each reservation
+through finalization. With only one table worker, it uses the strict path.
+Library callers must serialize one build per table.
 A completed build receives a short table boundary for background handoff, then a
 prepared candidate receives the next boundary for activation. Prepared work is
 preferred over a new CDC epoch; build handoff is preferred next so sustained CDC
-cannot starve maintenance. Invalidated work returns to scheduling, while hard
+cannot starve a completed build's handoff or activation. Invalidated work returns
+to scheduling, while hard
 reader pressure can select the strict bounded fallback. Publication never bypasses
 hard debt. The build wait requests cancellation after 30 seconds and still joins
 the actual worker before releasing ownership. Catch-up accepts at most 256
 intervening snapshots and applies the configured delete-input file, byte and row
 limits before staging. The Parquet read/write admission limits also apply.
+
+After one second of deferral, an eligible soft data-build probe may precede
+another ready CDC epoch. This does not guarantee admission of soft delete
+consolidation: a probe yields when the planner prefers that synchronous work,
+which may wait for a CDC gap or hard pressure. Running actors are not preempted.
 
 Catch-up also caps each mapping batch by the existing row limit and the smaller
 writer batch/row-group byte budget. It charges decoded keys, locations, paths

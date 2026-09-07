@@ -31,6 +31,13 @@ measure planning and scan time after ingestion stops, excluding REST lookup.
 They do not measure contention during active ingestion or all query patterns.
 The default high-load case took 23.54 ms versus 9.67 ms after compaction.
 
+A later [maintenance review](development/qualification/maintenance-review.md)
+ran mixed, hot-update and ten-table workloads for two measured minutes each at
+10k/s offered, using one unchanged policy. All passed exact-row and ACK checks;
+none passed every performance gate. The starvation regression passed on the
+current build and failed on its old-binary control. These establish the admission
+fix and remaining bottlenecks, not a measured end-to-end speedup.
+
 ## Environment and reproducibility
 
 These are finite single-host tests on an Apple M5 Pro with 48 GiB RAM. Docker had

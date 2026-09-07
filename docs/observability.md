@@ -50,7 +50,7 @@ No separate export task is created.
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
 | `flow_compaction_finalization_actor_lane_hold_seconds` | Completed data-build finalization from actual table-lane reservation through cleanup and lane release |
 | `flow_compaction_preparation_handoff_actor_lane_hold_seconds` | Actor time used to validate and hand a completed build to detached preparation; separate from finalization |
-| `flow_compaction_publication_stall_seconds` | Same-table publication gate from preparation handoff through activation, invalidation or the 750 ms deadline |
+| `flow_compaction_publication_stall_seconds` | Same-table publication gate from preparation handoff through activation, invalidation or preparation deadline expiry |
 | `flow_compaction_preparations_total`, `flow_compaction_activations_total` | Detached preparation and exact activation outcomes, with fixed result labels |
 | `flow_compaction_candidate_invalidations_total` | Candidates retired before publication, labelled by preparation/activation stage and bounded reason |
 | `flow_external_reconciliations_total` | External snapshots successfully verified and durably applied to the row index, labelled by table and bounded reconciliation kind |
@@ -159,7 +159,10 @@ Its `publication_stall_ms` begins at the earlier preparation handoff and include
 detached catch-up plus finalization. Deadline and failed-preparation stalls are
 reported by `compaction_preparation_deadline` or
 `compaction_preparation_discarded`; a timed-out worker can continue retiring after
-same-table CDC resumes. The handoff lane has its own event and histogram so it
+same-table CDC resumes. Optional preparation has a 750 ms budget; preparation
+handed off while hard debt already pauses the table may use the remaining
+original 30-second build age. These are preparation deadlines, not bounds on
+activation or worker joining. The handoff lane has its own event and histogram so it
 does not dilute finalization samples. Candidate invalidation events include stage,
 bounded reason and the complete error chain.
 `delete_rewrite_completed` similarly
@@ -219,7 +222,7 @@ write failures before propagation; earlier validation/read failures are excluded
 Final destructors and metric emission are outside the intervals. These phases
 are nested within epoch collapse and must not be added to that outer duration.
 
-Each table accepts `priority = "realtime"`, `"balanced"`, or `"efficient"` (default `realtime`). The scheduler uses the recent 32 completed table attempts to estimate the 95th-percentile service duration. It subtracts that estimate and existing source backlog age from the profile deadline, subject to a global commit-rate limit and file/byte thresholds. Maintenance occupies the same table lane and is included in the estimate. CDC completes its source-ledger and ACK boundary before optional maintenance. Due CDC has priority until the first pending maintenance opportunity has waited one second; that deadline is not extended by later CDC completions. Hard reader debt still requires maintenance before publication. The one-second deferral bounds admission priority, not maintenance duration or publication latency.
+Each table accepts `priority = "realtime"`, `"balanced"`, or `"efficient"` (default `realtime`). The scheduler uses the recent 32 completed table attempts to estimate the 95th-percentile service duration. It subtracts that estimate and existing source backlog age from the profile deadline, subject to a global commit-rate limit and file/byte thresholds. Maintenance occupies the same table lane and is included in the estimate. CDC completes its source-ledger and ACK boundary before optional maintenance. After one second of deferral, an eligible soft data-build probe or periodic maintenance visit may precede another ready CDC epoch; later CDC completions do not extend that deadline. Soft delete consolidation may still wait for a CDC gap or hard pressure. Hard reader debt requires maintenance before publication. The one-second deferral bounds admission priority, not maintenance duration or publication latency.
 
 Checkpoint and index-generation events include their revisions, paths, durations and restore/rebuild result in structured logs. Catalog publication events expose the first/last LSN and actual catalog completion timestamp independently of index completion. The local test runner uses those events rather than treating acknowledgement or a recent status timestamp as proof of catalog visibility.
 
