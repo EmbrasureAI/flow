@@ -1,0 +1,24 @@
+[package]
+name = "flow-ingress-journal"
+description = "Durable PostgreSQL transaction journal for Embrasure Flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flow-model.workspace = true
+serde.workspace = true
+bincode.workspace = true
+crc32fast.workspace = true
+metrics.workspace = true
+thiserror.workspace = true
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

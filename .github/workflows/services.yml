@@ -1,0 +1,184 @@
+name: Service integration
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: services-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['14.24', '15.19', '16.15', '17.11', '18.6']
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      COMPOSE_PROJECT_NAME: flow-ci
+      COMPOSE_FILE: tests/production/compose.yaml
+      FLOW_POSTGRES_IMAGE: postgres:${{ matrix.postgres }}-bookworm
+      FLOW_PRODUCTION_PG_CPUS: '2'
+      FLOW_PRODUCTION_PGDATA: /var/lib/postgresql/flow
+      AWS_ACCESS_KEY_ID: demo-access
+      AWS_SECRET_ACCESS_KEY: demo-secret-key
+      AWS_REGION: us-east-1
+      RUST_LOG: info
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - name: Verify stock reader extensions from an empty cache
+        run: uv run tests/local/duckdb_extensions.py
+      - run: cargo build --locked -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
+      - name: Select free ports that survive service restarts
+        run: |
+          python3 - <<'PY'
+          import contextlib
+          import os
+          import socket
+
+          with contextlib.ExitStack() as sockets, open(os.environ["GITHUB_ENV"], "a") as env:
+              for service in ("PG", "S3", "REST"):
+                  listener = sockets.enter_context(socket.socket())
+                  listener.bind(("127.0.0.1", 0))
+                  env.write(f"FLOW_PRODUCTION_{service}_PORT={listener.getsockname()[1]}\n")
+          PY
+      - name: Start durable services on assigned loopback ports
+        run: |
+          docker compose up -d --build --wait --wait-timeout 180
+          pg_port=$(docker compose port postgres 5432 | cut -d: -f2)
+          rest_port=$(docker compose port rest 8181 | cut -d: -f2)
+          s3_port=$(docker compose port minio 9000 | cut -d: -f2)
+          echo "FLOW_POSTGRES_URL=postgres://flow:local-test-password@127.0.0.1:${pg_port}/flow?sslmode=disable" >> "$GITHUB_ENV"
+          echo "FLOW_REST_URL=http://127.0.0.1:${rest_port}" >> "$GITHUB_ENV"
+          echo "FLOW_S3_URL=http://127.0.0.1:${s3_port}" >> "$GITHUB_ENV"
+      - name: Crash recovery and concurrent compaction
+        run: >-
+          uv run tests/production/faults.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --compactor-binary target/debug/examples/local_compactor
+          --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults"
+      - name: Schema, checkpoint and process lifecycle
+        run: >-
+          uv run tests/production/contracts.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --artifacts "$RUNNER_TEMP/service-contracts"
+      - name: Snapshot inheritance and row-security contracts
+        run: >-
+          uv run tests/production/source_snapshot_contracts.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-snapshot-contracts"
+      - name: Interrupted parallel bootstrap and index reconstruction
+        run: >-
+          uv run tests/production/bootstrap.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --artifacts "$RUNNER_TEMP/service-bootstrap" --add-column-during-recovery
+      - name: Reject incompatible source DDL without changing public data
+        if: matrix.postgres == '18.6'
+        run: |
+          unsafe_status=0
+          for unsafe_case in column-incarnation non-null-default volatile-default; do
+            uv run tests/production/contracts.py \
+              --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+              --unsafe-case "$unsafe_case" --artifacts "$RUNNER_TEMP/service-unsafe-${unsafe_case}" || unsafe_status=1
+          done
+          exit "$unsafe_status"
+      - name: Hard reader debt and automatic external compactor recovery
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/pressure.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --compactor-binary target/debug/examples/local_compactor
+          --artifacts "$RUNNER_TEMP/service-pressure"
+      - name: CDC during held compaction reads and abandoned build recovery
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/concurrent_compaction.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-concurrent-compaction"
+      - name: Two-table compaction cancellation and recovery
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/parallel_compaction.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-parallel-compaction"
+      - name: WAL monitor timeout, readiness and recovery
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/health.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-health"
+      - name: Background compaction admission under queued CDC
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/maintenance_fairness.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-maintenance-fairness"
+      - name: Periodic cleanup with a single shared worker
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/periodic_maintenance.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --two-hot-tables --table-workers 1
+          --timeout 600
+          --artifacts "$RUNNER_TEMP/service-periodic-single-worker"
+      - name: Periodic cleanup beside native compaction
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/periodic_maintenance.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --two-hot-tables
+          --timeout 600
+          --artifacts "$RUNNER_TEMP/service-periodic-with-builds"
+      - name: Composite keys, index reconstruction and journal quota recovery
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/boundaries.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-boundaries"
+      - name: Standard readers with native and external maintenance
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/readers.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers"
+          --native-compaction --keyless-duplicates
+      - name: Service logs
+        if: always()
+        run: docker compose logs --no-color > "$RUNNER_TEMP/service-containers.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: services-pg-${{ matrix.postgres }}
+          path: |
+            ${{ runner.temp }}/service-*/report.json
+            ${{ runner.temp }}/service-*/*.log
+            ${{ runner.temp }}/service-*/*.jsonl
+            ${{ runner.temp }}/service-*/*metadata.json
+            ${{ runner.temp }}/service-*/state/status.json
+            ${{ runner.temp }}/service-*/state/metrics.prom
+            ${{ runner.temp }}/service-containers.log
+      - name: Remove this job's disposable services
+        if: always()
+        run: docker compose down -v

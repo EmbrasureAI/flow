@@ -1,0 +1,5 @@
+FROM apache/iceberg-rest-fixture:1.10.1
+# Official pgJDBC distribution, pinned so the fixture survives catalog restarts
+# against PostgreSQL instead of relying on an in-memory or SQLite catalog.
+ADD --checksum=sha256:6e0e4cc2d8cae902084f8a2b18728b073a6fd9d1f87c9d8bff8f298c18185b93 --chmod=0444 https://jdbc.postgresql.org/download/postgresql-42.7.13.jar /usr/lib/iceberg-rest/postgresql.jar
+CMD ["java", "-cp", "iceberg-rest-adapter.jar:postgresql.jar", "org.apache.iceberg.rest.RESTCatalogServer"]

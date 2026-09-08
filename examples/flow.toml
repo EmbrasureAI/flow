@@ -1,0 +1,56 @@
+state_dir = "./data"
+
+[source]
+connection_env = "FLOW_POSTGRES_URL"
+id = "orders-primary-v1"
+slot = "embrasure_flow"
+publication = "embrasure_flow"
+ack_mode = "materialized"
+journal_durability = "local-disk"
+
+[catalog]
+uri = "http://localhost:8181"
+warehouse = "s3://warehouse/"
+"s3.endpoint" = "http://localhost:9000"
+"s3.region" = "us-east-1"
+"s3.path-style-access" = "true"
+# Use the standard storage credential chain or catalog-vended credentials.
+
+[limits]
+batch_rows = 1024
+batch_bytes = 8388608
+# Additional per-worker collapse retention; 0 forces the disk path.
+collapse_memory_bytes = 33554432
+parquet_row_group_bytes = 33554432
+chunk_bytes = 4194304
+pending_transactions = 256
+table_workers = 4
+commits_per_second = 100
+journal_bytes = 68719476736
+spool_bytes = 34359738368
+wal_soft_bytes = 17179869184
+wal_hard_bytes = 34359738368
+snapshot_retention_secs = 3600
+# Opt in only when external branch/tag creation and retention changes are coordinated.
+# Standard REST cannot assert the complete reference set during expiration.
+snapshot_expiration = false
+
+[parquet_read]
+footer_bytes = 8388608
+row_group_fetch_bytes = 134217728
+row_group_uncompressed_bytes = 268435456
+batch_bytes = 134217728
+
+[[tables]]
+source_namespace = "public"
+source_table = "orders"
+target_namespace = ["replicated"]
+target_table = "orders"
+# Use 3 for new v3 targets with deletion vectors; existing tables retain their format.
+format_version = 2
+primary_key = [0]
+append_only = false
+columns = [
+  { field_id = 1, name = "id", data_type = "Int64", nullable = false },
+  { field_id = 2, name = "status", data_type = "String", nullable = true },
+]

@@ -1,0 +1,93 @@
+# Single-host qualification fixture: durable storage, fixed loopback ports,
+# explicit service budgets, and production PostgreSQL durability settings.
+services:
+  postgres:
+    image: ${FLOW_POSTGRES_IMAGE:-postgres:18.6-bookworm}
+    cpus: ${FLOW_PRODUCTION_PG_CPUS:-4}
+    mem_limit: 2g
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=${FLOW_PRODUCTION_REPLICATION_SLOTS:-32}
+      - -c
+      - max_wal_senders=${FLOW_PRODUCTION_REPLICATION_SLOTS:-32}
+      - -c
+      - track_commit_timestamp=on
+      - -c
+      - logical_decoding_work_mem=4MB
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - max_slot_wal_keep_size=4GB
+    environment:
+      POSTGRES_USER: flow
+      POSTGRES_PASSWORD: local-test-password
+      POSTGRES_DB: flow
+      # Keep PG14–17 out of their nested anonymous /var/lib/postgresql/data volume.
+      # This default preserves existing PG18 fixture volumes.
+      PGDATA: ${FLOW_PRODUCTION_PGDATA:-/var/lib/postgresql/18/docker}
+    ports: ["127.0.0.1:${FLOW_PRODUCTION_PG_PORT:?set a free PostgreSQL port}:5432"]
+    volumes:
+      - postgres:/var/lib/postgresql
+      - ./init.sql:/docker-entrypoint-initdb.d/00-catalog.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flow -d flow"]
+      interval: 2s
+      retries: 30
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    cpus: 2
+    mem_limit: 2g
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: demo-access
+      MINIO_ROOT_PASSWORD: demo-secret-key
+    ports: ["127.0.0.1:${FLOW_PRODUCTION_S3_PORT:?set a free S3 port}:9000"]
+    volumes: ["objects:/data"]
+  bucket:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on: [minio]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 demo-access demo-secret-key; do sleep 1; done
+        mc mb --ignore-existing local/warehouse
+  rest:
+    build:
+      context: .
+      dockerfile: Dockerfile.catalog
+    cpus: 2
+    mem_limit: 1536m
+    depends_on:
+      bucket:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: demo-access
+      AWS_SECRET_ACCESS_KEY: demo-secret-key
+      AWS_REGION: us-east-1
+      JAVA_TOOL_OPTIONS: -Xmx768m
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_URI: jdbc:postgresql://postgres:5432/catalog
+      CATALOG_JDBC_USER: catalog
+      CATALOG_JDBC_PASSWORD: catalog-test-password
+    ports: ["127.0.0.1:${FLOW_PRODUCTION_REST_PORT:?set a free REST port}:8181"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 2s
+      retries: 60
+volumes:
+  postgres:
+  objects:
