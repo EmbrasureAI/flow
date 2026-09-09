@@ -1,81 +1,141 @@
-# Embrasure Flow
+<p align="center">
+  <a href="https://embrasure.ai">
+    <img src="docs/assets/embrasure-banner.svg" alt="Embrasure" width="100%">
+  </a>
+</p>
 
-Stream PostgreSQL changes into standard Apache Iceberg tables, using Rust.
-Inserts, updates and deletes publish as ordinary Parquet data with v2 position
-deletes or v3 deletion vectors. Compatible Iceberg readers query the tables directly.
+<h1 align="center">Flow</h1>
 
-**Development status:** correctness and recovery have passing local integration
-checks. Throughput, read overhead and endurance qualification are still in
-progress. This is not yet a qualified production release. See the
-[measured results and remaining targets](docs/performance.md).
+<p align="center">
+  Stream PostgreSQL changes into Apache Iceberg. Written in Rust.
+</p>
 
-## Get started
+<p align="center">
+  <a href="https://github.com/EmbrasureAI/flow/actions/workflows/ci.yml"><img src="https://github.com/EmbrasureAI/flow/actions/workflows/ci.yml/badge.svg?branch=main" alt="Rust CI"></a>
+  <a href="https://github.com/EmbrasureAI/flow/actions/workflows/services.yml"><img src="https://github.com/EmbrasureAI/flow/actions/workflows/services.yml/badge.svg?branch=main" alt="Service integration"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-2C2721" alt="License: Apache-2.0"></a>
+</p>
 
-The [Docker demo](demo/README.md) includes PostgreSQL, MinIO, an Iceberg REST
-catalog, Trino and the ingestion service:
+<p align="center">
+  <a href="docs/README.md">Documentation</a> ·
+  <a href="demo/README.md">Quickstart</a> ·
+  <a href="docs/performance.md">Benchmarks</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="https://github.com/EmbrasureAI/flow/issues">Issues</a>
+</p>
+
+Flow copies existing PostgreSQL rows, then continuously replicates inserts,
+updates and deletes into standard Iceberg tables. Query the tables directly
+through a compatible Iceberg reader, using your catalog and object storage.
+
+## Highlights
+
+- **Postgres to Iceberg in one service.** Initial COPY and ongoing logical
+  replication, with background compaction in the same Rust process.
+- **Standard tables.** Parquet data with Iceberg v2 position deletes or v3 deletion
+  vectors, published through an Iceberg REST catalog to S3-compatible storage.
+- **Mutable data.** Inserts, updates, deletes and primary-key changes, plus
+  append-only ingestion for tables without a primary key.
+- **Durable recovery.** A transaction journal, persistent row index and publication
+  ledger support replay, reconnects and interrupted-bootstrap recovery.
+- **Maintenance alongside ingestion.** Local data/delete compaction and
+  reconciliation of external compactor rewrites.
+
+## Quickstart
+
+Run the local demo with Git, Docker and Docker Compose. It includes PostgreSQL,
+MinIO, an Iceberg REST catalog, Trino and Flow:
 
 ```sh
+git clone https://github.com/EmbrasureAI/flow.git
+cd flow
 docker compose -f demo/compose.yaml up --build -d
 ```
 
-To build the native binary, install the pinned Rust toolchain, a C++ compiler,
-libclang, CMake, pkg-config and OpenSSL development headers:
+Once `initialize` has completed and `flow` has started, query the replicated table:
+
+```sh
+docker compose -f demo/compose.yaml exec trino trino \
+  --execute 'SELECT * FROM lake.replicated.orders'
+```
+
+The [demo guide](demo/README.md) walks through changing source rows, checking
+service status and cleaning up. The stack uses named volumes and does not
+publish ports on the host.
+
+### Build from source
+
+Install the [pinned Rust toolchain](rust-toolchain.toml), a C++ compiler, libclang,
+CMake, pkg-config and OpenSSL development headers, then build and validate the
+example configuration:
 
 ```sh
 cargo build --locked --release -p flow-daemon
-cargo run --locked -p flow-daemon -- --config examples/flow.toml check
+./target/release/embrasure-flow --config examples/flow.toml check
 ```
 
-Follow [Getting started](docs/getting-started.md) to configure a source and run
-`init`, `run` and `status` against your own services.
+To connect your own services, follow [Getting started](docs/getting-started.md)
+to configure the source, catalog and storage, then run `init`, `run` and `status`.
+Flow needs persistent disk for its transaction journal and RocksDB row index.
+Readers access Iceberg independently of the running service.
 
 ## How it works
 
-```text
-PostgreSQL WAL → durable transaction journal → per-table materialization
-                                             ↓
-                              Parquet data + deletes
-                                             ↓
-                                   Iceberg catalog commit
-                                             ↓
-                              durable row index → source ACK
+```mermaid
+flowchart LR
+    Postgres[PostgreSQL] -->|COPY + logical replication| Flow
+    Flow -->|Parquet data + deletes| Iceberg[Apache Iceberg]
+    Iceberg --> Readers[Compatible query engines]
 ```
 
-A source transaction becomes visible atomically within each destination table.
-A source-wide ledger advances acknowledgement only through completed transactions.
-The journal and RocksDB index support writes and recovery; readers need only the
-Iceberg catalog and object storage.
+Flow journals source transactions, materializes data and deletes, and commits
+them to the Iceberg catalog. A transaction becomes visible atomically within
+each destination table. A source-wide ledger advances acknowledgement only
+through completed transactions.
 
-Local compaction runs alongside ingestion. Before publishing a rewrite, the
+Compaction runs alongside ingestion. Before publishing a rewrite, the
 coordinator validates its inputs and translates intervening deletes. External
 physical rewrites are reconciled before ingestion reuses row locations.
+See the [architecture](docs/architecture.md) and
+[compaction protocol](docs/local-compaction.md) for the durable state transitions.
 
-## Current support
-
-- PostgreSQL initial COPY and logical replication, with transaction replay,
-  reconnects and interrupted-bootstrap recovery.
-- Unpartitioned Iceberg v2 position deletes or v3 deletion vectors, an Iceberg REST catalog and S3-compatible storage.
-- Inserts, updates, deletes and primary-key changes; append-only keyless tables.
-- Nullable column additions, durable publication recovery, checkpoints and index rebuilds.
-- Local data/delete compaction, external compactor reconciliation and protected cleanup.
+## Support and status
 
 Mutable tables require a stable primary key and `REPLICA IDENTITY FULL`.
-TRUNCATE and incompatible schema changes stop capture. Cross-table query
-atomicity, HA, distributed compaction and Z-order compaction are not supported.
-Partitioning remains planned work. See [v3 configuration](docs/iceberg-v3.md) and the full
-[operating limits](docs/getting-started.md#recovery-and-operational-limits).
+Automatic schema evolution supports nullable column additions without a non-null
+backfill. TRUNCATE and incompatible schema changes stop capture. Partitioning,
+cross-table query atomicity, HA, distributed compaction and Z-order compaction
+are not supported. Check [v3 reader compatibility](docs/iceberg-v3.md) and the
+[operating limits](docs/getting-started.md#recovery-and-operational-limits)
+before deploying.
 
-## Documentation and contributions
+**Status:** local correctness and recovery integration checks pass. Performance
+qualification is incomplete; this is not yet a qualified production release.
+The [benchmark report](docs/performance.md) records measured throughput,
+publication latency, reader overhead and remaining targets.
 
-- [Documentation index](docs/README.md)
-- [Architecture](docs/architecture.md) and [compaction protocol](docs/local-compaction.md)
-- [Configuration example](examples/flow.toml) and [observability](docs/observability.md)
-- [Integration tests](tests/production/README.md) and [performance results](docs/performance.md)
-- [Contributing](CONTRIBUTING.md) and [code guide](docs/code-guide.md)
+## Documentation
+
+| Guide | What you will find |
+| --- | --- |
+| [Getting started](docs/getting-started.md) | Build, configure, initialize and run Flow |
+| [Configuration](examples/flow.toml) | Source, storage, catalog and compaction settings |
+| [Observability](docs/observability.md) | Status, watermarks, metrics and operational diagnosis |
+| [Iceberg v3](docs/iceberg-v3.md) | Deletion vectors, upgrades and reader compatibility |
+| [Code guide](docs/code-guide.md) | Crate responsibilities and module layout |
+| [Integration tests](tests/production/README.md) | Service fixtures, reader checks and recovery scenarios |
+
+Browse the [documentation index](docs/README.md) for the full set of guides.
+
+## Contributing
+
+Bug reports, documentation improvements and code contributions are welcome.
+Read [Contributing](CONTRIBUTING.md) for development setup, checks and review
+expectations. Open an [issue](https://github.com/EmbrasureAI/flow/issues) to discuss
+substantial changes or report a bug with reproduction steps.
 
 ## License
 
-Embrasure Flow is licensed under [Apache-2.0](LICENSE). Vendored dependencies
-retain their upstream licenses and [attribution notices](NOTICE).
-[Distribution notices](licenses/README.md) explains the generated binary license
-bundle and the few upstream texts missing from published dependency packages.
+Flow is licensed under [Apache-2.0](LICENSE). Vendored dependencies retain their
+upstream licenses and [attribution notices](NOTICE). See
+[distribution notices](licenses/README.md) for the binary license bundle.
