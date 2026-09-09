@@ -115,7 +115,7 @@ impl PgOutputSource {
         let publications = quote_literal(&quote_identifier(publication));
         client.batch_execute("SET DateStyle TO 'ISO, YMD'; SET TimeZone TO 'UTC'; SET bytea_output TO 'hex'; SET extra_float_digits TO 3").await?;
         let query = format!(
-            "START_REPLICATION SLOT {slot} LOGICAL {:X}/{:X} (proto_version '2', publication_names {publications}, streaming 'on', binary 'false', messages 'false')",
+            "START_REPLICATION SLOT {slot} LOGICAL {:X}/{:X} (proto_version '2', publication_names {publications}, streaming 'on', binary 'false', messages 'true')",
             resume_lsn.0 >> 32,
             resume_lsn.0 & 0xffff_ffff
         );

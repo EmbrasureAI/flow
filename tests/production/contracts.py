@@ -43,6 +43,22 @@ class ContractRun(Run):
         return next(schema["fields"] for schema in metadata["schemas"]
                     if schema["schema-id"] == metadata["current-schema-id"])
 
+    def idle_wal_heartbeat(self):
+        # This table is outside the publication. No captured row transaction may
+        # be needed to release its WAL; only a durably completed heartbeat may ACK.
+        self.pg.execute("CREATE TABLE unrelated_wal (payload text)")
+        self.pg.execute("INSERT INTO unrelated_wal SELECT repeat('wal', 1000) FROM generate_series(1, 100)")
+        barrier = lsn(self.pg.execute("SELECT pg_current_wal_insert_lsn()::text").fetchone()[0])
+        self.wait_materialized(barrier)
+        def confirmed():
+            value = self.pg.execute(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s",
+                (self.name,),
+            ).fetchone()[0]
+            return value if value and lsn(value) >= barrier else None
+        flushed = self.until("idle heartbeat did not release unrelated WAL", confirmed)
+        return self.compare("idle-wal-heartbeat") | {"wal_barrier": barrier, "confirmed_flush_lsn": flushed}
+
     def idle_add(self):
         before = self.fields("orders")
         original = self.table("orders")
@@ -64,12 +80,14 @@ class ContractRun(Run):
         after_watermark = self.metrics()["flow_materialized_lsn"]
         assert after_watermark >= watermark
         if after_watermark != watermark:
-            # Some PostgreSQL majors emit the DDL's empty transaction. Its real
-            # terminal can advance ACK; the metadata update cannot invent one.
+            # The DDL or a logical-message heartbeat can emit a real empty
+            # transaction. Only its journaled terminal may advance ACK; the
+            # metadata update cannot invent source progress.
             events = [json.loads(line).get("fields", {}) for line in
                       (self.directory / f"daemon-{self.generation}.log").read_text().splitlines()
                       if line.startswith("{")]
-            assert any(event.get("event") == "transaction_journaled" and event.get("xid") == ddl_xid
+            assert any(event.get("event") == "transaction_journaled"
+                       and (event.get("xid") == ddl_xid or event.get("journal_payload_bytes") == 0)
                        and lsn(event["end_lsn"]) == after_watermark for event in events), \
                 "metadata-only evolution invented source progress"
         schema_requests = [event for event in self.proxy.events[event_start:]
@@ -284,6 +302,7 @@ class ContractRun(Run):
                 self.check_worker_panics()
                 self.report["passed"] = True
                 return
+            self.phase("idle-wal-heartbeat", self.idle_wal_heartbeat)
             self.phase("idle-nullable-add-with-lost-response", self.idle_add)
             self.phase("queued-schema-versions-and-crash", self.queued_versions)
             self.phase("streamed-aborted-ddl", self.aborted_ddl)
