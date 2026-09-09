@@ -34,8 +34,8 @@ class MaintenanceRun(Run):
         self.environment["RUST_LOG"] = "info"
         text = self.config.read_text().replace(json.dumps(args.catalog_uri), json.dumps(self.proxy.url))
         text = text.replace("[limits]\n", "[limits]\ntable_workers = 2\n")
-        text = text.replace("\n[[tables]]", "\n[compaction]\noldest_l0_soft_ms = 1000\noldest_l0_hard_ms = 2000\n\n[[tables]]", 1)
         self.config.write_text(text)
+        self.set_compaction_policy({"oldest_l0_soft_ms": 1000, "oldest_l0_hard_ms": 2000})
 
     def command(self, command):
         command_line = super().command(command)

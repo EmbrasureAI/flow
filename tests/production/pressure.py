@@ -26,8 +26,7 @@ class PressureRun(Run):
         self.compactor = None
         self.compactor_log = None
         self.environment["RUST_LOG"] = "info"
-        self.config.write_text(self.config.read_text().replace(
-            "\n[[tables]]", "\n[compaction]\noldest_l0_soft_ms = 1000\noldest_l0_hard_ms = 2000\n\n[[tables]]", 1))
+        self.set_compaction_policy({"oldest_l0_soft_ms": 1000, "oldest_l0_hard_ms": 2000})
         with args.compactor_binary.open("rb") as executable:
             digest = hashlib.file_digest(executable, "sha256").hexdigest()
         self.report["compactor_binary"] = {"path": str(args.compactor_binary.resolve()), "sha256": digest}

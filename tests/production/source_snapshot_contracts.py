@@ -64,7 +64,15 @@ class SnapshotRun(Run):
         original = self.table("orders")["metadata"]
         assert original.get("current-snapshot-id", -1) in (-1, None)
         self.start()
-        self.until("capture did not start", lambda: self.metrics().get("flow_source_received_lsn", 0))
+        def running_actor_ready():
+            path = self.directory / "state" / "status.json"
+            if not path.exists():
+                return False
+            status = json.loads(path.read_text())
+            return status.get("ready") and status.get("process_id") == self.process.pid
+        # init also writes nonzero metrics. Wait for this running process, not
+        # the previous init snapshot, before replacing its already-open target.
+        self.until("capture did not start", running_actor_ready)
         tables_uri = f"{self.args.catalog_uri.rstrip('/')}/v1/namespaces/{self.name}/tables"
         with urlopen(Request(tables_uri + "/orders", method="DELETE"), timeout=15):
             pass
@@ -78,10 +86,23 @@ class SnapshotRun(Run):
         barrier = self.transaction(["INSERT INTO orders(id, tenant, payload) VALUES (1, 1, 'must-not-publish')"])
         deadline = time.monotonic() + self.args.timeout
         log = self.directory / f"daemon-{self.generation}.log"
+        missing_target_rejected = False
         while time.monotonic() < deadline:
-            if "Iceberg target UUID changed" in log.read_text():
+            exit_code = self.process.poll()
+            output = log.read_text()
+            if ("Iceberg target UUID changed" in output or
+                    (missing_target_rejected and "target table was replaced; refusing to reuse its source watermark" in output)):
                 break
-            self.alive()
+            if exit_code is not None:
+                # A health/catalog read can observe the real DELETE/CREATE
+                # gap and fail closed first. Restart against the now-existing
+                # replacement to also prove the persisted UUID fence.
+                assert not missing_target_rejected and exit_code != 0 and "TableNotFound" in output, output
+                missing_target_rejected = True
+                self.stop()
+                self.start()
+                log = self.directory / f"daemon-{self.generation}.log"
+                continue
             time.sleep(.1)
         else:
             raise TimeoutError("running actor did not reject replacement table UUID")
@@ -93,6 +114,7 @@ class SnapshotRun(Run):
         assert after.get("current-snapshot-id", -1) in (-1, None)
         assert after["schemas"] == replacement["schemas"]
         return {"original_uuid": original["table-uuid"], "replacement_uuid": after["table-uuid"],
+                "missing_target_rejected_during_replace": missing_target_rejected,
                 "rejected_before_publication": True, "source_barrier_not_acknowledged": barrier, "confirmed_flush_lsn": confirmed}
 
     def rls(self):

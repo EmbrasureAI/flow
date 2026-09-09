@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import traceback
 from types import SimpleNamespace
 import unittest
@@ -103,6 +104,21 @@ def micros():
 
 
 class BenchmarkLifecycleTest(unittest.TestCase):
+    def test_fixture_compaction_overrides_keep_one_valid_section_and_table_contracts(self):
+        renderer = runner_class("../local/run.py", "Run", object, {"configure", "set_compaction_policy"})
+        with tempfile.TemporaryDirectory() as directory:
+            run = renderer()
+            run.directory, run.name = Path(directory), "fixture"
+            run.args = SimpleNamespace(catalog_uri="http://localhost:8181", warehouse="s3://warehouse/",
+                                       s3_endpoint="http://localhost:9000", postgres_url="postgres://localhost/test")
+            run.configure()
+            original = tomllib.loads(run.config.read_text())
+            run.set_compaction_policy({"oldest_l0_soft_ms": 1000, "delete_files_soft": 128})
+            updated = tomllib.loads(run.config.read_text())
+            self.assertEqual(updated.pop("compaction"), original.pop("compaction") |
+                             {"oldest_l0_soft_ms": 1000, "delete_files_soft": 128})
+            self.assertEqual(updated, original)
+
     def test_failures_close_real_recorder_and_exit(self):
         for mode, expected in (("manifest", "invalid-manifest"),
                                ("cleanup", "cleanup stop rejected"),
