@@ -61,6 +61,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let opened = crate::generation::open(&config, control.clone());
     let _lifecycle = crate::lifecycle::Lifecycle::start(&config)?;
     let mut boot = bootstrap(&control)?;
+    crate::bootstrap::validate_column_selection(&config, &boot)?;
     ensure!(
         boot.source_id == config.source.id
             && boot.slot == config.source.slot

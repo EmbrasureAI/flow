@@ -5,12 +5,14 @@
 mod types;
 pub use types::TypeRegistry;
 mod capture;
+mod projection;
 mod protocol;
+pub use projection::{EventProjector, project_relation};
 mod schema;
 mod snapshot;
 pub use schema::{
-    ColumnMetadata, TableMetadata, fetch_table_metadata, nullable_successor,
-    nullable_successor_with_types, same_wire_schema, validate_schema_metadata,
+    ColumnMetadata, TableMetadata, fetch_table_metadata, fetch_table_metadata_selected,
+    nullable_successor, nullable_successor_with_types, same_wire_schema, validate_schema_metadata,
 };
 mod spool;
 pub use capture::{CaptureAssembler, decode_row, decode_row_with_types};

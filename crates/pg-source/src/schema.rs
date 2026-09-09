@@ -29,6 +29,16 @@ pub async fn fetch_table_metadata(
     namespace: &str,
     table: &str,
 ) -> Result<TableMetadata> {
+    fetch_table_metadata_selected(client, namespace, table, None).await
+}
+
+/// Resolve only selected types, retaining original attribute identities and the complete key.
+pub async fn fetch_table_metadata_selected(
+    client: &(impl GenericClient + Sync),
+    namespace: &str,
+    table: &str,
+    selected: Option<&[String]>,
+) -> Result<TableMetadata> {
     let rows = client.query(
         "SELECT c.oid, c.relkind::text, c.relreplident::text, a.attname, a.atttypid, a.atttypmod,
                 EXISTS (SELECT 1 FROM pg_catalog.pg_index i
@@ -47,6 +57,29 @@ pub async fn fetch_table_metadata(
          WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind IN ('r','p')
          ORDER BY a.attnum", &[&namespace, &table]
     ).await?;
+    if let Some(selected) = selected {
+        for row in &rows {
+            if row.get::<_, bool>(6) && !selected.contains(&row.get::<_, String>(3)) {
+                return Err(Error::Config(
+                    "column selection must include the complete primary key",
+                ));
+            }
+        }
+    }
+    let rows = if let Some(selected) = selected {
+        selected
+            .iter()
+            .map(|name| {
+                rows.iter()
+                    .find(|row| row.get::<_, String>(3) == *name)
+                    .ok_or(Error::Config(
+                        "selected source column disappeared; resynchronization is required",
+                    ))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        rows.iter().collect()
+    };
     let first = rows
         .first()
         .ok_or(Error::Config("source table has no supported columns"))?;
@@ -224,7 +257,7 @@ pub(crate) fn column_type(oid: u32, modifier: i32) -> Result<ColumnType> {
         21 | 23 => ColumnType::Int32,
         20 => ColumnType::Int64,
         700 | 701 => ColumnType::Float64,
-        25 | 1042 | 1043 | 114 | 3802 => ColumnType::String,
+        25 | 1042 | 1043 | 114 | 3802 | 1083 => ColumnType::String,
         17 => ColumnType::Binary,
         1082 => ColumnType::Date,
         1114 => ColumnType::TimestampMicros,

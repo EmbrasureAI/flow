@@ -32,6 +32,8 @@ use tokio::sync::watch;
 pub(crate) const BOOTSTRAP: &[u8] = b"flow-daemon/bootstrap/v1";
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Bootstrap {
+    #[serde(default)]
+    pub(crate) explicit_projections: Vec<usize>,
     pub(crate) source_id: String,
     pub(crate) slot: String,
     pub(crate) publication: String,
@@ -184,7 +186,22 @@ pub async fn initialize(config: Config) -> Result<()> {
     result
 }
 
+pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Result<()> {
+    ensure!(
+        boot.explicit_projections
+            == config
+                .tables
+                .iter()
+                .enumerate()
+                .filter_map(|(index, table)| table.projection().map(|_| index))
+                .collect::<Vec<_>>(),
+        "column selection mode differs from durable bootstrap; resynchronization is required"
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
+    validate_column_selection(config, boot)?;
     ensure!(
         boot.source_id == config.source.id
             && boot.slot == config.source.slot
@@ -268,6 +285,12 @@ async fn prepare_source(
     }
     validate_publication(&sql, config, &schemas, true).await?;
     let boot = Bootstrap {
+        explicit_projections: config
+            .tables
+            .iter()
+            .enumerate()
+            .filter_map(|(index, table)| table.projection().map(|_| index))
+            .collect(),
         source_id: config.source.id.clone(),
         slot: config.source.slot.clone(),
         publication: config.source.publication.clone(),
