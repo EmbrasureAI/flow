@@ -105,7 +105,7 @@ pub enum SourceEvent {
         xid: u32,
         subxid: u32,
     },
-    /// Origin/type metadata does not mutate a replicated table.
+    /// Origin/type/logical-message metadata does not mutate a replicated table.
     Metadata,
 }
 
@@ -315,6 +315,23 @@ impl Decoder {
                 cursor.u32()?;
                 cursor.string()?;
                 cursor.string()?;
+                SourceEvent::Metadata
+            }
+            b'M' => {
+                if self.stream_xid.is_some() {
+                    cursor.u32()?;
+                }
+                match cursor.u8()? {
+                    0 => {}
+                    1 if self.normal_xid.is_some() || self.stream_xid.is_some() => {}
+                    _ => return Err(Error::Protocol("invalid logical message transaction flag")),
+                }
+                cursor.u64()?;
+                cursor.string()?;
+                let length = cursor.u32()? as usize;
+                cursor.take(length)?;
+                // Only the enclosing committed transaction may advance progress.
+                // A logical message's LSN is never an acknowledgement proof.
                 SourceEvent::Metadata
             }
             b'O' => {

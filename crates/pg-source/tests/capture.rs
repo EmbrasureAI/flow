@@ -205,3 +205,78 @@ fn malformed_wire_input_never_panics_or_creates_complete_transactions() {
     assert!(Decoder::new(10).decode(valid).is_err());
     assert!(Decoder::new(1024).decode(message(b'C', |_| {})).is_err());
 }
+
+#[test]
+fn logical_heartbeats_preserve_transaction_boundaries_and_reject_bad_lengths() {
+    let logical = |streamed: bool, flags: u8| {
+        message(b'M', |b| {
+            if streamed {
+                b.put_u32(42);
+            }
+            b.put_u8(flags);
+            b.put_u64(900);
+            b.extend_from_slice(b"embrasure-flow-heartbeat\0");
+            b.put_u32(0);
+        })
+    };
+    let mut decoder = Decoder::new(1024);
+    assert_eq!(
+        decoder.decode(logical(false, 0)).unwrap(),
+        SourceEvent::Metadata
+    );
+    assert!(decoder.decode(logical(false, 1)).is_err());
+    assert!(decoder.decode(logical(false, 2)).is_err());
+    decoder
+        .decode(message(b'B', |b| {
+            b.put_u64(1000);
+            b.put_i64(0);
+            b.put_u32(42);
+        }))
+        .unwrap();
+    assert_eq!(
+        decoder.decode(logical(false, 1)).unwrap(),
+        SourceEvent::Metadata
+    );
+    assert!(matches!(
+        decoder
+            .decode(message(b'C', |b| {
+                b.put_u8(0);
+                b.put_u64(1000);
+                b.put_u64(1010);
+                b.put_i64(0);
+            }))
+            .unwrap(),
+        SourceEvent::Commit {
+            xid: 42,
+            end_lsn: PgLsn(1010),
+            ..
+        }
+    ));
+    decoder
+        .decode(message(b'S', |b| {
+            b.put_u32(42);
+            b.put_u8(1);
+        }))
+        .unwrap();
+    assert_eq!(
+        decoder.decode(logical(true, 1)).unwrap(),
+        SourceEvent::Metadata
+    );
+    decoder.decode(message(b'E', |_| {})).unwrap();
+    assert_eq!(
+        decoder
+            .decode(message(b'A', |b| {
+                b.put_u32(42);
+                b.put_u32(42);
+            }))
+            .unwrap(),
+        SourceEvent::Abort {
+            xid: 42,
+            subxid: 42
+        }
+    );
+    let valid = logical(false, 0);
+    for end in 0..valid.len() {
+        assert!(Decoder::new(1024).decode(valid.slice(..end)).is_err());
+    }
+}

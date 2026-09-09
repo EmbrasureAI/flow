@@ -9,6 +9,17 @@ points, PostgreSQL framing, binary COPY framing, and `CopyBothDuplex`. Our
 `PostgresSource` boundary owns protocol-2 transaction semantics; changing the
 transport need not change the journal, coordinator, or materializer.
 
+## Idle publications
+
+Capture emits a transactional `pg_logical_emit_message` heartbeat immediately on
+connect and every 30 seconds. The source role needs EXECUTE permission on that
+PostgreSQL function. The heartbeat writes WAL metadata without changing source
+rows or requiring a heartbeat table. Its enclosing commit is captured, journaled
+and materialized through the ordinary ledger path before feedback advances.
+Nontransactional messages and server keepalive WAL ends never advance progress.
+This prevents an idle publication from retaining unrelated database WAL forever;
+long source transactions or blocked materialization can still retain WAL.
+
 ## Standards that determine behavior
 
 * [Logical replication parameters and flow](https://www.postgresql.org/docs/18/protocol-logical-replication.html):

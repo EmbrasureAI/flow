@@ -83,7 +83,7 @@ python3 tests/production/source_versions.py \
 
 Use a stable binary during this run. The report records its SHA-256, container
 image identities, selected ports and suite reports, including failed versions.
-PostgreSQL 14 emits an empty transaction for
-the tested ADD, so its idle-schema check permits ACK advancement only when it
-matches that exact SQL transaction's durable journal terminal; the Iceberg data
-snapshot must remain unchanged.
+The contract suite checks that idle publications release unrelated WAL through
+a durably completed heartbeat. Its idle-schema check permits ACK advancement
+only when it matches the DDL transaction or a real empty transaction's durable
+journal terminal; metadata changes cannot invent source progress.

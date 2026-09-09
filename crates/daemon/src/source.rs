@@ -206,6 +206,8 @@ pub(crate) async fn capture_loop(
             .with_pending_commit_limit(JOURNAL_GROUP_TRANSACTIONS)?;
             let mut feedback_tick = tokio::time::interval(Duration::from_secs(5));
             feedback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(30));
+            heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             delay = Duration::from_millis(250);
             let mut group_deadline = None;
             loop {
@@ -227,6 +229,24 @@ pub(crate) async fn capture_loop(
                                 tracing::warn!(%error, "source feedback disconnected"); break;
                             }
                             Err(error) => return Err(error),
+                        }
+                    }
+                    _ = heartbeat_tick.tick() => {
+                        // Idle publications still retain WAL from unrelated tables.
+                        // A real committed logical message traverses the same durable
+                        // journal/ledger path as row changes, without modifying rows.
+                        if let Err(error) = source_deadline(async {
+                            sql.query_one(
+                                "SELECT pg_catalog.pg_logical_emit_message(true, 'embrasure-flow-heartbeat', '')",
+                                &[],
+                            ).await?;
+                            Ok(())
+                        }).await {
+                            if retryable_connection(&error) {
+                                tracing::warn!(%error, "source WAL heartbeat disconnected");
+                                break;
+                            }
+                            return Err(error.context("Postgres CDC requires EXECUTE on pg_logical_emit_message for idle WAL progress"));
                         }
                     }
                     _ = feedback_tick.tick() => {

@@ -52,6 +52,7 @@ async fn keepalive_cannot_ack_requested_replay_position_and_disconnect_reconnect
             let query = std::str::from_utf8(&query).unwrap();
             assert!(query.contains("proto_version '2'"));
             assert!(query.contains("streaming 'on'"));
+            assert!(query.contains("messages 'true'"));
             assert!(query.contains("LOGICAL 0/64"));
             backend(&mut socket, b'W', &[0, 0, 0]).await;
 
