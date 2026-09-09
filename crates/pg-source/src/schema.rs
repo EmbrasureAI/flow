@@ -9,12 +9,13 @@ use tokio_postgres::GenericClient;
 #[derive(Debug)]
 pub struct ColumnMetadata {
     pub nullable: bool,
-    pub generated: bool,
+    pub unsupported_generated: bool,
     pub null_default: bool,
     pub null_missing_value: bool,
 }
 #[derive(Debug)]
 pub struct TableMetadata {
+    pub types: crate::TypeRegistry,
     pub storage_id: u32,
     pub attribute_numbers: Vec<i16>,
     pub relation: Relation,
@@ -34,7 +35,7 @@ pub async fn fetch_table_metadata(
                         CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ordinal)
                         WHERE i.indrelid=c.oid AND i.indisprimary
                           AND k.ordinal <= i.indnkeyatts AND k.attnum=a.attnum),
-                NOT a.attnotnull, a.attgenerated::text <> '',
+                NOT a.attnotnull, (a.attgenerated::text <> '' AND (a.attgenerated::text <> 's' OR current_setting('server_version_num')::int < 180000)),
                 (NOT a.atthasdef OR pg_catalog.pg_get_expr(d.adbin, d.adrelid)
                     IN ('NULL', 'NULL::' || pg_catalog.format_type(a.atttypid, a.atttypmod),
                                 'NULL::' || pg_catalog.format_type(a.atttypid, NULL))),
@@ -78,12 +79,14 @@ pub async fn fetch_table_metadata(
         .iter()
         .map(|row| ColumnMetadata {
             nullable: row.get(7),
-            generated: row.get(8),
+            unsupported_generated: row.get(8),
             null_default: row.get::<_, Option<bool>>(9).unwrap_or(false),
             null_missing_value: row.get(10),
         })
         .collect();
+    let types = crate::TypeRegistry::fetch(client, &relation).await?;
     Ok(TableMetadata {
+        types,
         storage_id: first.get(11),
         attribute_numbers: rows.iter().map(|row| row.get(12)).collect(),
         relation,
@@ -122,6 +125,21 @@ pub fn nullable_successor(
     relation: &Relation,
     version: u32,
 ) -> Result<TableSchema> {
+    nullable_successor_with_types(
+        base,
+        base_relation,
+        relation,
+        version,
+        &crate::TypeRegistry::default(),
+    )
+}
+pub fn nullable_successor_with_types(
+    base: &TableSchema,
+    base_relation: &Relation,
+    relation: &Relation,
+    version: u32,
+    types: &crate::TypeRegistry,
+) -> Result<TableSchema> {
     if !wire_prefix(base_relation, relation) || relation.columns.len() <= base.columns.len() {
         return Err(Error::Config(
             "schema evolution must only append nullable columns; existing names and wire types cannot change",
@@ -142,12 +160,12 @@ pub fn nullable_successor(
         next.columns.push(ModelColumn {
             field_id,
             name: column.name.clone(),
-            data_type: column_type(column)?,
+            data_type: types.column_type(column)?,
             nullable: true,
         });
     }
     base.validate_successor(&next)?;
-    relation.validate_schema(&next)?;
+    types.validate_relation(&next, relation)?;
     Ok(next)
 }
 
@@ -157,6 +175,7 @@ pub fn validate_schema_metadata(
     wire: &Relation,
     metadata: &TableMetadata,
 ) -> Result<()> {
+    metadata.types.validate_relation(schema, wire)?;
     if !wire_prefix(wire, &metadata.relation) {
         return Err(Error::Config(
             "committed source metadata no longer proves the decoded relation; schema migration or resynchronization is required",
@@ -180,10 +199,13 @@ pub fn validate_schema_metadata(
         }
     }
     for (index, (column, attributes)) in schema.columns.iter().zip(&metadata.columns).enumerate() {
-        if attributes.generated || (!column.nullable && attributes.nullable) {
+        if attributes.unsupported_generated {
             return Err(Error::Config(
-                "generated columns or relaxed source nullability are unsupported",
+                "generated columns require PostgreSQL 18 stored publication",
             ));
+        }
+        if !column.nullable && attributes.nullable {
+            return Err(Error::Config("relaxed source nullability is unsupported"));
         }
         if index >= base.columns.len()
             && (!attributes.nullable || !attributes.null_default || !attributes.null_missing_value)
@@ -196,26 +218,25 @@ pub fn validate_schema_metadata(
     Ok(())
 }
 
-pub(crate) fn column_type(column: &Column) -> Result<ColumnType> {
-    Ok(match column.type_oid {
+pub(crate) fn column_type(oid: u32, modifier: i32) -> Result<ColumnType> {
+    Ok(match oid {
         16 => ColumnType::Bool,
         21 | 23 => ColumnType::Int32,
         20 => ColumnType::Int64,
         700 | 701 => ColumnType::Float64,
-        25 | 1042 | 1043 => ColumnType::String,
+        25 | 1042 | 1043 | 114 | 3802 => ColumnType::String,
         17 => ColumnType::Binary,
         1082 => ColumnType::Date,
         1114 => ColumnType::TimestampMicros,
         1184 => ColumnType::TimestampTzMicros,
-        2950 => ColumnType::Uuid,
-        1700 if column.type_modifier >= 4 => {
-            let modifier = column.type_modifier - 4;
+        2950 => ColumnType::String,
+        1700 if modifier < 4 => ColumnType::String,
+        1700 if modifier >= 4 => {
+            let modifier = modifier - 4;
             let precision = ((modifier >> 16) & 0xffff) as u16;
             let scale = ((modifier & 0x7ff) ^ 1024) - 1024;
             if precision == 0 || precision > 38 || scale < 0 || scale > i32::from(precision) {
-                return Err(Error::Config(
-                    "numeric evolution requires precision 1..38 and scale 0..precision",
-                ));
+                return Ok(ColumnType::String);
             }
             ColumnType::Decimal {
                 precision: precision as u8,

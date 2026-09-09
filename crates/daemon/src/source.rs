@@ -45,7 +45,7 @@ pub(crate) async fn validate_source_table(
     client: &(impl flow_pg_source::tokio_postgres::GenericClient + Sync),
     configured: &Table,
     schema: &TableSchema,
-) -> Result<Relation> {
+) -> Result<(Relation, flow_pg_source::TypeRegistry)> {
     let (relation, _) = fetch_relation(
         client,
         &configured.source_namespace,
@@ -57,7 +57,8 @@ pub(crate) async fn validate_source_table(
         relation.id == schema.table_id.0,
         "source table was replaced; resynchronization is required"
     );
-    relation.validate_schema(schema)?;
+    let types = flow_pg_source::TypeRegistry::fetch(client, &relation).await?;
+    types.validate_relation(schema, &relation)?;
     let actual_key = relation
         .columns
         .iter()
@@ -69,7 +70,7 @@ pub(crate) async fn validate_source_table(
             || schema.primary_key.iter().copied().collect::<HashSet<_>>() == actual_key,
         "configured primary key differs from PostgreSQL primary key"
     );
-    Ok(relation)
+    Ok((relation, types))
 }
 
 pub(crate) async fn connect(config: &Config, replication: bool) -> Result<Client> {
@@ -274,8 +275,13 @@ pub(crate) async fn capture_loop(
                     next = source.next() => {
                         match next {
                             Ok(Some(event)) => {
-                                if let SourceEvent::Relation(relation) = &event {
-                                    registry.observe_relation(relation, &mut assembler)?;
+                                if let SourceEvent::Relation(relation) = &event
+                                    && let Err(error) = source_deadline(registry.observe_relation(&sql, relation, &mut assembler)).await {
+                                        if retryable_connection(&error) {
+                                            tracing::warn!(%error, "source type resolution interrupted; replaying before journal commit");
+                                            break;
+                                        }
+                                        return Err(error);
                                 }
                                 if let SourceEvent::Commit { xid, end_lsn, .. } = &event
                                     && *end_lsn > journal.staged_lsn() {

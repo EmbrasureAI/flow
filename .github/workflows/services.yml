@@ -75,6 +75,12 @@ jobs:
           uv run tests/production/contracts.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --artifacts "$RUNNER_TEMP/service-contracts"
+      - name: PostgreSQL type mappings through snapshot, CDC, restart and compaction
+        run: >-
+          uv run tests/production/type_compat.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-type-compat"
       - name: Snapshot inheritance and row-security contracts
         run: >-
           uv run tests/production/source_snapshot_contracts.py

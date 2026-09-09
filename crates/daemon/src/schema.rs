@@ -11,7 +11,8 @@ use flow_coordinator::{
 use flow_materializer::iceberg_schema;
 use flow_model::{SourceId, TableId, TableSchema};
 use flow_pg_source::{
-    CaptureAssembler, Relation, fetch_table_metadata, nullable_successor, same_wire_schema,
+    CaptureAssembler, Relation, TypeRegistry, fetch_table_metadata, nullable_successor_with_types,
+    same_wire_schema,
     tokio_postgres::{Client, GenericClient},
     validate_schema_metadata,
 };
@@ -29,6 +30,7 @@ pub(crate) struct SchemaRegistry {
     bases: BTreeMap<TableId, TableSchema>,
     candidates: BTreeMap<(TableId, u32), SchemaRecord>,
     dirty: BTreeSet<TableId>,
+    types: TypeRegistry,
 }
 impl SchemaRegistry {
     pub(crate) fn new(store: StateStore, source: SourceId, bases: &[TableSchema]) -> Result<Self> {
@@ -46,6 +48,7 @@ impl SchemaRegistry {
             bases: initial,
             candidates: BTreeMap::new(),
             dirty: BTreeSet::new(),
+            types: TypeRegistry::default(),
         })
     }
 
@@ -70,6 +73,7 @@ impl SchemaRegistry {
                 &configured.source_table,
             )
             .await?;
+            self.types.extend(metadata.types.clone());
             let base = self
                 .bases
                 .get(&TableId(metadata.relation.id))
@@ -82,7 +86,7 @@ impl SchemaRegistry {
                 );
                 let mut relation = metadata.relation.clone();
                 relation.columns.truncate(base.columns.len());
-                relation.validate_schema(&base)?;
+                self.types.validate_relation(&base, &relation)?;
                 validate_schema_metadata(&base, &base, &relation, &metadata)?;
                 self.persist(&SchemaRecord {
                     format: 2,
@@ -119,12 +123,18 @@ impl SchemaRegistry {
         Ok(result)
     }
 
-    pub(crate) fn observe_relation(
+    pub(crate) async fn observe_relation(
         &mut self,
+        client: &Client,
         relation: &Relation,
         assembler: &mut CaptureAssembler,
     ) -> Result<()> {
+        // Only relation changes perform catalog I/O. Rows use the cached resolver.
+        self.types
+            .extend(TypeRegistry::fetch(client, relation).await?);
         let record = self.select(relation)?;
+        self.types.validate_relation(&record.schema, relation)?;
+        assembler.set_types(self.types.clone());
         self.dirty.insert(record.schema.table_id);
         assembler.set_schema(record.schema)?;
         Ok(())
@@ -263,7 +273,13 @@ impl SchemaRegistry {
             historical.validate_successor(&latest.schema)?;
             historical
         } else {
-            nullable_successor(&latest.schema, &latest.relation, relation, version)?
+            nullable_successor_with_types(
+                &latest.schema,
+                &latest.relation,
+                relation,
+                version,
+                &self.types,
+            )?
         };
         let mut attribute_numbers = latest.attribute_numbers;
         attribute_numbers.resize(schema.columns.len(), 0);

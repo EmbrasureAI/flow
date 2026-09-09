@@ -69,7 +69,7 @@ Partitioning remains planned work. See [v3 configuration](docs/iceberg-v3.md) an
 
 - [Documentation index](docs/README.md)
 - [Architecture](docs/architecture.md) and [compaction protocol](docs/local-compaction.md)
-- [Configuration example](examples/flow.toml) and [observability](docs/observability.md)
+- [Configuration example](examples/flow.toml), [PostgreSQL type mappings](docs/postgres-types.md), and [observability](docs/observability.md)
 - [Integration tests](tests/production/README.md) and [performance results](docs/performance.md)
 - [Contributing](CONTRIBUTING.md) and [code guide](docs/code-guide.md)
 
