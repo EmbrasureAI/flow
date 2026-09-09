@@ -1046,10 +1046,40 @@ impl CheckpointTask {
                 control.forget_checkpoint(&obsolete)?;
                 std::fs::remove_dir_all(obsolete.path)?;
             }
+            remove_unregistered_checkpoints(&control, &directory, &cancellation)?;
             Ok(())
         });
         Self { task, canceled }
     }
+}
+
+// A crash can leave files before checkpoint registration or after forgetting it.
+// Only the serialized checkpoint task sweeps its own UUID-named directories;
+// registered checkpoints remain authoritative and are never removed here.
+fn remove_unregistered_checkpoints(
+    control: &ControlStore,
+    directory: &std::path::Path,
+    canceled: &AtomicBool,
+) -> Result<()> {
+    let registered: std::collections::HashSet<_> = control
+        .checkpoints()?
+        .into_iter()
+        .map(|checkpoint| checkpoint.path)
+        .collect();
+    let directory = std::fs::canonicalize(directory)?;
+    for entry in std::fs::read_dir(directory)? {
+        if canceled.load(Ordering::Acquire) {
+            break;
+        }
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok()
+            && !registered.contains(&entry.path())
+        {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 impl Future for CheckpointTask {
@@ -1110,6 +1140,42 @@ mod startup_recovery_tests {
         TableMutationCount,
     };
     use flow_state_store::{IndexDelta, PreparedOperation, StateStoreOptions};
+
+    #[test]
+    fn checkpoint_rotation_reclaims_crash_orphans_and_preserves_registered_state() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("checkpoints");
+        std::fs::create_dir(&directory).unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(root.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let retained = control
+            .checkpoint(&store, directory.join(uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        let forgotten = control
+            .checkpoint(&store, directory.join(uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        control.forget_checkpoint(&forgotten).unwrap();
+        let unfinished = directory.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&unfinished).unwrap();
+        std::fs::write(unfinished.join("CURRENT"), "unfinished").unwrap();
+        let operator_files = directory.join("operator-notes");
+        std::fs::create_dir(&operator_files).unwrap();
+        remove_unregistered_checkpoints(&control, &directory, &AtomicBool::new(true)).unwrap();
+        assert!(forgotten.path.exists() && unfinished.exists());
+        remove_unregistered_checkpoints(&control, &directory, &AtomicBool::new(false)).unwrap();
+        assert!(!forgotten.path.exists() && !unfinished.exists());
+        assert!(retained.path.exists() && operator_files.exists());
+        assert_eq!(control.checkpoints().unwrap().len(), 1);
+        control
+            .restore_checkpoint(
+                &retained,
+                root.path().join("restored"),
+                StateStoreOptions::default(),
+            )
+            .unwrap();
+    }
 
     #[test]
     fn startup_reconciles_source_progress_before_retiring_applied_state() {

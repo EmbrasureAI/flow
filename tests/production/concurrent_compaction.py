@@ -32,6 +32,10 @@ class ConcurrentRun(Run):
         text = self.config.read_text().replace(json.dumps(args.catalog_uri), json.dumps(self.catalog_proxy.url))
         text = text.replace("[limits]\n", "[limits]\ntable_workers = 4\n")
         self.config.write_text(text.replace(json.dumps(args.s3_endpoint), json.dumps(self.object_proxy.url)))
+        # The generic smoke fixture forces aggressive delete retirement. These
+        # phases test default soft/hard debt while holding an L0 rewrite; that
+        # override would prioritize unrelated L2 reclamation instead.
+        self.set_compaction_policy({"deleted_rows_percent": 30, "delete_files_soft": 8, "delete_files_hard": 16})
         # Keep default worker/read budgets and the default 10s/30s debt policy.
         self.report["compaction_policy"] = {"oldest_l0_soft_ms": 10000, "oldest_l0_hard_ms": 30000}
         self.report.update(table_workers=4, planned_phases=7)
