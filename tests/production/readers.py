@@ -69,7 +69,8 @@ class ReaderRun(Run):
     def configure(self):
         super().configure()
         self.reader_tables = ("orders", "accounts") + (("duplicates",) if self.args.keyless_duplicates else ())
-        text = self.config.read_text() + "\n[compaction]\noldest_l0_soft_ms = 60000\noldest_l0_hard_ms = 300000\n"
+        self.set_compaction_policy({"oldest_l0_soft_ms": 60000, "oldest_l0_hard_ms": 300000})
+        text = self.config.read_text()
         if self.args.keyless_duplicates:
             text += f'''\n[[tables]]
 source_namespace = "{self.name}"
@@ -94,7 +95,7 @@ columns = [
 
     def command(self, command):
         result = super().command(command)
-        if command == "run" and (not self.args.native_compaction or getattr(self, "protect_delete_inputs", False)):
+        if command == "run" and (not self.args.native_compaction or getattr(self, "protect_rewrite_inputs", False)):
             result += ["--roles", "ingest,coordinator"]
         return result
 
@@ -293,7 +294,7 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
         # are produced. Keep this role set until Spark has consumed the inputs.
         if self.args.native_compaction:
             self.stop()
-            self.protect_delete_inputs = True
+            self.protect_rewrite_inputs = True
             self.start()
         barrier = self.transaction(["UPDATE orders SET payload='fresh-spark-delete-input' WHERE id BETWEEN 200 AND 207"])
         self.wait_materialized(barrier)
@@ -307,12 +308,19 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
         return {"barrier": barrier, "snapshot": snapshot["snapshot-id"], "protected_delete_files": deletes}
 
     def restore_native(self):
-        if self.args.native_compaction and getattr(self, "protect_delete_inputs", False):
+        if self.args.native_compaction and getattr(self, "protect_rewrite_inputs", False):
             self.stop()
-            self.protect_delete_inputs = False
+            self.protect_rewrite_inputs = False
             self.start()
 
     def rewrite(self, procedure, table="orders"):
+        # Give Spark stable rewrite inputs. A concurrent native rewrite can
+        # legitimately invalidate Spark's optimistic plan. Native maintenance
+        # resumes before the following CDC and independent-reader assertions.
+        if self.args.native_compaction and not getattr(self, "protect_rewrite_inputs", False):
+            self.stop()
+            self.protect_rewrite_inputs = True
+            self.start()
         before = self.table(table)
         before_ids = {snapshot["snapshot-id"] for snapshot in before["metadata"]["snapshots"]}
         arguments = f"table => '{self.name}.{table}'"
@@ -394,6 +402,7 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
                 self.phase(f"cdc-after-{procedure}", lambda number=number: self.followup(number, restart=number == 3))
             if self.args.keyless_duplicates:
                 self.phase("keyless-external-data-rewrite", lambda: self.rewrite("rewrite_data_files", "duplicates"))
+                self.restore_native()
                 self.phase("keyless-append-and-restart", lambda: self.followup(4, restart=True))
             self.stop()
             self.check_worker_panics()

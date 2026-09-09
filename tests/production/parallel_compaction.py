@@ -28,8 +28,7 @@ class ParallelRun(ConcurrentRun):
             "oldest_l0_soft_ms": 1000, "oldest_l0_hard_ms": 240000,
             "min_file_age_ms": 0,
         }
-        policy = "\n[compaction]\n" + "".join(f"{key} = {value}\n" for key, value in self.policy.items())
-        self.config.write_text(self.config.read_text().replace("\n[[tables]]", policy + "\n[[tables]]", 1))
+        self.set_compaction_policy(self.policy)
         self.report.update(compaction_policy=self.policy, table_workers=4, required_parallel_builds=2,
                            planned_phases=6)
         self.paired_histories = {}
@@ -72,7 +71,7 @@ class ParallelRun(ConcurrentRun):
             assert self.object_path(build["held_file"]) in held
             assert self.object_path(build["held_file"]) not in completed, "a held worker request completed"
         started = self.build_events("compaction_build_started")
-        assert set(started) == {build["operation_id"] for build in pair.values()}, \
+        assert set(started) == self.preceding_builds | {build["operation_id"] for build in pair.values()}, \
             "a table admitted a duplicate build while its first worker was still held"
         assert all(path.exists() for path in self.pair_scratch), "scratch disappeared before worker join"
         self.alive()
@@ -121,21 +120,30 @@ class ParallelRun(ConcurrentRun):
         started = self.build_events("compaction_build_started")
         admitted = self.build_events("compaction_input_admitted")
         pair = {}
+        completed_before_hold = set()
         for name, table_id in self.table_ids.items():
+            # An eligible L2 rewrite can finish before the held L0 read. Capture
+            # the actual held build's head, as the single-table fixture does.
+            metadata = self.table(name)
+            snapshot, files = self.files(metadata)
+            completed_before_hold.update(item["summary"].get("flow.operation-id")
+                                         for item in metadata["metadata"]["snapshots"])
             matching = [operation for operation, event in admitted.items()
-                        if event["table_id"] == table_id and operation in started]
+                        if event["table_id"] == table_id and operation in started
+                        and started[operation]["base_snapshot_id"] == snapshot["snapshot-id"]]
             assert len(matching) == 1, f"{name}: expected one captured build, got {matching}"
             operation = matching[0]
-            metadata, _ = histories[name]
-            snapshot, _ = self.files(metadata)
             assert started[operation]["base_snapshot_id"] == snapshot["snapshot-id"]
             path = next(path for path in inputs[name] if self.object_path(path) in held)
+            assert path in files, "held input disappeared from the captured head"
             pair[name] = {"label": label, "operation_id": operation, "table_id": table_id,
                           "table_uuid": metadata["metadata"]["table-uuid"],
                           "base_snapshot": snapshot["snapshot-id"], "base_sequence": snapshot["sequence-number"],
                           "held_file": path, "keys": inputs[name][path]}
         assert len({build["operation_id"] for build in pair.values()}) == 2
         assert len({build["table_uuid"] for build in pair.values()}) == 2
+        self.preceding_builds = set(started) - {build["operation_id"] for build in pair.values()}
+        assert self.preceding_builds <= completed_before_hold, "unexpected concurrent build outside the held pair"
         self.pair_scratch = sorted(path for path in (self.directory / "state/compaction").iterdir() if path.is_dir())
         assert len(self.pair_scratch) == 2, "both workers must own separate scratch directories"
         assert all(str(UUID(path.name)) == path.name for path in self.pair_scratch)

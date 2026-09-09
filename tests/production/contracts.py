@@ -9,11 +9,13 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
 import time
 import traceback
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
 from run import Run, dump, lsn
@@ -21,6 +23,12 @@ from proxy import CatalogProxy
 
 
 class ContractRun(Run):
+    def command(self, command):
+        result = super().command(command)
+        if command == "run" and getattr(self, "checkpoint_without_compaction", False):
+            result.extend(["--roles", "ingest,coordinator"])
+        return result
+
     def __init__(self, args):
         super().__init__(args)
         self.proxy = CatalogProxy(args.catalog_uri, self.directory / "catalog-proxy.jsonl")
@@ -187,13 +195,32 @@ class ContractRun(Run):
         return self.compare("aborted-streamed-ddl")
 
     def checkpoint_restore(self):
+        # A concurrent compaction can replace the catalog snapshot immediately
+        # after a checkpoint, correctly forcing a catalog rebuild. This phase
+        # specifically tests a matching checkpoint, so keep its target stable.
+        self.stop()
+        self.checkpoint_without_compaction = True
+        # Deterministically reproduce a crash between checkpoint file creation
+        # and control-store registration. Rotation must reclaim these files.
+        directory = self.directory / "state" / "checkpoints"
+        orphan = directory / str(uuid.uuid4())
+        existing = next(directory.glob("*/CURRENT"))
+        shutil.copytree(existing.parent, orphan)
+        self.start()
         def retained():
             paths = list((self.directory / "state" / "checkpoints").glob("*/CURRENT"))
-            return paths if len(paths) == 2 else None
+            completed = 0
+            for line in (self.directory / f"daemon-{self.generation}.log").read_text().splitlines():
+                try:
+                    event = json.loads(line).get("fields", {})
+                except ValueError:
+                    continue
+                completed += event.get("event") == "index_checkpoint_completed"
+            # Equal-revision checkpoints are equivalent; retention may keep an
+            # older directory. Prove rotation by completed work and bounded
+            # retention, without requiring a particular tie-breaking order.
+            return paths if len(paths) == 2 and completed >= 4 and not orphan.exists() else None
         self.until("retained index checkpoints were not created", retained, timeout=40)
-        # Two further health cycles exercise retirement, not just creation.
-        time.sleep(11)
-        assert len(retained()) == 2
         self.stop(crash=True)
         lost = self.directory / "lost-index"
         lost.mkdir()
@@ -208,6 +235,12 @@ class ContractRun(Run):
             return next((event for event in events if event.get("event") == "index_generation_activated"), None)
         event = self.until("missing index was not recovered", restored)
         assert event["restored_checkpoint"], "matching retained checkpoint was not used"
+        # Changing the command flag does not change the active process roles.
+        # Restart with compaction before publishing more work, which can already
+        # be held by reader debt from earlier phases.
+        self.stop()
+        self.checkpoint_without_compaction = False
+        self.start()
         barrier = self.transaction(["UPDATE orders SET comment='after-checkpoint' WHERE id <= 8",
                                     "DELETE FROM orders WHERE id BETWEEN 60 AND 63"])
         self.wait_materialized(barrier)

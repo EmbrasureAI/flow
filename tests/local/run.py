@@ -19,6 +19,7 @@ from pathlib import Path
 import signal
 import subprocess
 import time
+import tomllib
 import traceback
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
@@ -135,6 +136,12 @@ spool_bytes = 134217728
 wal_soft_bytes = 1073741824
 wal_hard_bytes = 2147483648
 snapshot_retention_secs = 3600
+[compaction]
+# This fixture asserts delete retirement even for small changes. Production
+# defaults deliberately leave low-debt files alone instead of rewriting them.
+deleted_rows_percent = 1
+delete_files_soft = 1
+delete_files_hard = 2
 '''
         for table, fields in (("orders", columns), ("accounts", [columns[0], columns[3]])):
             text += f'''\n[[tables]]
@@ -160,6 +167,14 @@ columns = [\n'''
         details = action()
         self.report["phases"].append({"name": name, "seconds": round(time.monotonic() - start, 3), "details": details})
         dump(self.directory / "report.json", self.report)
+
+    def set_compaction_policy(self, values):
+        before, section, after = self.config.read_text().partition("[compaction]\n")
+        assert section, "base fixture must define compaction policy"
+        policy, boundary, rest = after.partition("\n[")
+        merged = tomllib.loads(policy) | values
+        replacement = "".join(f"{key} = {json.dumps(value)}\n" for key, value in merged.items())
+        self.config.write_text(before + section + replacement + ("\n[" + rest if boundary else ""))
 
     def command(self, command):
         return [str(self.args.binary.resolve()), "--config", str(self.config), command]
@@ -289,12 +304,17 @@ columns = [\n'''
             assert operation not in operations, "same logical operation committed twice"
             operations.add(operation)
             compact = summary.get("streaming.operation") == "compact"
+            delete_rewrite = summary.get("streaming.operation") in ("compact-deletes", "repair-delete-dependencies")
             compactions += int(compact)
-            assert not compact or summary["operation"] == "replace"
+            assert not (compact or delete_rewrite) or summary["operation"] == "replace"
+            removed_delete_sequences, added_delete_sequences = [], []
             live = {}
             for manifest in self.avro(snapshot["manifest-list"]):
                 for entry in self.avro(manifest["manifest_path"]):
                     if entry["status"] == 2:
+                        if delete_rewrite and entry.get("snapshot_id") == snapshot["snapshot-id"]:
+                            assert entry["data_file"]["content"] == 1, "delete rewrite removed a data file"
+                            removed_delete_sequences.append(entry["sequence_number"] if entry.get("sequence_number") is not None else manifest["sequence_number"])
                         continue
                     file = entry["data_file"]
                     path = file["file_path"]
@@ -309,9 +329,17 @@ columns = [\n'''
                     added_snapshot = entry.get("snapshot_id") or manifest["added_snapshot_id"]
                     if entry["status"] == 1 and added_snapshot == snapshot["snapshot-id"]:
                         assert file_sequence == snapshot["sequence-number"]
-                        if not compact:
+                        if delete_rewrite:
+                            assert file["content"] == 1, "delete rewrite added a data file"
+                            added_delete_sequences.append(data_sequence)
+                        elif not compact:
                             assert data_sequence == snapshot["sequence-number"], "RowDelta must share commit sequence"
                     live[path] = file
+            if delete_rewrite:
+                # Physical delete rewrites preserve the maximum input data
+                # sequence; assigning the new commit sequence changes scope.
+                assert removed_delete_sequences and added_delete_sequences
+                assert set(added_delete_sequences) == {max(removed_delete_sequences)}, "delete rewrite changed its input sequence scope"
             deletes = [file for file in live.values() if file["content"] == 1]
             assert all(file["content"] in (0, 1) for file in live.values())
             delete_snapshots += bool(deletes)

@@ -33,8 +33,8 @@ class FairnessRun(ConcurrentRun):
         # A low token rate introduces permit gaps in which even a starving
         # scheduler can run maintenance. Keep permits faster than real commits.
         text = text.replace("commits_per_second = 100", "commits_per_second = 10000")
-        policy = "\n[compaction]\n" + "".join(f"{key} = {value}\n" for key, value in self.policy.items())
-        self.config.write_text(text.replace("\n[[tables]]", policy + "\n[[tables]]", 1))
+        self.config.write_text(text)
+        self.set_compaction_policy(self.policy)
         self.report.update(compaction_policy=self.policy, table_workers=2,
                            pending_transactions=16, commits_per_second=10000,
                            queued_transactions=1025,

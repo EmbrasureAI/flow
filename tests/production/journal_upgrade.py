@@ -42,9 +42,8 @@ class JournalUpgradeRun(UpgradeRun):
         self.environment["RUST_LOG"] = "info"
         # Isolate format recovery from age-triggered maintenance while compaction
         # is disabled. This functional gate makes no latency or reader-debt claim.
-        self.config.write_text(self.config.read_text().replace(
-            "\n[[tables]]", "\n[compaction]\noldest_l0_soft_ms = 3600000\noldest_l0_hard_ms = 7200000\n\n[[tables]]", 1
-        ).replace("primary_key = [0]", 'primary_key = [0]\npriority = "balanced"'))
+        self.set_compaction_policy({"oldest_l0_soft_ms": 3600000, "oldest_l0_hard_ms": 7200000})
+        self.config.write_text(self.config.read_text().replace("primary_key = [0]", 'primary_key = [0]\npriority = "balanced"'))
 
     def command(self, command):
         result = super().command(command)
