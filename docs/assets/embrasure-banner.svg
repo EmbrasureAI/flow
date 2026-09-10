@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="280" viewBox="0 0 1200 280" role="img" aria-labelledby="title desc">
+  <title id="title">Embrasure</title>
+  <desc id="desc">The Embrasure mark and wordmark on a warm ivory background.</desc>
+  <rect width="1200" height="280" fill="#F7F3EB"/>
+  <g transform="translate(293 96) scale(.16)" fill="#2C2721">
+    <rect x="120" width="71.9999" height="71.9999"/>
+    <rect x="120" y="480.022" width="71.9999" height="71.9999"/>
+    <rect y="120.021" width="71.9999" height="71.9999"/>
+    <rect x="600" y="120.021" width="71.9999" height="71.9999"/>
+    <rect y="359.993" width="71.9999" height="71.9999"/>
+    <rect x="600" y="359.993" width="71.9999" height="71.9999"/>
+    <rect x="240" width="336" height="71.9999"/>
+    <rect x="240" y="480.022" width="336" height="71.9999"/>
+    <rect x="120" y="120.021" width="336" height="71.9999"/>
+    <rect x="120" y="359.993" width="336" height="71.9999"/>
+    <rect x="72.0007" y="240.05" width="336" height="71.9999"/>
+  </g>
+  <text x="438" y="166" fill="#2C2721" font-family="Georgia, 'Times New Roman', serif" font-size="80" letter-spacing="-3">Embrasure</text>
+</svg>
