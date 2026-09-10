@@ -86,6 +86,12 @@ jobs:
           uv run tests/production/bootstrap.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --artifacts "$RUNNER_TEMP/service-bootstrap" --add-column-during-recovery
+      - name: Snapshot keeper loss after COPY and preserved COPY failures
+        if: matrix.postgres == '18.6'
+        run: >-
+          uv run tests/production/snapshot_keeper.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --artifacts "$RUNNER_TEMP/service-snapshot-keeper"
       - name: Reject incompatible source DDL without changing public data
         if: matrix.postgres == '18.6'
         run: |

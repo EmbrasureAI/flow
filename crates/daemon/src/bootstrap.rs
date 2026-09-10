@@ -2,7 +2,10 @@
 use crate::{
     config::Config,
     services::{catalog, journal_config, ledger, state, target},
-    source::{CaptureProgress, capture_loop, connect, validate_publication, validate_source_table},
+    source::{
+        CaptureProgress, capture_loop, connect, connect_owned, validate_publication,
+        validate_source_table,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use flow_coordinator::{CollapseLimits, Epoch, SourceLedger, TablePublisher, collapse_epoch};
@@ -411,8 +414,9 @@ pub(crate) async fn resume(
     }
 
     let replication = connect(config, true).await?;
-    let mut keeper_sql = connect(config, false).await?;
+    let (mut keeper_sql, keeper_connection) = connect_owned(config, false).await?;
     let mut retry_keeper_sql;
+    let mut retry_keeper_connection = None;
     let mut keeper = None;
     if boot.consistent_lsn.is_none() {
         let cut = if let Some(cut) = slot_cut(&sql, &config.source.slot).await? {
@@ -526,7 +530,9 @@ pub(crate) async fn resume(
         missing.push(index);
     }
     if !missing.is_empty() && keeper.is_none() {
-        retry_keeper_sql = connect(config, false).await?;
+        let (sql, connection) = connect_owned(config, false).await?;
+        retry_keeper_sql = sql;
+        retry_keeper_connection = Some(connection);
         keeper = Some(
             export_temporary_snapshot(
                 &replication,
@@ -668,8 +674,21 @@ pub(crate) async fn resume(
         return Err(error);
     }
     if let Some(snapshot) = keeper {
-        snapshot.finish().await?;
+        // Every COPY/publication and capture result succeeded. This read-only
+        // transaction only retains the exported snapshot and schema locks;
+        // releasing it has no authority over the already durable table bases.
+        let cleanup = tokio::time::timeout(std::time::Duration::from_secs(5), snapshot.cancel())
+            .await
+            .context("snapshot keeper cleanup timed out")
+            .and_then(|result| result.map_err(anyhow::Error::from));
+        if let Err(error) = cleanup {
+            tracing::warn!(event = "bootstrap_snapshot_cleanup_failed", %error,
+                "failed to release snapshot keeper after successful COPY; closing its connection");
+        }
     }
+    // Bound socket lifetime even when cleanup timed out on an unanswered query.
+    drop(keeper_connection);
+    drop(retry_keeper_connection);
     register_captured(&reader, &mut ledger, usize::MAX)?;
     ledger.reconcile_table_progress()?;
     boot.copied = true;
