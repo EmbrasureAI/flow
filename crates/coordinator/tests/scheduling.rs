@@ -1,4 +1,4 @@
-use flow_coordinator::{Priority, Scheduler};
+use flow_coordinator::{Priority, Scheduler, SourceHealth, WalPressure};
 use flow_model::TableId;
 use std::time::{Duration, Instant};
 
@@ -168,5 +168,50 @@ fn continued_arrivals_and_force_preserve_overdue_order() {
     assert_eq!(
         scheduler.take_ready(start + Duration::from_millis(3)),
         Some(TableId(1))
+    );
+}
+
+#[test]
+fn wal_health_uses_source_headroom_before_larger_configured_limits() {
+    // The source permits 1,000 bytes; local soft/hard settings are much larger.
+    for (retained, safe, expected) in [
+        (0, 1_000, SourceHealth::Healthy),
+        (749, 251, SourceHealth::Healthy),
+        (750, 250, SourceHealth::Warning),
+        (899, 101, SourceHealth::Warning),
+        (900, 100, SourceHealth::AtRisk),
+        (1_000, 0, SourceHealth::AtRisk),
+    ] {
+        let pressure = WalPressure {
+            retained_bytes: retained,
+            journal_bytes: 0,
+            safe_wal_bytes: Some(safe),
+            slot_lost: false,
+        };
+        assert_eq!(pressure.health(16_000, 32_000, 8_000), expected);
+    }
+}
+
+#[test]
+fn wal_health_preserves_fixed_limits_and_handles_unlimited_and_large_budgets() {
+    let mut pressure = WalPressure {
+        retained_bytes: 750,
+        journal_bytes: 0,
+        safe_wal_bytes: None,
+        slot_lost: false,
+    };
+    assert_eq!(pressure.health(1_000, 2_000, 8_000), SourceHealth::Healthy);
+    assert_eq!(pressure.health(500, 2_000, 8_000), SourceHealth::Warning);
+    assert_eq!(pressure.health(500, 700, 8_000), SourceHealth::AtRisk);
+    pressure.retained_bytes = u64::MAX - 1;
+    pressure.safe_wal_bytes = Some(u64::MAX);
+    assert_eq!(
+        pressure.health(u64::MAX, u64::MAX, u64::MAX),
+        SourceHealth::Healthy
+    );
+    pressure.slot_lost = true;
+    assert_eq!(
+        pressure.health(u64::MAX, u64::MAX, u64::MAX),
+        SourceHealth::SlotLost
     );
 }

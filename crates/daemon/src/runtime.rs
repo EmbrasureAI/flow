@@ -372,6 +372,39 @@ struct PublishRuntime {
     profiles: BTreeMap<TableId, Priority>,
 }
 
+/// WAL pressure must reduce warehouse work that cannot advance the source ACK.
+/// Existing candidates and mandatory recovery keep their ownership and may finish.
+#[derive(Default)]
+struct MaintenanceAdmission {
+    source_pressure: bool,
+}
+
+impl MaintenanceAdmission {
+    fn observe(&mut self, health: SourceHealthStatus) {
+        match health {
+            SourceHealthStatus::Healthy => self.source_pressure = false,
+            SourceHealthStatus::Warning
+            | SourceHealthStatus::AtRisk
+            | SourceHealthStatus::SlotLost => {
+                self.source_pressure = true;
+            }
+            // Losing the health connection is not proof that WAL pressure cleared.
+            SourceHealthStatus::Unknown | SourceHealthStatus::Unavailable => {}
+        }
+    }
+
+    fn optional_allowed(
+        &self,
+        table_workers: usize,
+        free_workers: usize,
+        cdc_waiting: bool,
+    ) -> bool {
+        // A shared single actor keeps its bounded CDC/maintenance alternation.
+        // Pools can reserve a separate lane before starting speculative work.
+        !self.source_pressure && free_workers > usize::from(table_workers > 1 && cdc_waiting)
+    }
+}
+
 impl PublishRuntime {
     async fn run(
         self,
@@ -433,18 +466,29 @@ impl PublishRuntime {
         let mut periodic_due = BTreeMap::<TableId, Instant>::new();
         let mut periodic_active = false;
         let mut periodic_yield_to_cdc = false;
+        let mut maintenance_admission = MaintenanceAdmission::default();
         let mut checkpoint_at = Instant::now();
         let shutdown = crate::lifecycle::shutdown_signal();
         tokio::pin!(shutdown);
         observation.write(config, ledger, capture_goal, true)?;
         loop {
-            let available = running.len() + builds.len() + preparations.len() + retirements.len()
-                < config.limits.table_workers;
+            let free_workers = config.limits.table_workers.saturating_sub(
+                running.len() + builds.len() + preparations.len() + retirements.len(),
+            );
+            let available = free_workers > 0;
+            let optional_allowed = maintenance_admission.optional_allowed(
+                config.limits.table_workers,
+                free_workers,
+                pending.tables.values().any(|queue| !queue.is_empty())
+                    || ledger.pending_count() > pending.loaded.len()
+                    || ledger.watermarks().journal_durable_lsn < capture_goal,
+            );
             let cdc_deadline = scheduler.next_deadline();
-            let periodic_allowed = !periodic_active
+            let periodic_allowed = optional_allowed
+                && !periodic_active
                 && !(periodic_yield_to_cdc
                     && cdc_deadline.is_some_and(|due| due <= Instant::now()));
-            let deadline = if !idle_work.is_empty()
+            let deadline = if (optional_allowed && !idle_work.is_empty())
                 || ready_builds.keys().any(|id| !busy.contains(id))
                 || ready_preparations.keys().any(|id| !busy.contains(id))
             {
@@ -455,6 +499,7 @@ impl PublishRuntime {
                     .chain(
                         maintenance_due
                             .iter()
+                            .filter(|(id, _)| optional_allowed || fenced_fallback.contains(*id))
                             .chain(periodic_due.iter().filter(|_| periodic_allowed))
                             .filter(|(id, _)| {
                                 !busy.contains(*id)
@@ -768,6 +813,7 @@ impl PublishRuntime {
                 Some(result) = health_checks.next(), if !health_checks.is_empty() => {
                     let result: HealthCheckResult = result?;
                     health_client = result.connection;
+                    maintenance_admission.observe(result.source_health);
                     observation.record_source_health(result.source_health);
                     observation.write(config, ledger, capture_goal, true)?;
                     if result.source_health == SourceHealthStatus::SlotLost {
@@ -783,6 +829,16 @@ impl PublishRuntime {
                         < config.limits.table_workers
                     {
                         let now = Instant::now();
+                        let free_workers = config.limits.table_workers.saturating_sub(
+                            running.len() + builds.len() + preparations.len() + retirements.len()
+                        );
+                        let optional_allowed = maintenance_admission.optional_allowed(
+                            config.limits.table_workers,
+                            free_workers,
+                            pending.tables.values().any(|queue| !queue.is_empty())
+                                || ledger.pending_count() > pending.loaded.len()
+                                || ledger.watermarks().journal_durable_lsn < capture_goal,
+                        );
                         let prepared = ready_preparations
                             .keys()
                             .find(|id| !busy.contains(*id))
@@ -794,6 +850,7 @@ impl PublishRuntime {
                         let overdue = maintenance_due.iter()
                             .filter(|(id, due)| {
                                 **due <= now
+                                    && (optional_allowed || fenced_fallback.contains(*id))
                                     && !busy.contains(*id)
                                     && !build_active.contains(*id)
                                     && !retiring_builds.contains(*id)
@@ -803,7 +860,7 @@ impl PublishRuntime {
                         let cdc_ready = scheduler.next_deadline().is_some_and(|due| due <= now);
                         // One periodic visit at a time; ready CDC must receive a
                         // dispatch between visits even across different tables.
-                        let periodic = if !periodic_active && !(periodic_yield_to_cdc && cdc_ready) {
+                        let periodic = if optional_allowed && !periodic_active && !(periodic_yield_to_cdc && cdc_ready) {
                             periodic_due.iter()
                                 .filter(|(id, due)| **due <= now && !busy.contains(*id)
                                     && !build_active.contains(*id) && !retiring_builds.contains(*id))
@@ -816,15 +873,11 @@ impl PublishRuntime {
                         // build until reader debt requires a synchronous rewrite.
                         // The probe replaces its slot with a build. At least
                         // one other actor slot remains reusable for CDC.
-                        let free_workers = config.limits.table_workers.saturating_sub(
-                            running.len() + builds.len() + preparations.len() + retirements.len()
-                        );
-                        let probe = if work.compaction && background_build_limit > 0
+                        let probe = if optional_allowed && work.compaction && background_build_limit > 0
                             && config.compaction.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
-                            && free_workers >= 1
                             && build_active.len() < background_build_limit
                             && retiring_builds.is_empty()
-                            && scheduler.next_deadline().is_some_and(|due| due <= now)
+                            && cdc_ready
                         {
                             maintenance_due.iter()
                                 .filter(|(id, due)| **due <= now && !busy.contains(*id)
@@ -860,7 +913,7 @@ impl PublishRuntime {
                             (id, false, None)
                         } else if let Some(id) = overdue {
                             (id, true, None)
-                        } else if let Some(id) = idle_work.pop_front() {
+                        } else if optional_allowed && let Some(id) = idle_work.pop_front() {
                             if build_active.contains(&id) || retiring_builds.contains(&id) {
                                 continue;
                             }
@@ -1014,6 +1067,79 @@ impl PublishRuntime {
                 scheduler.stall(*id, true);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod maintenance_admission_tests {
+    use super::*;
+    use flow_coordinator::WalPressure;
+
+    #[test]
+    fn warning_suppresses_optional_work_until_positive_recovery() {
+        let mut admission = MaintenanceAdmission::default();
+        let health = WalPressure {
+            retained_bytes: 600 << 20,
+            journal_bytes: 0,
+            safe_wal_bytes: Some(1400 << 20),
+            slot_lost: false,
+        }
+        .health(512 << 20, 2 << 30, 8 << 30);
+        admission.observe(health.into());
+
+        // A source warning protects capacity even before the server reaches its
+        // hard limit, including when maintenance shares a single table actor.
+        assert!(!admission.optional_allowed(4, 4, true));
+        assert!(!admission.optional_allowed(1, 1, true));
+        for health in [
+            SourceHealthStatus::AtRisk,
+            SourceHealthStatus::Unavailable,
+            SourceHealthStatus::Unknown,
+        ] {
+            admission.observe(health);
+            assert!(!admission.optional_allowed(4, 4, false));
+        }
+        admission.observe(SourceHealthStatus::Healthy);
+        assert!(admission.optional_allowed(4, 4, false));
+        assert!(admission.optional_allowed(1, 1, true));
+    }
+
+    #[test]
+    fn maintenance_cannot_take_the_last_lane_during_a_cdc_permit_gap() {
+        let admission = MaintenanceAdmission::default();
+        let now = Instant::now();
+        let mut scheduler = Scheduler::new(10_000, 32 << 20, 1, now).unwrap();
+        scheduler.push(
+            TableId(1),
+            Some(1),
+            128,
+            Priority::Realtime,
+            Duration::from_secs(10),
+            now,
+        );
+        assert_eq!(scheduler.take_ready(now), Some(TableId(1)));
+        scheduler.push(
+            TableId(2),
+            Some(1),
+            128,
+            Priority::Realtime,
+            Duration::from_secs(10),
+            now,
+        );
+        assert!(scheduler.next_deadline().unwrap() > now);
+
+        // One CDC actor is running. A periodic visit and a build may use two
+        // more lanes, but the next probe must leave room for the queued epoch.
+        let mut free_workers = 3;
+        while admission.optional_allowed(4, free_workers, true) {
+            free_workers -= 1;
+        }
+        assert_eq!(free_workers, 1);
+        assert_eq!(
+            scheduler.take_ready(now + Duration::from_secs(1)),
+            Some(TableId(2))
+        );
+        assert!(admission.optional_allowed(4, 1, false));
     }
 }
 

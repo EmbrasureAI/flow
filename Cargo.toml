@@ -1,11 +1,12 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["vendor/iceberg", "vendor/iceberg-catalog-rest", "vendor/tokio-postgres"]
+exclude = ["vendor/iceberg", "vendor/iceberg-catalog-rest", "vendor/iceberg-storage-opendal", "vendor/tokio-postgres"]
 resolver = "2"
 
 [patch.crates-io]
 iceberg = { path = "vendor/iceberg" }
 iceberg-catalog-rest = { path = "vendor/iceberg-catalog-rest" }
+iceberg-storage-opendal = { path = "vendor/iceberg-storage-opendal" }
 
 [patch."https://github.com/iambriccardo/rust-postgres"]
 tokio-postgres = { path = "vendor/tokio-postgres" }

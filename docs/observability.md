@@ -9,6 +9,17 @@ A successful later check restores readiness; a lost slot is recorded before the
 process exits for resynchronization. Initial `unknown` permits startup readiness
 and is distinguished from a failed check by the health-availability metric.
 
+When PostgreSQL reports a finite remaining WAL budget, health becomes `warning`
+at 25% remaining and `at_risk` at 10% remaining, even when the configured byte
+limits are larger. Configured WAL and journal thresholds still apply.
+
+Source pressure suspends new optional maintenance until a check reports
+`healthy`; a failed check does not clear existing pressure. In-flight candidates
+and required recovery may finish. With multiple table workers, optional work
+also leaves one worker free for queued CDC, including between catalog commit
+permits. A single worker retains its bounded CDC/maintenance alternation while
+the source is healthy.
+
 `state_dir/metrics.prom` uses Prometheus text format for a textfile collector. Its integer LSN text remains exact; Prometheus stores floating-point samples, so use `status` for exact comparisons beyond its integer precision. Metrics reset on process restart. `init` installs its own recorder and flushes bootstrap duration, outcome and I/O diagnostics on success or failure. The next `init` or `run` replaces that process snapshot; archive `metrics.prom` after initialization to retain COPY cost diagnostics. Labels contain configured table IDs, not row keys or object paths.
 
 Source ledger completion and ACK feedback precede observation writes. Status
