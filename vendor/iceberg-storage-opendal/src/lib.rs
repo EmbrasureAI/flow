@@ -309,7 +309,8 @@ impl OpenDalStorage {
                 })?;
                 let prefix = format!("{}://{}/", url.scheme(), op_info.name());
                 if path.starts_with(&prefix) {
-                    (op, &path[prefix.len()..])
+                    // The cached operator already has its timeout/retry layers.
+                    return Ok((op, &path[prefix.len()..]));
                 } else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,

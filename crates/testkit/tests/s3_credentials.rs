@@ -204,3 +204,45 @@ async fn rotating_configurations_evict_old_operators_after_the_cache_limit() {
     );
     server.abort();
 }
+
+#[test]
+fn cached_s3_operator_layers_stay_bounded_through_reuse_and_shutdown() {
+    std::thread::Builder::new()
+        .name("s3-operator-shutdown".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let factory = Arc::new(
+                        OpenDalResolvingStorageFactory::new()
+                            .with_s3_credential_loader(loader(&calls, false)),
+                    );
+                    let io = file_io(factory.clone(), "http://127.0.0.1:1", "us-east-1");
+                    for _ in 0..50_000 {
+                        // S3 writer construction creates an operator but sends
+                        // no request until write/close. Dropping each writer
+                        // leaves only the factory's cached operator alive.
+                        drop(
+                            io.new_output("s3://warehouse/key")
+                                .unwrap()
+                                .writer()
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    // Drop every cache owner on the bounded stack. Reapplying
+                    // TimeoutLayer on cached clones used to grow a recursive
+                    // executor chain that overflowed here during shutdown.
+                    drop(io);
+                    drop(factory);
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
+use opendal::layers::{RetryLayer, TimeoutLayer};
 use opendal::services::S3Config;
 use url::Url;
 
@@ -77,7 +78,13 @@ impl S3OperatorCache {
 
         // Operator construction performs no I/O. Build under the lock so cold
         // concurrent callers receive one signer/credential cache, not many.
-        let operator = s3_config_build(config, loader, path)?;
+        // TimeoutLayer updates the shared accessor's executor. Applying it to
+        // cached clones would grow a recursive executor chain on every access.
+        // Layer once before sharing, with timeout inside retry so each attempt
+        // stays independently bounded.
+        let operator = s3_config_build(config, loader, path)?
+            .layer(TimeoutLayer::new())
+            .layer(RetryLayer::new());
         if entries.len() == CAPACITY {
             entries.pop_front();
         }

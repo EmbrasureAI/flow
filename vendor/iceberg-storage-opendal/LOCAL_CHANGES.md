@@ -18,3 +18,10 @@ The cache retains at most 128 operators and evicts entries idle for 15 minutes
 or older than one hour on access. The absolute age also refreshes providers that
 do not report credential expiration. It is neither serialized nor included in debug output. In-flight
 operations retain their own operator clones and survive eviction.
+
+Timeout and retry layers are applied once when an S3 operator enters the cache.
+OpenDAL's timeout layer updates a shared accessor executor, so layering cached
+clones on every file operation would build a recursive executor chain and could
+overflow the stack during execution or shutdown. S3 cache hits return the fully
+layered operator; other backends keep their existing layer path. A bounded-stack
+regression repeatedly constructs S3 writers and drops the final cache owner.
