@@ -17,6 +17,11 @@ futures.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+postgres-protocol = { git = "https://github.com/iambriccardo/rust-postgres", rev = "c4b8de06aaa99f71800126bedcca6e623d368357" }
+fallible-iterator = "0.2"
+bigdecimal = "0.4"
+base64 = "0.22"
 bincode.workspace = true
 uuid.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }

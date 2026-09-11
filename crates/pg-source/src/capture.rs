@@ -30,6 +30,7 @@ struct PendingTransaction {
 /// On any error stop capture and reopen the spool/journal before reconnecting.
 pub struct CaptureAssembler {
     source: SourceId,
+    types: crate::TypeRegistry,
     spool: TransactionSpool,
     schemas: HashMap<TableId, TableSchema>,
     relations: HashMap<u32, Relation>,
@@ -62,6 +63,7 @@ impl CaptureAssembler {
         }
         Ok(Self {
             source,
+            types: crate::TypeRegistry::default(),
             spool,
             schemas: configured,
             relations: HashMap::new(),
@@ -72,6 +74,10 @@ impl CaptureAssembler {
             pending_commit_bytes: 0,
             pending_commit_limit: 32,
         })
+    }
+
+    pub fn set_types(&mut self, types: crate::TypeRegistry) {
+        self.types = types;
     }
 
     /// Bound terminal descriptors waiting for one journal durability barrier.
@@ -236,7 +242,7 @@ impl CaptureAssembler {
                     .ok_or(Error::Config(
                         "publication contains an unconfigured relation",
                     ))?;
-                validate_relation(schema, &relation)?;
+                self.types.validate_relation(schema, &relation)?;
                 self.relations.insert(relation.id, relation);
             }
             SourceEvent::Insert {
@@ -250,7 +256,7 @@ impl CaptureAssembler {
                     table_id: schema.table_id,
                     schema_version: schema.version,
                     kind: MutationKind::Insert {
-                        row: decode_row(schema, metadata, &row)?,
+                        row: decode_row_with_types(schema, metadata, &row, &self.types)?,
                     },
                 };
                 self.append(xid, subxid, mutation)?;
@@ -285,9 +291,14 @@ impl CaptureAssembler {
                         }
                     }
                 }
-                let row = decode_row(schema, metadata, &row)?;
+                let row = decode_row_with_types(schema, metadata, &row, &self.types)?;
                 let old_key = if let Some(old) = old {
-                    schema.encode_key(&decode_row(schema, metadata, &old)?)?
+                    schema.encode_key(&decode_row_with_types(
+                        schema,
+                        metadata,
+                        &old,
+                        &self.types,
+                    )?)?
                 } else {
                     schema.encode_key(&row)?
                 };
@@ -312,7 +323,12 @@ impl CaptureAssembler {
                 if old_is_key {
                     return Err(Error::ReplicaIdentity(relation));
                 }
-                let key = schema.encode_key(&decode_row(schema, metadata, &old)?)?;
+                let key = schema.encode_key(&decode_row_with_types(
+                    schema,
+                    metadata,
+                    &old,
+                    &self.types,
+                )?)?;
                 let mutation = Mutation {
                     table_id: schema.table_id,
                     schema_version: schema.version,
@@ -492,35 +508,27 @@ impl CaptureAssembler {
 }
 
 pub(crate) fn validate_relation(schema: &TableSchema, relation: &Relation) -> Result<()> {
-    if !schema.append_only {
-        relation.validate_mutable()?;
-    }
-    if schema.columns.len() != relation.columns.len() {
-        return Err(Error::Config(
-            "source column count changed; reconcile schema before capture",
-        ));
-    }
-    for (expected, actual) in schema.columns.iter().zip(&relation.columns) {
-        if expected.name != actual.name || crate::schema::column_type(actual)? != expected.data_type
-        {
-            return Err(Error::Config(
-                "source column name or type differs from configured schema",
-            ));
-        }
-    }
-    Ok(())
+    crate::TypeRegistry::default().validate_relation(schema, relation)
 }
 
 pub fn decode_row(schema: &TableSchema, relation: &Relation, tuple: &Tuple) -> Result<Row> {
-    validate_relation(schema, relation)?;
+    decode_row_with_types(schema, relation, tuple, &crate::TypeRegistry::default())
+}
+pub fn decode_row_with_types(
+    schema: &TableSchema,
+    relation: &Relation,
+    tuple: &Tuple,
+    types: &crate::TypeRegistry,
+) -> Result<Row> {
+    types.validate_relation(schema, relation)?;
     relation.validate_row(tuple)?;
     let mut row = Vec::with_capacity(tuple.len());
     for ((cell, column), pg) in tuple.iter().zip(&schema.columns).zip(&relation.columns) {
         row.push(match cell {
             Cell::Null => Value::Null,
             Cell::UnchangedToast => return Err(Error::UnchangedToast(relation.id)),
-            Cell::Text(bytes) => decode_text(&column.data_type, pg.type_oid, bytes)?,
-            Cell::Binary(bytes) => decode_binary(&column.data_type, pg.type_oid, bytes)?,
+            Cell::Text(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, false)?,
+            Cell::Binary(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, true)?,
         });
     }
     schema.validate_row(&row)?;
@@ -634,7 +642,7 @@ fn timestamp_value(micros: i64, kind: &ColumnType) -> Result<Value> {
     })
 }
 
-fn decode_text(kind: &ColumnType, oid: u32, bytes: &[u8]) -> Result<Value> {
+pub(crate) fn decode_text(kind: &ColumnType, oid: u32, bytes: &[u8]) -> Result<Value> {
     let text = std::str::from_utf8(bytes).map_err(|_| invalid(kind))?;
     Ok(match kind {
         ColumnType::Bool => Value::Bool(match text {

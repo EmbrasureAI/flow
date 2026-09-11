@@ -1,4 +1,3 @@
-use crate::capture::{decode_binary, validate_relation};
 use crate::{Column, Error, Relation, Result, quote_identifier, quote_literal};
 use flow_model::PgLsn;
 use flow_model::{Row, TableSchema, Value};
@@ -259,11 +258,19 @@ pub fn decode_copy_row(
     relation: &Relation,
     row: &BinaryCopyOutRow,
 ) -> Result<Row> {
-    validate_relation(schema, relation)?;
+    decode_copy_row_with_types(schema, relation, row, &crate::TypeRegistry::default())
+}
+pub fn decode_copy_row_with_types(
+    schema: &TableSchema,
+    relation: &Relation,
+    row: &BinaryCopyOutRow,
+    types: &crate::TypeRegistry,
+) -> Result<Row> {
+    types.validate_relation(schema, relation)?;
     let mut values = Vec::with_capacity(schema.columns.len());
     for (index, (column, pg)) in schema.columns.iter().zip(&relation.columns).enumerate() {
         values.push(match row.try_get::<Option<RawColumn<'_>>>(index)? {
-            Some(raw) => decode_binary(&column.data_type, pg.type_oid, raw.0)?,
+            Some(raw) => types.decode(&column.data_type, pg.type_oid, raw.0, true)?,
             None => Value::Null,
         });
     }

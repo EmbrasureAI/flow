@@ -152,11 +152,12 @@ over missing transactions, or removes an existing source snapshot.
 
 ## Deliberate limits and performance choices
 
-* Initial V1 schema mapping accepts bool, int2/int4/int8, float4/float8, text,
-  varchar/bpchar, bytea, date, timestamp/timestamptz, UUID, and fixed-scale numeric
-  up to the model's decimal precision. Custom types, domains, arrays, infinite
-  dates/timestamps and special numeric values fail closed. No decimal float
-  conversion or silent rounding is used.
+* Scalar mappings include bool, integers, floats, strings, bytea, finite dates
+  and timestamps, and bounded decimals. [PostgreSQL type mappings](postgres-types.md)
+  adds UUID strings, JSON/JSONB strings, JSON-encoded arrays, enum labels, domain
+  base values, exact numeric strings, and published PostgreSQL 18 stored generated
+  columns. Native `Uuid` remains available for existing non-Athena targets. No
+  decimal-to-float conversion or silent numeric rounding is used.
 * Snapshot copy uses the verified current publication projection. Publication row
   filters are rejected at setup/reconnect. Keep publication membership, published
   operations and column/filter settings fixed from slot creation through capture;

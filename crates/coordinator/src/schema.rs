@@ -42,7 +42,18 @@ impl SourceSchemaRecord {
             "source schema relation identity mismatch"
         );
         record.schema.validate()?;
-        record.relation.validate_schema(&record.schema)?;
+        // User-defined OIDs require the live catalog resolver during capture.
+        // Recovery checks the persisted wire identity without changing its format.
+        ensure!(
+            record.relation.columns.len() == record.schema.columns.len()
+                && record
+                    .relation
+                    .columns
+                    .iter()
+                    .zip(&record.schema.columns)
+                    .all(|(wire, column)| wire.name == column.name),
+            "source schema proof has different columns"
+        );
         Ok(record)
     }
 }

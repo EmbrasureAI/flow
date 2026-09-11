@@ -2,20 +2,24 @@
 //! pgoutput protocol-2 decoder. Transport authentication/TLS is supplied by the
 //! caller's `tokio_postgres::Client`; ACK policy belongs to the coordinator.
 
+mod types;
+pub use types::TypeRegistry;
 mod capture;
+mod projection;
 mod protocol;
+pub use projection::{EventProjector, project_relation};
 mod schema;
 mod snapshot;
 pub use schema::{
-    ColumnMetadata, TableMetadata, fetch_table_metadata, nullable_successor, same_wire_schema,
-    validate_schema_metadata,
+    ColumnMetadata, TableMetadata, fetch_table_metadata, fetch_table_metadata_selected,
+    nullable_successor, nullable_successor_with_types, same_wire_schema, validate_schema_metadata,
 };
 mod spool;
-pub use capture::{CaptureAssembler, decode_row};
+pub use capture::{CaptureAssembler, decode_row, decode_row_with_types};
 pub use protocol::{Cell, Column, Decoder, Relation, SourceEvent, Tuple};
 pub use snapshot::{
-    SnapshotSession, TablePreflight, decode_copy_row, export_snapshot, export_temporary_snapshot,
-    fetch_relation, preflight_table,
+    SnapshotSession, TablePreflight, decode_copy_row, decode_copy_row_with_types, export_snapshot,
+    export_temporary_snapshot, fetch_relation, preflight_table,
 };
 pub use spool::{SpoolConfig, TransactionSpool};
 pub use tokio_postgres;
@@ -115,7 +119,7 @@ impl PgOutputSource {
         let publications = quote_literal(&quote_identifier(publication));
         client.batch_execute("SET DateStyle TO 'ISO, YMD'; SET TimeZone TO 'UTC'; SET bytea_output TO 'hex'; SET extra_float_digits TO 3").await?;
         let query = format!(
-            "START_REPLICATION SLOT {slot} LOGICAL {:X}/{:X} (proto_version '2', publication_names {publications}, streaming 'on', binary 'false', messages 'true')",
+            "START_REPLICATION SLOT {slot} LOGICAL {:X}/{:X} (proto_version '2', publication_names {publications}, streaming 'on', binary 'true', messages 'true')",
             resume_lsn.0 >> 32,
             resume_lsn.0 & 0xffff_ffff
         );

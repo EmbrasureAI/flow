@@ -45,8 +45,8 @@ pub(crate) async fn validate_source_table(
     client: &(impl flow_pg_source::tokio_postgres::GenericClient + Sync),
     configured: &Table,
     schema: &TableSchema,
-) -> Result<Relation> {
-    let (relation, _) = fetch_relation(
+) -> Result<(Relation, flow_pg_source::TypeRegistry)> {
+    let (mut relation, _) = fetch_relation(
         client,
         &configured.source_namespace,
         &configured.source_table,
@@ -57,7 +57,19 @@ pub(crate) async fn validate_source_table(
         relation.id == schema.table_id.0,
         "source table was replaced; resynchronization is required"
     );
-    relation.validate_schema(schema)?;
+    if let Some(selected) = configured.projection() {
+        ensure!(
+            relation
+                .columns
+                .iter()
+                .filter(|column| column.identity)
+                .all(|column| selected.contains(&column.name)),
+            "column selection must include the complete primary key"
+        );
+        relation = flow_pg_source::project_relation(&relation, &selected)?;
+    }
+    let types = flow_pg_source::TypeRegistry::fetch(client, &relation).await?;
+    types.validate_relation(schema, &relation)?;
     let actual_key = relation
         .columns
         .iter()
@@ -69,7 +81,7 @@ pub(crate) async fn validate_source_table(
             || schema.primary_key.iter().copied().collect::<HashSet<_>>() == actual_key,
         "configured primary key differs from PostgreSQL primary key"
     );
-    Ok(relation)
+    Ok((relation, types))
 }
 
 pub(crate) async fn connect(config: &Config, replication: bool) -> Result<Client> {
@@ -197,6 +209,17 @@ pub(crate) async fn capture_loop(
             };
             let spool =
                 TransactionSpool::open(config.state_dir.join("spool"), spool_config(&config))?;
+            let mut projector = flow_pg_source::EventProjector::new(
+                config
+                    .tables
+                    .iter()
+                    .zip(&effective_schemas)
+                    .filter_map(|(table, schema)| {
+                        table
+                            .projection()
+                            .map(|columns| (schema.table_id.0, columns))
+                    }),
+            )?;
             let mut assembler = CaptureAssembler::new(
                 SourceId(config.source.id.clone()),
                 spool,
@@ -274,8 +297,14 @@ pub(crate) async fn capture_loop(
                     next = source.next() => {
                         match next {
                             Ok(Some(event)) => {
-                                if let SourceEvent::Relation(relation) = &event {
-                                    registry.observe_relation(relation, &mut assembler)?;
+                                let event = projector.project(event)?;
+                                if let SourceEvent::Relation(relation) = &event
+                                    && let Err(error) = source_deadline(registry.observe_relation(&sql, relation, &mut assembler)).await {
+                                        if retryable_connection(&error) {
+                                            tracing::warn!(%error, "source type resolution interrupted; replaying before journal commit");
+                                            break;
+                                        }
+                                        return Err(error);
                                 }
                                 if let SourceEvent::Commit { xid, end_lsn, .. } = &event
                                     && *end_lsn > journal.staged_lsn() {
@@ -567,23 +596,61 @@ async fn validate_publication_membership(
             !filters,
             "publication row filters are not supported by initial COPY"
         );
+        let publish_generated = if version >= 180000 {
+            client
+                .query_one(
+                    "SELECT pubgencols::text = 's' FROM pg_catalog.pg_publication WHERE pubname=$1",
+                    &[&config.source.publication],
+                )
+                .await?
+                .get::<_, bool>(0)
+        } else {
+            false
+        };
+        if version >= 180000 && !publish_generated {
+            let generated_identity: bool = client.query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_publication_tables p JOIN pg_catalog.pg_namespace n ON n.nspname=p.schemaname JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=p.tablename JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE p.pubname=$1 AND c.relreplident='f' AND a.attnum>0 AND NOT a.attisdropped AND a.attgenerated='s')",
+                &[&config.source.publication]).await?.get(0);
+            ensure!(
+                !generated_identity,
+                "PostgreSQL 18 FULL replica identity requires publish_generated_columns=stored even when generated columns are excluded"
+            );
+        }
         for row in client
             .query(
                 "SELECT p.attnames, ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a
-             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum)
+             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND (a.attgenerated = '' OR ($2 AND a.attgenerated = 's')) ORDER BY a.attnum),
+             ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a
+             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND a.attgenerated = 's'), c.oid
              FROM pg_catalog.pg_publication_tables p
              JOIN pg_catalog.pg_namespace n ON p.schemaname=n.nspname
              JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=p.tablename
              WHERE p.pubname=$1",
-                &[&config.source.publication],
+                &[&config.source.publication, &publish_generated],
             )
             .await?
         {
-            let published: Vec<String> = row.get(0);
+            let mut published: Vec<String> = row.get(0);
             let full: Vec<String> = row.get(1);
+            if version < 180000 {
+                // PG15's catalog view includes generated columns even though
+                // pgoutput omits them; newer views omit them too. Normalize
+                // only these known non-published fields, never ordinary ones.
+                let generated: Vec<String> = row.get(2);
+                published.retain(|name| !generated.contains(name));
+            }
             ensure!(
                 published == full,
                 "publication must include every current source column"
+            );
+            let relation_id: u32 = row.get(3);
+            let schema = schemas
+                .iter()
+                .find(|schema| schema.table_id.0 == relation_id)
+                .context("publication contains an unconfigured relation")?;
+            ensure!(
+                schema.columns.iter().all(|column| published.contains(&column.name)),
+                "publication omits a configured source column; snapshot and CDC must use the same columns"
             );
         }
     }

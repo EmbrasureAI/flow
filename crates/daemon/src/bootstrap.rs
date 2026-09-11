@@ -16,8 +16,8 @@ use flow_model::{
     TableSchema, TableSchemaVersion,
 };
 use flow_pg_source::{
-    Acknowledgement, SnapshotSession, decode_copy_row, export_snapshot, export_temporary_snapshot,
-    fetch_relation,
+    Acknowledgement, SnapshotSession, decode_copy_row_with_types, export_snapshot,
+    export_temporary_snapshot, fetch_relation,
     tokio_postgres::{binary_copy::BinaryCopyOutStream, types::Type},
 };
 use flow_state_store::{ControlStore, OperationKind, OperationPhase, StateStore};
@@ -35,6 +35,8 @@ use tokio::sync::watch;
 pub(crate) const BOOTSTRAP: &[u8] = b"flow-daemon/bootstrap/v1";
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Bootstrap {
+    #[serde(default)]
+    pub(crate) explicit_projections: Vec<usize>,
     pub(crate) source_id: String,
     pub(crate) slot: String,
     pub(crate) publication: String,
@@ -187,7 +189,22 @@ pub async fn initialize(config: Config) -> Result<()> {
     result
 }
 
+pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Result<()> {
+    ensure!(
+        boot.explicit_projections
+            == config
+                .tables
+                .iter()
+                .enumerate()
+                .filter_map(|(index, table)| table.projection().map(|_| index))
+                .collect::<Vec<_>>(),
+        "column selection mode differs from durable bootstrap; resynchronization is required"
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
+    validate_column_selection(config, boot)?;
     ensure!(
         boot.source_id == config.source.id
             && boot.slot == config.source.slot
@@ -271,6 +288,12 @@ async fn prepare_source(
     }
     validate_publication(&sql, config, &schemas, true).await?;
     let boot = Bootstrap {
+        explicit_projections: config
+            .tables
+            .iter()
+            .enumerate()
+            .filter_map(|(index, table)| table.projection().map(|_| index))
+            .collect(),
         source_id: config.source.id.clone(),
         slot: config.source.slot.clone(),
         publication: config.source.publication.clone(),
@@ -786,7 +809,8 @@ async fn copy_and_publish(
         let snapshot =
             SnapshotSession::import(&mut sql, &config.source.slot, cut, &snapshot_name).await?;
         let configured = &config.tables[index];
-        let relation = validate_source_table(snapshot.transaction(), configured, schema).await?;
+        let (relation, resolved_types) =
+            validate_source_table(snapshot.transaction(), configured, schema).await?;
         let projection = schema
             .columns
             .iter()
@@ -795,13 +819,22 @@ async fn copy_and_publish(
         let output = snapshot
             .copy_table(&relation.namespace, &relation.name, &projection)
             .await?;
+        // COPY framing reads raw bytes. The catalog-validated resolver above
+        // interprets user-defined OIDs, not rust-postgres's built-in Type list.
         let types = relation
             .columns
             .iter()
             .map(|column| {
-                Type::from_oid(column.type_oid).context("unsupported PostgreSQL COPY type")
+                Type::from_oid(column.type_oid).unwrap_or_else(|| {
+                    Type::new(
+                        column.name.clone(),
+                        column.type_oid,
+                        flow_pg_source::tokio_postgres::types::Kind::Simple,
+                        "public".into(),
+                    )
+                })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         let stream = BinaryCopyOutStream::new(output, &types);
         tokio::pin!(stream);
         let (mut journal, recovered) =
@@ -817,7 +850,7 @@ async fn copy_and_publish(
                 table_id: schema.table_id,
                 schema_version: schema.version,
                 kind: MutationKind::Insert {
-                    row: decode_copy_row(schema, &relation, &row)?,
+                    row: decode_copy_row_with_types(schema, &relation, &row, &resolved_types)?,
                 },
             };
             let size = bincode::serialized_size(&mutation)?;

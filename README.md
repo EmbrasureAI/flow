@@ -120,6 +120,7 @@ publication latency, reader overhead and remaining targets.
 | --- | --- |
 | [Getting started](docs/getting-started.md) | Build, configure, initialize and run Flow |
 | [Configuration](examples/flow.toml) | Source, storage, catalog and compaction settings |
+| [PostgreSQL type mappings](docs/postgres-types.md) | Supported application types across snapshot and CDC |
 | [Observability](docs/observability.md) | Status, watermarks, metrics and operational diagnosis |
 | [Iceberg v3](docs/iceberg-v3.md) | Deletion vectors, upgrades and reader compatibility |
 | [Code guide](docs/code-guide.md) | Crate responsibilities and module layout |

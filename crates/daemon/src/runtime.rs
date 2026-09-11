@@ -62,6 +62,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let opened = crate::generation::open(&config, control.clone());
     let _lifecycle = crate::lifecycle::Lifecycle::start(&config)?;
     let mut boot = bootstrap(&control)?;
+    crate::bootstrap::validate_column_selection(&config, &boot)?;
     ensure!(
         boot.source_id == config.source.id
             && boot.slot == config.source.slot
@@ -1301,6 +1302,7 @@ impl CheckpointTask {
 }
 
 // A crash can leave files before checkpoint registration or after forgetting it.
+// RocksDB stages checkpoints at <UUID>.tmp before renaming them into place.
 // Only the serialized checkpoint task sweeps its own UUID-named directories;
 // registered checkpoints remain authoritative and are never removed here.
 fn remove_unregistered_checkpoints(
@@ -1319,8 +1321,11 @@ fn remove_unregistered_checkpoints(
             break;
         }
         let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let checkpoint_name = name.strip_suffix(".tmp").unwrap_or(&name);
         if entry.file_type()?.is_dir()
-            && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok()
+            && uuid::Uuid::parse_str(checkpoint_name).is_ok()
             && !registered.contains(&entry.path())
         {
             std::fs::remove_dir_all(entry.path())?;
@@ -1407,12 +1412,15 @@ mod startup_recovery_tests {
         let unfinished = directory.join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir(&unfinished).unwrap();
         std::fs::write(unfinished.join("CURRENT"), "unfinished").unwrap();
-        let operator_files = directory.join("operator-notes");
+        let staging = directory.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("CURRENT"), "unfinished RocksDB checkpoint").unwrap();
+        let operator_files = directory.join("operator-notes.tmp");
         std::fs::create_dir(&operator_files).unwrap();
         remove_unregistered_checkpoints(&control, &directory, &AtomicBool::new(true)).unwrap();
-        assert!(forgotten.path.exists() && unfinished.exists());
+        assert!(forgotten.path.exists() && unfinished.exists() && staging.exists());
         remove_unregistered_checkpoints(&control, &directory, &AtomicBool::new(false)).unwrap();
-        assert!(!forgotten.path.exists() && !unfinished.exists());
+        assert!(!forgotten.path.exists() && !unfinished.exists() && !staging.exists());
         assert!(retained.path.exists() && operator_files.exists());
         assert_eq!(control.checkpoints().unwrap().len(), 1);
         control
