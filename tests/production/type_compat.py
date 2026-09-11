@@ -27,7 +27,7 @@ class TypeRun(Run):
             ("tags", "String"), ("matrix", "String"), ("state", "String"),
             ("states", "String"), ("quantity", "Int32"), ("amount", "String"),
             ("amounts", "String"), ("domain_doc", "String"), ("domain_ids", "String"),
-            ("payload", "String"),
+            ("payload", "String"), ("domain_arrays", "String"),
         ]
         if self.generated:
             self.columns.append(("computed", "Int32"))
@@ -52,11 +52,12 @@ columns = [
         self.pg.execute("CREATE DOMAIN nested_int AS positive_int")
         self.pg.execute("CREATE DOMAIN json_doc AS jsonb")
         self.pg.execute("CREATE DOMAIN uuid_value AS uuid")
+        self.pg.execute("CREATE DOMAIN int_list AS integer[]")
         generated = ", computed integer GENERATED ALWAYS AS (quantity * 2) STORED" if self.generated else ""
         self.pg.execute("""CREATE TABLE orders (
             id uuid PRIMARY KEY, doc jsonb, json_raw json, tags text[], matrix integer[][],
             state status, states status[], quantity nested_int, amount numeric,
-            amounts numeric[], domain_doc json_doc, domain_ids uuid_value[], payload text
+            amounts numeric[], domain_doc json_doc, domain_ids uuid_value[], payload text, domain_arrays int_list[]
         """ + generated + ")")
         self.pg.execute("ALTER TABLE orders REPLICA IDENTITY FULL")
         self.pg.execute("""INSERT INTO orders (id, doc, json_raw, tags, matrix, state, states, quantity, amount, amounts, domain_doc, domain_ids, payload)
@@ -71,11 +72,27 @@ columns = [
                 (SELECT string_agg(md5((i * 1000 + j)::text), '') FROM generate_series(1,100) j)
             FROM generate_series(1,128) i""")
         self.pg.execute("UPDATE orders SET doc=doc || jsonb_build_object('large', payload)")
+        self.pg.execute("UPDATE orders SET domain_arrays=ARRAY[ARRAY[42,NULL]::int_list,NULL::int_list,ARRAY[]::int_list]")
         options = " WITH (publish_generated_columns = stored)" if self.generated else ""
         self.pg.execute(sql.SQL("CREATE PUBLICATION {} FOR TABLE orders" + options).format(sql.Identifier(self.name)))
         return {"rows": 128, "stored_generated": self.generated}
 
     def initialize(self):
+        if ("computed", "Int32") in self.columns:
+            # Append-only tables need no FULL identity, but COPY must still use
+            # only columns that the publication will send through CDC.
+            original = self.config.read_text()
+            self.config.write_text(original.replace("primary_key = [0]", "append_only = true\nprimary_key = [0]"))
+            self.pg.execute("ALTER TABLE orders REPLICA IDENTITY DEFAULT")
+            self.pg.execute(sql.SQL("ALTER PUBLICATION {} SET (publish_generated_columns=none)").format(sql.Identifier(self.name)))
+            try:
+                result = subprocess.run(self.command("init"), env=self.environment, capture_output=True, timeout=self.args.timeout)
+                assert result.returncode != 0 and b"publication omits a configured source column" in result.stderr, result.stderr.decode()
+                assert not self.pg.execute("SELECT 1 FROM pg_replication_slots WHERE slot_name=%s", (self.name,)).fetchone()
+            finally:
+                self.config.write_text(original)
+                self.pg.execute("ALTER TABLE orders REPLICA IDENTITY FULL")
+                self.pg.execute(sql.SQL("ALTER PUBLICATION {} SET (publish_generated_columns=stored)").format(sql.Identifier(self.name)))
         with (self.directory / "init.log").open("wb") as log:
             subprocess.run(self.command("init"), env=self.environment, stdout=log, stderr=subprocess.STDOUT,
                            timeout=self.args.timeout, check=True)
@@ -84,10 +101,10 @@ columns = [
         return self.compare("snapshot")
 
     def compare(self, phase):
-        json_columns = {"doc", "json_raw", "tags", "matrix", "states", "amounts", "domain_doc", "domain_ids", "extra_domain"}
+        json_columns = {"doc", "json_raw", "tags", "matrix", "states", "amounts", "domain_doc", "domain_ids", "domain_arrays", "extra_domain"}
         expressions = []
         for name, _ in self.columns:
-            if name in {"tags", "matrix", "states", "amounts", "domain_ids"}:
+            if name in {"tags", "matrix", "states", "amounts", "domain_ids", "domain_arrays"}:
                 expressions.append(f"to_json({name})::text")
             elif name in json_columns or name in {"id", "state", "amount", "extra_uuid"}:
                 expressions.append(f"{name}::text")
@@ -115,6 +132,7 @@ columns = [
 
     def changes(self):
         barrier = self.transaction([
+            "UPDATE orders SET domain_arrays=ARRAY[ARRAY[1,2,3]::int_list] WHERE quantity <= 16",
             "UPDATE orders SET quantity=quantity+1, state='waiting', amount=-0.000000000000000000000000000001 WHERE quantity <= 16",
             "UPDATE orders SET id='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', tags='{}', matrix=NULL, doc='null' WHERE id=md5('1')::uuid",
             "UPDATE orders SET doc=NULL, json_raw='null', states='{}', domain_ids='{}' WHERE id=md5('2')::uuid",

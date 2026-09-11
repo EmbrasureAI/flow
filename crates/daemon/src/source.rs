@@ -621,7 +621,7 @@ async fn validate_publication_membership(
                 "SELECT p.attnames, ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a
              WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND (a.attgenerated = '' OR ($2 AND a.attgenerated = 's')) ORDER BY a.attnum),
              ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a
-             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND a.attgenerated = 's')
+             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND a.attgenerated = 's'), c.oid
              FROM pg_catalog.pg_publication_tables p
              JOIN pg_catalog.pg_namespace n ON p.schemaname=n.nspname
              JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=p.tablename
@@ -642,6 +642,15 @@ async fn validate_publication_membership(
             ensure!(
                 published == full,
                 "publication must include every current source column"
+            );
+            let relation_id: u32 = row.get(3);
+            let schema = schemas
+                .iter()
+                .find(|schema| schema.table_id.0 == relation_id)
+                .context("publication contains an unconfigured relation")?;
+            ensure!(
+                schema.columns.iter().all(|column| published.contains(&column.name)),
+                "publication omits a configured source column; snapshot and CDC must use the same columns"
             );
         }
     }

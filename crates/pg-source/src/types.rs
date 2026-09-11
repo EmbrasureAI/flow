@@ -260,6 +260,8 @@ impl TypeRegistry {
                                         .unwrap_or(serde_json::Value::String(number))
                                 } else if matches!(types.0.get(&base), Some(SourceType::Vector)) {
                                     vector_json(raw, true)?
+                                } else if let Some(nested_element) = types.element(base) {
+                                    types.array_json(nested_element, raw)?
                                 } else if base == 2950 {
                                     serde_json::Value::String(
                                         uuid::Uuid::from_slice(raw)
@@ -689,6 +691,25 @@ mod tests {
             types
                 .array_json(25, &array(25, &[(i32::MAX, 1), (0, 1)], &[]))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn arrays_of_array_domains_preserve_nested_json_values() {
+        let mut types = TypeRegistry::default();
+        types.0.insert(
+            20001,
+            SourceType::Domain {
+                base: 1007,
+                modifier: -1,
+            },
+        );
+        let inner = array(23, &[(2, 1)], &[Some(&42i32.to_be_bytes()), None]);
+        let empty = array(23, &[], &[]);
+        let outer = array(20001, &[(3, 1)], &[Some(&inner), None, Some(&empty)]);
+        assert_eq!(
+            types.array_json(20001, &outer).unwrap(),
+            serde_json::json!([[42, null], null, []])
         );
     }
 
