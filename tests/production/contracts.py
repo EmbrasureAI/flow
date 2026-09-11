@@ -218,12 +218,14 @@ class ContractRun(Run):
         # specifically tests a matching checkpoint, so keep its target stable.
         self.stop()
         self.checkpoint_without_compaction = True
-        # Deterministically reproduce a crash between checkpoint file creation
-        # and control-store registration. Rotation must reclaim these files.
+        # Reproduce crashes during RocksDB's UUID.tmp staging and between final
+        # file creation and control-store registration. Rotation reclaims both.
         directory = self.directory / "state" / "checkpoints"
         orphan = directory / str(uuid.uuid4())
+        staging = directory / f"{uuid.uuid4()}.tmp"
         existing = next(directory.glob("*/CURRENT"))
         shutil.copytree(existing.parent, orphan)
+        shutil.copytree(existing.parent, staging)
         self.start()
         def retained():
             paths = list((self.directory / "state" / "checkpoints").glob("*/CURRENT"))
@@ -237,7 +239,7 @@ class ContractRun(Run):
             # Equal-revision checkpoints are equivalent; retention may keep an
             # older directory. Prove rotation by completed work and bounded
             # retention, without requiring a particular tie-breaking order.
-            return paths if len(paths) == 2 and completed >= 4 and not orphan.exists() else None
+            return paths if len(paths) == 2 and completed >= 4 and not orphan.exists() and not staging.exists() else None
         self.until("retained index checkpoints were not created", retained, timeout=40)
         self.stop(crash=True)
         lost = self.directory / "lost-index"

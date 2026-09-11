@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import traceback
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import urlopen
 
@@ -24,6 +24,8 @@ from psycopg import sql
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
 from run import Run, dump, lsn
 from proxy import CatalogProxy
+
+CATALOG_READ_RECOVERY_SECONDS = 5
 
 
 class FaultRun(Run):
@@ -45,6 +47,7 @@ class FaultRun(Run):
         self.compactor_generation = 0
         self.incidents = []
         self.recovery_times = []
+        self.catalog_database_restarted = False
         self.check_compose(args)
         super().__init__(args)
         self.proxy = CatalogProxy(self.upstream, self.directory / "catalog-proxy.jsonl")
@@ -89,8 +92,24 @@ class FaultRun(Run):
     def table(self, name):
         # Independent inspection bypasses only injected catalog transport faults.
         url = f"{self.upstream.rstrip('/')}/v1/namespaces/{quote(self.name)}/tables/{quote(name)}"
-        with urlopen(url, timeout=15) as response:
-            return json.load(response)
+        deadline = time.monotonic() + CATALOG_READ_RECOVERY_SECONDS
+        while True:
+            try:
+                timeout = max(0.01, deadline - time.monotonic()) if self.catalog_database_restarted else 15
+                with urlopen(url, timeout=timeout) as response:
+                    return json.load(response)
+            except HTTPError as error:
+                # A successful readiness read does not visit every JDBC pooled
+                # connection. A later read can still encounter one terminated
+                # by our database restart. Retry only this bounded read failure;
+                # missing tables and incorrect data remain immediate failures.
+                if (not self.catalog_database_restarted or error.code not in {500, 502, 503, 504}
+                        or time.monotonic() >= deadline):
+                    raise
+                self.incidents.append({"phase": self.current_phase, "service": "catalog-reader",
+                                       "http_status": error.code, "table": name, "retried": True})
+                error.close()
+                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
 
     def compose(self, *arguments):
         with (self.directory / "compose-actions.log").open("a") as output:
@@ -243,6 +262,7 @@ class FaultRun(Run):
         before = self.pg.execute("SELECT system_identifier::text FROM pg_control_system()").fetchone()[0]
         self.pg.close()
         self.compose("restart", "-t", "1", "postgres")
+        self.catalog_database_restarted = True
         deadline = time.monotonic() + 45
         while True:
             try:
