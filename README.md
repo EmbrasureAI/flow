@@ -1,10 +1,10 @@
 <p align="center">
   <a href="https://embrasure.ai">
-    <img src="docs/assets/embrasure-banner.svg" alt="Embrasure" width="100%">
+    <img src="docs/assets/embrasure-banner.svg" alt="Embrasure Flow" width="100%">
   </a>
 </p>
 
-<h1 align="center">Flow</h1>
+<h1 align="center">Embrasure Flow</h1>
 
 <p align="center">
   Stream PostgreSQL changes into Apache Iceberg. Written in Rust.
