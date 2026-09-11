@@ -153,6 +153,7 @@ class FaultRun(Run):
     def recover(self, barrier, name):
         """An explicit test supervisor, with every application exit reported as an incident."""
         started = time.monotonic()
+        barrier = self.materialization_barrier(barrier)
         restarted = False
         deadline = started + self.args.timeout
         while time.monotonic() < deadline:

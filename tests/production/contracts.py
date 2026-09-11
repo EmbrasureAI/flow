@@ -49,7 +49,10 @@ class ContractRun(Run):
         self.pg.execute("CREATE TABLE unrelated_wal (payload text)")
         self.pg.execute("INSERT INTO unrelated_wal SELECT repeat('wal', 1000) FROM generate_series(1, 100)")
         barrier = lsn(self.pg.execute("SELECT pg_current_wal_insert_lsn()::text").fetchone()[0])
-        self.wait_materialized(barrier)
+        # Do not use wait_materialized: its test marker would supply the idle
+        # progress that this phase requires the daemon's own heartbeat to make.
+        self.until("idle heartbeat did not materialize unrelated WAL", lambda:
+                   self.metrics().get("flow_materialized_lsn", 0) >= barrier)
         def confirmed():
             value = self.pg.execute(
                 "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s",

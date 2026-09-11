@@ -244,7 +244,19 @@ columns = [\n'''
             values[name] = int(value) if value.isdecimal() else float(value)
         return values
 
+    def materialization_barrier(self, barrier):
+        # transaction() returns a pre-COMMIT lower bound for negative ACK checks.
+        # Another transaction can commit past it before our changes commit.
+        # Emit a marker after the caller's COMMIT so source-wide progress past
+        # this point proves those changes are visible, even on an idle source.
+        assert self.pg.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        marker = self.pg.execute(
+            "SELECT pg_logical_emit_message(true, 'flow-test-barrier', '')::text"
+        ).fetchone()[0]
+        return max(barrier, lsn(marker))
+
     def wait_materialized(self, barrier):
+        barrier = self.materialization_barrier(barrier)
         def reached():
             metrics = self.metrics()
             return metrics if metrics.get("flow_materialized_lsn", 0) >= barrier else None
@@ -256,7 +268,8 @@ columns = [\n'''
         with self.pg.transaction():
             for statement in statements:
                 self.pg.execute(statement)
-            # Taken before COMMIT: the transaction end LSN must be beyond this.
+            # Lower bound for negative ACK checks, not proof of materialization.
+            # Source-wide waits add a marker after COMMIT before checking progress.
             barrier = lsn(self.pg.execute("SELECT pg_current_wal_insert_lsn()::text").fetchone()[0])
         return barrier
 
