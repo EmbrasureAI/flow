@@ -1,7 +1,7 @@
-use crate::config::Config;
+use crate::{config::Config, runtime::blocked::BlockedTable};
 use anyhow::{Context, Result};
 use flow_coordinator::{SourceHealth, SourceLedger, Watermarks};
-use flow_model::PgLsn;
+use flow_model::{PgLsn, TableId};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
@@ -21,6 +21,16 @@ pub(crate) struct Status {
     captured_durable_lsn: PgLsn,
     #[serde(default)]
     source_health: SourceHealthStatus,
+    #[serde(default)]
+    blocked_tables: Vec<BlockedTable>,
+    #[serde(default)]
+    table_progress: Vec<TableProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TableProgress {
+    pub(crate) table_id: TableId,
+    pub(crate) materialized_lsn: PgLsn,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,13 +73,20 @@ impl From<SourceHealth> for SourceHealthStatus {
 pub(crate) struct Lifecycle(Config);
 impl Lifecycle {
     pub(crate) fn start(config: &Config) -> Result<Self> {
-        emit(config, None, None, false, Some(SourceHealthStatus::Unknown))?;
+        emit(
+            config,
+            None,
+            None,
+            false,
+            Some(SourceHealthStatus::Unknown),
+            None,
+        )?;
         Ok(Self(config.clone()))
     }
 }
 impl Drop for Lifecycle {
     fn drop(&mut self) {
-        if let Err(error) = emit(&self.0, None, None, false, None) {
+        if let Err(error) = emit(&self.0, None, None, false, None, None) {
             tracing::warn!(%error, "could not mark local status stopped");
         }
     }
@@ -81,6 +98,7 @@ pub(crate) fn emit(
     captured: Option<PgLsn>,
     ready: bool,
     source_health: Option<SourceHealthStatus>,
+    tables: Option<(&[BlockedTable], &[TableProgress])>,
 ) -> Result<()> {
     let mut status = read(config).unwrap_or_else(|_| Status {
         source_id: config.source.id.clone(),
@@ -91,6 +109,8 @@ pub(crate) fn emit(
         pending_transactions: 0,
         captured_durable_lsn: PgLsn(0),
         source_health: SourceHealthStatus::Unknown,
+        blocked_tables: Vec::new(),
+        table_progress: Vec::new(),
     });
     status.process_id = std::process::id();
     status.ready = ready;
@@ -104,6 +124,10 @@ pub(crate) fn emit(
     }
     if let Some(source_health) = source_health {
         status.source_health = source_health;
+    }
+    if let Some((blocked, progress)) = tables {
+        status.blocked_tables = blocked.to_vec();
+        status.table_progress = progress.to_vec();
     }
     write_observation(
         &config.state_dir.join("status.json"),

@@ -53,6 +53,32 @@ Every phase records its duration and evidence. `report.json`, catalog metadata s
 
 This is correctness and reader-interoperability coverage. It is not a performance benchmark or a complete failure matrix. It does not deterministically interrupt every commit boundary, exercise full server or S3 outages, validate multiple Iceberg readers, or cover unsupported schema changes and unchanged TOAST values.
 
+## Table publication isolation
+
+`table_isolation.py` uses the same disposable services and connection arguments.
+It injects table-specific catalog failures with one worker, a four-descriptor
+admission budget, and disk-backed mutation collapse. It checks healthy-table rows
+and progress independently while the source acknowledgement remains pinned.
+
+```sh
+uv run tests/local/table_isolation.py \
+  --catalog-uri "http://$(docker compose -f tests/local/compose.yaml port rest 8181)" \
+  --s3-endpoint "http://$(docker compose -f tests/local/compose.yaml port minio 9000)" \
+  --artifacts /tmp/flow-table-isolation-001
+```
+
+The suite covers mixed transactions beyond the admission window, primary-key
+moves and repeated delete/reinsert, 403/503 repair, both tables blocked followed by
+repairing just one, restart while target loads are denied, lost successful commit
+responses, and commits completed after the caller is killed. Ordinary table
+failures must preserve the daemon PID. Native manifest audits verify unique
+operation identities and exact reader results. Source failure remains global.
+
+Run it again with `--quota` and a new artifact directory for the separate 64 MiB
+journal-limit scenario. That run verifies a safe stop with unpublished changes
+retained, then explicitly increases the fixture limit and checks exact replay.
+This is a journal quota; it does not bound all index, control, or object storage.
+
 ## Sustained concurrency and background compaction
 
 `stress.py` reuses the same disposable services and connection arguments. It runs three independently seeded PostgreSQL writers for 120 seconds of active work by default. Writers use separate key ranges, with repeated changes to a small hot-key set within each range. Four checkpoints pause writers between transactions, wait for a source-wide materialization barrier, and compare every row and column in both tables with DuckDB.

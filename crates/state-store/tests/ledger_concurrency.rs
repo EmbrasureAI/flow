@@ -41,6 +41,12 @@ fn ledger_progress_does_not_wait_for_row_work_and_reopens_with_matching_authorit
                 None,
             )
             .unwrap();
+        ledger_index
+            .put_source_transaction(b"direct-status", b"blocked")
+            .unwrap();
+        ledger_index
+            .delete_source_transaction(b"direct-status")
+            .unwrap();
         persisted_tx.send(()).unwrap();
         for lsn in 1u64..=32 {
             ledger_index
@@ -57,6 +63,14 @@ fn ledger_progress_does_not_wait_for_row_work_and_reopens_with_matching_authorit
         persisted_while_rows_held.is_ok(),
         "ledger waited for held row work"
     );
+    index
+        .update_source_ledger_with_deletes(
+            (b"ledger", &32u64.to_be_bytes()),
+            [(b"completed".as_slice(), b"yes".as_slice())],
+            [b"entry".as_slice()],
+            None,
+        )
+        .unwrap();
     let checkpoint = control
         .checkpoint(&index, root.path().join("checkpoint"))
         .unwrap();
@@ -73,9 +87,11 @@ fn ledger_progress_does_not_wait_for_row_work_and_reopens_with_matching_authorit
         index.source_transaction(b"ledger").unwrap(),
         Some(32u64.to_be_bytes().to_vec())
     );
+    assert!(index.source_transaction(b"entry").unwrap().is_none());
+    assert!(control.source_transaction(b"entry").unwrap().is_none());
     assert_eq!(
-        index.source_transaction(b"entry").unwrap(),
-        Some(b"value".to_vec())
+        index.source_transaction(b"completed").unwrap(),
+        Some(b"yes".to_vec())
     );
     assert_eq!(
         index.table_state(&TableId(1)).unwrap().materialized_lsn,

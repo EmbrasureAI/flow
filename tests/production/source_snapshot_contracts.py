@@ -71,7 +71,7 @@ class SnapshotRun(Run):
             status = json.loads(path.read_text())
             return status.get("ready") and status.get("process_id") == self.process.pid
         # init also writes nonzero metrics. Wait for this running process, not
-        # the previous init snapshot, before replacing its already-open target.
+        # the previous init snapshot, before replacing its configured target.
         self.until("capture did not start", running_actor_ready)
         tables_uri = f"{self.args.catalog_uri.rstrip('/')}/v1/namespaces/{self.name}/tables"
         with urlopen(Request(tables_uri + "/orders", method="DELETE"), timeout=15):
@@ -90,10 +90,14 @@ class SnapshotRun(Run):
         while time.monotonic() < deadline:
             exit_code = self.process.poll()
             output = log.read_text()
-            if ("Iceberg target UUID changed" in output or
-                    (missing_target_rejected and "target table was replaced; refusing to reuse its source watermark" in output)):
-                break
             if exit_code is not None:
+                # Target identity is checked both when a worker loads its table
+                # and when it refreshes metadata. Either fence must terminate
+                # the daemon, including on the first attempt after replacement.
+                if ("Iceberg target UUID changed" in output or
+                        "target table was replaced; refusing to reuse its source watermark" in output):
+                    assert exit_code != 0, output
+                    break
                 # A health/catalog read can observe the real DELETE/CREATE
                 # gap and fail closed first. Restart against the now-existing
                 # replacement to also prove the persisted UUID fence.
@@ -115,7 +119,7 @@ class SnapshotRun(Run):
         assert after["schemas"] == replacement["schemas"]
         return {"original_uuid": original["table-uuid"], "replacement_uuid": after["table-uuid"],
                 "missing_target_rejected_during_replace": missing_target_rejected,
-                "rejected_before_publication": True, "source_barrier_not_acknowledged": barrier, "confirmed_flush_lsn": confirmed}
+                "rejected_before_publication": True, "exit_code": exit_code, "source_barrier_not_acknowledged": barrier, "confirmed_flush_lsn": confirmed}
 
     def rls(self):
         self.seed()

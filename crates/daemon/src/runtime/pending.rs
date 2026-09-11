@@ -1,10 +1,10 @@
 //! Bounded transaction admission while preserving each table's source order.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use flow_coordinator::{Priority, Scheduler, SourceLedger};
 use flow_model::{PgLsn, SourceTransaction, TableId};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -53,14 +53,19 @@ pub(super) fn schedule_transactions<'a>(
 #[derive(Default)]
 pub(super) struct PendingWork {
     pub(super) tables: BTreeMap<TableId, VecDeque<SourceTransaction>>,
-    pub(super) loaded: BTreeMap<PgLsn, usize>,
-    through: PgLsn,
+    // Reservations include queued and running descriptors. A failure releases
+    // both only after the actual worker has returned; the ledger owns replay.
+    reserved: BTreeMap<TableId, BTreeSet<PgLsn>>,
+    loaded: usize,
+    through: BTreeMap<TableId, PgLsn>,
+    next_after: Option<TableId>,
+    observed_registered: PgLsn,
+    excluded: HashSet<TableId>,
+    capacity: usize,
+    unloaded: bool,
 }
 impl PendingWork {
     /// Dequeue a table's ordered prefix without splitting a source transaction.
-    /// Readiness never waits to fill a batch. Already-queued ordinary work may
-    /// exceed the row trigger, bounded by payload bytes and the loaded window.
-    /// Unknown legacy counts and oversized transactions each publish alone.
     pub(super) fn take_epoch(&mut self, table: TableId) -> Vec<SourceTransaction> {
         let queue = self.tables.entry(table).or_default();
         let mut transactions = Vec::new();
@@ -92,8 +97,6 @@ impl PendingWork {
         priority: Priority,
     ) {
         if !transactions.is_empty() {
-            // Only restore the dequeued prefix. The scheduler already owns
-            // the tail and any transactions loaded while this job was running.
             schedule_transactions(id, &transactions, scheduler, priority);
             let queue = self.tables.entry(id).or_default();
             for transaction in transactions.into_iter().rev() {
@@ -108,45 +111,116 @@ impl PendingWork {
         scheduler: &mut Scheduler,
         profiles: &BTreeMap<TableId, Priority>,
         capacity: usize,
+        blocked: &HashSet<TableId>,
     ) -> Result<()> {
-        for transaction in ledger
-            .pending_transactions_after(self.through)
-            .take(capacity.saturating_sub(self.loaded.len()))
+        self.capacity = capacity;
+        ensure!(
+            self.loaded <= capacity,
+            "table admission exceeds its descriptor budget"
+        );
+        let resumed = self.excluded.iter().any(|id| !blocked.contains(id));
+        self.excluded.clone_from(blocked);
+        if !self.unloaded
+            && !resumed
+            && self.observed_registered >= ledger.watermarks().journal_durable_lsn
         {
-            let transaction = transaction?;
-            self.through = transaction.end_lsn;
-            let mut tables = 0usize;
-            for table in ledger.pending_tables(transaction.end_lsn)? {
-                self.tables
-                    .entry(table)
-                    .or_default()
-                    .push_back(transaction.clone());
+            return Ok(());
+        }
+        self.observed_registered = ledger.watermarks().journal_durable_lsn;
+        // One reference per table per pass, rotating the starting table even
+        // when the table count exceeds the entire descriptor budget.
+        let mut ids = profiles
+            .keys()
+            .copied()
+            .filter(|id| !blocked.contains(id))
+            .collect::<Vec<_>>();
+        if let Some(after) = self.next_after {
+            let split = ids.partition_point(|id| *id <= after);
+            ids.rotate_left(split);
+        }
+        let mut exhausted = HashSet::new();
+        while self.loaded < capacity && exhausted.len() < ids.len() {
+            for id in &ids {
+                if self.loaded == capacity {
+                    break;
+                }
+                if exhausted.contains(id) {
+                    continue;
+                }
+                self.next_after = Some(*id);
+                let through = self.through.get(id).copied().unwrap_or_default();
+                let transaction = ledger
+                    .pending_table_transactions_after(*id, through)
+                    .next()
+                    .transpose()?;
+                let Some(transaction) = transaction else {
+                    exhausted.insert(*id);
+                    continue;
+                };
+                let end = transaction.end_lsn;
+                ensure!(
+                    self.reserved.entry(*id).or_default().insert(end),
+                    "duplicate table admission reservation"
+                );
+                self.loaded += 1;
+                self.through.insert(*id, end);
                 scheduler.push(
-                    table,
-                    transaction.mutation_count(table),
+                    *id,
+                    transaction.mutation_count(*id),
                     transaction.mutation_chunks.payload_bytes(),
-                    profiles[&table],
+                    profiles[id],
                     source_age(&transaction),
                     Instant::now(),
                 );
-                tables += 1;
-            }
-            if tables > 0 {
-                self.loaded.insert(transaction.end_lsn, tables);
+                self.tables.entry(*id).or_default().push_back(transaction);
             }
         }
+        self.unloaded = exhausted.len() < ids.len();
         Ok(())
     }
-    pub(super) fn complete(&mut self, end: PgLsn) -> Result<()> {
-        let remaining = self
-            .loaded
-            .get_mut(&end)
-            .context("completed transaction is outside the publication window")?;
-        *remaining -= 1;
-        if *remaining == 0 {
-            self.loaded.remove(&end);
-        }
+
+    pub(super) fn complete(&mut self, table: TableId, end: PgLsn) -> Result<()> {
+        let reserved = self
+            .reserved
+            .get_mut(&table)
+            .context("completed table is outside the publication window")?;
+        ensure!(
+            reserved.remove(&end),
+            "completed transaction is outside the publication window"
+        );
+        self.loaded -= 1;
+        self.unloaded = true;
         Ok(())
+    }
+
+    /// Evict admission after this table's worker returns. Its durable index and
+    /// unfinished operation retain all changes without occupying another lane.
+    pub(super) fn defer(&mut self, table: TableId, scheduler: &mut Scheduler) {
+        self.loaded -= self
+            .reserved
+            .remove(&table)
+            .map_or(0, |entries| entries.len());
+        self.tables.remove(&table);
+        self.through.remove(&table);
+        scheduler.remove(table);
+        self.unloaded = true;
+    }
+
+    pub(super) fn has_work(&self) -> bool {
+        self.loaded > 0
+    }
+
+    /// True only when another bounded refill can admit runnable work. Full
+    /// queues and durable references for blocked tables must not cause a spin.
+    pub(super) fn has_runnable_unloaded(
+        &self,
+        ledger: &SourceLedger,
+        blocked: &HashSet<TableId>,
+    ) -> bool {
+        self.loaded < self.capacity
+            && (self.unloaded
+                || self.observed_registered < ledger.watermarks().journal_durable_lsn
+                || self.excluded.iter().any(|id| !blocked.contains(id)))
     }
 }
 
@@ -222,7 +296,7 @@ mod admission_tests {
             Scheduler::new(EPOCH_MUTATION_TRIGGER, EPOCH_MAX_BYTES, 100, Instant::now()).unwrap();
         let profiles = BTreeMap::from([(first, Priority::Realtime), (second, Priority::Realtime)]);
         pending
-            .refill(&ledger, &mut scheduler, &profiles, 6)
+            .refill(&ledger, &mut scheduler, &profiles, 12, &HashSet::new())
             .unwrap();
         assert_eq!(scheduler.take_ready(Instant::now()), Some(first));
         let taken = pending.take_epoch(first);
@@ -247,7 +321,7 @@ mod admission_tests {
             ])
             .unwrap();
         pending
-            .refill(&ledger, &mut scheduler, &profiles, 9)
+            .refill(&ledger, &mut scheduler, &profiles, 18, &HashSet::new())
             .unwrap();
         pending.restore(first, taken, &mut scheduler, Priority::Realtime);
         // The last byte fits exactly; the next transaction remains whole in the
@@ -267,14 +341,13 @@ mod admission_tests {
             );
             for txn in epoch {
                 ledger.table_materialized(txn.end_lsn, first, 100).unwrap();
-                pending.complete(txn.end_lsn).unwrap();
+                pending.complete(first, txn.end_lsn).unwrap();
             }
         }
         assert!(pending.tables[&first].is_empty());
         assert_eq!(
-            pending.loaded.len(),
-            9,
-            "another affected table still owns every slot"
+            pending.loaded, 9,
+            "only the unfinished table retains its reservations"
         );
         assert_eq!(ledger.acknowledgement(), PgLsn(0));
         loop {
@@ -284,11 +357,200 @@ mod admission_tests {
             }
             for txn in epoch {
                 ledger.table_materialized(txn.end_lsn, second, 101).unwrap();
-                pending.complete(txn.end_lsn).unwrap();
+                pending.complete(second, txn.end_lsn).unwrap();
             }
         }
-        assert!(pending.loaded.is_empty());
+        assert_eq!(pending.loaded, 0);
         assert_eq!(ledger.pending_count(), 0);
         assert_eq!(ledger.acknowledgement(), PgLsn(91));
+    }
+
+    #[test]
+    fn blocked_table_releases_the_global_budget_and_healthy_tables_pass_its_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            flow_state_store::StateStore::open(directory.path(), StateStoreOptions::default())
+                .unwrap();
+        let source = SourceId("isolation".into());
+        let (blocked, healthy) = (TableId(1), TableId(2));
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        for xid in 1..=20 {
+            ledger
+                .journaled(SourceTransaction {
+                    source_id: source.clone(),
+                    xid,
+                    begin_lsn: PgLsn(xid as u64 * 10 - 1),
+                    commit_lsn: PgLsn(xid as u64 * 10),
+                    end_lsn: PgLsn(xid as u64 * 10 + 1),
+                    commit_timestamp_micros: 0,
+                    schema_versions: vec![],
+                    affected_tables: vec![blocked, healthy],
+                    mutation_chunks: Default::default(),
+                    table_mutation_counts: None,
+                })
+                .unwrap();
+        }
+        let profiles =
+            BTreeMap::from([(blocked, Priority::Realtime), (healthy, Priority::Realtime)]);
+        let mut scheduler = Scheduler::new(1, EPOCH_MAX_BYTES, 100, Instant::now()).unwrap();
+        let mut pending = PendingWork::default();
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 2, &HashSet::new())
+            .unwrap();
+        assert_eq!(pending.loaded, 2);
+        let failed = pending.take_epoch(blocked);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            pending.loaded, 2,
+            "running descriptors still reserve memory"
+        );
+        pending.defer(blocked, &mut scheduler);
+        let exclusions = HashSet::from([blocked]);
+        for expected in 1..=20 {
+            pending
+                .refill(&ledger, &mut scheduler, &profiles, 2, &exclusions)
+                .unwrap();
+            assert!(pending.loaded <= 2);
+            let epoch = pending.take_epoch(healthy);
+            assert_eq!(epoch.len(), 1);
+            assert_eq!(epoch[0].xid, expected);
+            ledger
+                .table_materialized(epoch[0].end_lsn, healthy, 100)
+                .unwrap();
+            pending.complete(healthy, epoch[0].end_lsn).unwrap();
+        }
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 2, &exclusions)
+            .unwrap();
+        assert!(!pending.has_work());
+        assert!(!pending.has_runnable_unloaded(&ledger, &exclusions));
+        assert_eq!(ledger.acknowledgement(), PgLsn(0));
+        assert_eq!(ledger.pending_count(), 20);
+        drop(ledger);
+        let mut ledger = SourceLedger::open(
+            store,
+            source,
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        let mut pending = PendingWork::default();
+        for expected in 1..=20 {
+            pending
+                .refill(&ledger, &mut scheduler, &profiles, 2, &HashSet::new())
+                .unwrap();
+            let epoch = pending.take_epoch(blocked);
+            assert_eq!(epoch[0].xid, expected);
+            assert!(pending.tables.get(&healthy).is_none_or(VecDeque::is_empty));
+            ledger
+                .table_materialized(epoch[0].end_lsn, blocked, 101)
+                .unwrap();
+            pending.complete(blocked, epoch[0].end_lsn).unwrap();
+        }
+        while ledger.drain_completed_prefix().unwrap() {}
+        assert_eq!(ledger.acknowledgement(), PgLsn(201));
+    }
+
+    #[test]
+    fn more_tables_than_budget_are_admitted_fairly_and_defer_reloads_durable_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            flow_state_store::StateStore::open(directory.path(), StateStoreOptions::default())
+                .unwrap();
+        let source = SourceId("fairness".into());
+        let profiles = (1..=7)
+            .map(|id| (TableId(id), Priority::Realtime))
+            .collect::<BTreeMap<_, _>>();
+        let mut ledger = SourceLedger::open(
+            store,
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        for xid in 1..=3 {
+            ledger
+                .journaled(SourceTransaction {
+                    source_id: source.clone(),
+                    xid,
+                    begin_lsn: PgLsn(xid as u64 * 10 - 1),
+                    commit_lsn: PgLsn(xid as u64 * 10),
+                    end_lsn: PgLsn(xid as u64 * 10 + 1),
+                    commit_timestamp_micros: 0,
+                    schema_versions: vec![],
+                    affected_tables: profiles.keys().copied().collect(),
+                    mutation_chunks: Default::default(),
+                    table_mutation_counts: Some(
+                        profiles
+                            .keys()
+                            .map(|table| TableMutationCount {
+                                table_id: *table,
+                                mutations: 1,
+                            })
+                            .collect(),
+                    ),
+                })
+                .unwrap();
+        }
+        let mut scheduler = Scheduler::new(1, EPOCH_MAX_BYTES, 100, Instant::now()).unwrap();
+        let mut pending = PendingWork::default();
+        let mut admitted = Vec::new();
+        for _ in 0..7 {
+            pending
+                .refill(&ledger, &mut scheduler, &profiles, 1, &HashSet::new())
+                .unwrap();
+            assert_eq!(pending.loaded, 1);
+            assert!(
+                !pending.has_runnable_unloaded(&ledger, &HashSet::new()),
+                "a full budget must not spin"
+            );
+            let id = *pending
+                .tables
+                .iter()
+                .find(|(_, queue)| !queue.is_empty())
+                .unwrap()
+                .0;
+            admitted.push(id);
+            scheduler.remove(id);
+            let epoch = pending.take_epoch(id);
+            ledger
+                .table_materialized(epoch[0].end_lsn, id, 100)
+                .unwrap();
+            pending.complete(id, epoch[0].end_lsn).unwrap();
+        }
+        assert_eq!(admitted, profiles.keys().copied().collect::<Vec<_>>());
+        let blocked = profiles
+            .keys()
+            .copied()
+            .filter(|id| *id != TableId(1))
+            .collect();
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 4, &blocked)
+            .unwrap();
+        let epoch = pending.take_epoch(TableId(1));
+        assert_eq!(
+            epoch.iter().map(|txn| txn.xid).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        pending.defer(TableId(1), &mut scheduler);
+        assert_eq!(pending.loaded, 0);
+        assert!(scheduler.next_deadline().is_none());
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 4, &blocked)
+            .unwrap();
+        assert_eq!(
+            pending
+                .take_epoch(TableId(1))
+                .iter()
+                .map(|txn| txn.xid)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 }
