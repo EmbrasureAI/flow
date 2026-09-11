@@ -30,6 +30,7 @@ NATIVE_FILES = {
         "src/polyfill/once_cell/LICENSE-MIT",
     ],
     "aws-lc-sys": ["aws-lc/LICENSE", "aws-lc/third_party/fiat/LICENSE"],
+    "tikv-jemalloc-sys": ["jemalloc/COPYING"],
 }
 NATIVE_HEADERS = {
     "librocksdb-sys": ["rocksdb/util/xxhash.cc", "rocksdb/util/xxhash.h"],
@@ -93,13 +94,23 @@ def check_policy(packages, policy):
                     raise ValueError(f"changed reviewed native notice: {identity}/{relative}")
 
 
+def metadata_command(target, features, no_default_features):
+    command = ["cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+               "--filter-platform", target]
+    if features:
+        command += ["--features", ",".join(
+            feature if "/" in feature else f"flow-daemon/{feature}" for feature in features)]
+    if no_default_features:
+        command.append("--no-default-features")
+    return command
+
+
 def package(args):
     rustc = capture("rustc", "-vV")
     target = args.target or next(line[6:] for line in rustc.splitlines() if line.startswith("host: "))
-    metadata = json.loads(capture(
-        "cargo", "metadata", "--locked", "--offline", "--format-version", "1",
-        "--filter-platform", target,
-    ))
+    features = sorted({feature for group in args.features for feature in re.split(r"[\s,]+", group) if feature})
+    metadata = json.loads(capture(*metadata_command(target, features, args.no_default_features)))
+    resolved_features = {node["id"]: node["features"] for node in metadata["resolve"]["nodes"]}
     policy_bytes = (ROOT / "licenses/policy.json").read_bytes()
     policy = json.loads(policy_bytes)
     if target not in policy["targets"]:
@@ -157,6 +168,7 @@ def package(args):
                 copy_notice(source / relative, destination / relative)
         inventory.append({
             "name": name, "version": version, "license": p["license"],
+            "features": resolved_features[p["id"]],
             "reviewed_license_choice": policy["reviewed_expressions"][p["license"]],
             "repository": p["repository"], "source": p["source"] or str(source.relative_to(ROOT)),
             "crate_sha256": locked[(name, version)].get("checksum"),
@@ -172,6 +184,7 @@ def package(args):
         raise ValueError("Rust toolchain license files are missing")
     inventory_document = {
         "format_version": 1, "target": target, "rustc": rustc,
+        "requested_features": features, "no_default_features": args.no_default_features,
         "license_policy_sha256": sha256(policy_bytes),
         "cargo_lock_sha256": sha256(lock_bytes), "packages": inventory,
         "files": {
@@ -189,4 +202,7 @@ if __name__ == "__main__":
     action.add_argument("--output", type=Path)
     action.add_argument("--check-only", action="store_true", help="check policy without writing a bundle")
     parser.add_argument("--target", help="Cargo target triple; defaults to rustc host")
+    parser.add_argument("--features", action="append", default=[],
+                        help="enabled daemon features, matching the build (repeatable; comma/space separated)")
+    parser.add_argument("--no-default-features", action="store_true", help="match a build without default features")
     package(parser.parse_args())

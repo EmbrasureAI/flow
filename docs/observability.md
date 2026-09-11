@@ -360,3 +360,23 @@ consume additional memory. Resource sizing must include that concurrency.
 `limits.table_workers` defaults to four and bounds concurrent table jobs across
 CDC publication and maintenance. Waiting tables retain their source backlog;
 reaching the worker limit does not relax reader-debt or acknowledgement rules.
+
+## Allocator memory
+
+GNU/Linux builds with `--features jemalloc` enable process-wide jemalloc and its
+background reclamation threads during `init` and `run`. The daemon samples the
+allocator at most once every 15 seconds and exports these gauges in `metrics.prom`:
+
+| Gauge | Meaning |
+| --- | --- |
+| `flow_allocator_allocated_bytes` | Bytes currently allocated to application objects |
+| `flow_allocator_active_bytes` | Active allocation pages, including unused space within them |
+| `flow_allocator_resident_bytes` | Allocator resident pages, including allocator metadata and dirty pages |
+
+The values overlap and must not be added together. Allocator resident memory is
+not process RSS: mapped files, thread stacks and other mappings are measured
+separately by the operating system. Compare allocator gauges with process RSS
+when distinguishing live objects from retained pages. Failed samples omit the
+gauges until a later sample succeeds; absence does not mean zero memory.
+Background reclamation does not cap live allocations or replace worker, batch,
+cache and container limits. Default and non-GNU/Linux builds omit these gauges.

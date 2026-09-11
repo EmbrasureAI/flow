@@ -1,3 +1,5 @@
+#[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
+mod allocator;
 mod bootstrap;
 mod config;
 mod generation;
@@ -64,6 +66,10 @@ async fn run_cli() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let config = config::Config::load(&cli.config)?;
+    #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
+    if matches!(&cli.command, Command::Init | Command::Run { .. }) {
+        allocator::initialize();
+    }
     match cli.command {
         Command::Check => {
             println!("configuration valid: {} tables", config.tables.len());

@@ -1,14 +1,35 @@
 """Exercise actual gate rejection boundaries without Cargo or native builds."""
 
 import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from package_licenses import check_policy, packages_for_daemon, sha256
+from package_licenses import check_policy, package, packages_for_daemon, sha256
 
 
 class LicensePolicyTests(unittest.TestCase):
+    def test_collector_resolves_the_requested_build_features(self):
+        metadata = {"packages": [{"id": "daemon", "name": "flow-daemon", "version": "0.1.0", "license": "Apache-2.0"}],
+                    "resolve": {"nodes": [{"id": "daemon", "deps": [], "features": []}]}}
+        for features, no_defaults in (([], False), (["jemalloc", "jemalloc"], True)):
+            args = SimpleNamespace(target="x86_64-unknown-linux-gnu", features=features,
+                                   no_default_features=no_defaults, check_only=True)
+            with self.subTest(features=features), patch("package_licenses.capture", side_effect=[
+                "host: x86_64-unknown-linux-gnu", json.dumps(metadata),
+            ]) as capture, patch("builtins.print"):
+                package(args)
+            command = capture.call_args.args
+            self.assertIn("--locked", command)
+            self.assertIn("--offline", command)
+            self.assertEqual("--features" in command, bool(features))
+            self.assertEqual("--no-default-features" in command, no_defaults)
+            if features:
+                self.assertEqual(command[command.index("--features") + 1], "flow-daemon/jemalloc")
+
     def test_exact_expressions_do_not_hide_unknown_or_additional_terms(self):
         policy = {"reviewed_expressions": {"MIT OR Apache-2.0": "Apache-2.0"},
                   "bundled_native": {}, "other_links": {}}

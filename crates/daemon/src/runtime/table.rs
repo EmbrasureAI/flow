@@ -244,7 +244,7 @@ fn candidate_invalidation_reason(error: &anyhow::Error) -> &'static str {
 
 #[derive(Clone)]
 pub(super) struct TableWork {
-    pub(super) config: Config,
+    pub(super) config: Arc<Config>,
     pub(super) store: StateStore,
     pub(super) control: ControlStore,
     pub(super) reader: JournalReader,

@@ -199,7 +199,7 @@ impl TableSchema {
         }
         let mut bytes = vec![1]; // canonical format version
         for idx in &self.primary_key {
-            encode_value(&row[*idx], &mut bytes);
+            encode_value(&row[*idx], |chunk| bytes.extend_from_slice(chunk));
         }
         Ok(PrimaryKey(bytes))
     }
@@ -238,23 +238,23 @@ impl TableSchema {
 }
 
 /// Canonical, typed, length-delimited encoding. Never concatenate unframed keys.
-fn encode_value(value: &Value, out: &mut Vec<u8>) {
+fn encode_value(value: &Value, mut emit: impl FnMut(&[u8])) {
     match value {
-        Value::Null => out.push(0),
+        Value::Null => emit(&[0]),
         Value::Bool(v) => {
-            out.push(1);
-            out.push(u8::from(*v));
+            emit(&[1]);
+            emit(&[u8::from(*v)]);
         }
         Value::Int32(v) => {
-            out.push(2);
-            out.extend(v.to_be_bytes());
+            emit(&[2]);
+            emit(&v.to_be_bytes());
         }
         Value::Int64(v) => {
-            out.push(3);
-            out.extend(v.to_be_bytes());
+            emit(&[3]);
+            emit(&v.to_be_bytes());
         }
         Value::Float64(v) => {
-            out.push(4);
+            emit(&[4]);
             let bits = if v.is_nan() {
                 f64::NAN.to_bits()
             } else if *v == 0.0 {
@@ -262,43 +262,44 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
             } else {
                 v.to_bits()
             };
-            out.extend(bits.to_be_bytes());
+            emit(&bits.to_be_bytes());
         }
         Value::String(v) => {
-            out.push(5);
-            out.extend((v.len() as u64).to_be_bytes());
-            out.extend(v.as_bytes());
+            emit(&[5]);
+            emit(&(v.len() as u64).to_be_bytes());
+            emit(v.as_bytes());
         }
         Value::Binary(v) => {
-            out.push(6);
-            out.extend((v.len() as u64).to_be_bytes());
-            out.extend(v);
+            emit(&[6]);
+            emit(&(v.len() as u64).to_be_bytes());
+            emit(v);
         }
         Value::Date(v) => {
-            out.push(7);
-            out.extend(v.to_be_bytes());
+            emit(&[7]);
+            emit(&v.to_be_bytes());
         }
         Value::TimestampMicros(v) => {
-            out.push(8);
-            out.extend(v.to_be_bytes());
+            emit(&[8]);
+            emit(&v.to_be_bytes());
         }
         Value::Uuid(v) => {
-            out.push(9);
-            out.extend(v);
+            emit(&[9]);
+            emit(v);
         }
         Value::Decimal { unscaled, scale } => {
-            out.push(10);
-            out.push(*scale);
-            out.extend(unscaled.to_be_bytes());
+            emit(&[10]);
+            emit(&[*scale]);
+            emit(&unscaled.to_be_bytes());
         }
         Value::TimestampTzMicros(v) => {
-            out.push(11);
-            out.extend(v.to_be_bytes());
+            emit(&[11]);
+            emit(&v.to_be_bytes());
         }
     }
 }
 pub fn fingerprint(row: &Row) -> [u8; 16] {
-    let mut bytes = vec![1];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[1]);
     // Schema evolution only appends nullable columns. Their implicit nulls must
     // fingerprint identically before and after an old file is projected through
     // the new schema. Interior nulls still encode their position.
@@ -307,10 +308,12 @@ pub fn fingerprint(row: &Row) -> [u8; 16] {
         .rposition(|value| !matches!(value, Value::Null))
         .map_or(0, |index| index + 1);
     for value in &row[..end] {
-        encode_value(value, &mut bytes);
+        encode_value(value, |chunk| {
+            hasher.update(chunk);
+        });
     }
     let mut result = [0; 16];
-    result.copy_from_slice(&blake3::hash(&bytes).as_bytes()[..16]);
+    result.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     result
 }
 

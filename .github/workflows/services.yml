@@ -40,7 +40,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Verify stock reader extensions from an empty cache
         run: uv run tests/local/duckdb_extensions.py
-      - run: cargo build --locked -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
+      - run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
       - name: Select free ports that survive service restarts
         run: |
           python3 - <<'PY'
@@ -230,7 +230,7 @@ jobs:
           toolchain: '1.97.1'
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
-      - run: cargo build --locked -p flow-daemon
+      - run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon
       - name: Select free service ports
         run: |
           python3 - <<'PYPORTS'

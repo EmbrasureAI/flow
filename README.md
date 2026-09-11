@@ -74,6 +74,13 @@ cargo build --locked --release -p flow-daemon
 ./target/release/embrasure-flow --config examples/flow.toml check
 ```
 
+On GNU/Linux, add `--features jemalloc` to enable process-wide allocation and
+background reclamation of unused pages, including RocksDB's C++ allocations.
+For the Docker image, use `docker build --build-arg FLOW_FEATURES=jemalloc -t flow .`.
+The default build uses the system allocator; the feature has no effect on other
+targets. See [allocator metrics](docs/observability.md#allocator-memory) for
+measurement details and limits.
+
 To connect your own services, follow [Getting started](docs/getting-started.md)
 to configure the source, catalog and storage, then run `init`, `run` and `status`.
 Flow needs persistent disk for its transaction journal and RocksDB row index.

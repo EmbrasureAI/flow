@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result};
 use flow_coordinator::{SourceHealth, WalPressure};
 use flow_pg_source::tokio_postgres::Client;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -23,7 +23,7 @@ pub(super) struct HealthCheckResult {
 }
 
 pub(super) async fn check_health(
-    config: Config,
+    config: Arc<Config>,
     client: Option<HealthConnection>,
 ) -> Result<HealthCheckResult> {
     let result: Result<(HealthConnection, SourceHealth)> = async {

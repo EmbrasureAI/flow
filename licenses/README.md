@@ -11,7 +11,8 @@ binary notices. Most dependency notices come directly from Cargo packages.
 and SHA-256 hashes. Identical Apache license texts share one checked-in copy.
 
 The Docker build generates a bundle at `/usr/share/licenses/embrasure-flow`.
-Its `index.json` records the target, compiler, Cargo.lock hash, dependency versions,
+Its `index.json` records the target, compiler, requested and resolved features,
+Cargo.lock hash, dependency versions,
 crate checksums and hashes of bundled notices. It covers the daemon's normal and
 build dependencies, including some tools and feature-unified dependencies that
 may not be linked. Dependencies reached only through dev dependencies are excluded.
@@ -25,6 +26,10 @@ cargo fetch --locked
 python3 scripts/package_licenses.py --output target/distribution-licenses
 python3 scripts/package_licenses.py --check-only --target x86_64-unknown-linux-gnu
 ```
+
+For an allocator-enabled build, pass `--features jemalloc` to the notice collector
+as well. Docker forwards `FLOW_FEATURES` to both the build and notice collection.
+The bundle retains jemalloc's BSD terms alongside its Rust wrapper licenses.
 
 The default target is the compiler's host. Reviewed targets are
 `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu` and
