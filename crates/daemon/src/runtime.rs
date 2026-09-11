@@ -1,10 +1,12 @@
 //! Recover durable state and coordinate source capture, publication, and maintenance.
 
+pub(crate) mod blocked;
 mod health;
 mod pending;
 mod table;
 
 use self::{
+    blocked::BlockedTables,
     health::{HealthCheckResult, check_health},
     pending::{EPOCH_MAX_BYTES, EPOCH_MUTATION_TRIGGER, PendingWork, schedule_transactions},
     table::{
@@ -22,15 +24,14 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use flow_coordinator::{
-    Epoch, PreparationWait, Priority, ReadyCompaction, ReplanRequired, Scheduler, SourceLedger,
+    PreparationWait, Priority, ReadyCompaction, ReplanRequired, Scheduler, SourceLedger,
     TableMaintenance, TablePublisher,
 };
 use flow_ingress_journal::Journal;
-use flow_model::{SourceId, TableId, TableSchema};
+use flow_model::{PgLsn, SourceId, TableId, TableSchema};
 use flow_pg_source::Acknowledgement;
-use flow_state_store::{ControlStore, OperationKind, OperationPhase, StateStore};
+use flow_state_store::{ControlStore, OperationKind, StateStore};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use iceberg::table::Table;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     future::Future,
@@ -82,7 +83,16 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         );
     }
     let catalog = catalog(&config).await?;
-    let mut tables = tables(catalog.as_ref(), &boot).await?;
+    // An intact completed bootstrap has durable target identity. Load each
+    // target in its worker so a remote table outage cannot block startup.
+    // Bootstrap, legacy identity adoption and index rebuild still need all tables.
+    let isolated_start =
+        opened.is_ok() && boot.copied && boot.layout > 0 && !boot.target_uuids.is_empty();
+    let tables = if isolated_start {
+        BTreeMap::new()
+    } else {
+        tables(catalog.as_ref(), &boot).await?
+    };
     if boot.target_uuids.is_empty() {
         // Upgrade only an intact legacy index with retained source history.
         // A missing index cannot establish the identity of a replaced target.
@@ -115,7 +125,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     );
     for (schema, uuid) in boot.schemas.iter().zip(&boot.target_uuids) {
         ensure!(
-            tables[&schema.table_id].metadata().uuid() == *uuid,
+            tables
+                .get(&schema.table_id)
+                .is_none_or(|table| table.metadata().uuid() == *uuid),
             "target table was replaced; refusing to reuse its source watermark"
         );
     }
@@ -155,7 +167,6 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     };
     if !boot.copied || boot.layout == 0 {
         crate::bootstrap::resume(&config, store.clone(), catalog.clone(), &mut boot).await?;
-        tables = self::tables(catalog.as_ref(), &boot).await?;
     }
     let (journal, recovery) =
         Journal::open(config.state_dir.join("journal"), journal_config(&config))?;
@@ -196,41 +207,22 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         .with_read_limits(config.parquet_read.clone())?,
     );
     for operation in store.pending_operations()? {
-        let table = tables
-            .get(&operation.operation.table_id)
-            .context("pending operation has no configured table")?;
-        match operation.phase {
-            OperationPhase::Building => {
-                store.discard_uncommitted(&operation.operation.id)?;
-            }
-            _ if operation.operation.kind == OperationKind::Ingest => {
-                if let Err(error) = publisher.recover(table, &operation.operation.id).await {
-                    if error.downcast_ref::<ReplanRequired>().is_none() {
-                        return Err(error);
-                    }
-                    tracing::info!(operation = %operation.operation.id.0, "replaying invalidated publication from the journal");
-                }
-            }
-            _ if matches!(
+        ensure!(
+            boot.schemas
+                .iter()
+                .any(|schema| schema.table_id == operation.operation.table_id),
+            "pending operation has no configured table"
+        );
+        ensure!(
+            matches!(
                 operation.operation.kind,
-                OperationKind::Rewrite | OperationKind::Reconcile | OperationKind::ManifestRewrite
-            ) =>
-            {
-                if let Err(error) = maintenance.recover(table, &operation.operation.id).await {
-                    if error.downcast_ref::<ReplanRequired>().is_none() {
-                        return Err(error);
-                    }
-                    tracing::info!(operation = %operation.operation.id.0, "replanning invalidated maintenance");
-                } else {
-                    let store = store.clone();
-                    tokio::task::spawn_blocking(move || {
-                        store.forget_applied(&operation.operation.id)
-                    })
-                    .await??;
-                }
-            }
-            _ => bail!("index reconciliation must complete before source capture"),
-        }
+                OperationKind::Ingest
+                    | OperationKind::Rewrite
+                    | OperationKind::Reconcile
+                    | OperationKind::ManifestRewrite
+            ),
+            "index reconciliation must complete before source capture"
+        );
     }
     let retired = reconcile_source_progress(&store, &mut ledger)?;
     if retired > 0 {
@@ -249,7 +241,6 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     // The control database excludes another daemon, recovery is complete and
     // no worker has started. These stores contain temporary mappings only.
     remove_abandoned_scratch(&config)?;
-    tables = self::tables(catalog.as_ref(), &boot).await?;
     let reader = journal.reader();
     let (events, mut receive) = watch::channel(CaptureProgress {
         durable_lsn: journal.durable_lsn(),
@@ -279,12 +270,24 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
             control,
             reader,
             catalog,
+            targets: Arc::new(
+                boot.schemas
+                    .iter()
+                    .zip(&boot.targets)
+                    .zip(&boot.target_uuids)
+                    .map(|((schema, (namespace, name)), uuid)| {
+                        Ok((
+                            schema.table_id,
+                            (crate::services::target(namespace, name)?, *uuid),
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+            ),
             publisher,
             maintenance,
             garbage_checked: Arc::default(),
             compaction,
         },
-        tables,
         profiles: boot
             .schemas
             .iter()
@@ -367,7 +370,6 @@ fn remove_abandoned_scratch(config: &Config) -> Result<()> {
 
 struct PublishRuntime {
     work: TableWork,
-    tables: BTreeMap<TableId, Table>,
     schemas: BTreeMap<TableId, TableSchema>,
     profiles: BTreeMap<TableId, Priority>,
 }
@@ -415,12 +417,15 @@ impl PublishRuntime {
     ) -> Result<()> {
         let Self {
             work,
-            tables,
             schemas,
             profiles,
         } = self;
         let config = &work.config;
         let store = &work.store;
+        let mut blocked = BlockedTables::load(store, &SourceId(config.source.id.clone()))?;
+        let mut excluded: HashSet<_> = blocked.ids().collect();
+        let mut recovering: HashSet<TableId>;
+        let mut retrying = HashSet::new();
         let mut pending = PendingWork::default();
         let mut scheduler = Scheduler::new(
             EPOCH_MUTATION_TRIGGER,
@@ -433,6 +438,7 @@ impl PublishRuntime {
             &mut scheduler,
             &profiles,
             config.limits.pending_transactions,
+            &excluded,
         )?;
         let mut capture_goal = receive.borrow_and_update().durable_lsn;
         let mut busy = HashSet::new();
@@ -461,17 +467,37 @@ impl PublishRuntime {
         let mut health_client = None;
         let mut health_checks = FuturesUnordered::new();
         let mut checkpoints = FuturesUnordered::new();
-        let mut idle_work = VecDeque::new();
+        let mut idle_work: VecDeque<_> = schemas
+            .keys()
+            .filter(|id| !excluded.contains(id) && blocked.get(**id).is_none())
+            .copied()
+            .collect();
         let mut maintenance_due = BTreeMap::<TableId, Instant>::new();
         let mut periodic_due = BTreeMap::<TableId, Instant>::new();
         let mut periodic_active = false;
         let mut periodic_yield_to_cdc = false;
+        let mut retry_yield_to_cdc = false;
         let mut maintenance_admission = MaintenanceAdmission::default();
         let mut checkpoint_at = Instant::now();
         let shutdown = crate::lifecycle::shutdown_signal();
         tokio::pin!(shutdown);
+        observation.table_states(store, &blocked, schemas.keys().copied())?;
         observation.write(config, ledger, capture_goal, true)?;
         loop {
+            recovering = store
+                .applied_operations(schemas.len().max(1))?
+                .into_iter()
+                .map(|operation| operation.operation.table_id)
+                .filter(|id| !busy.contains(id))
+                .collect();
+            excluded = blocked
+                .ids()
+                .filter(|id| !retrying.contains(id))
+                .chain(recovering.iter().copied())
+                .collect();
+            for id in &recovering {
+                pending.defer(*id, &mut scheduler);
+            }
             let free_workers = config.limits.table_workers.saturating_sub(
                 running.len() + builds.len() + preparations.len() + retirements.len(),
             );
@@ -479,8 +505,8 @@ impl PublishRuntime {
             let optional_allowed = maintenance_admission.optional_allowed(
                 config.limits.table_workers,
                 free_workers,
-                pending.tables.values().any(|queue| !queue.is_empty())
-                    || ledger.pending_count() > pending.loaded.len()
+                pending.has_work()
+                    || pending.has_runnable_unloaded(ledger, &excluded)
                     || ledger.watermarks().journal_durable_lsn < capture_goal,
             );
             let cdc_deadline = scheduler.next_deadline();
@@ -488,10 +514,16 @@ impl PublishRuntime {
                 && !periodic_active
                 && !(periodic_yield_to_cdc
                     && cdc_deadline.is_some_and(|due| due <= Instant::now()));
-            let deadline = if (optional_allowed && !idle_work.is_empty())
-                || ready_builds.keys().any(|id| !busy.contains(id))
-                || ready_preparations.keys().any(|id| !busy.contains(id))
-            {
+            let deadline = if (optional_allowed
+                && idle_work
+                    .iter()
+                    .any(|id| !excluded.contains(id) && blocked.get(*id).is_none()))
+                || ready_builds.keys().any(|id| {
+                    !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
+                })
+                || ready_preparations.keys().any(|id| {
+                    !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
+                }) {
                 Instant::now()
             } else {
                 cdc_deadline
@@ -503,10 +535,21 @@ impl PublishRuntime {
                             .chain(periodic_due.iter().filter(|_| periodic_allowed))
                             .filter(|(id, _)| {
                                 !busy.contains(*id)
+                                    && !excluded.contains(*id)
+                                    && blocked.get(**id).is_none()
                                     && !build_active.contains(*id)
                                     && !retiring_builds.contains(*id)
                             })
                             .map(|(_, due)| *due),
+                    )
+                    .chain(
+                        blocked
+                            .records()
+                            .filter(|record| {
+                                !busy.contains(&record.table_id)
+                                    && !recovering.contains(&record.table_id)
+                            })
+                            .filter_map(|record| blocked.deadline_for(record.table_id)),
                     )
                     .min()
                     .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
@@ -540,14 +583,63 @@ impl PublishRuntime {
                     capture_goal = capture_goal.max(ledger.watermarks().journal_durable_lsn);
                     ack.send(feedback(ledger))?;
                 }
+                _ = tokio::task::yield_now(), if !recovering.is_empty() || ledger.has_completed_prefix()? => {
+                    if let Some(operation) = store.applied_operations(schemas.len().max(1))?
+                        .into_iter().find(|operation| !busy.contains(&operation.operation.table_id)) {
+                        let id = operation.operation.table_id;
+                        let transactions = ledger.pending_table_transactions_after(id, PgLsn(0))
+                            .take(ledger.batch_capacity()).collect::<Result<Vec<_>>>()?;
+                        let ends = transactions.iter()
+                            .take_while(|transaction| transaction.end_lsn <= operation.operation.last_lsn)
+                            .map(|transaction| transaction.end_lsn).collect::<Vec<_>>();
+                        if ends.is_empty() {
+                            store.forget_applied(&operation.operation.id)?;
+                        } else {
+                            ledger.table_materialized_batch(&ends, id,
+                                store.table_state(&id)?.snapshot_id.unwrap_or(0))?;
+                        }
+                    } else {
+                        ledger.drain_completed_prefix()?;
+                    }
+                    ack.send(feedback(ledger))?;
+                }
                 Some(result) = running.next(), if !running.is_empty() => {
-                    let TableCompletion { id, transactions, outcome, elapsed, reserved_build, finalization_lane } = result?;
+                    let TableCompletion { id, transactions, outcome, elapsed, reserved_build, finalization_lane, periodic_maintenance } = result?;
                     busy.remove(&id);
+                    retrying.remove(&id);
                     if let Some(lane) = finalization_lane {
                         lane.record_release(id, Instant::now());
                     }
                     scheduler.stall(id, false);
                     match outcome {
+                        TableOutcome::Blocked { error_code } => {
+                            let indexed = store.table_state(&id)?;
+                            blocked.record(id, error_code, indexed.pending_operation)?;
+                            metrics::counter!("flow_table_retries_total", "table_id" => id.0.to_string()).increment(1);
+                            pending.defer(id, &mut scheduler);
+                            observation.table_states(store, &blocked, [id])?;
+                            observation.write(config, ledger, capture_goal, true)?;
+                            if reserved_build {
+                                build_active.remove(&id);
+                                activation_pending.remove(&id);
+                                waiting_for_build.remove(&id);
+                            }
+                            maintenance_due.remove(&id);
+                            periodic_due.remove(&id);
+                            idle_work.retain(|queued| *queued != id);
+                            if periodic_maintenance {
+                                periodic_active = false;
+                            }
+                        }
+                        TableOutcome::Recovered => {
+                            if reserved_build {
+                                build_active.remove(&id);
+                                activation_pending.remove(&id);
+                                waiting_for_build.remove(&id);
+                            }
+                            pending.defer(id, &mut scheduler);
+                            blocked.clear(id)?;
+                        }
                         TableOutcome::Build(build) => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid background build handoff");
                             builds.push(Box::pin(async move {
@@ -610,6 +702,7 @@ impl PublishRuntime {
                             maintenance_due.remove(&id);
                         }
                         TableOutcome::Deferred => {
+                            blocked.clear(id)?;
                             ensure!(!reserved_build, "build reservation deferred behind itself");
                             pending.restore(id, transactions, &mut scheduler, profiles[&id]);
                             if build_active.contains(&id) {
@@ -630,7 +723,7 @@ impl PublishRuntime {
                             }
                             maintenance_due.insert(id, Instant::now());
                         }
-                        TableOutcome::Complete { snapshot, maintenance_pending } => {
+                        TableOutcome::Complete { snapshot, operation, maintenance_pending } => {
                             let completion_started = Instant::now();
                             if reserved_build {
                                 build_active.remove(&id);
@@ -641,17 +734,17 @@ impl PublishRuntime {
                             for batch in transactions.chunks(ledger.batch_capacity()) {
                                 let ends = batch.iter().map(|transaction| transaction.end_lsn).collect::<Vec<_>>();
                                 ledger.table_materialized_batch(&ends, id, snapshot.unwrap_or(0))?;
-                                for end in ends { pending.complete(end)?; }
+                                for end in ends { pending.complete(id, end)?; }
                             }
-                            let completed_epoch = if !transactions.is_empty() {
-                                let epoch = Epoch::new(SourceId(config.source.id.clone()), id, &transactions)?;
-                                if store.operation(&epoch.id)?.is_some() {
-                                    store.forget_applied(&epoch.id)?;
-                                }
-                                Some(epoch.id)
-                            } else { None };
+                            let completed_epoch = operation;
+                            if let Some(operation) = &completed_epoch
+                                && store.operation(operation)?.is_some() {
+                                store.forget_applied(operation)?;
+                            }
+                            blocked.clear(id)?;
                             ack.send(feedback(ledger))?;
                             let durable_completed = Instant::now();
+                            observation.table_states(store, &blocked, [id])?;
                             let metrics_exported = observation.write(config, ledger, capture_goal, true)?;
                             let completion_finished = Instant::now();
                             if let Some(epoch) = completed_epoch {
@@ -835,23 +928,23 @@ impl PublishRuntime {
                         let optional_allowed = maintenance_admission.optional_allowed(
                             config.limits.table_workers,
                             free_workers,
-                            pending.tables.values().any(|queue| !queue.is_empty())
-                                || ledger.pending_count() > pending.loaded.len()
+                            pending.has_work()
+                                || pending.has_runnable_unloaded(ledger, &excluded)
                                 || ledger.watermarks().journal_durable_lsn < capture_goal,
                         );
                         let prepared = ready_preparations
                             .keys()
-                            .find(|id| !busy.contains(*id))
+                            .find(|id| !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none())
                             .copied();
                         let built = ready_builds
                             .keys()
-                            .find(|id| !busy.contains(*id))
+                            .find(|id| !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none())
                             .copied();
                         let overdue = maintenance_due.iter()
                             .filter(|(id, due)| {
                                 **due <= now
                                     && (optional_allowed || fenced_fallback.contains(*id))
-                                    && !busy.contains(*id)
+                                    && !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none()
                                     && !build_active.contains(*id)
                                     && !retiring_builds.contains(*id)
                             })
@@ -862,7 +955,7 @@ impl PublishRuntime {
                         // dispatch between visits even across different tables.
                         let periodic = if optional_allowed && !periodic_active && !(periodic_yield_to_cdc && cdc_ready) {
                             periodic_due.iter()
-                                .filter(|(id, due)| **due <= now && !busy.contains(*id)
+                                .filter(|(id, due)| **due <= now && !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none()
                                     && !build_active.contains(*id) && !retiring_builds.contains(*id))
                                 .min_by_key(|(_, due)| **due)
                                 .map(|(id, _)| *id)
@@ -880,7 +973,7 @@ impl PublishRuntime {
                             && cdc_ready
                         {
                             maintenance_due.iter()
-                                .filter(|(id, due)| **due <= now && !busy.contains(*id)
+                                .filter(|(id, due)| **due <= now && !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none()
                                     && !build_active.contains(*id) && !retiring_builds.contains(*id)
                                     && !fenced_fallback.contains(*id))
                                 .min_by_key(|(_, due)| **due)
@@ -888,7 +981,27 @@ impl PublishRuntime {
                         } else {
                             None
                         };
-                        let (id, idle, candidate) = if let Some(id) = prepared {
+                        let retry = if retry_yield_to_cdc && cdc_ready { None } else {
+                            blocked.due(now).into_iter()
+                                .find(|id| !busy.contains(id) && !recovering.contains(id))
+                        };
+                        if let Some(id) = retry
+                            && store.table_state(&id)?.pending_operation.is_none()
+                            && ledger.pending_table_transactions_after(id, PgLsn(0)).next().transpose()?.is_some()
+                        {
+                                blocked.release_due(id);
+                                retrying.insert(id);
+                                excluded.remove(&id);
+                                pending.refill(ledger, &mut scheduler, &profiles,
+                                    config.limits.pending_transactions, &excluded)?;
+                                continue;
+                        }
+                        let (id, idle, candidate) = if let Some(id) = retry {
+                            blocked.release_due(id);
+                            retrying.insert(id);
+                            retry_yield_to_cdc = true;
+                            (id, true, None)
+                        } else if let Some(id) = prepared {
                             (
                                 id,
                                 true,
@@ -914,11 +1027,11 @@ impl PublishRuntime {
                         } else if let Some(id) = overdue {
                             (id, true, None)
                         } else if optional_allowed && let Some(id) = idle_work.pop_front() {
-                            if build_active.contains(&id) || retiring_builds.contains(&id) {
+                            if excluded.contains(&id) || build_active.contains(&id) || retiring_builds.contains(&id) {
                                 continue;
                             }
                             if ledger.watermarks().journal_durable_lsn < capture_goal
-                                || ledger.pending_count() != pending.loaded.len()
+                                || pending.has_runnable_unloaded(ledger, &excluded)
                             {
                                 idle_work.clear();
                                 break;
@@ -930,7 +1043,7 @@ impl PublishRuntime {
                         } else {
                             break;
                         };
-                        if busy.contains(&id) {
+                        if busy.contains(&id) || (excluded.contains(&id) && retry != Some(id)) {
                             scheduler.stall(id, true);
                             continue;
                         }
@@ -958,7 +1071,9 @@ impl PublishRuntime {
                             }
                             idle_work.retain(|queued| *queued != id);
                         }
-                        let build_admission = if periodic_maintenance {
+                        let build_admission = if retry == Some(id) {
+                            BuildAdmission::Fenced
+                        } else if periodic_maintenance {
                             BuildAdmission::Wait
                         } else if probing {
                             build_active.insert(id);
@@ -992,6 +1107,7 @@ impl PublishRuntime {
                         }
                         if !idle {
                             periodic_yield_to_cdc = false;
+                            retry_yield_to_cdc = false;
                         }
                         if !idle && let Some(queue) = pending.tables.get(&id).filter(|queue| !queue.is_empty()) {
                             schedule_transactions(id, queue, &mut scheduler, profiles[&id]);
@@ -1007,11 +1123,9 @@ impl PublishRuntime {
                             })
                         });
                         let schema = schemas[&id].clone();
-                        let table = tables[&id].clone();
                         let work = work.clone();
                         running.push(Box::pin(async move {
                             work.run(
-                                table,
                                 schema,
                                 transactions,
                                 options,
@@ -1024,6 +1138,7 @@ impl PublishRuntime {
                 }
                 _ = health.tick() => {
                     // Keep durability visible while a catalog publication is stalled.
+                    observation.table_states(store, &blocked, schemas.keys().copied())?;
                     observation.write(config, ledger, capture_goal, true)?;
                     if checkpoints.is_empty()
                         && checkpoint_at.elapsed() >= Duration::from_secs(config.limits.checkpoint_interval_secs)
@@ -1038,10 +1153,10 @@ impl PublishRuntime {
                     // Queue at most one idle check per table. Admission rechecks
                     // for CDC and gives due publication work the available slots.
                     if ledger.watermarks().journal_durable_lsn >= capture_goal
-                        && ledger.pending_count() == pending.loaded.len()
+                        && !pending.has_runnable_unloaded(ledger, &excluded)
                     {
-                        for id in tables.keys() {
-                            if !busy.contains(id)
+                        for id in schemas.keys() {
+                            if !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
                                 && !build_active.contains(id)
                                 && !retiring_builds.contains(id)
                                 && pending.tables.get(id).is_none_or(VecDeque::is_empty)
@@ -1053,11 +1168,17 @@ impl PublishRuntime {
                     }
                 }
             }
+            excluded = blocked
+                .ids()
+                .filter(|id| !retrying.contains(id))
+                .chain(recovering.iter().copied())
+                .collect();
             pending.refill(
                 ledger,
                 &mut scheduler,
                 &profiles,
                 config.limits.pending_transactions,
+                &excluded,
             )?;
             for id in busy
                 .iter()
@@ -1265,7 +1386,7 @@ mod startup_recovery_tests {
         FileId, JournalChunks, OperationId, PgLsn, PrimaryKey, RowLocation, SourceTransaction,
         TableMutationCount,
     };
-    use flow_state_store::{IndexDelta, PreparedOperation, StateStoreOptions};
+    use flow_state_store::{IndexDelta, OperationPhase, PreparedOperation, StateStoreOptions};
 
     #[test]
     fn checkpoint_rotation_reclaims_crash_orphans_and_preserves_registered_state() {

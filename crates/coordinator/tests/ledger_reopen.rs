@@ -39,6 +39,17 @@ fn reopen_removes_records_left_after_a_durable_completion_watermark() {
     assert_eq!(ledger.acknowledgement(), PgLsn(11));
     // Recreate exactly the stale record left by a crash after the meta sync.
     store.put_source_transaction(&key, &value).unwrap();
+    // That older protocol also predates the table admission index. Migration
+    // must not create a reference to a descriptor that reopen will reclaim.
+    let index_keys = store
+        .source_transactions()
+        .map(Result::unwrap)
+        .map(|(key, _)| key)
+        .filter(|key| key.windows(13).any(|part| part == b"/table-index/"))
+        .collect::<Vec<_>>();
+    for key in index_keys {
+        store.delete_source_transaction(&key).unwrap();
+    }
     drop(ledger);
     drop(store);
     let store = StateStore::open(temp.path(), StateStoreOptions::default()).unwrap();
@@ -51,6 +62,12 @@ fn reopen_removes_records_left_after_a_durable_completion_watermark() {
     .unwrap();
     assert_eq!(ledger.acknowledgement(), PgLsn(11));
     assert!(store.source_transaction(&key).unwrap().is_none());
+    assert!(
+        ledger
+            .pending_table_transactions_after(TableId(1), PgLsn(0))
+            .next()
+            .is_none()
+    );
 }
 
 #[test]

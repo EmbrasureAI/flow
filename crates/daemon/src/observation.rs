@@ -1,8 +1,13 @@
 //! Prometheus textfile output and bounded-cardinality service observations.
-use crate::{config::Config, lifecycle::SourceHealthStatus};
+use crate::{
+    config::Config,
+    lifecycle::{SourceHealthStatus, TableProgress},
+    runtime::blocked::{BlockedTable, BlockedTables},
+};
 use anyhow::Result;
 use flow_coordinator::{Inventory, SourceLedger};
 use flow_model::{PgLsn, TableId};
+use flow_state_store::StateStore;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::{
     fmt::Write,
@@ -15,6 +20,8 @@ pub(crate) struct Observation {
     handle: PrometheusHandle,
     last_export: Option<(Instant, bool)>,
     source_health: SourceHealthStatus,
+    blocked_tables: Vec<BlockedTable>,
+    table_progress: Vec<TableProgress>,
 }
 impl Observation {
     pub(crate) fn install() -> Result<Self> {
@@ -37,11 +44,43 @@ impl Observation {
                 .install_recorder()?,
             last_export: None,
             source_health: SourceHealthStatus::Unknown,
+            blocked_tables: Vec::new(),
+            table_progress: Vec::new(),
         })
     }
 
     pub(crate) fn record_source_health(&mut self, health: impl Into<SourceHealthStatus>) {
         self.source_health = health.into();
+    }
+
+    /// Refresh only changed tables; unrelated progress stays cached. The runtime
+    /// supplies all tables at startup and during its periodic health observation.
+    pub(crate) fn table_states(
+        &mut self,
+        store: &StateStore,
+        blocked: &BlockedTables,
+        ids: impl IntoIterator<Item = TableId>,
+    ) -> Result<()> {
+        let progress = ids
+            .into_iter()
+            .map(|table_id| {
+                Ok(TableProgress {
+                    table_id,
+                    materialized_lsn: store.table_state(&table_id)?.materialized_lsn,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for progress in progress {
+            match self
+                .table_progress
+                .binary_search_by_key(&progress.table_id, |table| table.table_id)
+            {
+                Ok(index) => self.table_progress[index] = progress,
+                Err(index) => self.table_progress.insert(index, progress),
+            }
+        }
+        self.blocked_tables = blocked.records().cloned().collect();
+        Ok(())
     }
 
     /// Flush process counters even when initialization failed before a source
@@ -78,6 +117,7 @@ impl Observation {
             Some(captured),
             ready,
             Some(self.source_health),
+            Some((&self.blocked_tables, &self.table_progress)),
         )?;
         if self.last_export.is_some_and(|(last, was_ready)| {
             ready == was_ready && now.duration_since(last) < EXPORT_INTERVAL
@@ -169,7 +209,7 @@ mod tests {
         let store =
             StateStore::open(temp.path().join("index"), StateStoreOptions::default()).unwrap();
         let ledger = SourceLedger::open(
-            store,
+            store.clone(),
             SourceId(config.source.id.clone()),
             AckMode::Materialized,
             JournalDurability::LocalDisk,
@@ -179,6 +219,8 @@ mod tests {
             handle: PrometheusBuilder::new().build_recorder().handle(),
             last_export: None,
             source_health: SourceHealthStatus::Unknown,
+            blocked_tables: Vec::new(),
+            table_progress: Vec::new(),
         };
         let metrics = temp.path().join("metrics.prom");
         let status = temp.path().join("status.json");
@@ -193,6 +235,18 @@ mod tests {
         );
         assert_eq!(read_status()["source_health"], "unknown");
         assert_eq!(read_status()["ready"], true);
+        let mut blocked = BlockedTables::load(&store, &SourceId(config.source.id.clone())).unwrap();
+        store.complete_noop(&TableId(1), PgLsn(7), 1).unwrap();
+        store.complete_noop(&TableId(2), PgLsn(8), 1).unwrap();
+        blocked
+            .record(TableId(1), "catalog_unavailable", None)
+            .unwrap();
+        observation
+            .table_states(&store, &blocked, [TableId(2)])
+            .unwrap();
+        observation
+            .table_states(&store, &blocked, [TableId(1)])
+            .unwrap();
         observation.record_source_health(SourceHealth::Healthy);
         assert!(
             !observation
@@ -201,6 +255,19 @@ mod tests {
         );
         assert_eq!(read_status()["source_health"], "healthy");
         assert_eq!(read_status()["ready"], true);
+        assert_eq!(read_status()["blocked_tables"][0]["table_id"], 1);
+        assert_eq!(
+            read_status()["blocked_tables"][0]["error_code"],
+            "catalog_unavailable"
+        );
+        assert_eq!(read_status()["table_progress"].as_array().unwrap().len(), 2);
+        assert_eq!(read_status()["table_progress"][0]["materialized_lsn"], 7);
+        assert_eq!(read_status()["table_progress"][1]["materialized_lsn"], 8);
+        blocked.clear(TableId(1)).unwrap();
+        store.complete_noop(&TableId(1), PgLsn(9), 1).unwrap();
+        observation
+            .table_states(&store, &blocked, [TableId(1)])
+            .unwrap();
         let first = std::fs::read(&metrics).unwrap();
         assert!(
             !observation
@@ -215,6 +282,9 @@ mod tests {
         );
         assert_eq!(std::fs::read(&metrics).unwrap(), first);
         assert_eq!(read_status()["captured_durable_lsn"], 20);
+        assert_eq!(read_status()["blocked_tables"], serde_json::json!([]));
+        assert_eq!(read_status()["table_progress"][0]["materialized_lsn"], 9);
+        assert_eq!(read_status()["table_progress"][1]["materialized_lsn"], 8);
         assert_eq!(read_status()["ready"], true);
         assert_eq!(read_status()["source_health"], "healthy");
         let due = now + EXPORT_INTERVAL;

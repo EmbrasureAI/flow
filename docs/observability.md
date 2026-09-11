@@ -241,6 +241,14 @@ Capture seals a group when it reaches 32 complete transactions, crosses 4 MiB of
 
 Capture phase timings isolate work within the capture actor, not time waiting for PostgreSQL or queued WAL. Schema validation includes the final buffered chunk flush; ordinary verified schemas do not require a SQL query per transaction. Spool replay includes journal chunk appends but excludes terminal sync. Journal sync measures the commit `sync_data` call; it excludes terminal serialization and index bookkeeping. Spool begin and disposal measure filesystem lifecycle calls. These phases do not cover all capture CPU time and must not be treated as a complete latency decomposition.
 
+`status` also reports `blocked_tables` with stable error codes, retry timestamps,
+attempt counts, and retained operation IDs. `table_progress` reports each table's
+last successful materialized LSN. These positions may advance independently of the
+connection's contiguous materialized watermark. A blocked table retains its last
+successful position while other tables continue. See
+[table publication isolation](table-publication-isolation.md) for recovery and
+storage limits.
+
 ## Storage and REST cost diagnostics
 
 The daemon decorates the configured Iceberg storage factory without replacing
