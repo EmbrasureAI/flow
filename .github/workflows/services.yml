@@ -81,6 +81,18 @@ jobs:
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-type-compat"
+      - name: Explicit projection through excluded types, DDL and durable restart
+        run: >-
+          uv run tests/production/projection_compat.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-projection-compat"
+      - name: Time values, key movement and nullable time schema evolution
+        run: >-
+          uv run tests/production/time_vector_compat.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-time-compat"
       - name: Snapshot inheritance and row-security contracts
         run: >-
           uv run tests/production/source_snapshot_contracts.py
@@ -184,6 +196,74 @@ jobs:
             ${{ runner.temp }}/service-*/*metadata.json
             ${{ runner.temp }}/service-*/state/status.json
             ${{ runner.temp }}/service-*/state/metrics.prom
+            ${{ runner.temp }}/service-containers.log
+      - name: Remove this job's disposable services
+        if: always()
+        run: docker compose down -v
+
+  pgvector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      COMPOSE_PROJECT_NAME: flow-vector-ci
+      COMPOSE_FILE: tests/production/compose.yaml
+      FLOW_POSTGRES_IMAGE: pgvector/pgvector:0.8.0-pg17-bookworm
+      FLOW_PRODUCTION_PG_CPUS: '2'
+      FLOW_PRODUCTION_PGDATA: /var/lib/postgresql/flow
+      AWS_ACCESS_KEY_ID: demo-access
+      AWS_SECRET_ACCESS_KEY: demo-secret-key
+      AWS_REGION: us-east-1
+      RUST_LOG: info
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: cargo build --locked -p flow-daemon
+      - name: Select free service ports
+        run: |
+          python3 - <<'PYPORTS'
+          import contextlib
+          import os
+          import socket
+          with contextlib.ExitStack() as sockets, open(os.environ["GITHUB_ENV"], "a") as env:
+              for service in ("PG", "S3", "REST"):
+                  listener = sockets.enter_context(socket.socket())
+                  listener.bind(("127.0.0.1", 0))
+                  env.write(f"FLOW_PRODUCTION_{service}_PORT={listener.getsockname()[1]}\n")
+          PYPORTS
+      - name: Start disposable pgvector, catalog and object storage
+        run: |
+          docker compose up -d --build --wait --wait-timeout 180
+          pg_port=$(docker compose port postgres 5432 | cut -d: -f2)
+          rest_port=$(docker compose port rest 8181 | cut -d: -f2)
+          s3_port=$(docker compose port minio 9000 | cut -d: -f2)
+          echo "FLOW_POSTGRES_URL=postgres://flow:local-test-password@127.0.0.1:${pg_port}/flow?sslmode=disable" >> "$GITHUB_ENV"
+          echo "FLOW_REST_URL=http://127.0.0.1:${rest_port}" >> "$GITHUB_ENV"
+          echo "FLOW_S3_URL=http://127.0.0.1:${s3_port}" >> "$GITHUB_ENV"
+      - name: Dense vectors and time through snapshot, CDC, restart and compaction
+        run: >-
+          uv run tests/production/time_vector_compat.py --vector
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-vector-compat"
+      - name: Service logs
+        if: always()
+        run: docker compose logs --no-color > "$RUNNER_TEMP/service-containers.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: services-pgvector
+          path: |
+            ${{ runner.temp }}/service-vector-compat/report.json
+            ${{ runner.temp }}/service-vector-compat/*.log
+            ${{ runner.temp }}/service-vector-compat/*metadata.json
+            ${{ runner.temp }}/service-vector-compat/state/status.json
             ${{ runner.temp }}/service-containers.log
       - name: Remove this job's disposable services
         if: always()

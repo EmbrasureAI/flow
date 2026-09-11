@@ -8,7 +8,8 @@ services:
       POSTGRES_DB: flow
     ports: ["127.0.0.1:${FLOW_LOCAL_PG_PORT:-0}:5432"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U flow -d flow"]
+      # initdb's temporary server accepts Unix sockets before TCP is ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U flow -d flow"]
       interval: 2s
       retries: 30
   minio:

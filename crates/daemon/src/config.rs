@@ -39,6 +39,9 @@ pub struct Source {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
+    /// Explicit selection freezes configured columns; all_current allows safe nullable additions.
+    #[serde(default)]
+    pub column_selection: ColumnSelection,
     pub source_namespace: String,
     pub source_table: String,
     pub target_namespace: Vec<String>,
@@ -53,11 +56,27 @@ pub struct Table {
     #[serde(default)]
     pub priority: Priority,
 }
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnSelection {
+    #[default]
+    AllCurrent,
+    Explicit,
+}
+
 fn default_format_version() -> iceberg::spec::FormatVersion {
     iceberg::spec::FormatVersion::V2
 }
 
 impl Table {
+    pub fn projection(&self) -> Option<Vec<String>> {
+        (self.column_selection == ColumnSelection::Explicit).then(|| {
+            self.columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        })
+    }
     pub fn schema(&self, id: u32) -> TableSchema {
         TableSchema {
             table_id: TableId(id),

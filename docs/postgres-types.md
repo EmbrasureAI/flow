@@ -7,6 +7,8 @@ claim of complete Fivetran feature parity.
 
 | PostgreSQL | Flow configuration / Iceberg output |
 | --- | --- |
+| `time without time zone` (any supported precision) | `String`: fixed `HH:MM:SS.ffffff`, including `24:00:00.000000` |
+| pgvector `vector` / `vector(n)` | `String`: JSON array of the exact stored float32 values |
 | UUID | `String`: canonical lowercase hyphenated UUID |
 | JSON / JSONB | `String`: normalized JSON text |
 | Arrays of supported types, including enum/domain elements | `String`: JSON array text |
@@ -60,6 +62,20 @@ nullable UUID columns inferred during schema evolution use strings.
   `-Infinity` are strings. This intentionally differs from Fivetran's documented
   Iceberg DOUBLE fallback for unspecified precision: Flow does not silently lose
   numeric precision. Decimal output retains its existing finite, checked contract.
+* Time strings preserve microseconds and the distinct PostgreSQL end-of-day value
+  `24:00:00`. Canonical formatting is identical for binary COPY and CDC, including
+  time primary keys. Time arrays and domains follow the same mapping. `timetz`
+  remains unsupported. String output avoids the [Athena Iceberg TIME limitation](https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-supported-data-types.html).
+* pgvector recognition uses extension membership, even when installed outside
+  `public`; an unrelated type named `vector` is not accepted. Dense `vector` and
+  `vector(n)` values retain dimension order and stored float32 precision as JSON
+  numbers (exactly promoted to float64). Text output may therefore have more
+  decimal digits than pgvector's shortest source display. Untyped vectors can
+  have different dimensions per row. Domains and arrays of vectors are supported;
+  vector array elements are nested JSON arrays, not quoted JSON strings. SQL NULL
+  stays NULL. Vector primary keys are rejected, and `halfvec` / `sparsevec` are
+  not mapped. The wire decoder validates lengths, reserved bytes and finite
+  elements against [pgvector's binary format](https://github.com/pgvector/pgvector/blob/master/src/vector.c).
 * Domain constraints remain enforced by PostgreSQL, not copied to Iceberg.
   Unsupported domain base types are rejected. Enum label additions are accepted;
   label renames or other DDL that changes existing values without row CDC require
@@ -103,3 +119,35 @@ uv run tests/production/type_compat.py \
 Use the disposable services and environment variables from the
 [local service guide](../tests/local/README.md). These are correctness tests, not
 throughput benchmarks or an AWS Glue/Athena qualification run.
+
+`tests/production/time_vector_compat.py` additionally checks time primary-key
+movement (including `24:00:00`), microseconds, nullable time domains/arrays,
+nullable time-column additions, deletes, restart and compaction. Run with
+`--vector` against a server with pgvector installed to also check 1536-dimensional
+embeddings, arrays/domain wrappers, varying untyped dimensions, float32 edge
+values, unchanged toasted vectors and NULL transitions through the same pipeline.
+
+## Explicit column selection
+
+PostgreSQL tables can set `column_selection = "explicit"` and list only the
+columns to ingest in `columns`, in source order. The default `all_current` keeps
+existing behavior, including compatible nullable-column additions. Explicit
+selection must retain the complete primary key; an omitted unsupported,
+generated, or TOASTed column is never decoded or materialized.
+
+The publication must still include all publishable source columns and have no
+row filter. Projection is performed locally for both binary COPY and pgoutput,
+so PostgreSQL 14 is supported and PostgreSQL 17 generated columns can be excluded.
+On PostgreSQL 18, FULL replica identity requires the publication to include stored
+generated columns (`publish_generated_columns=stored`) even when they are excluded
+from the destination. This reduces destination/storage work, but does not reduce full-publication WAL
+or wire traffic. The source message size limit still applies before projection.
+
+Explicit selection is immutable after initialization. New unselected columns
+remain excluded. Changes to excluded columns can continue when PostgreSQL does
+not rewrite the heap. Selected column drops, renames, replacements, incompatible
+type changes, or heap rewrites stop capture rather than guessing a new mapping.
+Changing the selection or recovering from such a change requires a fresh source
+slot, state directory, and empty target generation; retain the prior target until
+the new snapshot and subsequent CDC are verified and downstream routing switches.
+Never reset an existing slot or reuse an existing target as a resync shortcut.

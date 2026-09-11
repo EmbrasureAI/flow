@@ -13,6 +13,7 @@ pub struct TypeRegistry(BTreeMap<u32, SourceType>);
 #[derive(Clone, Debug)]
 enum SourceType {
     Enum,
+    Vector,
     Domain { base: u32, modifier: i32 },
     Array(u32),
 }
@@ -36,10 +37,13 @@ impl TypeRegistry {
                 }
                 continue;
             }
-            let row = client.query_opt("SELECT typtype::text, typbasetype, typtypmod, typelem FROM pg_catalog.pg_type WHERE oid=$1", &[&oid]).await?
+            let row = client.query_opt("SELECT t.typtype::text, t.typbasetype, t.typtypmod, t.typelem, t.typname, EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e ON e.oid=d.refobjid WHERE d.classid='pg_catalog.pg_type'::regclass AND d.objid=t.oid AND d.refclassid='pg_catalog.pg_extension'::regclass AND d.deptype='e' AND e.extname='vector') FROM pg_catalog.pg_type t WHERE t.oid=$1", &[&oid]).await?
                 .ok_or(Error::Config("PostgreSQL source type disappeared"))?;
             let kind: String = row.get(0);
             let resolved = match kind.as_str() {
+                "b" if row.get::<_, String>(4) == "vector" && row.get::<_, bool>(5) => {
+                    SourceType::Vector
+                }
                 "e" => SourceType::Enum,
                 "d" => {
                     let base = row.get(1);
@@ -110,7 +114,10 @@ impl TypeRegistry {
             self.mapped_type(element, modifier, depth + 1)?;
             return Ok(ColumnType::String);
         }
-        if matches!(self.0.get(&oid), Some(SourceType::Enum)) {
+        if matches!(
+            self.0.get(&oid),
+            Some(SourceType::Enum | SourceType::Vector)
+        ) {
             return Ok(ColumnType::String);
         }
         crate::schema::column_type(oid, modifier)
@@ -141,10 +148,12 @@ impl TypeRegistry {
                 ));
             }
             if schema.primary_key.contains(&index)
-                && (self.element(oid).is_some() || matches!(oid, 114 | 3802))
+                && (self.element(oid).is_some()
+                    || matches!(oid, 114 | 3802)
+                    || matches!(self.0.get(&oid), Some(SourceType::Vector)))
             {
                 return Err(Error::Config(
-                    "JSON and array primary keys are unsupported by the string mapping",
+                    "JSON, array and vector primary keys are unsupported by the string mapping",
                 ));
             }
         }
@@ -160,6 +169,12 @@ impl TypeRegistry {
     ) -> Result<Value> {
         let (oid, _) = self.base(oid, -1)?;
         if *kind == ColumnType::String {
+            if oid == 1083 {
+                return Ok(Value::String(time_string(bytes, binary)?));
+            }
+            if matches!(self.0.get(&oid), Some(SourceType::Vector)) {
+                return Ok(Value::String(vector_json(bytes, binary)?.to_string()));
+            }
             if let Some(element) = self.element(oid) {
                 if !binary {
                     return Err(Error::Config("array capture requires binary pgoutput"));
@@ -243,6 +258,8 @@ impl TypeRegistry {
                                     let number = numeric_binary(raw)?;
                                     serde_json::from_str(&number)
                                         .unwrap_or(serde_json::Value::String(number))
+                                } else if matches!(types.0.get(&base), Some(SourceType::Vector)) {
+                                    vector_json(raw, true)?
                                 } else if base == 2950 {
                                     serde_json::Value::String(
                                         uuid::Uuid::from_slice(raw)
@@ -265,6 +282,87 @@ impl TypeRegistry {
         }
         Ok(result)
     }
+}
+
+// Keep time at the source boundary: Iceberg TIME is not supported by Athena,
+// and PostgreSQL's valid 24:00:00 cannot be represented by chrono::NaiveTime.
+fn time_string(bytes: &[u8], binary: bool) -> Result<String> {
+    const DAY_MICROS: i64 = 86_400_000_000;
+    let micros = if binary {
+        i64::from_be_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| Error::Config("invalid time wire length"))?,
+        )
+    } else {
+        let value = text(bytes)?;
+        let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+        let parts: Vec<_> = whole.split(':').collect();
+        if parts.len() != 3
+            || parts
+                .iter()
+                .any(|p| p.len() != 2 || !p.bytes().all(|c| c.is_ascii_digit()))
+            || fraction.len() > 6
+            || !fraction.bytes().all(|c| c.is_ascii_digit())
+        {
+            return Err(Error::Config("invalid PostgreSQL time text"));
+        }
+        let hour: i64 = parts[0].parse().map_err(value_error)?;
+        let minute: i64 = parts[1].parse().map_err(value_error)?;
+        let second: i64 = parts[2].parse().map_err(value_error)?;
+        if minute > 59 || second > 59 {
+            return Err(Error::Config("invalid PostgreSQL time fields"));
+        }
+        let subsecond = if fraction.is_empty() {
+            0
+        } else {
+            fraction.parse::<i64>().map_err(value_error)? * 10i64.pow(6 - fraction.len() as u32)
+        };
+        (hour * 3600 + minute * 60 + second) * 1_000_000 + subsecond
+    };
+    if !(0..=DAY_MICROS).contains(&micros) {
+        return Err(Error::Config("PostgreSQL time outside 00:00:00..24:00:00"));
+    }
+    Ok(format!(
+        "{:02}:{:02}:{:02}.{:06}",
+        micros / 3_600_000_000,
+        micros / 60_000_000 % 60,
+        micros / 1_000_000 % 60,
+        micros % 1_000_000
+    ))
+}
+
+fn vector_json(bytes: &[u8], binary: bool) -> Result<serde_json::Value> {
+    // pgvector vector_send: int16 dimensions, int16 reserved zero, float4[].
+    // Promoting f32 to f64 is exact and keeps the stored value in JSON numbers.
+    let values: Vec<f32> = if binary {
+        if bytes.len() < 4 || bytes[2..4] != [0, 0] {
+            return Err(Error::Config("invalid pgvector wire header"));
+        }
+        let dimensions = usize::from(u16::from_be_bytes(bytes[..2].try_into().unwrap()));
+        if !(1..=16_000).contains(&dimensions) || bytes.len() != 4 + dimensions * 4 {
+            return Err(Error::Config("invalid pgvector wire dimensions"));
+        }
+        bytes[4..]
+            .chunks_exact(4)
+            .map(|v| f32::from_be_bytes(v.try_into().unwrap()))
+            .collect()
+    } else {
+        let values: Vec<f32> = serde_json::from_slice(bytes).map_err(value_error)?;
+        if !(1..=16_000).contains(&values.len()) {
+            return Err(Error::Config("invalid pgvector text dimensions"));
+        }
+        values
+    };
+    if values.iter().any(|v| !v.is_finite()) {
+        return Err(Error::Config("pgvector elements must be finite"));
+    }
+    Ok(serde_json::Value::Array(
+        values
+            .into_iter()
+            .map(|v| serde_json::json!(f64::from(v)))
+            .collect(),
+    ))
 }
 
 fn text(bytes: &[u8]) -> Result<&str> {
@@ -392,6 +490,128 @@ mod tests {
             }
         }
         bytes
+    }
+
+    #[test]
+    fn time_text_binary_and_wrappers_preserve_microseconds_and_end_of_day() {
+        let mut types = TypeRegistry::default();
+        types.0.insert(
+            20001,
+            SourceType::Domain {
+                base: 1083,
+                modifier: 6,
+            },
+        );
+        for (source, micros, expected) in [
+            ("00:00:00", 0i64, "00:00:00.000000"),
+            ("12:34:56.1", 45_296_100_000, "12:34:56.100000"),
+            ("23:59:59.999999", 86_399_999_999, "23:59:59.999999"),
+            ("24:00:00", 86_400_000_000, "24:00:00.000000"),
+        ] {
+            for oid in [1083, 20001] {
+                for (bytes, binary) in [
+                    (micros.to_be_bytes().to_vec(), true),
+                    (source.as_bytes().to_vec(), false),
+                ] {
+                    assert_eq!(
+                        types
+                            .decode(&ColumnType::String, oid, &bytes, binary)
+                            .unwrap(),
+                        Value::String(expected.into())
+                    );
+                }
+            }
+        }
+        for invalid in [
+            "24:00:00.000001",
+            "25:00:00",
+            "12:60:00",
+            "12:00:60",
+            "12:00:00.0000001",
+            "12:00:00+01",
+            "-1:00:00",
+        ] {
+            assert!(time_string(invalid.as_bytes(), false).is_err(), "{invalid}");
+        }
+        for invalid in [-1i64, 86_400_000_001] {
+            assert!(time_string(&invalid.to_be_bytes(), true).is_err());
+        }
+        assert!(time_string(&[0; 7], true).is_err());
+        assert_eq!(
+            types
+                .array_json(
+                    20001,
+                    &array(
+                        20001,
+                        &[(2, 1)],
+                        &[Some(&86_400_000_000i64.to_be_bytes()), None]
+                    )
+                )
+                .unwrap(),
+            serde_json::json!(["24:00:00.000000", null])
+        );
+    }
+
+    fn vector(values: &[f32]) -> Vec<u8> {
+        let mut bytes = (values.len() as u16).to_be_bytes().to_vec();
+        bytes.extend([0, 0]);
+        for value in values {
+            bytes.extend(value.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn vector_numbers_roundtrip_exactly_with_domain_and_array_wrappers() {
+        let mut types = TypeRegistry::default();
+        types.0.insert(20010, SourceType::Vector);
+        types.0.insert(
+            20011,
+            SourceType::Domain {
+                base: 20010,
+                modifier: 4,
+            },
+        );
+        let values = [0.1f32, -0.0, f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)];
+        let binary = vector(&values);
+        let text = serde_json::to_vec(&values).unwrap();
+        for oid in [20010, 20011] {
+            assert_eq!(types.mapped_type(oid, -1, 0).unwrap(), ColumnType::String);
+            assert_eq!(
+                types
+                    .decode(&ColumnType::String, oid, &binary, true)
+                    .unwrap(),
+                types
+                    .decode(&ColumnType::String, oid, &text, false)
+                    .unwrap()
+            );
+        }
+        let json = vector_json(&binary, true).unwrap();
+        for (number, expected) in json.as_array().unwrap().iter().zip(values) {
+            assert_eq!(
+                (number.as_f64().unwrap() as f32).to_bits(),
+                expected.to_bits()
+            );
+        }
+        assert_eq!(
+            types
+                .array_json(20011, &array(20011, &[(2, 1)], &[Some(&binary), None]))
+                .unwrap(),
+            serde_json::json!([json, null])
+        );
+        for bad in [
+            vec![],
+            vec![0, 0, 0, 0],
+            vec![0, 1, 0, 1, 0, 0, 0, 0],
+            vec![0, 1, 0, 0],
+            vector(&[f32::NAN]),
+            vector(&[f32::INFINITY]),
+        ] {
+            assert!(vector_json(&bad, true).is_err());
+        }
+        for bad in ["[]", "[null]", "[[1]]", "[1e100]", "[NaN]"] {
+            assert!(vector_json(bad.as_bytes(), false).is_err());
+        }
     }
 
     #[test]
@@ -543,8 +763,20 @@ mod tests {
                 .encode_key(&bincode::deserialize(&bytes).unwrap())
                 .unwrap()
         );
-        relation.columns[0].type_oid = 1009;
-        assert!(types.validate_relation(&schema, &relation).is_err());
+        types.0.insert(20010, SourceType::Vector);
+        types.0.insert(
+            20011,
+            SourceType::Domain {
+                base: 20010,
+                modifier: 3,
+            },
+        );
+        for oid in [1009, 20010, 20011] {
+            relation.columns[0].type_oid = oid;
+            assert!(types.validate_relation(&schema, &relation).is_err());
+        }
+        relation.columns[0].type_oid = 1083;
+        assert!(types.validate_relation(&schema, &relation).is_ok());
         schema.primary_key.clear();
         schema.append_only = true;
         assert!(types.validate_relation(&schema, &relation).is_ok());
