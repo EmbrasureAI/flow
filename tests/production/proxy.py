@@ -22,9 +22,12 @@ class CatalogProxy:
         self.trace = Path(trace)
         self.lock = threading.Lock()
         self.reject = False
+        self.table_rejections = {}
         self.delay_seconds = 0
         self.drop_remaining = 0
         self.drop_kind = "ingest"
+        self.drop_table = None
+        self.reject_after_drop = None
         self.hold_kind = "ingest"
         self.hold_table = None
         self.dropped = threading.Event()
@@ -82,10 +85,25 @@ class CatalogProxy:
         self.server.server_close()
         self.thread.join(timeout=5)
 
-    def arm_drop(self, kind="ingest"):
+    def reject_table(self, table, status=503, methods=None):
+        """Reject this table before upstream; other tables and config stay live."""
+        if status not in (403, 503):
+            raise ValueError("table fault status must be 403 or 503")
+        with self.lock:
+            self.table_rejections[table] = (status, frozenset(methods) if methods is not None else None)
+
+    def allow_table(self, table):
+        with self.lock:
+            self.table_rejections.pop(table, None)
+
+    def arm_drop(self, kind="ingest", table=None, reject_after=None):
+        if reject_after is not None and (table is None or reject_after not in (403, 503)):
+            raise ValueError("post-commit rejection requires a table and status 403 or 503")
         with self.lock:
             self.drop_remaining = 1
             self.drop_kind = kind
+            self.drop_table = table
+            self.reject_after_drop = reject_after
             self.dropped.clear()
 
     def hold_commits(self, kind="ingest", table=None):
@@ -127,10 +145,22 @@ class CatalogProxy:
                 event["fault"] = "reject-before-upstream"
                 self.respond(handler, 503, b'{"error":{"message":"injected catalog outage","type":"ServiceUnavailableException","code":503}}')
                 return
+            with self.lock:
+                rejection = next(((table, status) for table, (status, methods) in self.table_rejections.items()
+                                  if self.matches_table(handler.path, table)
+                                  and (methods is None or handler.command in methods)), None)
+            if rejection is not None:
+                table, status = rejection
+                event.update(fault="reject-table-before-upstream", table=table, status=status)
+                error_type = "ForbiddenException" if status == 403 else "ServiceUnavailableException"
+                self.respond(handler, status, json.dumps({"error": {
+                    "message": "injected table catalog fault", "type": error_type, "code": status,
+                }}).encode())
+                return
             if self.delay_seconds:
                 time.sleep(self.delay_seconds)
             if (self.hold_kind in operations and not self.release_commits.is_set()
-                    and (self.hold_table is None or handler.path.endswith("/tables/" + quote(self.hold_table)))):
+                    and (self.hold_table is None or self.matches_table(handler.path, self.hold_table))):
                 event["held_before_upstream"] = True
                 self.commit_held.set()
                 if not self.release_commits.wait(timeout=45):
@@ -144,9 +174,13 @@ class CatalogProxy:
             should_drop = False
             if (self.drop_kind in operations or schema_update and self.drop_kind == "schema") and 200 <= response.status < 300:
                 with self.lock:
-                    if self.drop_remaining:
+                    if self.drop_remaining and (self.drop_table is None or self.matches_table(handler.path, self.drop_table)):
                         self.drop_remaining -= 1
                         should_drop = True
+                        if self.reject_after_drop is not None:
+                            # Install before disconnecting: recovery reads cannot race
+                            # ahead of the fixture's post-commit failure boundary.
+                            self.table_rejections[self.drop_table] = (self.reject_after_drop, None)
             if should_drop:
                 # Upstream has durably accepted the actual add-snapshot request. Closing
                 # without headers prevents the client from learning the outcome.
@@ -170,6 +204,10 @@ class CatalogProxy:
         finally:
             event["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
             self.record(event)
+
+    @staticmethod
+    def matches_table(path, table):
+        return urlsplit(path).path.endswith("/tables/" + quote(table, safe=""))
 
     @staticmethod
     def respond(handler, status, body, content_type="application/json", content_length=None):

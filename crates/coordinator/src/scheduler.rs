@@ -122,6 +122,10 @@ impl Scheduler {
             p.stalled = stalled;
         }
     }
+    /// Evict only volatile admission; the source ledger retains table work.
+    pub fn remove(&mut self, table: TableId) {
+        self.pending.remove(&table);
+    }
     pub fn force(&mut self, table: TableId, now: Instant) {
         if let Some(p) = self.pending.get_mut(&table) {
             p.ready_at = p.ready_at.min(now);
@@ -166,15 +170,23 @@ pub struct WalPressure {
 }
 impl WalPressure {
     pub fn health(&self, wal_soft: u64, wal_hard: u64, journal_quota: u64) -> SourceHealth {
+        // PostgreSQL's actual retention budget can be smaller than our configured
+        // thresholds. React with headroom remaining, not only after it reaches zero.
+        let headroom = self.safe_wal_bytes.map(|safe| {
+            let budget = u128::from(self.retained_bytes) + u128::from(safe);
+            (u128::from(safe), budget)
+        });
         if self.slot_lost {
             SourceHealth::SlotLost
         } else if self.retained_bytes >= wal_hard
             || self.journal_bytes >= journal_quota
             || self.safe_wal_bytes == Some(0)
+            || headroom.is_some_and(|(safe, budget)| safe * 10 <= budget)
         {
             SourceHealth::AtRisk
         } else if self.retained_bytes >= wal_soft
             || self.journal_bytes >= journal_quota.saturating_mul(4) / 5
+            || headroom.is_some_and(|(safe, budget)| safe * 4 <= budget)
         {
             SourceHealth::Warning
         } else {

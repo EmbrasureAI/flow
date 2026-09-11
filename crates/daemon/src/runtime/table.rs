@@ -1,6 +1,6 @@
 //! Execute one table's publication or maintenance visit under scheduler ownership.
 
-use super::{BUILD_MAX_AGE, OPTIONAL_MAINTENANCE_DELAY};
+use super::{BUILD_MAX_AGE, OPTIONAL_MAINTENANCE_DELAY, blocked::publication_error_code};
 use crate::config::Config;
 use anyhow::{Context, Result, bail, ensure};
 use flow_coordinator::{
@@ -20,6 +20,17 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+async fn discard_unowned_spool(store: StateStore, operation: OperationId) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        if store.operation(&operation)?.is_none() {
+            store.discard_transaction(&operation.0)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
 
 fn history_due(table: &Table, retention_seconds: u64) -> Result<bool> {
     if table.metadata().snapshots().len() < 128 {
@@ -122,6 +133,7 @@ pub(super) struct MaintenancePending {
 pub(super) enum TableOutcome {
     Complete {
         snapshot: Option<i64>,
+        operation: Option<OperationId>,
         maintenance_pending: MaintenancePending,
     },
     Build(Box<StartedBuild>),
@@ -132,6 +144,10 @@ pub(super) enum TableOutcome {
     Preparation(Box<StartedPreparation>),
     CandidateInvalidated,
     Deferred,
+    Recovered,
+    Blocked {
+        error_code: &'static str,
+    },
 }
 
 enum MaintenanceOutcome {
@@ -153,6 +169,7 @@ pub(super) struct TableCompletion {
     pub(super) elapsed: Duration,
     pub(super) reserved_build: bool,
     pub(super) finalization_lane: Option<FinalizationLane>,
+    pub(super) periodic_maintenance: bool,
 }
 
 pub(super) struct FinalizationLane {
@@ -189,6 +206,10 @@ impl FinalizationLane {
 }
 
 pub(super) fn retry_table_work(error: &anyhow::Error) -> bool {
+    // Optional maintenance must obey the same shared-failure precedence as CDC.
+    if publication_error_code(error).is_none() {
+        return false;
+    }
     error.downcast_ref::<ReplanRequired>().is_some()
         || crate::retry::transient(error)
         || matches!(
@@ -228,6 +249,7 @@ pub(super) struct TableWork {
     pub(super) control: ControlStore,
     pub(super) reader: JournalReader,
     pub(super) catalog: Arc<dyn Catalog>,
+    pub(super) targets: Arc<BTreeMap<TableId, (iceberg::TableIdent, uuid::Uuid)>>,
     pub(super) publisher: Arc<TablePublisher>,
     pub(super) maintenance: Arc<TableMaintenance>,
     pub(super) garbage_checked: Arc<Mutex<BTreeMap<TableId, Instant>>>,
@@ -368,7 +390,6 @@ impl TableWork {
 
     pub(super) async fn run(
         self,
-        table: Table,
         schema: TableSchema,
         transactions: Vec<SourceTransaction>,
         options: WorkOptions,
@@ -376,7 +397,6 @@ impl TableWork {
         finalization_lane: Option<FinalizationLane>,
     ) -> Result<TableCompletion> {
         let started = Instant::now();
-        let mut attempt = 0u32;
         let mut repair_cursor = DeleteRepairCursor::default();
         let scratch_path = candidate.as_ref().map(|candidate| candidate.path().clone());
         let reserved_build = candidate.is_some()
@@ -384,21 +404,28 @@ impl TableWork {
                 options.build_admission,
                 BuildAdmission::Start | BuildAdmission::Probe
             );
-        let result = loop {
-            let candidate_context = candidate.as_ref().map(|candidate| {
-                (
-                    if candidate.is_prepared() {
-                        "activation"
-                    } else {
-                        "preparation"
-                    },
-                    candidate.operation_id().clone(),
-                )
-            });
-            match self
-                .clone()
+        let candidate_stage = candidate.as_ref().map(|candidate| {
+            if candidate.is_prepared() {
+                "activation"
+            } else {
+                "preparation"
+            }
+        });
+        // Catalog loading and recovery use the same bounded worker admission as
+        // publication. No retry delay holds a worker or its transaction batch.
+        let result = async {
+            let (target, uuid) = self
+                .targets
+                .get(&schema.table_id)
+                .context("table has no persisted target identity")?;
+            let table = self.catalog.load_table(target).await?;
+            ensure!(
+                table.metadata().uuid() == *uuid,
+                "target table was replaced; refusing to reuse its source watermark"
+            );
+            self.clone()
                 .run_once(
-                    table.clone(),
+                    table,
                     schema.clone(),
                     transactions.clone(),
                     options,
@@ -406,127 +433,78 @@ impl TableWork {
                     &mut repair_cursor,
                 )
                 .await
+        }
+        .await;
+        let outcome = match result {
+            Err(error)
+                if options.periodic_maintenance
+                    && retry_table_work(&error)
+                    && self
+                        .store
+                        .table_state(&schema.table_id)?
+                        .pending_operation
+                        .is_none() =>
             {
-                Err(error)
-                    if options.periodic_maintenance
-                        && retry_table_work(&error)
-                        && self
-                            .store
-                            .table_state(&schema.table_id)?
-                            .pending_operation
-                            .is_none() =>
-                {
-                    tracing::debug!(table = ?schema.table_id, %error,
-                        "periodic maintenance yielded after a transient failure");
-                    break Ok(TableCompletion {
-                        id: schema.table_id,
-                        transactions,
-                        outcome: TableOutcome::PeriodicComplete {
-                            next_due: Some(Instant::now() + OPTIONAL_MAINTENANCE_DELAY),
-                        },
-                        elapsed: started.elapsed(),
-                        reserved_build,
-                        finalization_lane,
-                    });
-                }
-                Err(error)
-                    if options.build_admission == BuildAdmission::Probe
-                        && retry_table_work(&error) =>
-                {
-                    tracing::debug!(table = ?schema.table_id, %error,
-                        "background build probe yielded to normal table work");
-                    break Ok(TableCompletion {
-                        id: schema.table_id,
-                        transactions,
-                        outcome: TableOutcome::ProbeComplete,
-                        elapsed: started.elapsed(),
-                        reserved_build,
-                        finalization_lane,
-                    });
-                }
-                Err(error) if candidate_context.is_some() && retry_table_work(&error) => {
-                    let (stage, operation_id) =
-                        candidate_context.expect("checked candidate context");
-                    if self.store.operation(&operation_id)?.is_some() {
-                        let delay = crate::retry::delay(attempt);
-                        metrics::counter!("flow_table_retries_total", "table_id" => schema.table_id.0.to_string()).increment(1);
-                        tracing::warn!(
-                            table = ?schema.table_id,
-                            operation_id = %operation_id.0,
-                            attempt,
-                            delay_ms = delay.as_millis(),
-                            error = ?error,
-                            "durable compaction activation interrupted; recovering before releasing the table lane"
-                        );
-                        tokio::time::sleep(delay).await;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    let reason = candidate_invalidation_reason(&error);
-                    metrics::counter!(
-                        "flow_compaction_candidate_invalidations_total",
-                        "table_id" => schema.table_id.0.to_string(),
-                        "stage" => stage,
-                        "reason" => reason
-                    )
-                    .increment(1);
-                    if stage == "activation" {
-                        metrics::counter!(
-                            "flow_compaction_activations_total",
-                            "table_id" => schema.table_id.0.to_string(),
-                            "result" => "invalidated"
-                        )
-                        .increment(1);
-                    }
-                    tracing::warn!(
-                        event = "compaction_candidate_invalidated",
-                        table = ?schema.table_id,
-                        stage,
-                        reason,
-                        error = ?error,
-                        "retired stale compaction candidate before rescheduling"
-                    );
-                    break Ok(TableCompletion {
-                        id: schema.table_id,
-                        transactions,
-                        outcome: TableOutcome::CandidateInvalidated,
-                        elapsed: started.elapsed(),
-                        reserved_build,
-                        finalization_lane,
-                    });
-                }
-                Err(error) if retry_table_work(&error) => {
-                    let delay = crate::retry::delay(attempt);
-                    metrics::counter!("flow_table_retries_total", "table_id" => schema.table_id.0.to_string()).increment(1);
-                    tracing::warn!(table = ?schema.table_id, attempt, delay_ms = delay.as_millis(), %error,
-                        "table work interrupted; recovering the durable operation before retrying");
-                    tokio::time::sleep(delay).await;
-                    attempt = attempt.saturating_add(1);
-                }
-                result => {
-                    break result.map(|outcome| TableCompletion {
-                        id: schema.table_id,
-                        transactions,
-                        outcome,
-                        elapsed: started.elapsed(),
-                        reserved_build,
-                        finalization_lane,
-                    });
+                TableOutcome::PeriodicComplete {
+                    next_due: Some(Instant::now() + OPTIONAL_MAINTENANCE_DELAY),
                 }
             }
+            Err(error)
+                if options.build_admission == BuildAdmission::Probe && retry_table_work(&error) =>
+            {
+                TableOutcome::ProbeComplete
+            }
+            Err(error)
+                if candidate_stage.is_some()
+                    && retry_table_work(&error)
+                    && self
+                        .store
+                        .table_state(&schema.table_id)?
+                        .pending_operation
+                        .is_none() =>
+            {
+                let stage = candidate_stage.expect("checked candidate stage");
+                let reason = candidate_invalidation_reason(&error);
+                metrics::counter!("flow_compaction_candidate_invalidations_total",
+                    "table_id" => schema.table_id.0.to_string(), "stage" => stage, "reason" => reason)
+                .increment(1);
+                if stage == "activation" {
+                    metrics::counter!("flow_compaction_activations_total",
+                        "table_id" => schema.table_id.0.to_string(), "result" => "invalidated")
+                    .increment(1);
+                }
+                tracing::warn!(event = "compaction_candidate_invalidated",
+                    table = ?schema.table_id, stage, reason, %error,
+                    "retired stale compaction candidate before rescheduling");
+                TableOutcome::CandidateInvalidated
+            }
+            Err(error) if publication_error_code(&error).is_some() => {
+                let error_code =
+                    publication_error_code(&error).expect("classified publication error");
+                tracing::warn!(table = ?schema.table_id, error_code, %error,
+                    "table publication blocked; releasing worker until retry");
+                TableOutcome::Blocked { error_code }
+            }
+            result => result?,
         };
-        let preparation_handoff = result
-            .as_ref()
-            .is_ok_and(|completion| matches!(completion.outcome, TableOutcome::Preparation(_)));
-        // A candidate's workers have already joined. If table refresh failed
-        // before ownership was transferred, retire its independent BUILD record.
+        let preparation_handoff = matches!(outcome, TableOutcome::Preparation(_));
+        // Independent build state can be retired after its workers join. A
+        // publication operation and its staged files retain durable ownership.
         if let Some(candidate) = candidate {
             candidate.discard().await?;
         }
         if !preparation_handoff && let Some(path) = scratch_path {
             std::fs::remove_dir_all(path)?;
         }
-        result
+        Ok(TableCompletion {
+            id: schema.table_id,
+            transactions,
+            outcome,
+            elapsed: started.elapsed(),
+            reserved_build,
+            finalization_lane,
+            periodic_maintenance: options.periodic_maintenance,
+        })
     }
 
     async fn run_once(
@@ -554,9 +532,15 @@ impl TableWork {
             match (record.phase, record.operation.kind) {
                 (OperationPhase::Building, _) => {
                     self.store.discard_uncommitted(&operation)?;
+                    self.store.discard_transaction(&operation.0)?;
                 }
                 (_, OperationKind::Ingest) => {
-                    self.publisher.recover(&table, &operation).await?;
+                    let recovery = self.publisher.recover(&table, &operation).await;
+                    discard_unowned_spool(self.store.clone(), operation.clone()).await?;
+                    recovery?;
+                    // Reconcile the recovered operation separately from newly
+                    // admitted CDC. Its original batch may differ after restart.
+                    return Ok(TableOutcome::Recovered);
                 }
                 (
                     _,
@@ -577,6 +561,7 @@ impl TableWork {
             .is_some_and(|transaction| transaction.end_lsn <= indexed.materialized_lsn)
         {
             return Ok(TableOutcome::Complete {
+                operation: None,
                 snapshot: indexed.snapshot_id,
                 maintenance_pending: MaintenancePending {
                     data: true,
@@ -584,6 +569,10 @@ impl TableWork {
                 },
             });
         }
+        let transactions = transactions
+            .into_iter()
+            .filter(|transaction| transaction.end_lsn > indexed.materialized_lsn)
+            .collect::<Vec<_>>();
         let source = SourceId(self.config.source.id.clone());
         let schema = crate::schema::latest_schema(&self.store, &source, id)?.unwrap_or(schema);
         for version in transactions
@@ -700,6 +689,7 @@ impl TableWork {
                         metrics::counter!("flow_compactions_total", "table_id" => id.0.to_string(), "kind" => "data").increment(1);
                     }
                     return Ok(TableOutcome::Complete {
+                        operation: None,
                         snapshot,
                         maintenance_pending: MaintenancePending {
                             data: true,
@@ -725,11 +715,13 @@ impl TableWork {
         };
         if transactions.is_empty() {
             return Ok(TableOutcome::Complete {
+                operation: None,
                 snapshot: current.metadata().current_snapshot_id(),
                 maintenance_pending,
             });
         }
         let epoch = Epoch::new(SourceId(self.config.source.id.clone()), id, &transactions)?;
+        let result = async {
         let collapse_started = Instant::now();
         let store = self.store.clone();
         let prepare_schema = schema.clone();
@@ -763,11 +755,16 @@ impl TableWork {
             collapse_memory_peak_known = collapsed.memory_peak_bytes().is_some(),
             "epoch mutations collapsed against the row index");
         let snapshot = self.publisher.publish(&current, &schema, collapsed).await?;
-        self.store.discard_transaction(&epoch.id.0)?;
         Ok(TableOutcome::Complete {
+            operation: Some(epoch.id.clone()),
             snapshot,
             maintenance_pending,
         })
+        }.await;
+        // Changed retry batches must not orphan a previous disk collapse. The
+        // durable operation retains any spool until its recovery/retirement.
+        discard_unowned_spool(self.store.clone(), epoch.id).await?;
+        result
     }
 
     /// Capture only a soft data build. Recovery, schema changes, dependency
@@ -1068,5 +1065,75 @@ mod finalization_lane_tests {
                 && trace.contains("lane_hold_ms=25"),
             "{trace}"
         );
+    }
+}
+
+#[cfg(test)]
+mod publication_retry_tests {
+    use super::*;
+    use flow_model::{PgLsn, PrimaryKey};
+    use flow_state_store::{Change, PreparedOperation};
+
+    #[tokio::test]
+    async fn regrouped_retry_removes_unowned_spool_but_preserves_durable_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let id = TableId(7);
+        let failed = OperationId("failed-before-prepare".into());
+        let owned = OperationId("uncertain-commit".into());
+        for operation in [&failed, &owned] {
+            store
+                .collapse_changes(
+                    &operation.0,
+                    [(id, PrimaryKey(vec![1]), Change::Insert(vec![]))],
+                )
+                .unwrap();
+            store.seal_transaction(&operation.0).unwrap();
+        }
+        store
+            .begin_prepare(PreparedOperation {
+                id: owned.clone(),
+                table_id: id,
+                kind: OperationKind::Ingest,
+                base_snapshot_id: None,
+                last_lsn: PgLsn(9),
+                schema_version: 1,
+                artifacts: vec![],
+                payload: vec![],
+            })
+            .unwrap();
+        discard_unowned_spool(store.clone(), failed.clone())
+            .await
+            .unwrap();
+        discard_unowned_spool(store.clone(), owned.clone())
+            .await
+            .unwrap();
+        store.seal_transaction(&failed.0).unwrap();
+        assert_eq!(store.collapsed(&failed.0, &id).unwrap().count(), 0);
+        assert_eq!(store.collapsed(&owned.0, &id).unwrap().count(), 1);
+        assert_eq!(
+            store.table_state(&id).unwrap().pending_operation,
+            Some(owned.clone())
+        );
+        store.discard_uncommitted(&owned).unwrap();
+        discard_unowned_spool(store.clone(), owned.clone())
+            .await
+            .unwrap();
+        store.seal_transaction(&owned.0).unwrap();
+        assert_eq!(store.collapsed(&owned.0, &id).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn maintenance_retry_never_masks_shared_corruption() {
+        let error = anyhow::Error::new(
+            iceberg::Error::new(iceberg::ErrorKind::Unexpected, "remote wrapper").with_source(
+                flow_state_store::Error::AuthorityCorruption("bad revision".into()),
+            ),
+        );
+        assert!(!retry_table_work(&error));
+        assert!(retry_table_work(&ReplanRequired.into()));
+        assert!(retry_table_work(
+            &flow_compactor::Error::MaintenanceRequired.into()
+        ));
     }
 }

@@ -9,6 +9,17 @@ A successful later check restores readiness; a lost slot is recorded before the
 process exits for resynchronization. Initial `unknown` permits startup readiness
 and is distinguished from a failed check by the health-availability metric.
 
+When PostgreSQL reports a finite remaining WAL budget, health becomes `warning`
+at 25% remaining and `at_risk` at 10% remaining, even when the configured byte
+limits are larger. Configured WAL and journal thresholds still apply.
+
+Source pressure suspends new optional maintenance until a check reports
+`healthy`; a failed check does not clear existing pressure. In-flight candidates
+and required recovery may finish. With multiple table workers, optional work
+also leaves one worker free for queued CDC, including between catalog commit
+permits. A single worker retains its bounded CDC/maintenance alternation while
+the source is healthy.
+
 `state_dir/metrics.prom` uses Prometheus text format for a textfile collector. Its integer LSN text remains exact; Prometheus stores floating-point samples, so use `status` for exact comparisons beyond its integer precision. Metrics reset on process restart. `init` installs its own recorder and flushes bootstrap duration, outcome and I/O diagnostics on success or failure. The next `init` or `run` replaces that process snapshot; archive `metrics.prom` after initialization to retain COPY cost diagnostics. Labels contain configured table IDs, not row keys or object paths.
 
 Source ledger completion and ACK feedback precede observation writes. Status
@@ -229,6 +240,14 @@ Checkpoint and index-generation events include their revisions, paths, durations
 Capture seals a group when it reaches 32 complete transactions, crosses 4 MiB of transaction payload, or reaches a five-millisecond scheduling deadline. The payload threshold can be exceeded by the final complete transaction; its payload stays disk-backed and the transaction remains atomic. Source/schema interruptions may seal smaller groups. Terminal records and their chunks become discoverable by concurrent journal readers together, only after sync; source notifications and ACK eligibility follow that boundary. Slow disk or source I/O can exceed the scheduling deadline.
 
 Capture phase timings isolate work within the capture actor, not time waiting for PostgreSQL or queued WAL. Schema validation includes the final buffered chunk flush; ordinary verified schemas do not require a SQL query per transaction. Spool replay includes journal chunk appends but excludes terminal sync. Journal sync measures the commit `sync_data` call; it excludes terminal serialization and index bookkeeping. Spool begin and disposal measure filesystem lifecycle calls. These phases do not cover all capture CPU time and must not be treated as a complete latency decomposition.
+
+`status` also reports `blocked_tables` with stable error codes, retry timestamps,
+attempt counts, and retained operation IDs. `table_progress` reports each table's
+last successful materialized LSN. These positions may advance independently of the
+connection's contiguous materialized watermark. A blocked table retains its last
+successful position while other tables continue. See
+[table publication isolation](table-publication-isolation.md) for recovery and
+storage limits.
 
 ## Storage and REST cost diagnostics
 

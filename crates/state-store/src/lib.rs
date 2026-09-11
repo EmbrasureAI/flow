@@ -877,7 +877,13 @@ impl StateStore {
     /// Source-wide transaction ledger payloads. One key per transaction, never
     /// raw transaction rows. The caller owns the payload schema.
     pub fn put_source_transaction(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let _guard = self.lock()?;
+        // SOURCE-only writes need authority revision serialization, not the
+        // row CAS mutex held by unrelated table collapse/apply work.
+        let _guard = if self.0.control.is_none() {
+            Some(self.lock()?)
+        } else {
+            None
+        };
         let mut batch = StateBatch::default();
         self.put_source_record(&mut batch, key, value);
         self.write(batch)
@@ -893,7 +899,11 @@ impl StateStore {
     }
 
     pub fn delete_source_transaction(&self, key: &[u8]) -> Result<()> {
-        let _guard = self.lock()?;
+        let _guard = if self.0.control.is_none() {
+            Some(self.lock()?)
+        } else {
+            None
+        };
         let mut batch = StateBatch::default();
         batch.control.delete(control::record_key(SOURCE, key));
         batch.delete_cf(
@@ -912,6 +922,19 @@ impl StateStore {
         transactions: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
         completed_range: Option<(&[u8], &[u8])>,
     ) -> Result<()> {
+        self.update_source_ledger_with_deletes(metadata, transactions, [], completed_range)
+    }
+
+    /// Include bounded secondary-reference deletions in the same authoritative
+    /// write as their source-ledger transitions. Readers can never observe a
+    /// completed table transaction with an outstanding admission reference.
+    pub fn update_source_ledger_with_deletes<'a>(
+        &self,
+        metadata: (&[u8], &[u8]),
+        transactions: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        deletes: impl IntoIterator<Item = &'a [u8]>,
+        completed_range: Option<(&[u8], &[u8])>,
+    ) -> Result<()> {
         // The single ledger owner supplies a complete SOURCE-only batch. Its
         // controlled commit needs revision serialization, not the row CAS lock.
         let _guard = if self.0.control.is_none() {
@@ -928,6 +951,10 @@ impl StateStore {
         for (key, value) in transactions {
             batch.control.put(control::record_key(SOURCE, key), value);
             batch.put_cf(&cf, key, value);
+        }
+        for key in deletes {
+            batch.control.delete(control::record_key(SOURCE, key));
+            batch.delete_cf(&cf, key);
         }
         if let Some((start, end)) = completed_range {
             batch.control.delete_range(

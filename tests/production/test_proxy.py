@@ -176,6 +176,53 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual([request[1] for request in requests], ["/object", "/commit"])
             self.assertEqual(len(accepted), 1)
 
+    def test_table_rejection_matches_exact_table_and_selected_methods(self):
+        with fixture(CatalogProxy) as (proxy, client, requests, _):
+            proxy.reject_table("orders", 403, methods=("POST",))
+            for method, path, expected in (
+                ("GET", "/v1/config", 200),
+                ("GET", "/v1/namespaces/test/tables/orders", 200),
+                ("POST", "/v1/namespaces/test/tables/accounts", 200),
+                ("POST", "/v1/namespaces/test/tables/orders_backup", 200),
+                ("POST", "/v1/namespaces/test/tables/orders?test=1", 403),
+            ):
+                client.request(method, path, b"{}")
+                response = client.getresponse()
+                self.assertEqual(response.status, expected)
+                response.read()
+            self.assertEqual(len(requests), 4, "a rejected write reached upstream")
+            proxy.reject_table("orders", 503)
+            client.request("GET", "/v1/namespaces/test/tables/orders")
+            response = client.getresponse()
+            self.assertEqual(response.status, 503)
+            response.read()
+            proxy.allow_table("orders")
+            client.request("GET", "/v1/namespaces/test/tables/orders")
+            self.assertEqual(client.getresponse().read(), b"abcde")
+            self.assertEqual(len(requests), 5)
+
+    def test_table_drop_waits_for_selected_commit_and_blocks_recovery_reads(self):
+        with fixture(CatalogProxy) as (proxy, client, requests, _):
+            proxy.arm_drop(table="orders", reject_after=403)
+            body = json.dumps({"updates": [{"action": "add-snapshot", "snapshot": {
+                "summary": {"streaming.operation": "ingest"}}}]})
+            client.request("POST", "/v1/namespaces/test/tables/accounts", body)
+            self.assertEqual(client.getresponse().read(), b"abcde")
+            self.assertFalse(proxy.dropped.is_set())
+            client.request("POST", "/v1/namespaces/test/tables/orders", body)
+            with self.assertRaises(http.client.RemoteDisconnected):
+                client.getresponse()
+            self.assertTrue(proxy.dropped.is_set())
+            client.close()
+            client.request("GET", "/v1/namespaces/test/tables/orders")
+            response = client.getresponse()
+            self.assertEqual(response.status, 403)
+            response.read()
+            client.request("GET", "/v1/namespaces/test/tables/accounts")
+            self.assertEqual(client.getresponse().read(), b"abcde")
+            self.assertEqual([request[1].rsplit("/", 1)[1] for request in requests],
+                             ["accounts", "orders", "accounts"])
+
 
 if __name__ == "__main__":
     unittest.main()

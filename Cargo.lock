@@ -1517,6 +1517,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
  "parquet",
+ "reqsign-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -2034,8 +2035,6 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "983efbae430ed40c074af69a8b0aff99bee73e54686cf26ecde97f84127812a2"
 dependencies = [
  "anyhow",
  "async-trait",
