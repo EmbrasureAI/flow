@@ -264,6 +264,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
                 ack_receive,
             ))
     });
+    // Workers and health checks share the immutable admission configuration.
+    // Evolving source schemas are read from the durable schema registry.
+    let config = Arc::new(config);
     let publishing = PublishRuntime {
         work: TableWork {
             config: config.clone(),

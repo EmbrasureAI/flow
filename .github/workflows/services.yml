@@ -11,16 +11,59 @@ concurrency:
   group: services-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  build:
+    # Every service job executes these exact binaries; native dependencies compile once.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_LOG: info
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Retain the existing service-build dependency cache across this job split.
+          shared-key: postgres
+      - name: Build service binaries
+        run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
+      - name: Package service binaries with executable permissions and checksums
+        run: |
+          sha256sum target/debug/embrasure-flow target/debug/examples/local_compactor > target/service-binaries.sha256
+          tar -cf "$RUNNER_TEMP/service-binaries.tar" target/debug/embrasure-flow target/debug/examples/local_compactor target/service-binaries.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-binaries
+          path: ${{ runner.temp }}/service-binaries.tar
+          if-no-files-found: error
+          retention-days: 1
+
   postgres:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         postgres: ['14.24', '15.19', '16.15', '17.11', '18.6']
+        suite: [compatibility]
+        # Split by measured duration. Each shard owns an isolated service stack.
+        include:
+          - postgres: '18.6'
+            suite: lifecycle
+          - postgres: '18.6'
+            suite: compaction
+          - postgres: '18.6'
+            suite: periodic-single-worker
+          - postgres: '18.6'
+            suite: periodic-with-builds
+          - postgres: '18.6'
+            suite: readers
     env:
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
       COMPOSE_PROJECT_NAME: flow-ci
       COMPOSE_FILE: tests/production/compose.yaml
       FLOW_POSTGRES_IMAGE: postgres:${{ matrix.postgres }}-bookworm
@@ -32,15 +75,17 @@ jobs:
       RUST_LOG: info
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/download-artifact@v4
         with:
-          toolchain: '1.97.1'
-      - uses: Swatinem/rust-cache@v2
+          name: service-binaries
+          path: ${{ runner.temp }}/service-binaries
+      - name: Unpack and verify service binaries
+        run: |
+          tar -xf "$RUNNER_TEMP/service-binaries/service-binaries.tar"
+          sha256sum -c target/service-binaries.sha256
       - uses: astral-sh/setup-uv@v6
       - name: Verify stock reader extensions from an empty cache
         run: uv run tests/local/duckdb_extensions.py
-      - run: cargo build --locked -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
       - name: Select free ports that survive service restarts
         run: |
           python3 - <<'PY'
@@ -54,9 +99,21 @@ jobs:
                   listener.bind(("127.0.0.1", 0))
                   env.write(f"FLOW_PRODUCTION_{service}_PORT={listener.getsockname()[1]}\n")
           PY
+      - name: Prepare service images with bounded download retries
+        timeout-minutes: 5
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose pull --ignore-buildable && docker compose build; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
       - name: Start durable services on assigned loopback ports
         run: |
-          docker compose up -d --build --wait --wait-timeout 180
+          docker compose up -d --no-build --pull never --wait --wait-timeout 180
           pg_port=$(docker compose port postgres 5432 | cut -d: -f2)
           rest_port=$(docker compose port rest 8181 | cut -d: -f2)
           s3_port=$(docker compose port minio 9000 | cut -d: -f2)
@@ -64,6 +121,7 @@ jobs:
           echo "FLOW_REST_URL=http://127.0.0.1:${rest_port}" >> "$GITHUB_ENV"
           echo "FLOW_S3_URL=http://127.0.0.1:${s3_port}" >> "$GITHUB_ENV"
       - name: Crash recovery and concurrent compaction
+        if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/faults.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
@@ -71,47 +129,53 @@ jobs:
           --compactor-binary target/debug/examples/local_compactor
           --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults"
       - name: Schema, checkpoint and process lifecycle
+        if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/contracts.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --artifacts "$RUNNER_TEMP/service-contracts"
       - name: PostgreSQL type mappings through snapshot, CDC, restart and compaction
+        if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/type_compat.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-type-compat"
       - name: Explicit projection through excluded types, DDL and durable restart
+        if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/projection_compat.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-projection-compat"
       - name: Time values, key movement and nullable time schema evolution
+        if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/time_vector_compat.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-time-compat"
       - name: Snapshot inheritance and row-security contracts
+        if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/source_snapshot_contracts.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-snapshot-contracts"
       - name: Interrupted parallel bootstrap and index reconstruction
+        if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/bootstrap.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --artifacts "$RUNNER_TEMP/service-bootstrap" --add-column-during-recovery
+          --artifacts "$RUNNER_TEMP/service-bootstrap" --add-column-during-recovery --lose-index-during-bootstrap
       - name: Snapshot keeper loss after COPY and preserved COPY failures
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'lifecycle'
         run: >-
           uv run tests/production/snapshot_keeper.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --artifacts "$RUNNER_TEMP/service-snapshot-keeper"
       - name: Reject incompatible source DDL without changing public data
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'lifecycle'
         run: |
           unsafe_status=0
           for unsafe_case in column-incarnation non-null-default volatile-default; do
@@ -121,7 +185,7 @@ jobs:
           done
           exit "$unsafe_status"
       - name: Hard reader debt and automatic external compactor recovery
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'lifecycle'
         run: >-
           uv run tests/production/pressure.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
@@ -129,35 +193,35 @@ jobs:
           --compactor-binary target/debug/examples/local_compactor
           --artifacts "$RUNNER_TEMP/service-pressure"
       - name: CDC during held compaction reads and abandoned build recovery
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'compaction'
         run: >-
           uv run tests/production/concurrent_compaction.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-concurrent-compaction"
       - name: Two-table compaction cancellation and recovery
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'compaction'
         run: >-
           uv run tests/production/parallel_compaction.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-parallel-compaction"
       - name: WAL monitor timeout, readiness and recovery
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'lifecycle'
         run: >-
           uv run tests/production/health.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-health"
       - name: Background compaction admission under queued CDC
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'lifecycle'
         run: >-
           uv run tests/production/maintenance_fairness.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-maintenance-fairness"
       - name: Periodic cleanup with a single shared worker
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'periodic-single-worker'
         run: >-
           uv run tests/production/periodic_maintenance.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
@@ -166,7 +230,7 @@ jobs:
           --timeout 600
           --artifacts "$RUNNER_TEMP/service-periodic-single-worker"
       - name: Periodic cleanup beside native compaction
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'periodic-with-builds'
         run: >-
           uv run tests/production/periodic_maintenance.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
@@ -175,14 +239,14 @@ jobs:
           --timeout 600
           --artifacts "$RUNNER_TEMP/service-periodic-with-builds"
       - name: Composite keys, index reconstruction and journal quota recovery
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'lifecycle'
         run: >-
           uv run tests/production/boundaries.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-boundaries"
       - name: Standard readers with native and external maintenance
-        if: matrix.postgres == '18.6'
+        if: matrix.suite == 'readers'
         run: >-
           uv run tests/production/readers.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
@@ -194,7 +258,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: services-pg-${{ matrix.postgres }}
+          name: services-pg-${{ matrix.postgres }}-${{ matrix.suite }}
           path: |
             ${{ runner.temp }}/service-*/report.json
             ${{ runner.temp }}/service-*/*.log
@@ -208,11 +272,10 @@ jobs:
         run: docker compose down -v
 
   pgvector:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     env:
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
       COMPOSE_PROJECT_NAME: flow-vector-ci
       COMPOSE_FILE: tests/production/compose.yaml
       FLOW_POSTGRES_IMAGE: pgvector/pgvector:0.8.0-pg17-bookworm
@@ -224,13 +287,15 @@ jobs:
       RUST_LOG: info
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/download-artifact@v4
         with:
-          toolchain: '1.97.1'
-      - uses: Swatinem/rust-cache@v2
+          name: service-binaries
+          path: ${{ runner.temp }}/service-binaries
+      - name: Unpack and verify service binaries
+        run: |
+          tar -xf "$RUNNER_TEMP/service-binaries/service-binaries.tar"
+          sha256sum -c target/service-binaries.sha256
       - uses: astral-sh/setup-uv@v6
-      - run: cargo build --locked -p flow-daemon
       - name: Select free service ports
         run: |
           python3 - <<'PYPORTS'
@@ -243,9 +308,21 @@ jobs:
                   listener.bind(("127.0.0.1", 0))
                   env.write(f"FLOW_PRODUCTION_{service}_PORT={listener.getsockname()[1]}\n")
           PYPORTS
+      - name: Prepare service images with bounded download retries
+        timeout-minutes: 5
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose pull --ignore-buildable && docker compose build; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
       - name: Start disposable pgvector, catalog and object storage
         run: |
-          docker compose up -d --build --wait --wait-timeout 180
+          docker compose up -d --no-build --pull never --wait --wait-timeout 180
           pg_port=$(docker compose port postgres 5432 | cut -d: -f2)
           rest_port=$(docker compose port rest 8181 | cut -d: -f2)
           s3_port=$(docker compose port minio 9000 | cut -d: -f2)

@@ -42,6 +42,39 @@ jobs:
           python3 -B scripts/package_licenses.py --target x86_64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-x86_64-linux"
           python3 -B scripts/package_licenses.py --target aarch64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-aarch64-linux"
       - run: cargo run --locked -p flow-daemon -- --config examples/flow.toml check
+  jemalloc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+          components: clippy,rust-docs
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: jemalloc
+      - run: cargo clippy --locked -p flow-daemon -p flow-state-store --all-targets --features flow-daemon/jemalloc --no-deps -- -D warnings
+      - run: cargo test --locked -p flow-daemon -p flow-state-store --all-targets --features flow-daemon/jemalloc
+      - name: Reviewed jemalloc distribution licenses
+        run: |
+          cargo fetch --locked
+          python3 -B scripts/package_licenses.py --features jemalloc --target x86_64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-jemalloc-x86_64-linux"
+          python3 -B scripts/package_licenses.py --features jemalloc --target aarch64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-jemalloc-aarch64-linux"
+      - run: cargo run --locked -p flow-daemon --features jemalloc -- --config examples/flow.toml check
+      - name: Verify process-wide allocator linkage
+        run: |
+          readelf --dyn-syms --wide target/debug/embrasure-flow > "$RUNNER_TEMP/flow-dynamic-symbols.txt"
+          for symbol in malloc calloc realloc free; do
+            if ! awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol { found = 1 } END { exit !found }' "$RUNNER_TEMP/flow-dynamic-symbols.txt"; then
+              echo "Missing defined dynamic allocator symbol: $symbol"
+              exit 1
+            fi
+          done
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -52,4 +85,4 @@ jobs:
         with:
           toolchain: '1.94.0'
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +1.94.0 check --locked --workspace --all-targets
+      - run: cargo +1.94.0 check --locked --workspace --all-targets --all-features

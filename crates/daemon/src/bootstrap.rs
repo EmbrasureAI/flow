@@ -167,8 +167,8 @@ pub async fn initialize(config: Config) -> Result<()> {
     let observation = crate::observation::Observation::install()?;
     let started = std::time::Instant::now();
     let result = async {
-        let store = state(&config)?;
         let catalog = catalog(&config).await?;
+        let store = open_bootstrap_state(&config, catalog.clone()).await?;
         let mut boot = match store.source_transaction(BOOTSTRAP)? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => prepare_source(&config, &store, catalog.as_ref()).await?,
@@ -187,6 +187,37 @@ pub async fn initialize(config: Config) -> Result<()> {
         tracing::warn!(%error, "failed to flush bootstrap diagnostics");
     }
     result
+}
+
+// COPY can be interrupted between the index and control writes just like CDC.
+// Reuse the normal generation rebuild before any source ACK or publication.
+async fn open_bootstrap_state(config: &Config, catalog: Arc<dyn Catalog>) -> Result<StateStore> {
+    match state(config) {
+        Ok(store) => Ok(store),
+        Err(error)
+            if error
+                .downcast_ref::<flow_state_store::Error>()
+                .is_some_and(flow_state_store::Error::requires_index_rebuild) =>
+        {
+            let control = ControlStore::open(config.state_dir.join("control"))?;
+            let boot = bootstrap(&control)?;
+            validate_config(config, &boot)?;
+            ensure!(
+                boot.target_uuids.len() == boot.schemas.len(),
+                "bootstrap requires durable target identities"
+            );
+            let targets = tables(catalog.as_ref(), &boot).await?;
+            for (schema, uuid) in boot.schemas.iter().zip(&boot.target_uuids) {
+                ensure!(
+                    targets[&schema.table_id].metadata().uuid() == *uuid,
+                    "initial target incarnation changed"
+                );
+            }
+            tracing::warn!(%error, "rebuilding the bootstrap index from durable control and Iceberg");
+            crate::generation::rebuild(config, control, catalog, &boot.schemas, &targets).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Result<()> {
@@ -942,6 +973,119 @@ mod tests {
     use super::*;
     use flow_coordinator::{AckMode, JournalDurability};
     use flow_state_store::StateStoreOptions;
+
+    #[tokio::test]
+    async fn bootstrap_rebuild_preserves_control_and_rejects_replaced_targets() {
+        use iceberg::{
+            CatalogBuilder, NamespaceIdent,
+            memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().join("state");
+        let schema = config.tables[0].schema(17);
+        let namespace =
+            NamespaceIdent::from_vec(config.tables[0].target_namespace.clone()).unwrap();
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "bootstrap",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://bootstrap".into())]),
+                )
+                .await
+                .unwrap(),
+        );
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let creation = || {
+            TableCreation::builder()
+                .name(config.tables[0].target_table.clone())
+                .format_version(config.tables[0].format_version)
+                .schema(flow_materializer::iceberg_schema(&schema).unwrap())
+                .build()
+        };
+        let table = catalog.create_table(&namespace, creation()).await.unwrap();
+        let store = state(&config).unwrap();
+        store
+            .complete_noop(&schema.table_id, PgLsn(0), schema.version)
+            .unwrap();
+        let boot = Bootstrap {
+            explicit_projections: Vec::new(),
+            source_id: config.source.id.clone(),
+            slot: config.source.slot.clone(),
+            publication: config.source.publication.clone(),
+            schemas: vec![schema.clone()],
+            targets: vec![(
+                config.tables[0].target_namespace.clone(),
+                config.tables[0].target_table.clone(),
+            )],
+            target_uuids: vec![table.metadata().uuid()],
+            consistent_lsn: Some(PgLsn(41)),
+            copied: false,
+            layout: 1,
+        };
+        persist_bootstrap(&store, &boot).unwrap();
+        let stale = root.path().join("stale-index");
+        store.checkpoint(&stale).unwrap();
+        store
+            .put_source_transaction(b"durable-cdc", b"retained")
+            .unwrap();
+        drop(store);
+        let original = config.state_dir.join("index");
+        std::fs::rename(&original, root.path().join("newer-index")).unwrap();
+        std::fs::rename(stale, &original).unwrap();
+        let error = state(&config).err().expect("stale index must be rejected");
+        assert!(error.to_string().contains("index/control revision differs"));
+
+        let rebuilt = open_bootstrap_state(&config, catalog.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            rebuilt
+                .source_transaction(b"durable-cdc")
+                .unwrap()
+                .as_deref(),
+            Some(b"retained".as_slice())
+        );
+        assert_eq!(
+            rebuilt
+                .table_state(&schema.table_id)
+                .unwrap()
+                .materialized_lsn,
+            PgLsn(0)
+        );
+        let resumed: Bootstrap =
+            serde_json::from_slice(&rebuilt.source_transaction(BOOTSTRAP).unwrap().unwrap())
+                .unwrap();
+        assert!(!resumed.copied);
+        assert_eq!(resumed.consistent_lsn, boot.consistent_lsn);
+        drop(rebuilt);
+
+        let control = ControlStore::open(config.state_dir.join("control")).unwrap();
+        let active = control.active_generation().unwrap().unwrap();
+        drop(control);
+        std::fs::rename(&active.path, root.path().join("lost-rebuilt-index")).unwrap();
+        catalog.drop_table(table.identifier()).await.unwrap();
+        catalog.create_table(&namespace, creation()).await.unwrap();
+        let error = open_bootstrap_state(&config, catalog)
+            .await
+            .err()
+            .expect("replacement target must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("initial target incarnation changed")
+        );
+        let control = ControlStore::open(config.state_dir.join("control")).unwrap();
+        assert_eq!(
+            control.active_generation().unwrap().unwrap().path,
+            active.path
+        );
+    }
 
     #[test]
     fn published_copy_recovery_reconciles_ledger_and_reclaims_owned_staging() {

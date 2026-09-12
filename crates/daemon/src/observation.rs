@@ -22,6 +22,8 @@ pub(crate) struct Observation {
     source_health: SourceHealthStatus,
     blocked_tables: Vec<BlockedTable>,
     table_progress: Vec<TableProgress>,
+    #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
+    allocator_sample: Option<(Instant, Option<crate::allocator::MemoryUsage>)>,
 }
 impl Observation {
     pub(crate) fn install() -> Result<Self> {
@@ -46,6 +48,8 @@ impl Observation {
             source_health: SourceHealthStatus::Unknown,
             blocked_tables: Vec::new(),
             table_progress: Vec::new(),
+            #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
+            allocator_sample: None,
         })
     }
 
@@ -126,6 +130,26 @@ impl Observation {
         }
         let watermarks = ledger.watermarks();
         let mut text = self.handle.render();
+        #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
+        {
+            // Allocator fields overlap and are distinct from operating-system RSS.
+            // Sampling all arenas is bounded to every 15 seconds, including retries.
+            let sample = self
+                .allocator_sample
+                .get_or_insert_with(|| (now - Duration::from_secs(15), None));
+            if now.duration_since(sample.0) >= Duration::from_secs(15) {
+                *sample = (now, crate::allocator::memory_usage().ok());
+            }
+            if let Some(usage) = &sample.1 {
+                for (name, value) in [
+                    ("flow_allocator_allocated_bytes", usage.allocated_bytes),
+                    ("flow_allocator_active_bytes", usage.active_bytes),
+                    ("flow_allocator_resident_bytes", usage.resident_bytes),
+                ] {
+                    writeln!(text, "# TYPE {name} gauge\n{name} {value}")?;
+                }
+            }
+        }
         // Keep exact integer text for local inspection. Prometheus itself uses
         // floating-point samples; status.json is the exact watermark interface.
         for (name, value) in [
@@ -221,6 +245,8 @@ mod tests {
             source_health: SourceHealthStatus::Unknown,
             blocked_tables: Vec::new(),
             table_progress: Vec::new(),
+            #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
+            allocator_sample: None,
         };
         let metrics = temp.path().join("metrics.prom");
         let status = temp.path().join("status.json");

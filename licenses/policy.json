@@ -43,6 +43,16 @@
     "Zlib OR Apache-2.0 OR MIT": "Apache-2.0"
   },
   "bundled_native": {
+    "tikv-jemalloc-sys": {
+      "version": "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7",
+      "links": "jemalloc",
+      "review": "Select Apache-2.0 for the Rust wrapper and retain the bundled jemalloc BSD-2-Clause copyright, conditions and disclaimer. The wrapper license does not replace the native allocator terms.",
+      "files": {
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397",
+        "jemalloc/COPYING": "94aa2caa98c25d942f58b956c71dba6a99ff98fc3a31cbc669fe2a4cd0268b53"
+      }
+    },
     "aws-lc-sys": {
       "version": "0.45.0",
       "links": "aws_lc_0_45_0",
