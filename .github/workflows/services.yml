@@ -155,7 +155,7 @@ jobs:
         run: >-
           uv run tests/production/bootstrap.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --artifacts "$RUNNER_TEMP/service-bootstrap" --add-column-during-recovery
+          --artifacts "$RUNNER_TEMP/service-bootstrap" --add-column-during-recovery --lose-index-during-bootstrap
       - name: Snapshot keeper loss after COPY and preserved COPY failures
         if: matrix.suite == 'lifecycle'
         run: >-
