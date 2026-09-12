@@ -99,9 +99,21 @@ jobs:
                   listener.bind(("127.0.0.1", 0))
                   env.write(f"FLOW_PRODUCTION_{service}_PORT={listener.getsockname()[1]}\n")
           PY
+      - name: Prepare service images with bounded download retries
+        timeout-minutes: 5
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose pull --ignore-buildable && docker compose build; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
       - name: Start durable services on assigned loopback ports
         run: |
-          docker compose up -d --build --wait --wait-timeout 180
+          docker compose up -d --no-build --pull never --wait --wait-timeout 180
           pg_port=$(docker compose port postgres 5432 | cut -d: -f2)
           rest_port=$(docker compose port rest 8181 | cut -d: -f2)
           s3_port=$(docker compose port minio 9000 | cut -d: -f2)
@@ -296,9 +308,21 @@ jobs:
                   listener.bind(("127.0.0.1", 0))
                   env.write(f"FLOW_PRODUCTION_{service}_PORT={listener.getsockname()[1]}\n")
           PYPORTS
+      - name: Prepare service images with bounded download retries
+        timeout-minutes: 5
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose pull --ignore-buildable && docker compose build; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
       - name: Start disposable pgvector, catalog and object storage
         run: |
-          docker compose up -d --build --wait --wait-timeout 180
+          docker compose up -d --no-build --pull never --wait --wait-timeout 180
           pg_port=$(docker compose port postgres 5432 | cut -d: -f2)
           rest_port=$(docker compose port rest 8181 | cut -d: -f2)
           s3_port=$(docker compose port minio 9000 | cut -d: -f2)
