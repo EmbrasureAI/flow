@@ -13,7 +13,8 @@ concurrency:
 jobs:
   postgres:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Cold native builds plus the extended PostgreSQL 18 suite exceed 45 minutes.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
