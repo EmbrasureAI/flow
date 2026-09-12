@@ -128,6 +128,13 @@ class ConcurrentRun(Run):
         assert selected is not None, "fixture did not publish a selectable L0 data file"
         input_snapshot = next(snapshot for snapshot in metadata["metadata"]["snapshots"]
                               if snapshot["snapshot-id"] == files[selected[0]]["added_snapshot"])
+        if label == "hard":
+            # Enter the late soft-age window before starting the worker. Waiting
+            # for all 30s of file age with a live build can consume its separate
+            # 30s lifetime before the deliberately slow preparation finishes.
+            age_ms = time.time_ns() // 1_000_000 - input_snapshot["timestamp-ms"]
+            time.sleep(max(0, (20000 - age_ms) / 1000))
+            assert time.time_ns() // 1_000_000 - input_snapshot["timestamp-ms"] < 30000, "fixture missed the soft-age admission window"
         self.object_proxy.hold_reads([selected[0]])
         self.native = True
         self.start()
@@ -228,8 +235,8 @@ class ConcurrentRun(Run):
 
     def hard_pressure(self):
         build = self.held_build("hard", 1025)
-        # Started near soft age 10s. Cross hard age 30s while still below the
-        # worker's independent 30s lifetime limit, without relaxing policy.
+        # Started after file age 20s. Cross hard age 30s with room for slow
+        # preparation within the worker's independent 30s lifetime limit.
         self.until("L0 did not reach the default hard age", lambda:
                    time.time_ns() // 1_000_000 - build["input_timestamp_ms"] >= 31000, timeout=25)
         before = self.head()

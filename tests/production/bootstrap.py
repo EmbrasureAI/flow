@@ -50,9 +50,9 @@ class BootstrapRun(Run):
         self.log = self.log_path.open("wb")
         self.process = subprocess.Popen(self.command("init"), env=self.environment | {"RUST_LOG": "info"}, stdout=self.log, stderr=subprocess.STDOUT)
 
-    def events(self):
+    def events(self, log_path=None):
         events = []
-        for line in self.log_path.read_text().splitlines():
+        for line in (log_path or self.log_path).read_text().splitlines():
             try:
                 events.append(json.loads(line).get("fields", {}))
             except json.JSONDecodeError:
@@ -143,6 +143,9 @@ class BootstrapRun(Run):
                 "orders_staging_bytes": sum(path.stat().st_size for path in (self.directory / "state" / "bootstrap").rglob("*.segment"))}
 
     def kill_after_terminal(self):
+        if self.args.lose_index_during_bootstrap:
+            index = self.directory / "state" / "index"
+            index.rename(index.with_name("index-lost-during-bootstrap"))
         if self.args.add_column_during_recovery:
             self.pg.execute("ALTER TABLE orders ADD COLUMN added text")
             self.pg.execute("UPDATE orders SET added = 'new-column-before-recopy' WHERE id % 17 = 0")
@@ -196,6 +199,17 @@ class BootstrapRun(Run):
     def index_loss(self):
         self.stop(crash=True)
         index = self.directory / "state" / "index"
+        # A previous bootstrap crash may already have selected a rebuilt index.
+        # Remove the active generation, not its retained predecessor.
+        for generation in range(1, self.generation + 1):
+            for kind in ("init", "daemon"):
+                log = self.directory / f"{kind}-{generation}.log"
+                if not log.exists():
+                    continue
+                for event in self.events(log):
+                    if event.get("event") == "index_generation_activated":
+                        index = Path(event["path"])
+        assert index.resolve().is_relative_to((self.directory / "state").resolve())
         index.rename(index.with_name("index-lost-for-test"))
         self.start()
         self.until("index reconstruction did not finish", lambda: '"index_generation_activated"' in (self.directory / f"daemon-{self.generation}.log").read_text())
@@ -242,6 +256,8 @@ def main():
     parser.add_argument("--binary", type=Path, default=Path("target/debug/embrasure-flow"))
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--lose-index-during-bootstrap", action="store_true",
+                        help="require index reconstruction while one table is copied and another is unfinished")
     parser.add_argument("--add-column-during-recovery", action="store_true", help="add and populate a nullable column between the interrupted COPY and its newer snapshot")
     parser.add_argument("--supervised-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
