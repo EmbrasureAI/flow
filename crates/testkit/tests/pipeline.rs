@@ -1521,3 +1521,86 @@ async fn dropped_keyless_collapse_replays_the_same_identities_after_reopen() {
         );
     }
 }
+
+#[tokio::test]
+async fn malformed_journal_payloads_cannot_be_acknowledged_as_empty_publications() {
+    for memory_bytes in [0, 8 << 20] {
+        for invalid in ["trailing_bytes", "wrong_count", "undeclared_table"] {
+            let temp = TempDir::new().unwrap();
+            let store =
+                StateStore::open(temp.path().join("index"), StateStoreOptions::default()).unwrap();
+            let catalog = catalog(&temp.path().join("warehouse")).await;
+            let schema = schema(1);
+            let table = table(&catalog, &schema).await;
+            let (mut journal, _) =
+                Journal::open(temp.path().join("journal"), JournalConfig::default()).unwrap();
+            let mutations = if invalid == "undeclared_table" {
+                vec![mutation(
+                    2,
+                    MutationKind::Insert {
+                        row: row(1, "unrouted"),
+                    },
+                )]
+            } else {
+                vec![]
+            };
+            let mut payload = bincode::serialize(&mutations).unwrap();
+            if invalid == "trailing_bytes" {
+                payload.push(1);
+            }
+            journal.append_chunk(1, &payload).unwrap();
+            let transaction = SourceTransaction {
+                source_id: SourceId("invalid-payload".into()),
+                xid: 1,
+                begin_lsn: PgLsn(0),
+                commit_lsn: PgLsn(0),
+                end_lsn: PgLsn(1),
+                commit_timestamp_micros: 0,
+                schema_versions: vec![TableSchemaVersion {
+                    table_id: schema.table_id,
+                    version: schema.version,
+                }],
+                affected_tables: vec![schema.table_id],
+                mutation_chunks: journal.transaction_chunks(1),
+                table_mutation_counts: Some(vec![flow_model::TableMutationCount {
+                    table_id: schema.table_id,
+                    mutations: u64::from(invalid == "wrong_count"),
+                }]),
+            };
+            journal.commit(transaction.clone()).unwrap();
+            let transactions = [transaction];
+            let epoch = Epoch::new(
+                transactions[0].source_id.clone(),
+                schema.table_id,
+                &transactions,
+            )
+            .unwrap();
+            let result = collapse_epoch(
+                &store,
+                &journal,
+                &table,
+                &schema,
+                &epoch,
+                &transactions,
+                CollapseLimits {
+                    batch_rows: 128,
+                    batch_bytes: 8 << 20,
+                    memory_bytes,
+                },
+            );
+            assert!(
+                result.is_err(),
+                "{invalid} must fail before publication (memory={memory_bytes})"
+            );
+            assert!(store.operation(&epoch.id).unwrap().is_none());
+            assert_eq!(
+                store
+                    .table_state(&schema.table_id)
+                    .unwrap()
+                    .materialized_lsn,
+                PgLsn(0)
+            );
+            assert!(table.metadata().current_snapshot_id().is_none());
+        }
+    }
+}
