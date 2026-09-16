@@ -414,6 +414,13 @@ impl TableWork {
         // Catalog loading and recovery use the same bounded worker admission as
         // publication. No retry delay holds a worker or its transaction batch.
         let result = async {
+            if crate::schema::capture_blocked(
+                &self.store,
+                &SourceId(self.config.source.id.clone()),
+                schema.table_id,
+            )? {
+                return Err(flow_model::SourceTableBlocked.into());
+            }
             let (target, uuid) = self
                 .targets
                 .get(&schema.table_id)

@@ -185,6 +185,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
             "journal tail truncated during recovery"
         );
     }
+    observation.table_sources(&config, &boot.schemas);
     let sql = connect(&config, false).await?;
     crate::schema::SchemaRegistry::new(
         store.clone(),
@@ -1144,6 +1145,11 @@ impl PublishRuntime {
                     }
                 }
                 _ = health.tick() => {
+                    for id in schemas.keys().copied() {
+                        if blocked.get(id).is_none() && crate::schema::capture_blocked(store, &SourceId(config.source.id.clone()), id)? {
+                            blocked.record(id, "source_schema_incompatible", None)?;
+                        }
+                    }
                     // Keep durability visible while a catalog publication is stalled.
                     observation.table_states(store, &blocked, schemas.keys().copied())?;
                     observation.write(config, ledger, capture_goal, true)?;

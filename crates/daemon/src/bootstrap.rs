@@ -679,6 +679,12 @@ pub(crate) async fn resume(
                 },
             )
             .await
+            .with_context(|| {
+                format!(
+                    "initial snapshot for {}.{}",
+                    config.tables[index].source_namespace, config.tables[index].source_table
+                )
+            })
         }
     }))
     .buffer_unordered(4);

@@ -217,20 +217,26 @@ impl TableSchema {
         row.resize(target.columns.len(), Value::Null);
         Ok(row)
     }
-    /// Only additive nullable columns are safe without an explicit migration.
+    /// Nullable additions and relaxing non-key fields preserve old rows and keys.
     pub fn validate_successor(&self, next: &Self) -> Result<(), ModelError> {
         next.validate()?;
         if next.table_id != self.table_id
             || next.version <= self.version
             || next.primary_key != self.primary_key
             || next.append_only != self.append_only
-            || !next.columns.starts_with(&self.columns)
+            || next.columns.len() < self.columns.len()
+            || self.columns.iter().zip(&next.columns).any(|(old, new)| {
+                old.field_id != new.field_id
+                    || old.name != new.name
+                    || old.data_type != new.data_type
+                    || (old.nullable && !new.nullable)
+            })
             || next.columns[self.columns.len()..]
                 .iter()
                 .any(|c| !c.nullable)
         {
             return Err(ModelError::InvalidSchema(
-                "only additive nullable schema evolution is supported".into(),
+                "only nullable additions and non-key nullability relaxation are supported".into(),
             ));
         }
         Ok(())
@@ -325,10 +331,34 @@ pub struct Mutation {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MutationKind {
-    Insert { row: Row },
-    Update { old_key: PrimaryKey, row: Row },
-    Delete { key: PrimaryKey },
+    Insert {
+        row: Row,
+    },
+    Update {
+        old_key: PrimaryKey,
+        row: Row,
+    },
+    Delete {
+        key: PrimaryKey,
+    },
+    /// Selected source evidence for an incompatible table. Never publish or ACK
+    /// this mutation. Its transaction stays pending until an explicit resync.
+    Quarantined {
+        format: QuarantineFormat,
+        payload: Vec<u8>,
+    },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuarantineFormat {
+    PostgresEventV1,
+    DecodedMutationV1,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("source table requires schema repair or full resync")]
+pub struct SourceTableBlocked;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalChunkRef {
     pub segment: u64,

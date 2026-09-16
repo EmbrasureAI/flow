@@ -116,6 +116,7 @@ impl AddColumn {
 pub struct UpdateSchemaAction {
     additions: Vec<AddColumn>,
     deletes: Vec<String>,
+    optional: Vec<i32>,
 }
 
 impl UpdateSchemaAction {
@@ -124,6 +125,7 @@ impl UpdateSchemaAction {
         Self {
             additions: Vec::new(),
             deletes: Vec::new(),
+            optional: Vec::new(),
         }
     }
 
@@ -136,6 +138,12 @@ impl UpdateSchemaAction {
     /// If the parent resolves to a map/list, the column is added to map value/list element.
     pub fn add_column(mut self, add_column: AddColumn) -> Self {
         self.additions.push(add_column);
+        self
+    }
+
+    /// Relax a root field without changing its ID, type, or historical files.
+    pub fn make_column_optional(mut self, field_id: i32) -> Self {
+        self.optional.push(field_id);
         self
     }
 
@@ -442,12 +450,23 @@ impl TransactionAction for UpdateSchemaAction {
         }
 
         // --- 4. Rebuild the schema tree with additions and deletions ---
-        let new_fields = rebuild_fields(
+        let mut new_fields = rebuild_fields(
             base_schema.as_struct().fields(),
             &additions_by_parent,
             &delete_ids,
             None,
         );
+
+        for id in &self.optional {
+            if base_schema.identifier_field_ids().any(|key| key == *id) {
+                return Err(Error::new(ErrorKind::PreconditionFailed, "Cannot relax an identifier field"));
+            }
+            let field = new_fields.iter_mut().find(|field| field.id == *id)
+                .ok_or_else(|| Error::new(ErrorKind::PreconditionFailed, "Optional field must be an existing root column"))?;
+            let mut relaxed = field.as_ref().clone();
+            relaxed.required = false;
+            *field = Arc::new(relaxed);
+        }
 
         // --- 5. Build the new schema ---
         let schema = Schema::builder()

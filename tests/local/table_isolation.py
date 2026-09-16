@@ -297,7 +297,7 @@ class IsolationRun(Run):
                 self.phase("source-reconnect", self.reconnect)
             self.phase("native-manifest-and-operation-audit", lambda:
                        {table: self.audit(table) for table in ("orders", "accounts")})
-            self.phase("source-failure-remains-global", self.truncate)
+            self.phase("source-truncate-isolates-table", self.truncate)
             self.stop()
             self.report["passed"] = True
         except BaseException as error:

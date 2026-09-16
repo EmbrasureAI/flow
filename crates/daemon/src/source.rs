@@ -3,7 +3,7 @@ use crate::config::{Config, Table};
 use crate::schema::SchemaRegistry;
 use anyhow::{Context, Result, ensure};
 use flow_ingress_journal::Journal;
-use flow_model::{PgLsn, SourceId, TableSchema};
+use flow_model::{PgLsn, SourceId, TableId, TableSchema};
 use flow_pg_source::{
     Acknowledgement, CaptureAssembler, PgOutputSource, PostgresSource, Relation, SourceEvent,
     SpoolConfig, TransactionSpool, fetch_relation,
@@ -227,6 +227,7 @@ pub(crate) async fn capture_loop(
                 config.limits.chunk_bytes,
             )?
             .with_pending_commit_limit(JOURNAL_GROUP_TRANSACTIONS)?;
+            let mut wire_relations = std::collections::HashMap::new();
             let mut feedback_tick = tokio::time::interval(Duration::from_secs(5));
             feedback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(30));
@@ -297,15 +298,57 @@ pub(crate) async fn capture_loop(
                     next = source.next() => {
                         match next {
                             Ok(Some(event)) => {
-                                let event = projector.project(event)?;
-                                if let SourceEvent::Relation(relation) = &event
-                                    && let Err(error) = source_deadline(registry.observe_relation(&sql, relation, &mut assembler)).await {
-                                        if retryable_connection(&error) {
-                                            tracing::warn!(%error, "source type resolution interrupted; replaying before journal commit");
-                                            break;
-                                        }
-                                        return Err(error);
+                                if let SourceEvent::Truncate { xid, subxid, relations, cascade, restart_identity } = &event {
+                                    for id in relations {
+                                        let table = TableId(*id);
+                                        registry.block(table)?;
+                                        registry.block_decoder(table, &mut assembler)?;
+                                        assembler.quarantine(SourceEvent::Truncate { xid:*xid,subxid:*subxid,
+                                            relations:vec![*id],cascade:*cascade,restart_identity:*restart_identity },
+                                            &registry.saved_relation(table)?)?;
+                                    }
+                                    continue;
                                 }
+                                let event = if let SourceEvent::Relation(relation) = &event {
+                                    let id = TableId(relation.id);
+                                    let projected = if registry.is_blocked(id) {
+                                        SourceEvent::Relation(projector.quarantine_relation(relation))
+                                    } else {
+                                        match projector.project(event.clone()) {
+                                            Ok(projected) => projected,
+                                            Err(error) => {
+                                                let error = anyhow::Error::new(error);
+                                                if !crate::schema::table_schema_error(&error) { return Err(error); }
+                                                registry.block(id)?;
+                                                SourceEvent::Relation(projector.quarantine_relation(relation))
+                                            }
+                                        }
+                                    };
+                                    let SourceEvent::Relation(projected_relation) = &projected else { unreachable!() };
+                                    if !registry.is_blocked(id)
+                                        && let Err(error) = source_deadline(registry.observe_relation(&sql, projected_relation, &mut assembler)).await {
+                                            if retryable_connection(&error) { break; }
+                                            if !crate::schema::table_schema_error(&error) { return Err(error); }
+                                            registry.block(id)?;
+                                        }
+                                    wire_relations.insert(relation.id, projected_relation.clone());
+                                    if registry.is_blocked(id) {
+                                        registry.block_decoder(id, &mut assembler)?;
+                                        continue;
+                                    }
+                                    projected
+                                } else { projector.project(event)? };
+                                let row_table = match &event {
+                                    SourceEvent::Insert { relation, .. } | SourceEvent::Update { relation, .. }
+                                    | SourceEvent::Delete { relation, .. } => Some(TableId(*relation)),
+                                    _ => None,
+                                };
+                                if let Some(id) = row_table
+                                    && registry.is_blocked(id) {
+                                        registry.block_decoder(id, &mut assembler)?;
+                                        assembler.quarantine(event, wire_relations.get(&id.0).context("row before source relation")?)?;
+                                        continue;
+                                    }
                                 if let SourceEvent::Commit { xid, end_lsn, .. } = &event
                                     && *end_lsn > journal.staged_lsn() {
                                     if registry.validation_may_query() {
@@ -327,7 +370,19 @@ pub(crate) async fn capture_loop(
                                         return Err(error);
                                     }
                                 }
-                                assembler.push_buffered_at(event, source.received_lsn, &mut journal)?;
+                                registry.observe_nulls(&event, &mut assembler)?;
+                                let retained = row_table.map(|_| event.clone());
+                                if let Err(error) = assembler.push_buffered_at(event, source.received_lsn, &mut journal) {
+                                    if let Some(id) = row_table
+                                        && matches!(&error, flow_pg_source::Error::Row(_) | flow_pg_source::Error::Value(_)
+                                            | flow_pg_source::Error::ReplicaIdentity(_) | flow_pg_source::Error::UnchangedToast(_)) {
+                                            registry.block(id)?;
+                                            registry.block_decoder(id, &mut assembler)?;
+                                            assembler.quarantine(retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?)?;
+                                            continue;
+                                        }
+                                    return Err(error.into());
+                                }
                                 if assembler.pending_commit_count() > 0 {
                                     group_deadline.get_or_insert_with(|| tokio::time::Instant::now() + JOURNAL_GROUP_DELAY);
                                     if assembler.pending_commit_count() >= JOURNAL_GROUP_TRANSACTIONS
@@ -632,11 +687,11 @@ async fn validate_publication_membership(
         {
             let mut published: Vec<String> = row.get(0);
             let full: Vec<String> = row.get(1);
+            let generated: Vec<String> = row.get(2);
             if version < 180000 {
                 // PG15's catalog view includes generated columns even though
                 // pgoutput omits them; newer views omit them too. Normalize
                 // only these known non-published fields, never ordinary ones.
-                let generated: Vec<String> = row.get(2);
                 published.retain(|name| !generated.contains(name));
             }
             ensure!(
@@ -648,8 +703,15 @@ async fn validate_publication_membership(
                 .iter()
                 .find(|schema| schema.table_id.0 == relation_id)
                 .context("publication contains an unconfigured relation")?;
+            // Current ordinary columns are covered by the full-publication
+            // check above. Missing historical names belong to the schema
+            // registry's durable table block, so they must not stop healthy
+            // tables on restart. Still reject selected generated fields that
+            // COPY would read but pgoutput would omit.
             ensure!(
-                schema.columns.iter().all(|column| published.contains(&column.name)),
+                schema.columns.iter().all(|column| {
+                    !generated.contains(&column.name) || published.contains(&column.name)
+                }),
                 "publication omits a configured source column; snapshot and CDC must use the same columns"
             );
         }

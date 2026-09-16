@@ -67,3 +67,9 @@ patch -p1 < docs/patches/iceberg-v3.patch
 The patches include prominent local-modification notices. This provenance file is
 added separately. The crate's original Cargo.lock is omitted because the repository
 uses its root Cargo.lock. No upstream submission is claimed.
+
+The source-nullability patch adds a root-field `make_column_optional(field_id)`
+schema action. It preserves IDs/types/defaults and rejects identifier fields,
+missing fields and nested paths. Existing current-schema requirements still
+fence concurrent catalog schema edits. Changed file:
+`src/transaction/update_schema.rs`.

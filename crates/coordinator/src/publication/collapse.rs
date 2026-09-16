@@ -283,6 +283,9 @@ fn replay_epoch(
                 if mutation.table_id != epoch.table {
                     continue;
                 }
+                if matches!(&mutation.kind, MutationKind::Quarantined { .. }) {
+                    return Err(flow_model::SourceTableBlocked.into());
+                }
                 ensure!(
                     mutation.schema_version <= schema.version,
                     "mutation requires a newer publication schema"
@@ -315,6 +318,9 @@ fn replay_epoch(
                     }
                 };
                 let (first, second) = match mutation.kind {
+                    MutationKind::Quarantined { .. } => {
+                        return Err(flow_model::SourceTableBlocked.into());
+                    }
                     MutationKind::Insert { row } => {
                         let row = project(row)?;
                         let key = if schema.primary_key.is_empty() {

@@ -71,6 +71,28 @@ impl EventProjector {
         *row = indices.iter().map(|index| row[*index].clone()).collect();
         Ok(())
     }
+    /// Keep only available explicitly selected fields when schema drift has
+    /// removed/reordered a selection. Excluded cells never enter quarantine.
+    pub fn quarantine_relation(&mut self, relation: &Relation) -> Relation {
+        let Some(selected) = self.selected.get(&relation.id) else {
+            return relation.clone();
+        };
+        let indices: Vec<_> = relation
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, column)| selected.contains(&column.name).then_some(index))
+            .collect();
+        self.wire
+            .insert(relation.id, (relation.columns.len(), indices.clone()));
+        let mut projected = relation.clone();
+        projected.columns = indices
+            .iter()
+            .map(|index| relation.columns[*index].clone())
+            .collect();
+        projected
+    }
+
     pub fn project(&mut self, mut event: SourceEvent) -> Result<SourceEvent> {
         match &mut event {
             SourceEvent::Relation(relation) => {
@@ -119,6 +141,31 @@ mod tests {
                 .collect(),
         }
     }
+    #[test]
+    fn quarantine_after_selected_column_removal_never_keeps_excluded_cells() {
+        let mut projector =
+            EventProjector::new([(1, vec!["id".into(), "removed".into()])]).unwrap();
+        let wire = relation(&["id", "secret"]);
+        assert!(
+            projector
+                .project(SourceEvent::Relation(wire.clone()))
+                .is_err()
+        );
+        let projected = projector.quarantine_relation(&wire);
+        assert_eq!(projected.columns.len(), 1);
+        let event = projector
+            .project(SourceEvent::Insert {
+                xid: 1,
+                subxid: 1,
+                relation: 1,
+                row: vec![Cell::Text("1".into()), Cell::Text("do-not-retain".into())],
+            })
+            .unwrap();
+        assert!(
+            matches!(event, SourceEvent::Insert { row, .. } if row == vec![Cell::Text("1".into())])
+        );
+    }
+
     #[test]
     fn excluded_toast_and_changed_wire_offsets_do_not_change_selected_values() {
         let mut projector = EventProjector::new([(1, vec!["id".into(), "value".into()])]).unwrap();

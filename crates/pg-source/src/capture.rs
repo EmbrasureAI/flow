@@ -40,6 +40,7 @@ pub struct CaptureAssembler {
     pending_commits: Vec<SourceTransaction>,
     pending_commit_bytes: u64,
     pending_commit_limit: usize,
+    blocked: BTreeSet<TableId>,
 }
 
 impl CaptureAssembler {
@@ -64,6 +65,7 @@ impl CaptureAssembler {
         Ok(Self {
             source,
             types: crate::TypeRegistry::default(),
+            blocked: BTreeSet::new(),
             spool,
             schemas: configured,
             relations: HashMap::new(),
@@ -91,6 +93,75 @@ impl CaptureAssembler {
         }
         self.pending_commit_limit = limit;
         Ok(self)
+    }
+
+    pub fn schema(&self, table: TableId) -> Option<&TableSchema> {
+        self.schemas.get(&table)
+    }
+
+    pub fn is_blocked(&self, table: TableId) -> bool {
+        self.blocked.contains(&table)
+    }
+
+    pub fn block_table(&mut self, table: TableId) -> Result<()> {
+        if !self.schemas.contains_key(&table) {
+            return Err(Error::Config("unconfigured blocked table"));
+        }
+        self.blocked.insert(table);
+        Ok(())
+    }
+
+    /// Retain only projected cells, together with their wire relation. The
+    /// normal spool owns rollback/quotas and the journal owns committed payloads.
+    pub fn quarantine(&mut self, event: SourceEvent, relation: &Relation) -> Result<()> {
+        let (xid, subxid, table) = match &event {
+            SourceEvent::Insert {
+                xid,
+                subxid,
+                relation,
+                ..
+            }
+            | SourceEvent::Update {
+                xid,
+                subxid,
+                relation,
+                ..
+            }
+            | SourceEvent::Delete {
+                xid,
+                subxid,
+                relation,
+                ..
+            } => (*xid, *subxid, TableId(*relation)),
+            SourceEvent::Truncate {
+                xid,
+                subxid,
+                relations,
+                ..
+            } if relations.len() == 1 => (*xid, *subxid, TableId(relations[0])),
+            _ => {
+                return Err(Error::Config(
+                    "only single-table source events can be quarantined",
+                ));
+            }
+        };
+        if relation.id != table.0 {
+            return Err(Error::Protocol("quarantine relation identity mismatch"));
+        }
+        self.block_table(table)?;
+        let version = self.schemas[&table].version;
+        self.append(
+            xid,
+            subxid,
+            Mutation {
+                table_id: table,
+                schema_version: version,
+                kind: MutationKind::Quarantined {
+                    format: flow_model::QuarantineFormat::PostgresEventV1,
+                    payload: bincode::serialize(&(relation, event))?,
+                },
+            },
+        )
     }
 
     pub fn pending_commit_count(&self) -> usize {
@@ -392,7 +463,27 @@ impl CaptureAssembler {
                         .ok_or(Error::Protocol("transaction mutation count overflow"))?;
                     // Each chunk contains one table/schema. Its tiny spool-only
                     // header lets commit avoid decoding and reallocating rows.
-                    journal.append_chunk(xid, &bytes[8..])?;
+                    if self.blocked.contains(&table_id) {
+                        use bincode::Options;
+                        let mut mutations: Vec<Mutation> = bincode::DefaultOptions::new()
+                            .with_fixint_encoding()
+                            .with_limit(bytes.len() as u64)
+                            .reject_trailing_bytes()
+                            .deserialize(&bytes[8..])?;
+                        for mutation in &mut mutations {
+                            if !matches!(&mutation.kind, MutationKind::Quarantined { .. }) {
+                                mutation.kind = MutationKind::Quarantined {
+                                    format: flow_model::QuarantineFormat::DecodedMutationV1,
+                                    payload: bincode::serialize(mutation)?,
+                                };
+                            }
+                            mutation.schema_version = self.schemas[&table_id].version;
+                        }
+                        journal.append_chunk(xid, &bincode::serialize(&mutations)?)?;
+                        entry.0 = self.schemas[&table_id].version;
+                    } else {
+                        journal.append_chunk(xid, &bytes[8..])?;
+                    }
                     Ok(())
                 });
                 metrics::histogram!(

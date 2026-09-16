@@ -51,7 +51,9 @@ impl BlockedTables {
             let delay = Duration::from_millis(record.retry_at_ms.saturating_sub(wall_ms))
                 .min(MAX_RETRY_DELAY);
             record.retry_at_ms = wall_ms.saturating_add(delay.as_millis() as u64);
-            deadlines.insert(record.table_id, now + delay);
+            if record.error_code != "source_schema_incompatible" {
+                deadlines.insert(record.table_id, now + delay);
+            }
             records.insert(record.table_id, record);
         }
         Ok(Self {
@@ -88,7 +90,11 @@ impl BlockedTables {
         self.store
             .put_source_transaction(&record_key(&self.prefix, id), &serde_json::to_vec(&record)?)?;
         // Never alter scheduler-visible state before its durable write succeeds.
-        self.deadlines.insert(id, Instant::now() + delay);
+        if error_code == "source_schema_incompatible" {
+            self.deadlines.remove(&id);
+        } else {
+            self.deadlines.insert(id, Instant::now() + delay);
+        }
         self.records.insert(id, record);
         Ok(())
     }
@@ -156,7 +162,8 @@ fn now_ms() -> Result<u64> {
 fn valid_error_code(code: &str) -> bool {
     matches!(
         code,
-        "publication_replan"
+        "source_schema_incompatible"
+            | "publication_replan"
             | "maintenance_pressure"
             | "catalog_unavailable"
             | "catalog_conflict"
@@ -174,6 +181,9 @@ fn valid_error_code(code: &str) -> bool {
 /// Only call at the table publication boundary. Raw messages may contain URLs,
 /// credentials or row values and must never enter durable status observations.
 pub(crate) fn publication_error_code(error: &anyhow::Error) -> Option<&'static str> {
+    if error.is::<flow_model::SourceTableBlocked>() {
+        return Some("source_schema_incompatible");
+    }
     let replanning = error
         .downcast_ref::<flow_coordinator::ReplanRequired>()
         .is_some();

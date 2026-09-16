@@ -191,14 +191,17 @@ class ContractRun(Run):
             expected = "heap was rewritten"
         else:
             raise ValueError(case)
-        code = self.process.wait(timeout=25)
-        assert code != 0, f"unsafe {case} was accepted"
-        log = (self.directory / f"daemon-{self.generation}.log").read_text()
-        assert expected in log, f"wrong rejection for {case}: {log[-2000:]}"
+        orders_id = self.pg.execute("SELECT 'orders'::regclass::oid").fetchone()[0]
+        def blocked():
+            self.alive()
+            status = json.loads((self.directory / "state" / "status.json").read_text())
+            return any(t['table_id'] == orders_id and t['error_code'] == 'source_schema_incompatible'
+                       for t in status.get('blocked_tables', []))
+        self.until(f"unsafe {case} was not isolated", blocked)
         after = self.table("orders")
         assert after["metadata"]["current-schema-id"] == before["metadata"]["current-schema-id"]
         assert self.rows("orders", before) == self.rows("orders", after), "unsafe DDL changed public rows"
-        return {"case": case, "rejection": expected, "exit_code": code}
+        return {"case": case, "rejection": expected, "table_blocked": True}
 
     def aborted_ddl(self):
         before = self.fields("orders")
@@ -284,16 +287,22 @@ class ContractRun(Run):
 
     def key_drift(self):
         self.pg.execute("ALTER TABLE orders DROP CONSTRAINT orders_pkey, ADD PRIMARY KEY (tenant,id)")
-        code = self.process.wait(timeout=20)
-        assert code != 0, "primary-key contract drift was accepted"
-        log = (self.directory / f"daemon-{self.generation}.log").read_text()
-        assert "primary key" in log.lower() or "primary-key" in log.lower()
+        orders_id = self.pg.execute("SELECT 'orders'::regclass::oid").fetchone()[0]
+        def blocked():
+            self.alive()
+            state = json.loads((self.directory / 'state' / 'status.json').read_text())
+            return any(t['table_id'] == orders_id and t['error_code'] == 'source_schema_incompatible'
+                       for t in state.get('blocked_tables', []))
+        self.until('primary-key drift was not isolated', blocked)
+        barrier = self.transaction(["UPDATE accounts SET amount=123.5 WHERE id=1"])
+        expected = self.pg.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+        self.until('healthy table stopped after key drift', lambda: self.rows('accounts') == expected)
         self.pg.execute("ALTER TABLE orders DROP CONSTRAINT orders_pkey, ADD PRIMARY KEY (id)")
         self.stop()
         self.start()
-        barrier = self.transaction(["UPDATE orders SET comment='restored-key-contract' WHERE id <= 8"])
-        self.wait_materialized(barrier)
-        return self.compare("source-key-contract-restored")
+        self.until('restart discarded the source-table block', blocked)
+        return {'source_key_contract_restored': True, 'block_retained_until_resync': True,
+                'healthy_table_continued': True, 'barrier': barrier}
 
     def execute(self):
         try:

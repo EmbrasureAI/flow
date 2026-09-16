@@ -772,3 +772,133 @@ fn buffered_capture_preserves_spools_and_mixed_schema_transactions_until_group_s
         .collect();
     assert!(matches!(deleted[0].kind, MutationKind::Delete { .. }));
 }
+
+#[test]
+fn quarantined_rows_keep_mixed_transaction_counts_and_rollback_across_journal_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut journal, _) =
+        Journal::open(root.path().join("journal"), JournalConfig::default()).unwrap();
+    let spool = TransactionSpool::open(root.path().join("spool"), SpoolConfig::default()).unwrap();
+    let mut assembler = CaptureAssembler::new(
+        SourceId("source".into()),
+        spool,
+        [schema(11), schema(12)],
+        1024,
+    )
+    .unwrap();
+    assembler
+        .push(SourceEvent::Relation(relation(12)), &mut journal)
+        .unwrap();
+    assembler
+        .push(
+            SourceEvent::StreamStart {
+                xid: 42,
+                first: true,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    let quarantined = |subxid, body| SourceEvent::Insert {
+        xid: 42,
+        subxid,
+        relation: 11,
+        row: row("1", body),
+    };
+    assembler
+        .quarantine(quarantined(42, "retained"), &relation(11))
+        .unwrap();
+    assembler
+        .quarantine(quarantined(43, "rolled back"), &relation(11))
+        .unwrap();
+    assembler
+        .push(
+            SourceEvent::Abort {
+                xid: 42,
+                subxid: 43,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    assembler
+        .push(
+            SourceEvent::Insert {
+                xid: 42,
+                subxid: 42,
+                relation: 12,
+                row: row("2", "healthy"),
+            },
+            &mut journal,
+        )
+        .unwrap();
+    assembler
+        .push(
+            SourceEvent::Commit {
+                xid: 42,
+                commit_lsn: PgLsn(20),
+                end_lsn: PgLsn(21),
+                commit_timestamp_micros: 0,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    drop(assembler);
+    drop(journal);
+    let (journal, _) =
+        Journal::open(root.path().join("journal"), JournalConfig::default()).unwrap();
+    let transaction = journal
+        .transactions()
+        .iter()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(transaction.affected_tables, [TableId(11), TableId(12)]);
+    assert_eq!(transaction.mutation_count(TableId(11)), Some(1));
+    assert_eq!(transaction.mutation_count(TableId(12)), Some(1));
+    let mutations: Vec<Mutation> = journal
+        .reader()
+        .chunks(&transaction.mutation_chunks)
+        .unwrap()
+        .flat_map(|chunk| bincode::deserialize::<Vec<Mutation>>(&chunk.unwrap()).unwrap())
+        .collect();
+    let raw = mutations
+        .iter()
+        .find(|mutation| mutation.table_id == TableId(11))
+        .unwrap();
+    let MutationKind::Quarantined { payload, format } = &raw.kind else {
+        panic!("quarantine lost")
+    };
+    assert_eq!(*format, flow_model::QuarantineFormat::PostgresEventV1);
+    let (wire, event): (Relation, SourceEvent) = bincode::deserialize(payload).unwrap();
+    assert_eq!(wire, relation(11));
+    assert_eq!(event, quarantined(42, "retained"));
+    assert!(
+        mutations
+            .iter()
+            .any(|mutation| mutation.table_id == TableId(12)
+                && matches!(&mutation.kind, MutationKind::Insert { .. }))
+    );
+}
+
+#[test]
+fn nullable_successor_preserves_keys_and_historical_rows_but_rejects_key_relaxation() {
+    let base = schema(1);
+    let mut next = base.clone();
+    next.version += 1;
+    next.columns[1].nullable = true;
+    base.validate_successor(&next).unwrap();
+    let values = vec![Value::Int32(1), Value::String("original".into())];
+    assert_eq!(
+        base.encode_key(&values).unwrap(),
+        next.encode_key(&values).unwrap()
+    );
+    assert_eq!(base.project_row(values.clone(), &next).unwrap(), values);
+    next.validate_row(&vec![Value::Int32(1), Value::Null])
+        .unwrap();
+    let mut tightened = next.clone();
+    tightened.version += 1;
+    tightened.columns[1].nullable = false;
+    assert!(next.validate_successor(&tightened).is_err());
+    next.columns[0].nullable = true;
+    assert!(base.validate_successor(&next).is_err());
+}
