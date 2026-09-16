@@ -31,10 +31,21 @@ jobs:
           shared-key: postgres
       - name: Build service binaries
         run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
+      - name: Build snapshot timeout regression test
+        run: |
+          cargo test --locked -p flow-pg-source --test snapshot_timeout --no-run --message-format=json > target/snapshot-test-build.jsonl
+          python3 - <<'PYTEST'
+          import json
+          import shutil
+          from pathlib import Path
+          artifacts = [json.loads(line) for line in Path("target/snapshot-test-build.jsonl").read_text().splitlines()]
+          executable, = [item["executable"] for item in artifacts if item.get("executable") and item.get("target", {}).get("name") == "snapshot_timeout"]
+          shutil.copy2(executable, "target/debug/snapshot_timeout_tests")
+          PYTEST
       - name: Package service binaries with executable permissions and checksums
         run: |
-          sha256sum target/debug/embrasure-flow target/debug/examples/local_compactor > target/service-binaries.sha256
-          tar -cf "$RUNNER_TEMP/service-binaries.tar" target/debug/embrasure-flow target/debug/examples/local_compactor target/service-binaries.sha256
+          sha256sum target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests > target/service-binaries.sha256
+          tar -cf "$RUNNER_TEMP/service-binaries.tar" target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/service-binaries.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: service-binaries
@@ -120,6 +131,9 @@ jobs:
           echo "FLOW_POSTGRES_URL=postgres://flow:local-test-password@127.0.0.1:${pg_port}/flow?sslmode=disable" >> "$GITHUB_ENV"
           echo "FLOW_REST_URL=http://127.0.0.1:${rest_port}" >> "$GITHUB_ENV"
           echo "FLOW_S3_URL=http://127.0.0.1:${s3_port}" >> "$GITHUB_ENV"
+      - name: Snapshot COPY survives inherited statement timeouts
+        if: matrix.suite == 'compatibility'
+        run: target/debug/snapshot_timeout_tests --ignored
       - name: Crash recovery and concurrent compaction
         if: matrix.suite == 'compatibility'
         run: >-
@@ -128,6 +142,11 @@ jobs:
           --binary target/debug/embrasure-flow
           --compactor-binary target/debug/examples/local_compactor
           --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults"
+      - name: Source schema isolation, nullability, restart and selected-column quarantine
+        if: matrix.suite == 'compatibility'
+        run: |
+          uv run tests/local/schema_isolation.py --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" --artifacts "$RUNNER_TEMP/service-schema-isolation"
+          uv run tests/local/schema_isolation.py --explicit --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" --artifacts "$RUNNER_TEMP/service-schema-isolation-explicit"
       - name: Schema, checkpoint and process lifecycle
         if: matrix.suite == 'compatibility'
         run: >-

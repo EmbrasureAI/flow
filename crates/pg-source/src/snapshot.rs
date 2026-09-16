@@ -238,6 +238,12 @@ impl<'a> SnapshotSession<'a> {
             quote_identifier(namespace),
             quote_identifier(table)
         );
+        // A streamed snapshot can outlive an application's query deadline,
+        // especially while the bounded reader applies backpressure. Keep this
+        // override local to the read-only snapshot transaction.
+        self.transaction
+            .batch_execute("SET LOCAL statement_timeout = 0")
+            .await?;
         Ok(self.transaction.copy_out(&query).await?)
     }
 

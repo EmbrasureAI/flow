@@ -5,6 +5,7 @@
 # ///
 """Explicit projection across COPY/WAL, excluded TOAST/DDL and durable restarts."""
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -114,8 +115,14 @@ columns = [
         self.pg.execute("ALTER TABLE orders DROP COLUMN value")
         self.pg.execute("ALTER TABLE orders ADD COLUMN value text")
         self.pg.execute("UPDATE orders SET value='replacement'")
-        result = subprocess.run(self.command("run"), env=self.environment, capture_output=True, timeout=self.args.timeout)
-        assert result.returncode != 0 and b"dropped or replaced" in result.stderr, result.stderr.decode()
+        self.start()
+        orders_id = self.pg.execute("SELECT 'orders'::regclass::oid").fetchone()[0]
+        def blocked():
+            self.alive()
+            status = json.loads((self.directory / 'state' / 'status.json').read_text())
+            return any(t['table_id'] == orders_id and t['error_code'] == 'source_schema_incompatible'
+                       for t in status.get('blocked_tables', []))
+        self.until('selected-column replacement was not isolated', blocked)
         assert self.rows("orders", self.table("orders")) == previous
         return {"selected_column_replacement_rejected": True, "published_rows_unchanged": True}
 

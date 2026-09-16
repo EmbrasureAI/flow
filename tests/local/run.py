@@ -534,18 +534,19 @@ columns = [\n'''
     def truncate(self):
         before = {table: self.table(table)["metadata"]["current-snapshot-id"] for table in ("orders", "accounts")}
         barrier = self.transaction(["TRUNCATE orders", "UPDATE accounts SET amount = 0 WHERE id = 1"])
-        try:
-            code = self.process.wait(timeout=self.args.timeout)
-        except subprocess.TimeoutExpired as error:
-            raise AssertionError("unsupported TRUNCATE did not stop capture") from error
-        assert code != 0
-        message = (self.directory / f"daemon-{self.generation}.log").read_text()
-        assert "TRUNCATE requires coordinated table replacement" in message
+        orders_id = self.pg.execute("SELECT 'orders'::regclass::oid").fetchone()[0]
+        def blocked():
+            self.alive()
+            status = json.loads((self.directory / "state" / "status.json").read_text())
+            return any(t['table_id'] == orders_id and t['error_code'] == 'source_schema_incompatible'
+                       for t in status.get('blocked_tables', []))
+        self.until("TRUNCATE did not block its table", blocked)
+        expected = self.pg.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+        self.until("healthy table stopped behind TRUNCATE", lambda: self.rows("accounts") == expected)
         confirmed = self.pg.execute("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = %s", (self.name,)).fetchone()[0]
         assert lsn(confirmed) < barrier, "unsupported source operation was acknowledged"
-        after = {table: self.table(table)["metadata"]["current-snapshot-id"] for table in ("orders", "accounts")}
-        assert before == after, "unsupported transaction changed a target snapshot"
-        return {"exit_code": code, "confirmed_flush_lsn": confirmed, "snapshot_ids_unchanged": True}
+        assert self.table("orders")["metadata"]["current-snapshot-id"] == before['orders']
+        return {"table_blocked": True, "confirmed_flush_lsn": confirmed, "healthy_table_continued": True}
 
     def execute(self):
         try:
@@ -559,7 +560,7 @@ columns = [\n'''
             self.phase("replication-connection-recovery", self.reconnect)
             self.phase("sigkill-and-wal-backlog-recovery", self.restart)
             self.phase("compaction-and-native-metadata", self.compaction)
-            self.phase("unsupported-truncate-fails-before-ack", self.truncate)
+            self.phase("truncate-isolates-before-ack", self.truncate)
             self.report["passed"] = True
         except BaseException as error:
             self.report["failure"] = str(error)

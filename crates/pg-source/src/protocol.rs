@@ -3,7 +3,7 @@ use bytes::Bytes;
 use flow_model::PgLsn;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Cell {
     Null,
     UnchangedToast,
@@ -53,7 +53,7 @@ impl Relation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceEvent {
     /// pgoutput Begin contains the transaction's FINAL LSN, not a begin LSN.
     Begin {

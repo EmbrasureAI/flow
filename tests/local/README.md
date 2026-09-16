@@ -2,7 +2,7 @@
 
 This suite runs the actual Rust daemon against PostgreSQL, an Apache Iceberg REST catalog, and MinIO. Stock DuckDB independently reads the committed Iceberg tables. The driver compares complete, ordered rows with PostgreSQL; it does not substitute direct Parquet reads for an Iceberg query.
 
-It creates a unique source schema, publication, replication slot, and target namespace per run. Only disposable test services should be supplied. The final test deliberately truncates its source table and confirms the daemon stops without acknowledging that unsupported transaction. Artifacts and service data remain for inspection.
+It creates a unique source schema, publication, replication slot, and target namespace per run. Only disposable test services should be supplied. The final test deliberately truncates its source table and confirms its table is blocked without acknowledging that transaction while healthy tables continue. Artifacts and service data remain for inspection.
 
 ## Run
 
@@ -72,7 +72,7 @@ moves and repeated delete/reinsert, 403/503 repair, both tables blocked followed
 repairing just one, restart while target loads are denied, lost successful commit
 responses, and commits completed after the caller is killed. Ordinary table
 failures must preserve the daemon PID. Native manifest audits verify unique
-operation identities and exact reader results. Source failure remains global.
+operation identities and exact reader results. Source connection/slot/identity failure remains global. Classified table schema/row errors and TRUNCATE are isolated.
 
 Run it again with `--quota` and a new artifact directory for the separate 64 MiB
 journal-limit scenario. That run verifies a safe stop with unpublished changes
@@ -113,3 +113,13 @@ The report records committed transaction counts, actual affected insert/update/d
 - [PostgreSQL replication slot statistics](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-SLOTS-VIEW): independently verify logical streaming occurred.
 - [Iceberg format specification](https://iceberg.apache.org/spec/): validate manifest status, sequence inheritance, and v2 positional deletes independently of the writer.
 - Package versions were resolved from each maintainer's PyPI metadata: [DuckDB](https://pypi.org/project/duckdb/), [psycopg](https://pypi.org/project/psycopg/), [boto3](https://pypi.org/project/boto3/), and [fastavro](https://pypi.org/project/fastavro/).
+
+## Source schema isolation
+
+Run `uv run tests/local/schema_isolation.py` with the same service/binary/artifact
+arguments, then repeat with `--explicit` and a new artifact directory. It verifies
+required-to-nullable evolution through a lost catalog response, restart and a
+later nullable addition. Renaming a selected column must block only that table,
+retain its changes, preserve healthy-table progress and hold the source ACK.
+The explicit-selection case checks that excluded values never enter the journal.
+Source-table blocks require explicit resynchronization; ordinary publication blocks still retry.

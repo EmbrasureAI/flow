@@ -231,15 +231,20 @@ pub fn validate_schema_metadata(
             return Err(Error::Config("source primary key changed"));
         }
     }
-    for (index, (column, attributes)) in schema.columns.iter().zip(&metadata.columns).enumerate() {
+    for (index, attributes) in metadata
+        .columns
+        .iter()
+        .take(schema.columns.len())
+        .enumerate()
+    {
         if attributes.unsupported_generated {
             return Err(Error::Config(
                 "generated columns require PostgreSQL 18 stored publication",
             ));
         }
-        if !column.nullable && attributes.nullable {
-            return Err(Error::Config("relaxed source nullability is unsupported"));
-        }
+        // Historical decoded rows remain valid after DROP NOT NULL. The daemon
+        // installs a nullable successor before decoding new rows; do not reject
+        // an older transaction merely because the live catalog has relaxed.
         if index >= base.columns.len()
             && (!attributes.nullable || !attributes.null_default || !attributes.null_missing_value)
         {

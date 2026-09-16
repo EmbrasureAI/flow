@@ -31,6 +31,10 @@ pub(crate) struct Status {
 pub(crate) struct TableProgress {
     pub(crate) table_id: TableId,
     pub(crate) materialized_lsn: PgLsn,
+    #[serde(default)]
+    pub(crate) source_namespace: Option<String>,
+    #[serde(default)]
+    pub(crate) source_table: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

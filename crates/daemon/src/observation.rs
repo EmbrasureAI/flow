@@ -22,6 +22,7 @@ pub(crate) struct Observation {
     source_health: SourceHealthStatus,
     blocked_tables: Vec<BlockedTable>,
     table_progress: Vec<TableProgress>,
+    table_sources: std::collections::BTreeMap<TableId, (String, String)>,
     #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
     allocator_sample: Option<(Instant, Option<crate::allocator::MemoryUsage>)>,
 }
@@ -48,9 +49,23 @@ impl Observation {
             source_health: SourceHealthStatus::Unknown,
             blocked_tables: Vec::new(),
             table_progress: Vec::new(),
+            table_sources: Default::default(),
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         })
+    }
+
+    pub(crate) fn table_sources(&mut self, config: &Config, schemas: &[flow_model::TableSchema]) {
+        self.table_sources = schemas
+            .iter()
+            .zip(&config.tables)
+            .map(|(schema, table)| {
+                (
+                    schema.table_id,
+                    (table.source_namespace.clone(), table.source_table.clone()),
+                )
+            })
+            .collect();
     }
 
     pub(crate) fn record_source_health(&mut self, health: impl Into<SourceHealthStatus>) {
@@ -71,6 +86,8 @@ impl Observation {
                 Ok(TableProgress {
                     table_id,
                     materialized_lsn: store.table_state(&table_id)?.materialized_lsn,
+                    source_namespace: self.table_sources.get(&table_id).map(|name| name.0.clone()),
+                    source_table: self.table_sources.get(&table_id).map(|name| name.1.clone()),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -245,6 +262,7 @@ mod tests {
             source_health: SourceHealthStatus::Unknown,
             blocked_tables: Vec::new(),
             table_progress: Vec::new(),
+            table_sources: Default::default(),
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         };

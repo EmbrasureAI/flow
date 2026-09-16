@@ -50,12 +50,35 @@ reconciliation seeks each pending table prefix and compares references with its
 materialized position, while retaining the conservative fence on unfinished
 operations. It does not walk healthy tables' already-completed retained history.
 
-Only known table publication errors receive this treatment. Journal corruption,
-source failures, state-store failures, invalid shared invariants, and unclassified
-errors remain connection-wide. Completed bootstrap with intact local authority
+Known source-table schema/row errors also isolate an established table identity.
+Compatible required-to-nullable transitions evolve the existing Iceberg schema,
+preserving field IDs, key bytes, and old files. New nullable source versions are
+proved at commit before publication; streamed NULL rows may select a provisional
+decoder while the committed catalog proof is still pending.
+
+Incompatible names/types, selected-column loss, primary-key/replica-identity drift,
+row decoding failures, and TRUNCATE latch a source-table block in the authoritative
+control store. Subsequent selected row images and wire metadata are retained as
+opaque quarantined mutations in the existing transaction spool/journal. Commit
+proof failures quarantine that table's decoded evidence too. The failed table
+remains in every affected transaction descriptor, including mixed transactions;
+its publications and the shared completed acknowledgement frontier cannot advance.
+Subtransaction rollback still removes its spool records. Explicitly excluded cells
+are projected out before quarantine, including when a selected column disappears.
+
+A source-table block persists across restart and source repair. Use an explicit
+resync/replacement to establish new authoritative state; never clear the block or
+discard journal records manually. This version does not reinterpret quarantined
+mutations automatically. Reinitialize the connection with a new state directory
+and verified targets. Journal/spool quotas and source WAL pressure still bound how long
+healthy tables can continue; quota exhaustion fails closed.
+
+Journal corruption, source connection/slot/identity failures, state-store failures,
+invalid shared invariants, and unclassified errors remain connection-wide. Completed bootstrap with intact local authority
 can load and recover targets independently. Initial snapshot/bootstrap, legacy
 target-identity adoption, and whole-index reconstruction still require their
-existing coordinated recovery path. Source schema validation remains shared.
+existing coordinated recovery path. Unknown/replaced source identities and
+publication-membership changes also retain coordinated recovery.
 
 ## Acknowledgements, limits, and observations
 
@@ -101,3 +124,17 @@ publication is blocked or catching up.
 
 These are design precedents, not claims that the projects expose identical
 failure guarantees. The Moonlink references identify a fixed public revision.
+
+
+## Compatibility and qualification
+
+The new `Quarantined` mutation is appended to the bincode enum, preserving existing
+mutation encodings. Older binaries cannot consume new quarantine records or the
+new nullable schema lineage. Keep the upgraded binary with that generation; use a
+forward repair or explicit replacement instead of rolling the engine back.
+
+`tests/local/schema_isolation.py` covers real PostgreSQL/Iceberg nullable updates,
+lost schema commit responses, streamed DDL, subsequent additions, incompatible
+schema blocks, mixed transactions beyond admission capacity, acknowledgement
+fencing, process restart, and exclusion of unselected values. Run it with and
+without `--explicit`. The PostgreSQL 14–18 CI matrix runs both selections.
