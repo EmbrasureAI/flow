@@ -5,6 +5,7 @@
 
 use super::ReplanRequired;
 use anyhow::{Result, ensure};
+use bincode::Options;
 use flow_iceberg_ext::CommitBase;
 use flow_ingress_journal::ChunkReader;
 use flow_materializer::iceberg_schema;
@@ -265,9 +266,20 @@ fn replay_epoch(
     let mut historical_schema: Option<TableSchema> = None;
     let mut replay = journal.replay_cursor();
     for txn in transactions {
+        let first_ordinal = ordinal;
+        let affected: std::collections::BTreeSet<_> = txn.affected_tables.iter().copied().collect();
         for bytes in replay.chunks(&txn.mutation_chunks)? {
-            let mutations: Vec<Mutation> = bincode::deserialize(&bytes?)?;
+            let bytes = bytes?;
+            let mutations: Vec<Mutation> = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .with_limit(bytes.len() as u64)
+                .reject_trailing_bytes()
+                .deserialize(&bytes)?;
             for mutation in mutations {
+                ensure!(
+                    affected.contains(&mutation.table_id),
+                    "journal mutation references an undeclared table"
+                );
                 if mutation.table_id != epoch.table {
                     continue;
                 }
@@ -355,6 +367,14 @@ fn replay_epoch(
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("mutation ordinal overflow"))?;
             }
+        }
+        if let Some(expected) = txn.mutation_count(epoch.table) {
+            ensure!(
+                ordinal - first_ordinal == expected,
+                "journal mutation count differs from transaction descriptor for table {}: expected {expected}, decoded {}",
+                epoch.table.0,
+                ordinal - first_ordinal
+            );
         }
     }
     if !changes.is_empty() {
