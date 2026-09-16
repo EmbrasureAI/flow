@@ -166,6 +166,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    // Recovery may have loaded every table's snapshot history. Workers reload
+    // targets on admission, so do not retain this inventory for the daemon's lifetime.
+    drop(tables);
     if !boot.copied || boot.layout == 0 {
         crate::bootstrap::resume(&config, store.clone(), catalog.clone(), &mut boot).await?;
     }
