@@ -255,12 +255,12 @@ columns = [\n'''
         ).fetchone()[0]
         return max(barrier, lsn(marker))
 
-    def wait_materialized(self, barrier):
+    def wait_materialized(self, barrier, timeout=None):
         barrier = self.materialization_barrier(barrier)
         def reached():
             metrics = self.metrics()
             return metrics if metrics.get("flow_materialized_lsn", 0) >= barrier else None
-        metrics = self.until("source materialization did not reach transaction", reached)
+        metrics = self.until("source materialization did not reach transaction", reached, timeout=timeout)
         assert metrics["flow_materialized_lsn"] <= metrics["flow_journal_durable_lsn"] <= metrics["flow_source_received_lsn"]
         return metrics
 

@@ -38,7 +38,8 @@ class PeriodicRun(FairnessRun):
                            native_compaction=True, manifest_max_count=4,
                            snapshot_retention_secs=2, garbage_interval_secs=1,
                            orphan_grace_secs=1, checkpoint_interval_secs=2,
-                           catalog_request_delay_seconds=.01, timeout_seconds=args.timeout)
+                           catalog_request_delay_seconds=.01, timeout_seconds=args.timeout,
+                           drain_timeout_seconds=args.drain_timeout or args.timeout)
 
     def queued_backlog(self):
         result = super().queued_backlog()
@@ -126,7 +127,10 @@ class PeriodicRun(FairnessRun):
         before = self.status()["watermarks"]["materialized_lsn"]
         self.until("CDC did not resume after periodic reclamation", lambda:
                    self.status()["watermarks"]["materialized_lsn"] > before)
-        self.wait_materialized(self.barrier)
+        # Fairness/reclamation must meet the original deadline above. Draining
+        # 1,025 queued transactions under deliberately frequent maintenance is
+        # a separate correctness check, not a throughput qualification.
+        self.wait_materialized(self.barrier, timeout=self.args.drain_timeout)
         self.until("source ACK did not reach the final transaction", lambda: self.confirmed() >= self.barrier)
         result = self.compare("periodic-maintenance-and-queued-cdc")
         metadata = self.table("orders")
@@ -183,6 +187,7 @@ def main():
     parser.add_argument("--table-workers", type=int, choices=(1, 2), default=2)
     parser.add_argument("--two-hot-tables", action="store_true")
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--drain-timeout", type=float, help="final backlog drain limit; defaults to --timeout")
     args = parser.parse_args()
     PeriodicRun(args).execute()
     print(f"PASS: {args.artifacts.resolve() / 'report.json'}", flush=True)

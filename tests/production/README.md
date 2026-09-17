@@ -654,12 +654,14 @@ uv run tests/production/periodic_maintenance.py \
   --binary target/debug/embrasure-flow --artifacts target/service-periodic
 ```
 
-Use `--two-hot-tables --table-workers 1 --timeout 600` for a shared single worker, or
+Use `--two-hot-tables --table-workers 1 --timeout 600 --drain-timeout 900` for a shared single worker, or
 `--two-hot-tables --timeout 600` to include competing tables and native background builds.
 Native data rewrites remain enabled so expired file-birth snapshots cannot leave
 unclearable hard L0 age debt. The four-transaction pages, short retention/cleanup
 intervals and 10 ms catalog request delay isolate scheduling and reclamation. These are diagnostic settings,
-not production defaults or a throughput benchmark.
+not production defaults or a throughput benchmark. `--timeout` still bounds the
+fairness and reclamation checks. `--drain-timeout` independently bounds the final
+backlog drain, which must still reach exact source/target equality and ACK.
 
 The fault proxies reuse HTTP connections for ordinary requests and close them
 on transport errors or deliberately lost responses. They never replay writes.

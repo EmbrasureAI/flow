@@ -23,10 +23,9 @@ fn failed_init_exports_process_metrics_without_hiding_the_primary_error() {
     };
     let first = run();
     assert!(!first.status.success());
-    assert!(
-        String::from_utf8_lossy(&first.stderr)
-            .contains("source connection environment variable is missing")
-    );
+    assert!(String::from_utf8_lossy(&first.stderr).contains(
+        "source connection environment variable is missing: FLOW_INIT_TEST_MISSING_CONNECTION"
+    ));
     let metrics = std::fs::read_to_string(state.join("metrics.prom")).unwrap();
     assert!(
         metrics.contains("flow_bootstrap_runs_total{outcome=\"error\"} 1"),

@@ -15,13 +15,56 @@ cargo build --locked --release -p flow-daemon
 cargo run --locked -p flow-daemon -- --config examples/flow.toml check
 ```
 
+## Prepare PostgreSQL
+
+Flow supports PostgreSQL 14–18. Enable `wal_level = logical` and reserve enough
+`max_replication_slots` and `max_wal_senders` for Flow alongside existing
+replication. Each Flow source uses a permanent slot and may need one additional
+temporary slot during recovery. Server setting changes may require a restart;
+see [PostgreSQL's configuration guide](https://www.postgresql.org/docs/18/logical-replication-config.html).
+
+Use a login with `REPLICATION`, database `CONNECT`, schema `USAGE` and `SELECT`
+on each configured table. Configure database access in `pg_hba.conf` or the
+provider's equivalent. The login must also be able to execute the text overload
+of `pg_catalog.pg_logical_emit_message` for idle-source heartbeats. On PostgreSQL
+17–18 that function has arguments `(boolean, text, text, boolean)`; on 14–16 it
+has `(boolean, text, text)`. Managed services may expose replication privileges
+through provider-specific roles. See [PostgreSQL's privilege requirements](https://www.postgresql.org/docs/18/logical-replication-security.html).
+
+As the table owner or administrator, prepare the existing example table before
+running `init`:
+
+```sql
+-- public.orders must have the stable primary key described in flow.toml.
+ALTER TABLE public.orders REPLICA IDENTITY FULL;
+CREATE PUBLICATION embrasure_flow FOR TABLE public.orders
+  WITH (publish = 'insert, update, delete, truncate');
+```
+
+Include every configured source table in that publication. Flow validates the
+publication; it does not create or alter it. For PostgreSQL 18 stored generated
+columns, also set `publish_generated_columns = stored`; see the
+[type guide](postgres-types.md#generated-columns). Initial COPY requires full
+row visibility: a role subject to row-level security is rejected rather than
+silently copying a filtered snapshot. Have the administrator provide appropriate
+full-table access for the replication login.
+
 ## Configuration
 
-Copy `examples/flow.toml` and provide the PostgreSQL URL through its named environment variable. Storage and catalog credentials follow their standard credential providers. The configured column list defines the initial source schema. New nullable columns without a non-null backfill are discovered automatically; keep the original prefix in the configuration across restarts. Field IDs are stable destination identities, while PostgreSQL attribute identity is checked separately to detect drop-and-recreate changes.
+Copy `examples/flow.toml` to `flow.toml` and provide the PostgreSQL URL through its named environment variable. Storage and catalog credentials follow their standard credential providers. The configured column list defines the initial source schema; use the [type mappings](postgres-types.md) when filling it in. `primary_key` contains zero-based positions in that list. New nullable columns without a non-null backfill are discovered automatically; keep the original prefix in the configuration across restarts. Field IDs are stable destination identities, while PostgreSQL attribute identity is checked separately to detect drop-and-recreate changes.
 
-Mutable tables require a primary key and `REPLICA IDENTITY FULL`. Publications must include inserts, updates, deletes and truncates, with exactly the configured tables and no row filters. TRUNCATE causes capture to stop explicitly. Keyless tables are supported only in append-only mode.
+Configure the REST catalog URI, warehouse and object-store endpoint for your own
+services. Flow needs catalog access to load/create tables and commit snapshots,
+and object access to read, write, list and delete its files. Use a persistent,
+writable `state_dir`; do not share it between running Flow processes.
 
-An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values stop capture rather than publishing an incomplete row.
+`check` validates the configuration locally. It does not verify credentials,
+source permissions, publication membership or service connectivity; `init`
+performs those checks while initializing the pipeline.
+
+Mutable tables require a primary key and `REPLICA IDENTITY FULL`. Publications must include inserts, updates, deletes and truncates, with exactly the configured tables and no row filters. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
+
+An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values block the affected table rather than publishing an incomplete row.
 
 ```sh
 export FLOW_POSTGRES_URL='postgres://user:password@host/database?sslmode=require'
@@ -35,6 +78,21 @@ The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,c
 
 `status` reads an atomic status file without locking the index. It reports exact source watermarks, readiness, process identity and freshness while running or stopped. `state_dir/metrics.prom` supports a Prometheus textfile collector. See [observability](observability.md) for latency definitions, reader debt and the distinction between SDK operations and billed requests.
 
+## Common setup errors
+
+| Error or symptom | Action |
+| --- | --- |
+| Source connection environment variable is missing | Export the variable named by `source.connection_env` in the process running Flow. |
+| Publication not found or table membership differs | Create the named publication in the source database with exactly the configured tables and all four operation flags. |
+| Replica identity or primary-key validation fails | Set FULL replica identity and match the complete primary key in `primary_key`; keyless tables require append-only mode. |
+| Source column name or type differs | Match column order, names and the type mappings; check `column_selection` if intentionally excluding columns. |
+| Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. A successful `check` does not validate them. |
+| Source slot is missing, lost WAL, or source identity changed | Preserve local state and diagnose the source change. Restoring the slot name alone cannot recover missing changes; coordinated resynchronization is required. |
+
+Inspect `status`, `blocked_tables` and the structured process logs together.
+The [observability guide](observability.md) explains readiness and retryable table
+failures, including cases where healthy tables continue publishing.
+
 ## Recovery and operational limits
 
 `materialized` acknowledgement is the default. `journaled` mode requires an explicit declaration of independently durable storage. Selecting that mode does not replicate a local disk. Disk loss and a process crash are different failure models.
@@ -47,7 +105,7 @@ Current support boundaries:
 
 - Unpartitioned Iceberg v2 position deletes and v3 deletion vectors. Set `format_version = 3` on a table to create a v3 target; see [v3 configuration and compatibility](iceberg-v3.md). Partitioning remains planned work.
 - Mutable tables require a stable primary key and FULL replica identity. Keyless tables support append-only ingestion and equivalent external physical rewrites, including duplicate rows.
-- Automatic DDL supports nullable column additions without a non-null backfill. Unsupported type, key, identity or source-lineage changes fail closed. TRUNCATE is rejected.
+- Automatic DDL supports nullable column additions without a non-null backfill and compatible required-to-nullable changes. During streaming, classified table schema/row errors and TRUNCATE durably block that table. Healthy tables can continue within the journal/WAL budgets, but shared acknowledgement cannot pass an incomplete transaction. Source connection/slot/identity failures remain connection-wide. See [table isolation and recovery](table-publication-isolation.md).
 - Initial COPY uses up to four workers. Recovery needs capacity for one additional temporary replication slot. Transaction metadata and row payloads spill to disk; configured journal, spool, message and row-size budgets still apply.
 - Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor for process failures and startup failures. Local fault tests do not establish independent-host durability.
 - Compaction supports unsorted layouts. Z-order-aware compaction, distributed compaction protocols, HA and global autocompaction are outside the early release scope. External compactor reconciliation is included and tested with actual Spark maintenance.

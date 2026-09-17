@@ -72,6 +72,14 @@ columns = [
                 (SELECT string_agg(md5((i * 1000 + j)::text), '') FROM generate_series(1,100) j)
             FROM generate_series(1,128) i""")
         self.pg.execute("UPDATE orders SET doc=doc || jsonb_build_object('large', payload)")
+        # Keep SQL NULL, JSON null and the JSON string "null" distinct through
+        # COPY, CDC, restart and compaction, including top-level scalar values.
+        self.pg.execute("""UPDATE orders SET doc = CASE quantity % 6
+            WHEN 0 THEN NULL WHEN 1 THEN 'null'::jsonb WHEN 2 THEN '"null"'::jsonb
+            WHEN 3 THEN 'false'::jsonb WHEN 4 THEN '[]'::jsonb
+            ELSE '123456789012345678901234567890.123456789'::jsonb END
+            WHERE quantity <= 12""")
+        self.pg.execute("UPDATE orders SET json_raw=doc::json WHERE quantity <= 12")
         self.pg.execute("UPDATE orders SET domain_arrays=ARRAY[ARRAY[42,NULL]::int_list,NULL::int_list,ARRAY[]::int_list]")
         options = " WITH (publish_generated_columns = stored)" if self.generated else ""
         self.pg.execute(sql.SQL("CREATE PUBLICATION {} FOR TABLE orders" + options).format(sql.Identifier(self.name)))
@@ -119,7 +127,7 @@ columns = [
                 values = list(row)
                 for i, (name, _) in enumerate(self.columns):
                     if values[i] is not None and name in json_columns:
-                        values[i] = json.loads(values[i], parse_float=Decimal, parse_int=Decimal)
+                        values[i] = ("json", json.loads(values[i], parse_float=Decimal, parse_int=Decimal))
                     elif values[i] is not None and name == "amount":
                         values[i] = str(Decimal(values[i])) if values[i] in {"NaN", "Infinity", "-Infinity"} else Decimal(values[i])
                 result.append(values)
