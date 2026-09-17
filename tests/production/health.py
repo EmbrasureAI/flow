@@ -157,24 +157,37 @@ class HealthRun(Run):
             "pending_transactions = 32\ntable_workers = 1\ncheckpoint_interval_secs = 1\nretained_checkpoints = 2"))
         self.environment.update(FLOW_LOCAL_POSTGRES_URL=self.health.connection, RUST_LOG="info")
 
-    def blocked_health_cdc(self):
+    def worker_admission(self):
+        # Recovery and the first decoder/catalog use can exceed the health-query
+        # deadline on CI. Test worker admission without spending that deadline.
+        self.health.stall_health.clear()
         self.catalog_proxy.peak_posts = 0  # Initial COPY has its own worker budget.
         self.catalog_proxy.hold_commits()
         self.start()
         try:
-            self.until("WAL health query was not intercepted", lambda: self.health.active == 1, timeout=10)
             barrier = self.transaction([
-                "UPDATE orders SET payload='health-query-is-blocked' WHERE id <= 32",
+                "UPDATE orders SET payload='worker-admission' WHERE id <= 32",
                 "DELETE FROM orders WHERE id BETWEEN 40 AND 47",
                 "UPDATE orders SET id=id+100000 WHERE id BETWEEN 48 AND 55",
                 "INSERT INTO orders (id,tenant,payload) VALUES (9000,3,'new')",
                 "UPDATE accounts SET amount=amount+1 WHERE id <= 8",
             ])
-            assert self.catalog_proxy.commit_held.wait(timeout=2), "no table publication reached the catalog"
+            self.until("no table publication reached the catalog", self.catalog_proxy.commit_held.is_set)
             time.sleep(1)
             assert self.catalog_proxy.peak_posts == 1, "table_workers=1 admitted concurrent table publications"
         finally:
             self.catalog_proxy.release_commits.set()
+        self.wait_materialized(barrier)
+        result = self.compare("single-worker-admission")
+        result["peak_concurrent_table_posts"] = self.catalog_proxy.peak_posts
+        return result
+
+    def blocked_health_cdc(self):
+        # Warm capture and publication first, then measure a separate mutation
+        # strictly inside the first held query's unchanged five-second timeout.
+        self.health.stall_health.set()
+        self.until("WAL health query was not intercepted", lambda: self.health.active == 1, timeout=10)
+        barrier = self.transaction(["UPDATE accounts SET amount=amount+1 WHERE id=1"])
         # Status updates on every completion. Metrics can wait for the five-second
         # idle tick, which coincides with the injected query timeout.
         self.until("CDC did not finish before the stalled health query timed out",
@@ -239,7 +252,8 @@ class HealthRun(Run):
         try:
             self.phase("seed", self.seed)
             self.phase("initial-copy", self.initialize)
-            self.phase("cdc-and-worker-admission-during-stalled-health", self.blocked_health_cdc)
+            self.phase("single-worker-admission", self.worker_admission)
+            self.phase("cdc-during-stalled-health", self.blocked_health_cdc)
             self.phase("health-timeout-checkpoint-and-sigterm", self.timeout_checkpoint_shutdown)
             self.report["passed"] = True
         except BaseException as error:

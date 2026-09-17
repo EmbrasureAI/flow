@@ -115,7 +115,7 @@ impl SchemaRegistry {
                 }
                 Err(error) if known.is_some() && table_schema_error(&error) => {
                     let schema = known.expect("checked above");
-                    self.block(schema.table_id)?;
+                    self.block(schema.table_id, schema_block_reason(&error))?;
                     result.push(schema);
                 }
                 Err(error) => return Err(error),
@@ -213,7 +213,7 @@ impl SchemaRegistry {
         Ok(())
     }
 
-    pub(crate) fn block(&mut self, table: TableId) -> Result<()> {
+    pub(crate) fn block(&mut self, table: TableId, reason: &'static str) -> Result<()> {
         ensure!(
             self.bases.contains_key(&table),
             "unconfigured capture block"
@@ -229,6 +229,7 @@ impl SchemaRegistry {
             event = "source_table_blocked",
             table_id = table.0,
             error_code = "source_schema_incompatible",
+            reason,
             "source table requires schema repair or full resync"
         );
         Ok(())
@@ -407,7 +408,7 @@ impl SchemaRegistry {
                 if !table_schema_error(&error) {
                     return Err(error);
                 }
-                self.block(version.table_id)?;
+                self.block(version.table_id, schema_block_reason(&error))?;
                 self.block_decoder(version.table_id, assembler)?;
                 publish.retain(|record| record.schema.table_id != version.table_id);
             }
@@ -562,6 +563,31 @@ impl std::fmt::Display for SchemaChange {
     }
 }
 impl std::error::Error for SchemaChange {}
+
+/// Only static diagnostics may reach logs: row/value errors and outer contexts
+/// can contain source data, URLs or credentials.
+pub(crate) fn schema_block_reason(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(change) = cause.downcast_ref::<SchemaChange>() {
+            return change.0;
+        }
+        if let Some(error) = cause.downcast_ref::<flow_pg_source::Error>() {
+            return match error {
+                flow_pg_source::Error::Config(reason) => reason,
+                flow_pg_source::Error::ReplicaIdentity(_) => {
+                    "source requires REPLICA IDENTITY FULL"
+                }
+                flow_pg_source::Error::UnchangedToast(_) => {
+                    "source row has unresolved unchanged TOAST values"
+                }
+                flow_pg_source::Error::Row(_) => "source row does not match the selected schema",
+                flow_pg_source::Error::Value(_) => "source value cannot be decoded",
+                _ => "source schema validation failed",
+            };
+        }
+    }
+    "source schema validation failed"
+}
 
 /// Explicit source-table validation failures only. Shared storage, transport,
 /// corrupted proofs and unknown errors must never be turned into quarantine.
@@ -725,6 +751,28 @@ mod target_identity_tests {
         assert!(!table_schema_error(
             &flow_pg_source::Error::Protocol("malformed frame").into()
         ));
+    }
+
+    #[test]
+    fn block_diagnostics_explain_heap_rewrites_without_exposing_source_values() {
+        let rewrite = anyhow::Error::new(SchemaChange(
+            "source heap was rewritten; resynchronization is required",
+        ))
+        .context("private connection URL");
+        assert_eq!(
+            schema_block_reason(&rewrite),
+            "source heap was rewritten; resynchronization is required"
+        );
+        let value = anyhow::Error::new(flow_pg_source::Error::Value("secret row value".into()))
+            .context("private connection URL");
+        assert_eq!(
+            schema_block_reason(&value),
+            "source value cannot be decoded"
+        );
+        assert_eq!(
+            schema_block_reason(&anyhow::anyhow!("secret unknown error")),
+            "source schema validation failed"
+        );
     }
 
     #[tokio::test]

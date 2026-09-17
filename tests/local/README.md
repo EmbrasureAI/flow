@@ -123,3 +123,8 @@ later nullable addition. Renaming a selected column must block only that table,
 retain its changes, preserve healthy-table progress and hold the source ACK.
 The explicit-selection case checks that excluded values never enter the journal.
 Source-table blocks require explicit resynchronization; ordinary publication blocks still retry.
+
+`schema_isolation.py --heap-rewrite` covers excluded-column migration safety:
+adding without a default and backfilling with ordinary updates preserves capture;
+adding a volatile default rewrites the heap and durably fences only that table.
+It checks healthy-table progress, restart retention, and the safe diagnostic reason.
