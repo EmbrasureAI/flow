@@ -305,7 +305,7 @@ pub(crate) async fn capture_loop(
                                 if let SourceEvent::Truncate { xid, subxid, relations, cascade, restart_identity } = &event {
                                     for id in relations {
                                         let table = TableId(*id);
-                                        registry.block(table)?;
+                                        registry.block(table, "source table was truncated; resynchronization is required")?;
                                         registry.block_decoder(table, &mut assembler)?;
                                         assembler.quarantine(SourceEvent::Truncate { xid:*xid,subxid:*subxid,
                                             relations:vec![*id],cascade:*cascade,restart_identity:*restart_identity },
@@ -323,7 +323,7 @@ pub(crate) async fn capture_loop(
                                             Err(error) => {
                                                 let error = anyhow::Error::new(error);
                                                 if !crate::schema::table_schema_error(&error) { return Err(error); }
-                                                registry.block(id)?;
+                                                registry.block(id, crate::schema::schema_block_reason(&error))?;
                                                 SourceEvent::Relation(projector.quarantine_relation(relation))
                                             }
                                         }
@@ -333,7 +333,7 @@ pub(crate) async fn capture_loop(
                                         && let Err(error) = source_deadline(registry.observe_relation(&sql, projected_relation, &mut assembler)).await {
                                             if retryable_connection(&error) { break; }
                                             if !crate::schema::table_schema_error(&error) { return Err(error); }
-                                            registry.block(id)?;
+                                            registry.block(id, crate::schema::schema_block_reason(&error))?;
                                         }
                                     wire_relations.insert(relation.id, projected_relation.clone());
                                     if registry.is_blocked(id) {
@@ -380,7 +380,7 @@ pub(crate) async fn capture_loop(
                                     if let Some(id) = row_table
                                         && matches!(&error, flow_pg_source::Error::Row(_) | flow_pg_source::Error::Value(_)
                                             | flow_pg_source::Error::ReplicaIdentity(_) | flow_pg_source::Error::UnchangedToast(_)) {
-                                            registry.block(id)?;
+                                            registry.block(id, crate::schema::schema_block_reason(&error.into()))?;
                                             registry.block_decoder(id, &mut assembler)?;
                                             assembler.quarantine(retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?)?;
                                             continue;

@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import traceback
 
+from psycopg import sql
+
 from run import dump
 from table_isolation import IsolationRun
 
@@ -89,6 +91,40 @@ class SchemaRun(IsolationRun):
         return {"blocked": self.blocked(), "healthy_barrier": barrier,
                 "restart_preserved_block": True, "excluded_values_retained": False}
 
+    def heap_rewrite(self):
+        # Excluded additions must preserve capture when populated via normal DML.
+        filenode = self.pg.execute("SELECT pg_relation_filenode('orders')").fetchone()
+        self.pg.execute("ALTER TABLE orders ADD COLUMN excluded_generation uuid")
+        self.pg.execute("ALTER TABLE orders ALTER COLUMN excluded_generation SET DEFAULT gen_random_uuid()")
+        barrier = self.transaction(["UPDATE orders SET excluded_generation=gen_random_uuid()",
+                                    "ALTER TABLE orders ALTER COLUMN excluded_generation SET NOT NULL"])
+        assert self.pg.execute("SELECT pg_relation_filenode('orders')").fetchone() == filenode
+        self.wait_materialized(barrier)
+        columns = sql.SQL(", ").join(sql.Identifier(field["name"]) for field in self.fields())
+        expected = self.pg.execute(sql.SQL("SELECT {} FROM orders ORDER BY id").format(columns)).fetchall()
+        assert self.rows("orders") == expected
+        previous = self.rows("orders")
+        # PostgreSQL rewrites even an excluded column when its ADD default is volatile.
+        self.pg.execute("ALTER TABLE orders ADD COLUMN excluded_volatile uuid NOT NULL DEFAULT gen_random_uuid()")
+        assert self.pg.execute("SELECT pg_relation_filenode('orders')").fetchone() != filenode
+        barrier = self.transaction(["UPDATE orders SET payload='after-rewrite' WHERE id=1",
+                                    "UPDATE accounts SET amount=42 WHERE id=1"])
+        self.wait_blocked()
+        self.healthy(barrier)
+        self.check_ack(barrier)
+        assert self.rows("orders") == previous
+        self.stop(crash=True)
+        self.start()
+        self.wait_blocked()
+        barrier = self.transaction(["UPDATE accounts SET amount=43 WHERE id=1"])
+        self.healthy(barrier)
+        self.check_ack(barrier)
+        assert self.rows("orders") == previous
+        logs = "\n".join(p.read_text() for p in self.directory.glob("*.log"))
+        assert "source heap was rewritten; resynchronization is required" in logs
+        return {"blocked": self.blocked(), "healthy_barrier": barrier,
+                "rewrite_detected": True, "restart_preserved_block": True}
+
     def execute(self):
         try:
             self.phase("seed", self.seed)
@@ -98,8 +134,11 @@ class SchemaRun(IsolationRun):
             self.phase("initial-copy", self.initialize)
             self.start()
             self.phase("handoff", self.handoff)
-            self.phase("relax-nullability-and-restart", self.relax)
-            self.phase("schema-block-mixed-transactions-and-restart", self.isolate)
+            if self.args.heap_rewrite:
+                self.phase("excluded-column-heap-rewrite-and-restart", self.heap_rewrite)
+            else:
+                self.phase("relax-nullability-and-restart", self.relax)
+                self.phase("schema-block-mixed-transactions-and-restart", self.isolate)
             self.report["passed"] = True
         except BaseException as error:
             self.report.update(failure=str(error), traceback=traceback.format_exc())
@@ -122,7 +161,10 @@ if __name__ == "__main__":
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--explicit", action="store_true")
+    parser.add_argument("--heap-rewrite", action="store_true")
     parser.set_defaults(quota=False)
     args = parser.parse_args()
+    if args.heap_rewrite:
+        args.explicit = True
     SchemaRun(args).execute()
     print(f"PASS: {args.artifacts / 'report.json'}", flush=True)

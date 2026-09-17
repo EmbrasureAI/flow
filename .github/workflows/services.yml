@@ -147,6 +147,7 @@ jobs:
         run: |
           uv run tests/local/schema_isolation.py --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" --artifacts "$RUNNER_TEMP/service-schema-isolation"
           uv run tests/local/schema_isolation.py --explicit --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" --artifacts "$RUNNER_TEMP/service-schema-isolation-explicit"
+          uv run tests/local/schema_isolation.py --heap-rewrite --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" --artifacts "$RUNNER_TEMP/service-schema-isolation-heap-rewrite"
       - name: Schema, checkpoint and process lifecycle
         if: matrix.suite == 'compatibility'
         run: >-
