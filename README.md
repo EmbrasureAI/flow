@@ -109,8 +109,13 @@ See the [architecture](docs/architecture.md) and
 ## Support and status
 
 Mutable tables require a stable primary key and `REPLICA IDENTITY FULL`.
+JSON and JSONB replicate as normalized JSON text in both formats; native Iceberg
+Variant is not yet supported. See the [type mappings](docs/postgres-types.md).
 Automatic schema evolution supports nullable column additions without a non-null
-backfill. TRUNCATE and incompatible schema changes stop capture. Partitioning,
+backfill and compatible required-to-nullable changes. During streaming, TRUNCATE
+and classified incompatible schema changes block the affected table while healthy
+tables continue within journal and WAL limits; see [table isolation](docs/table-publication-isolation.md).
+Partitioning,
 cross-table query atomicity, HA, distributed compaction and Z-order compaction
 are not supported. Check [v3 reader compatibility](docs/iceberg-v3.md) and the
 [operating limits](docs/getting-started.md#recovery-and-operational-limits)

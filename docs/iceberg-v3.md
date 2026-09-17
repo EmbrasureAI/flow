@@ -57,6 +57,18 @@ Spark also verified row IDs and update sequences. Fixtures can be retained for
 other readers with `FLOW_V3_EXPORT=/absolute/output/path` when running the
 `flow-testkit` `v3_pipeline` test target.
 
+The Rust CI job exports those fixtures and runs the stock DuckDB check on every
+change. Reproduce the check locally with:
+
+```sh
+FLOW_V3_EXPORT="$PWD/target/v3-reader" cargo test --locked -p flow-testkit --test v3_pipeline
+uv run tests/local/v3_reader.py target/v3-reader
+```
+
+This checks user rows after cumulative deletes, compaction and a v2-to-v3
+upgrade; the Rust tests also check row lineage. The independent Spark lineage
+check above is recorded manual validation, not part of this CI job.
+
 The [v3 service benchmark](benchmarks/v3-deletion-vectors.md)
 adds six PostgreSQL/REST/MinIO runs with native background compaction, exact-row
 checks and external reconciliation. V3 sustained 10k mutations/s with subsecond

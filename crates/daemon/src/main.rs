@@ -19,7 +19,7 @@ use std::path::PathBuf;
 #[command(
     name = "embrasure-flow",
     version,
-    about = "PostgreSQL streaming materialization into ordinary Iceberg v2 tables"
+    about = "PostgreSQL streaming materialization into ordinary Iceberg v2/v3 tables"
 )]
 struct Cli {
     #[arg(long, default_value = "flow.toml", global = true)]

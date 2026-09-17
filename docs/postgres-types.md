@@ -7,6 +7,15 @@ claim of complete Fivetran feature parity.
 
 | PostgreSQL | Flow configuration / Iceberg output |
 | --- | --- |
+| `boolean` | `Bool`: Iceberg boolean |
+| `smallint`, `integer` | `Int32`: Iceberg int |
+| `bigint` | `Int64`: Iceberg long |
+| `real`, `double precision` | `Float64`: Iceberg double |
+| `text`, `varchar`, `char` | `String`: Iceberg string |
+| `bytea` | `Binary`: Iceberg binary |
+| `date` | `Date`: Iceberg date |
+| `timestamp without time zone` | `TimestampMicros`: Iceberg timestamp |
+| `timestamp with time zone` | `TimestampTzMicros`: Iceberg timestamptz, normalized to UTC |
 | `time without time zone` (any supported precision) | `String`: fixed `HH:MM:SS.ffffff`, including `24:00:00.000000` |
 | pgvector `vector` / `vector(n)` | `String`: JSON array of the exact stored float32 values |
 | UUID | `String`: canonical lowercase hyphenated UUID |
@@ -17,6 +26,12 @@ claim of complete Fivetran feature parity.
 | Unbounded numeric, precision above 38, negative scale, or scale above precision | `String`: exact normalized decimal text |
 | Bounded numeric with `0 <= scale <= precision <= 38` | `Decimal { precision, scale }`, or explicit `String` |
 | Stored generated columns on PostgreSQL 18+ | The generated value's ordinary mapping |
+
+JSON / JSONB uses Iceberg strings in both v2 and v3 tables. Native Iceberg
+Variant is not currently supported. Parse the JSON text in the query engine
+when accessing nested fields. Types outside these mappings are rejected;
+explicit column selection can exclude unsupported columns. PostgreSQL infinite
+dates and timestamps are also rejected.
 
 For example, a table with a UUID key, JSONB payload and unbounded amount uses:
 
@@ -42,8 +57,9 @@ nullable UUID columns inferred during schema evolution use strings.
 
 ## Value semantics
 
-* JSON is parsed with arbitrary-precision numbers. SQL NULL remains a missing
-  value; JSON `null` becomes the string `null`. Object key order and whitespace
+* JSON is parsed with arbitrary-precision numbers. SQL NULL remains an Iceberg
+  NULL; JSON `null` becomes the non-NULL string `null`, and JSON `"null"` retains
+  its JSON quotes. Object key order and whitespace
   normalize, and the last duplicate object key wins. JSONB already has PostgreSQL's
   normalized semantics. Large unchanged TOAST fields still use the validated FULL
   old tuple; the decoder never queries the source per row.

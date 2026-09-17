@@ -29,7 +29,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
       - run: cargo test --locked --workspace --all-targets
+        env:
+          FLOW_V3_EXPORT: ${{ runner.temp }}/flow-v3-reader
       - uses: astral-sh/setup-uv@v6
+      - name: Independent Iceberg v3 reader
+        run: uv run tests/local/v3_reader.py "$RUNNER_TEMP/flow-v3-reader"
       - name: Python fixture regressions
         run: >-
           uv run --with 'psycopg[binary]==3.3.5' --with 'duckdb==1.5.5'

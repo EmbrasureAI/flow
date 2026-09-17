@@ -112,8 +112,12 @@ pub(crate) async fn connect_owned(
     config: &Config,
     replication: bool,
 ) -> Result<(Client, ConnectionTask)> {
-    let url = std::env::var(&config.source.connection_env)
-        .context("source connection environment variable is missing")?;
+    let url = std::env::var(&config.source.connection_env).with_context(|| {
+        format!(
+            "source connection environment variable is missing: {}",
+            config.source.connection_env
+        )
+    })?;
     let mut pg: PgConfig = url
         .parse()
         .context("invalid PostgreSQL connection settings")?;

@@ -107,10 +107,12 @@ else:
 ''')
             docker.chmod(0o755)
             directory = root / "run"
+            # Allow Python/psycopg startup before the deadline so the test
+            # actually reaches the stalled Docker child on a busy host.
             result = subprocess.run([sys.executable, str(Path(__file__).with_name("wal_overhead.py")),
-                                     "--artifacts", str(directory), "--timeout", "1"],
+                                     "--artifacts", str(directory), "--timeout", "5"],
                                     env=os.environ | {"PATH": str(root) + os.pathsep + os.environ["PATH"]},
-                                    capture_output=True, text=True, timeout=8)
+                                    capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 124, result.stderr)
             pid = int((root / "create-pid").read_text())
             # The process group kill also removes the worker's blocked Docker child.
