@@ -666,3 +666,34 @@ backlog drain, which must still reach exact source/target equality and ACK.
 The fault proxies reuse HTTP connections for ordinary requests and close them
 on transport errors or deliberately lost responses. They never replay writes.
 S3 response bodies without safe length framing remain close-delimited.
+
+## Many-column and MiB-row recovery
+
+`wide_rows.py` complements the single-payload benchmark with independently
+variable column count and cell size. It compares every cell through DuckDB after
+initial COPY, complete CDC transactions with unchanged values and NULL changes,
+and a same-state SIGKILL/restart with key moves, deletes and writes while down.
+It also requires the original source identity and safe PostgreSQL acknowledgement.
+Comparison streams 32 rows at a time rather than retaining two complete wide
+tables in Python. These are finite correctness probes, not latency or endurance
+qualification; values are deterministic, compressible MD5 text.
+
+```sh
+uv run tests/production/wide_rows.py \
+  --catalog-uri http://127.0.0.1:58181 --s3-endpoint http://127.0.0.1:59000 \
+  --binary target/qualification-binaries/current/embrasure-flow \
+  --columns 256 --value-bytes 256 --rows 1000 \
+  --transactions 12 --transaction-rows 200 \
+  --artifacts target/wide-columns-01
+```
+
+Use a fresh artifact directory for each case. To probe the column-count boundary,
+use `--columns 1500 --value-bytes 1 --rows 1000`. To exercise approximately MiB
+rows, use `--columns 8 --value-bytes 131072 --rows 128 --transaction-rows 4`.
+Each table also has an ID and a version column. Nullable values make actual row
+width slightly smaller than `columns * value-bytes`. PostgreSQL's physical tuple
+limit also constrains combinations of column count and value size; a source-side
+insert rejection is not an ingestion result. The fixture uses the ordinary
+4 MiB chunk / 8 MiB batch budgets and the smoke fixture's smaller disk quotas.
+Run the production matrix separately for high-entropy 16 KiB payloads and measured
+throughput, and the fault suite for SIGKILL with proven unfinished journal work.

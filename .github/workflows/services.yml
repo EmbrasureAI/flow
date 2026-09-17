@@ -56,7 +56,7 @@ jobs:
   postgres:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ matrix.suite == 'periodic-single-worker' && 30 || 20 }}
+    timeout-minutes: ${{ matrix.suite == 'wide-rows' && 35 || matrix.suite == 'periodic-single-worker' && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +74,8 @@ jobs:
             suite: periodic-with-builds
           - postgres: '18.6'
             suite: readers
+          - postgres: '18.6'
+            suite: wide-rows
     env:
       COMPOSE_PROJECT_NAME: flow-ci
       COMPOSE_FILE: tests/production/compose.yaml
@@ -203,6 +205,18 @@ jobs:
               --unsafe-case "$unsafe_case" --artifacts "$RUNNER_TEMP/service-unsafe-${unsafe_case}" || unsafe_status=1
           done
           exit "$unsafe_status"
+      - name: Many-column and MiB-row COPY, CDC and restart
+        if: matrix.suite == 'wide-rows'
+        run: |
+          for dimensions in "256 256 1000 200" "1500 1 1000 200" "8 131072 128 4"; do
+            read -r columns value_bytes rows transaction_rows <<< "$dimensions"
+            uv run tests/production/wide_rows.py \
+              --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+              --binary target/debug/embrasure-flow --timeout 600 \
+              --columns "$columns" --value-bytes "$value_bytes" --rows "$rows" \
+              --transactions 12 --transaction-rows "$transaction_rows" \
+              --artifacts "$RUNNER_TEMP/service-wide-${columns}"
+          done
       - name: Hard reader debt and automatic external compactor recovery
         if: matrix.suite == 'lifecycle'
         run: >-
