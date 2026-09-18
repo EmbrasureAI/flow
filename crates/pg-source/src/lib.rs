@@ -47,6 +47,8 @@ pub enum Error {
     Unsupported(u8),
     #[error("table {0} requires REPLICA IDENTITY FULL for mutable replication")]
     ReplicaIdentity(u32),
+    #[error("{0}")]
+    DefaultIdentity(String),
     #[error(
         "table {0} contains an unchanged TOAST value; pause publication until a complete row image is available"
     )]

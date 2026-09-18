@@ -214,8 +214,8 @@ pub fn validate_schema_metadata(
             "committed source metadata no longer proves the decoded relation; schema migration or resynchronization is required",
         ));
     }
-    if !schema.append_only && metadata.relation.replica_identity != b'f' {
-        return Err(Error::ReplicaIdentity(wire.id));
+    if !schema.append_only {
+        metadata.relation.validate_mutable()?;
     }
     let actual_key: Vec<_> = metadata
         .relation

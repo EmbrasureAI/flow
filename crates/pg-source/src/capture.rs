@@ -344,13 +344,13 @@ impl CaptureAssembler {
                 if schema.append_only {
                     return Err(Error::Config("UPDATE on an append-only table"));
                 }
-                if old_is_key {
-                    return Err(Error::ReplicaIdentity(relation));
-                }
                 if row.iter().any(|cell| matches!(cell, Cell::UnchangedToast)) {
                     // pgoutput omits unchanged TOAST values from the new tuple,
                     // even with FULL identity. Its complete old tuple supplies
                     // those values without consulting mutable source state.
+                    if metadata.replica_identity != b'f' || old_is_key {
+                        return Err(Error::UnchangedToast(relation));
+                    }
                     let previous = old.as_ref().ok_or(Error::UnchangedToast(relation))?;
                     metadata.validate_row(previous)?;
                     if row.len() != previous.len() {
@@ -364,12 +364,7 @@ impl CaptureAssembler {
                 }
                 let row = decode_row_with_types(schema, metadata, &row, &self.types)?;
                 let old_key = if let Some(old) = old {
-                    schema.encode_key(&decode_row_with_types(
-                        schema,
-                        metadata,
-                        &old,
-                        &self.types,
-                    )?)?
+                    decode_key(schema, metadata, &old, &self.types)?
                 } else {
                     schema.encode_key(&row)?
                 };
@@ -385,21 +380,13 @@ impl CaptureAssembler {
                 subxid,
                 relation,
                 old,
-                old_is_key,
+                old_is_key: _,
             } => {
                 let (schema, metadata) = self.table(relation)?;
                 if schema.append_only {
                     return Err(Error::Config("DELETE on an append-only table"));
                 }
-                if old_is_key {
-                    return Err(Error::ReplicaIdentity(relation));
-                }
-                let key = schema.encode_key(&decode_row_with_types(
-                    schema,
-                    metadata,
-                    &old,
-                    &self.types,
-                )?)?;
+                let key = decode_key(schema, metadata, &old, &self.types)?;
                 let mutation = Mutation {
                     table_id: schema.table_id,
                     schema_version: schema.version,
@@ -600,6 +587,40 @@ impl CaptureAssembler {
 
 pub(crate) fn validate_relation(schema: &TableSchema, relation: &Relation) -> Result<()> {
     crate::TypeRegistry::default().validate_relation(schema, relation)
+}
+
+/// pgoutput key tuples retain relation positions, with NULL placeholders for
+/// non-key columns. Decode only actual primary-key fields, in configured order.
+fn decode_key(
+    schema: &TableSchema,
+    relation: &Relation,
+    tuple: &Tuple,
+    types: &crate::TypeRegistry,
+) -> Result<flow_model::PrimaryKey> {
+    if tuple.len() != relation.columns.len() {
+        return Err(Error::Protocol(
+            "key tuple column count differs from relation",
+        ));
+    }
+    let mut key_schema = schema.clone();
+    key_schema.columns = schema
+        .primary_key
+        .iter()
+        .map(|&i| schema.columns[i].clone())
+        .collect();
+    key_schema.primary_key = (0..key_schema.columns.len()).collect();
+    let mut values = Vec::with_capacity(schema.primary_key.len());
+    for &index in &schema.primary_key {
+        let column = &schema.columns[index];
+        let pg = &relation.columns[index];
+        values.push(match &tuple[index] {
+            Cell::Null => return Err(Error::Protocol("NULL primary key in old tuple")),
+            Cell::UnchangedToast => return Err(Error::UnchangedToast(relation.id)),
+            Cell::Text(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, false)?,
+            Cell::Binary(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, true)?,
+        });
+    }
+    Ok(key_schema.encode_key(&values)?)
 }
 
 pub fn decode_row(schema: &TableSchema, relation: &Relation, tuple: &Tuple) -> Result<Row> {
