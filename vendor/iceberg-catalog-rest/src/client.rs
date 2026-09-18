@@ -26,8 +26,8 @@ use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
+use crate::types::TokenResponse;
 use crate::RestCatalogConfig;
-use crate::types::{ErrorResponse, TokenResponse};
 
 pub(crate) struct HttpClient {
     client: Client,
@@ -149,32 +149,25 @@ impl HttpClient {
             let text = response_bytes(auth_resp)
                 .await
                 .map_err(|err| err.with_url(auth_url.clone()))?;
-            Ok(serde_json::from_slice(&text).map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to parse response from rest catalog server!",
-                )
-                .with_context("operation", "auth")
-                .with_context("url", auth_url.to_string())
-                .with_context("json", String::from_utf8_lossy(&text))
-                .with_source(e)
+            Ok(parse_response_json(&text).map_err(|error| {
+                error
+                    .with_context("operation", "auth")
+                    .with_context("url", auth_url.to_string())
             })?)
         } else {
             let code = auth_resp.status();
             let retryable = retryable_status(code);
-            let text = response_bytes(auth_resp)
+            // Consume the body for transport accounting, but never put OAuth
+            // response text (including server error messages) into diagnostics.
+            let _ = response_bytes(auth_resp)
                 .await
                 .map_err(|err| err.with_url(auth_url.clone()))?;
-            let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Received unexpected response")
+            Err(
+                Error::new(ErrorKind::Unexpected, "OAuth token request failed")
                     .with_retryable(retryable)
                     .with_context("code", code.to_string())
-                    .with_context("operation", "auth")
-                    .with_context("url", auth_url.to_string())
-                    .with_context("json", String::from_utf8_lossy(&text))
-                    .with_source(e)
-            })?;
-            Err(Error::from(e).with_retryable(retryable))
+                    .with_context("operation", "auth"),
+            )
         }?;
         Ok(auth_res.access_token)
     }
@@ -296,14 +289,20 @@ pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
     response: Response,
 ) -> Result<R> {
     let bytes = response_bytes(response).await?;
+    parse_response_json(&bytes)
+}
 
-    serde_json::from_slice::<R>(&bytes).map_err(|e| {
+fn parse_response_json<R: DeserializeOwned>(bytes: &[u8]) -> Result<R> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        // serde errors can themselves quote input values. Keep only structural
+        // diagnostics, without either the response body or the original source.
         Error::new(
             ErrorKind::Unexpected,
             "Failed to parse response from rest catalog server",
         )
-        .with_context("json", String::from_utf8_lossy(&bytes))
-        .with_source(e)
+        .with_context("category", format!("{:?}", error.classify()))
+        .with_context("line", error.line().to_string())
+        .with_context("column", error.column().to_string())
     })
 }
 
@@ -378,10 +377,7 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
         Err(err) => return err.into(),
     };
 
-    if bytes.is_empty() {
-        return err;
-    }
-    err.with_context("json", String::from_utf8_lossy(&bytes))
+    err.with_context("response_bytes", bytes.len().to_string())
 }
 
 #[cfg(test)]

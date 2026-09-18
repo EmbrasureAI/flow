@@ -142,11 +142,52 @@ impl Default for Limits {
 }
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let config: Self =
-            toml::from_str(&std::fs::read_to_string(path).context("read configuration")?)
-                .context("parse configuration")?;
+        let input = std::fs::read_to_string(path).context("read configuration")?;
+        let config: Self = toml::from_str(&input).map_err(|error: toml::de::Error| {
+            // Both source excerpts and serde messages can contain secret values.
+            // Retain the location without chaining the original error.
+            let offset = error.span().map_or(0, |span| span.start).min(input.len());
+            let prefix = &input[..input.floor_char_boundary(offset)];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let column = prefix
+                .rsplit('\n')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .count()
+                + 1;
+            anyhow::anyhow!("invalid configuration at line {line}, column {column}")
+        })?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Resolve catalog secrets only when connecting, not during `check` or `status`.
+    pub fn catalog_properties(&self) -> Result<HashMap<String, String>> {
+        self.resolve_catalog_properties(|name| std::env::var(name).ok())
+    }
+
+    fn resolve_catalog_properties(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<HashMap<String, String>> {
+        let mut properties = self.catalog.clone();
+        for key in ["token", "credential"] {
+            if let Some(name) = properties.remove(&format!("{key}_env")) {
+                // EnvVarError::NotUnicode can include the secret in its Debug output.
+                let value = lookup(&name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "catalog.{key}_env must name a set, Unicode environment variable"
+                    )
+                })?;
+                ensure!(
+                    !value.is_empty(),
+                    "catalog.{key}_env resolved to an empty value"
+                );
+                properties.insert(key.to_owned(), value);
+            }
+        }
+        Ok(properties)
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -162,6 +203,18 @@ impl Config {
             "journaled acknowledgement requires independently durable storage"
         );
         ensure!(self.catalog.contains_key("uri"), "catalog.uri is required");
+        for key in ["token", "credential"] {
+            if let Some(name) = self.catalog.get(&format!("{key}_env")) {
+                ensure!(
+                    !self.catalog.contains_key(key),
+                    "configure only one of catalog.{key} and catalog.{key}_env"
+                );
+                ensure!(
+                    !name.is_empty() && !name.contains(['=', '\0']),
+                    "catalog.{key}_env must be an environment variable name"
+                );
+            }
+        }
         self.compaction.validate()?;
         self.parquet_read.validate()?;
         let l = &self.limits;
@@ -247,6 +300,47 @@ mod tests {
 
     fn valid_config() -> Config {
         toml::from_str(include_str!("../../../examples/flow.toml")).unwrap()
+    }
+
+    #[test]
+    fn catalog_secret_references_resolve_without_changing_literal_properties() {
+        let mut config = valid_config();
+        let original = config.catalog.clone();
+        assert_eq!(
+            config
+                .resolve_catalog_properties(|_| unreachable!())
+                .unwrap(),
+            original
+        );
+        for key in ["token", "credential"] {
+            config
+                .catalog
+                .insert(format!("{key}_env"), format!("FLOW_{key}"));
+        }
+        config.validate().unwrap();
+        let resolved = config
+            .resolve_catalog_properties(|name| match name {
+                "FLOW_token" => Some("test-token".into()),
+                "FLOW_credential" => Some("client:test-secret".into()),
+                _ => unreachable!(),
+            })
+            .unwrap();
+        let mut expected = original;
+        expected.insert("token".into(), "test-token".into());
+        expected.insert("credential".into(), "client:test-secret".into());
+        assert_eq!(resolved, expected);
+        assert!(config.catalog.contains_key("token_env"));
+        for key in ["token", "credential"] {
+            config.catalog.insert(key.into(), "test-secret".into());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("configure only one")
+            );
+            config.catalog.remove(key);
+        }
     }
 
     #[test]
