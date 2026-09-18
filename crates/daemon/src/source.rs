@@ -129,7 +129,7 @@ pub(crate) async fn connect_owned(
     // The same admission cap protects binary COPY workers before allocation.
     pg.max_backend_message_bytes(config.limits.source_message_bytes.saturating_add(25));
     pg.connect_timeout(Duration::from_secs(10));
-    let tls = postgres_native_tls::MakeTlsConnector::new(native_tls::TlsConnector::new()?);
+    let tls = postgres_native_tls::MakeTlsConnector::new(crate::source_tls::connector(&pg)?);
     let (client, connection) = tokio::time::timeout(Duration::from_secs(30), pg.connect(tls))
         .await
         .context("PostgreSQL connection timed out")?

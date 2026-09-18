@@ -10,6 +10,7 @@ mod runtime;
 mod schema;
 mod services;
 mod source;
+mod source_tls;
 mod storage_observer;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
