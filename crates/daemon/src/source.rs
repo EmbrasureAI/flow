@@ -379,7 +379,7 @@ pub(crate) async fn capture_loop(
                                 if let Err(error) = assembler.push_buffered_at(event, source.received_lsn, &mut journal) {
                                     if let Some(id) = row_table
                                         && matches!(&error, flow_pg_source::Error::Row(_) | flow_pg_source::Error::Value(_)
-                                            | flow_pg_source::Error::ReplicaIdentity(_) | flow_pg_source::Error::UnchangedToast(_)) {
+                                            | flow_pg_source::Error::ReplicaIdentity(_) | flow_pg_source::Error::DefaultIdentity(_) | flow_pg_source::Error::UnchangedToast(_)) {
                                             registry.block(id, crate::schema::schema_block_reason(&error.into()))?;
                                             registry.block_decoder(id, &mut assembler)?;
                                             assembler.quarantine(retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?)?;

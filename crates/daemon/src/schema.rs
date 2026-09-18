@@ -213,7 +213,7 @@ impl SchemaRegistry {
         Ok(())
     }
 
-    pub(crate) fn block(&mut self, table: TableId, reason: &'static str) -> Result<()> {
+    pub(crate) fn block(&mut self, table: TableId, reason: &str) -> Result<()> {
         ensure!(
             self.bases.contains_key(&table),
             "unconfigured capture block"
@@ -564,9 +564,10 @@ impl std::fmt::Display for SchemaChange {
 }
 impl std::error::Error for SchemaChange {}
 
-/// Only static diagnostics may reach logs: row/value errors and outer contexts
-/// can contain source data, URLs or credentials.
-pub(crate) fn schema_block_reason(error: &anyhow::Error) -> &'static str {
+/// Only vetted schema diagnostics may reach logs. DEFAULT eligibility names
+/// columns, but row/value errors and outer contexts may contain source data,
+/// URLs or credentials and must keep their static summaries.
+pub(crate) fn schema_block_reason(error: &anyhow::Error) -> &str {
     for cause in error.chain() {
         if let Some(change) = cause.downcast_ref::<SchemaChange>() {
             return change.0;
@@ -574,6 +575,7 @@ pub(crate) fn schema_block_reason(error: &anyhow::Error) -> &'static str {
         if let Some(error) = cause.downcast_ref::<flow_pg_source::Error>() {
             return match error {
                 flow_pg_source::Error::Config(reason) => reason,
+                flow_pg_source::Error::DefaultIdentity(reason) => reason,
                 flow_pg_source::Error::ReplicaIdentity(_) => {
                     "source requires REPLICA IDENTITY FULL"
                 }
@@ -599,6 +601,7 @@ pub(crate) fn table_schema_error(error: &anyhow::Error) -> bool {
                 Some(
                     flow_pg_source::Error::Config(_)
                         | flow_pg_source::Error::ReplicaIdentity(_)
+                        | flow_pg_source::Error::DefaultIdentity(_)
                         | flow_pg_source::Error::UnchangedToast(_)
                         | flow_pg_source::Error::Value(_)
                         | flow_pg_source::Error::Row(_)

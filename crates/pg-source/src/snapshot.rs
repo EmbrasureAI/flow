@@ -42,7 +42,7 @@ pub async fn preflight_table(
             "mutable replicated tables require a primary key",
         ));
     }
-    if mutable && replica_identity != b'f' {
+    if mutable && !matches!(replica_identity, b'f' | b'd') {
         return Err(Error::ReplicaIdentity(relation_oid));
     }
     Ok(TablePreflight {

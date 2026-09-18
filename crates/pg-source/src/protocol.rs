@@ -34,7 +34,9 @@ impl Relation {
         crate::capture::validate_relation(schema, self)
     }
     pub fn validate_mutable(&self) -> Result<()> {
-        if self.replica_identity != b'f' {
+        if self.replica_identity != b'f'
+            && !(self.replica_identity == b'd' && self.columns.iter().any(|column| column.identity))
+        {
             return Err(Error::ReplicaIdentity(self.id));
         }
         Ok(())
