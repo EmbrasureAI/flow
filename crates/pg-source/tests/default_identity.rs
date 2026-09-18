@@ -259,7 +259,7 @@ fn default_never_repairs_unchanged_toast_from_key_null_placeholders() {
 #[test]
 fn default_eligibility_rejects_variable_width_and_other_identities() {
     let (mut schema, mut relation) = fixture();
-    for identity in [b'n', b'i'] {
+    for identity in *b"ni" {
         relation.replica_identity = identity;
         assert!(relation.validate_schema(&schema).is_err());
     }
