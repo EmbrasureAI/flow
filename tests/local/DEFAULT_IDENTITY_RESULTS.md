@@ -1,5 +1,38 @@
 # DEFAULT CDC qualification results
 
+## Review follow-up: deterministic pending-batch interruption
+
+The original crash case did not prove work remained unapplied at SIGKILL. It is
+now gated by the existing real-catalog proxy before an `orders` ingest commit
+reaches Iceberg. The production engine is unchanged; both engine repositories
+have the strengthened harness and Docker test-layer dependency.
+
+The complete production-image qualification was rerun successfully at
+`/tmp/flow-default-pk-e2e-05` (both mutation/recovery and identity-change cases).
+Immediately before the verified SIGKILL:
+
+- Batch lower-bound LSN: **32,610,152**.
+- Post-commit WAL fence: **32,610,272**.
+- Durable journal LSN: **32,610,320**.
+- Materialized and source-confirmed LSN: **29,936,760**.
+- Pending transactions: **2**; exact `orders` rows still matched their pre-batch values.
+
+After SIGKILL, the gate released the same prepared request to the real catalog,
+which returned HTTP 200. Restart recovered it exactly once, with exact rows
+matching PostgreSQL. Both materialized and source-confirmed checkpoints reached
+**32,746,400**, beyond the original batch fence. Only then did the
+separate WAL-backlog case run using its distinct LSN **33,260,512**.
+
+Evidence: `run/pending-before-sigkill.json`, `run/catalog-proxy.jsonl`, and
+`run/report.json` under that artifact directory. The held operation ID was
+`87ab2552fc4712605094a11130b52b779ebc93c4d1fdc1705d1a597d29045d15`. All fixture services were cleaned up.
+
+Test image: `sha256:67d3a32afedc66076db50b7be108fd45a1d2f1e1a43df70761b199a69cc9f9cf`.
+Executed binary: `f8c0b8714ddf2fdcfe9f895f46c0534b942067fe0376409784e6499ac417af4e`,
+still from pinned engine source `63e0a092d931e8142c324343d04adc6afb956807`.
+The earlier `-04` attempt stopped because the internal harness lacks the public
+harness's marker helper; the test now emits its own explicit WAL fence.
+
 Local qualification completed 2026-09-17 (America/Los_Angeles).
 
 ## Implementation and branches

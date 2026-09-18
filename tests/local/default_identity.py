@@ -1,6 +1,8 @@
 """Production-image DEFAULT identity qualification; invoked by default_identity.sh."""
 import json
 import os
+import signal
+import sys
 from pathlib import Path
 import subprocess
 import time
@@ -10,8 +12,18 @@ from types import SimpleNamespace
 from run import Run, dump, lsn
 from src.services.warehouse_ingestion_runtime import _cdc_preflight_report
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'production'))
+from proxy import CatalogProxy
+
 
 class DefaultRun(Run):
+    def __init__(self, args):
+        super().__init__(args)
+        self.proxy = CatalogProxy(args.catalog_uri, self.directory / 'catalog-proxy.jsonl')
+        # Only daemon requests use the gate. Row assertions read the real catalog.
+        self.config.write_text(self.config.read_text().replace(
+            f'uri = {json.dumps(args.catalog_uri)}', f'uri = {json.dumps(self.proxy.url)}'))
+
     def configure(self):
         super().configure()
         text = self.config.read_text().split('[[tables]]')[0]
@@ -118,20 +130,71 @@ class DefaultRun(Run):
         return self.compare('mutations-rollback')
 
     def restart(self):
-        # Kill during an outstanding committed CDC batch; durable state stays mounted.
-        barrier = self.transaction(['UPDATE orders SET body=body+1000',
-                                    'UPDATE accounts SET id=id+100', 'UPDATE projected SET body=88'])
+        def source_fence():
+            return lsn(self.pg.execute(
+                "SELECT pg_logical_emit_message(true, 'flow-crash-barrier', '')::text"
+            ).fetchone()[0])
+        self.wait_materialized(source_fence())
+        before_rows = self.rows('orders')
+        offset = len(self.proxy.events)
+        self.proxy.hold_commits(table='orders')
+        try:
+            batch_lsn = self.transaction(['UPDATE orders SET body=body+1000',
+                                         'UPDATE accounts SET id=id+100', 'UPDATE projected SET body=88'])
+            batch_fence = source_fence()
+            self.until('no prepared orders commit reached the catalog gate', self.proxy.commit_held.is_set)
+            # Prove this committed batch is durably captured, but not applied.
+            def captured():
+                metrics = self.metrics()
+                return metrics if metrics.get('flow_journal_durable_lsn', 0) >= batch_fence else None
+            pending = self.until('held batch was not durably captured', captured)
+            confirmed = lsn(self.pg.execute(
+                'SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s',
+                (self.name,)).fetchone()[0])
+            assert pending['flow_materialized_lsn'] < batch_lsn
+            assert pending['flow_pending_transactions'] > 0
+            assert confirmed < batch_lsn
+            assert self.rows('orders') == before_rows, 'held batch already changed Iceberg rows'
+            evidence = {'batch_lsn': batch_lsn, 'batch_fence': batch_fence,
+                        'journal_durable_lsn': pending['flow_journal_durable_lsn'],
+                        'materialized_lsn': pending['flow_materialized_lsn'],
+                        'confirmed_lsn': confirmed, 'pending_transactions': pending['flow_pending_transactions']}
+            dump(self.directory / 'pending-before-sigkill.json', evidence)
+            process = self.process
+            self.stop(crash=True)
+            assert process.returncode == -signal.SIGKILL
+        finally:
+            # The real catalog may commit after the caller dies. Recovery must
+            # recognize that same prepared operation rather than duplicate it.
+            self.proxy.release_commits.set()
+        completed = self.until('held commit did not complete after SIGKILL', lambda: [
+            event for event in self.proxy.events[offset:] if event.get('held_before_upstream')
+            and 200 <= event.get('upstream_status', 0) < 300])
+        assert len(completed) == 1 and completed[0].get('operation_id')
+        self.start()
+        recovered = self.wait_materialized(batch_fence)
+        first_rows = self.compare('interrupted-batch-recovery')
+        snapshots = self.table('orders')['metadata']['snapshots']
+        assert sum(s['summary'].get('flow.operation-id') == completed[0]['operation_id']
+                   for s in snapshots) == 1, 'recovery duplicated the prepared commit'
+        def acknowledged():
+            value = lsn(self.pg.execute(
+                'SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s',
+                (self.name,)).fetchone()[0])
+            return value if value >= batch_fence else None
+        recovered_ack = self.until('source ACK did not advance after recovery', acknowledged)
+        assert recovered['flow_materialized_lsn'] > evidence['materialized_lsn']
+        # Keep the separate WAL-backlog restart case, with its own LSN.
         self.stop(crash=True)
-        confirmed = lsn(self.pg.execute('SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s', (self.name,)).fetchone()[0])
-        barrier = self.transaction(['DELETE FROM orders WHERE id%11=0',
-                                   'UPDATE orders SET id=id+50000 WHERE id%5=0',
-                                   'INSERT INTO orders VALUES (1,700,90000)'])
-        self.start(); self.wait_materialized(barrier)
-        result = self.compare('crash-recovery')
-        # A second restart replays the persisted identity/checkpoint state.
-        self.stop(crash=True); self.start(); self.wait_materialized(0)
-        self.compare('second-restart')
-        return {'slot_before_recovery':confirmed, 'rows':result}
+        backlog_lsn = self.transaction(['DELETE FROM orders WHERE id%11=0',
+                                       'UPDATE orders SET id=id+50000 WHERE id%5=0',
+                                       'INSERT INTO orders VALUES (1,700,90000)'])
+        self.start(); self.wait_materialized(backlog_lsn)
+        result = self.compare('backlog-recovery')
+        return {'pending_before_kill': evidence, 'held_commit': completed[0],
+                'recovered_materialized_lsn': recovered['flow_materialized_lsn'],
+                'recovered_confirmed_lsn': recovered_ack, 'interrupted_batch_rows': first_rows,
+                'backlog_lsn': backlog_lsn, 'rows': result}
 
     def schema_change(self):
         self.pg.execute('ALTER TABLE orders ADD COLUMN extra integer')
@@ -201,7 +264,7 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
             self.report.update(failure=str(error),traceback=traceback.format_exc())
             raise
         finally:
-            self.stop(); dump(self.directory/'report.json',self.report)
+            self.stop(); self.proxy.close(); dump(self.directory/'report.json',self.report)
             self.pg.close(); self.duck.close()
 
 

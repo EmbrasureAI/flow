@@ -63,3 +63,19 @@ transactions, rollback, NULL, projection excluding a large TOAST value, FULL
 with externally stored values, two SIGKILL/recovery cycles, nullable fixed-column
 addition, unsafe DEFAULT rejection, and checkpoint pinning on unsupported DDL.
 The harness records failure rather than treating job/log success as row proof.
+
+### Deterministic interrupted-batch recovery
+
+The crash case gates an actual `orders` ingestion commit in the existing catalog
+proxy before forwarding it to Iceberg. Before SIGKILL it asserts that the batch's
+post-commit WAL fence is durably captured, transactions remain pending, exact
+`orders` rows are unchanged, and both materialized and source-confirmed LSNs are
+below the batch. `pending-before-sigkill.json` records that evidence.
+
+Only after confirming SIGKILL does the fixture release the held request. The
+real catalog commits after the caller's death; restart must recover the same
+prepared operation exactly once. The test checks exact rows and advancement of
+both materialized and source-confirmed checkpoints beyond the original batch
+fence before starting the separate WAL-backlog case. Batch and backlog LSNs are
+retained separately in `report.json`; `catalog-proxy.jsonl` records the held
+operation and actual upstream result.
