@@ -1,5 +1,6 @@
 /target/
 /data/
+/flow.toml
 *.profraw
 .DS_Store
 .env

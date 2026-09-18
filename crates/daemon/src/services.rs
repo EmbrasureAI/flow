@@ -44,7 +44,7 @@ pub(crate) async fn catalog(config: &Config) -> Result<Arc<dyn Catalog>> {
             .with_storage_factory(crate::storage_observer::observe(Arc::new(
                 OpenDalResolvingStorageFactory::new(),
             )))
-            .load("destination", config.catalog.clone())
+            .load("destination", config.catalog_properties()?)
             .await?,
     ))
 }

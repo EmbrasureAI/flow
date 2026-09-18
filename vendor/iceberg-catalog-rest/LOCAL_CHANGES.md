@@ -23,6 +23,13 @@ property, and unrelated properties are preserved. HTTP request regression cases
 cover default v2, explicit v3, and a conflicting property. This correction changes
 `src/catalog.rs` and `README.md`.
 
+Response diagnostics omit OAuth and catalog response bodies, which can contain
+tokens or vended storage credentials. JSON decoding errors retain only category,
+line and column, since serde's original message can also quote secret values.
+OAuth failure status continues to determine retryability without logging the
+server's free-form error message. Workspace daemon HTTP regressions cover these
+paths through the public catalog API. This correction changes `src/client.rs`.
+
 From an extracted crate, apply these repository patches in order (use absolute
 patch paths):
 
@@ -30,6 +37,7 @@ patch paths):
 patch -p1 < docs/patches/iceberg-rest-retryable-status.patch
 patch -p3 < docs/patches/iceberg-rest-observability.patch
 patch -p3 < docs/patches/iceberg-rest-format-version.patch
+patch -p3 < docs/patches/iceberg-rest-response-redaction.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is

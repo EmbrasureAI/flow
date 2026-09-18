@@ -51,7 +51,32 @@ full-table access for the replication login.
 
 ## Configuration
 
-Copy `examples/flow.toml` to `flow.toml` and provide the PostgreSQL URL through its named environment variable. Storage and catalog credentials follow their standard credential providers. The configured column list defines the initial source schema; use the [type mappings](postgres-types.md) when filling it in. `primary_key` contains zero-based positions in that list. New nullable columns without a non-null backfill are discovered automatically; keep the original prefix in the configuration across restarts. Field IDs are stable destination identities, while PostgreSQL attribute identity is checked separately to detect drop-and-recreate changes.
+Copy `examples/flow.toml` to `flow.toml` (ignored by Git) and provide the PostgreSQL URL through its named environment variable. Object-storage credentials use the standard storage credential chain or catalog-vended credentials. For REST catalog authentication, configure environment-variable names under `[catalog]`:
+
+```toml
+[catalog]
+uri = "https://catalog.example.com"
+token_env = "FLOW_CATALOG_TOKEN"
+# Alternatively, use OAuth client credentials:
+# credential_env = "FLOW_CATALOG_CREDENTIAL"
+```
+
+Set the named variable in the Flow process environment through your shell,
+container or secret manager. `token_env` supplies a bearer token;
+`credential_env` supplies `client_id:client_secret` (or a client secret alone,
+if the catalog supports it). Flow does not load `.env` files automatically.
+Missing, empty or non-Unicode values fail when connecting. `check` and `status`
+do not resolve these secrets. Restart Flow to use changed environment values.
+Existing literal `token` and `credential` properties remain supported, but do
+not set a literal property and its corresponding `_env` reference together.
+If both token and OAuth credentials are supplied, the token takes precedence.
+
+Configuration parse errors report a location without source excerpts or input
+values. Catalog errors similarly omit response bodies, including OAuth error
+descriptions; use the HTTP status and server-side diagnostics when investigating
+an authentication failure.
+
+The configured column list defines the initial source schema; use the [type mappings](postgres-types.md) when filling it in. `primary_key` contains zero-based positions in that list. New nullable columns without a non-null backfill are discovered automatically; keep the original prefix in the configuration across restarts. Field IDs are stable destination identities, while PostgreSQL attribute identity is checked separately to detect drop-and-recreate changes.
 
 Configure the REST catalog URI, warehouse and object-store endpoint for your own
 services. Flow needs catalog access to load/create tables and commit snapshots,

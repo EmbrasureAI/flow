@@ -409,6 +409,116 @@ mod rest_tests {
         assert!(!text.contains("private-") && !text.contains(&address.to_string()));
     }
     #[tokio::test]
+    async fn rest_response_errors_omit_secrets_even_from_serde_messages() {
+        for (oauth, status, body, transient) in [
+            (
+                true,
+                "200 OK",
+                r#"{"access_token":"FAKE_RESPONSE_SECRET"}"#,
+                false,
+            ),
+            (
+                true,
+                "200 OK",
+                r#"{"access_token":"token","token_type":"bearer","expires_in":"FAKE_RESPONSE_SECRET"}"#,
+                false,
+            ),
+            (
+                true,
+                "400 Bad Request",
+                r#"{"error":{"message":"FAKE_RESPONSE_SECRET","type":"BadRequest","code":400}}"#,
+                false,
+            ),
+            (
+                false,
+                "200 OK",
+                r#"{"defaults":{"token":"FAKE_RESPONSE_SECRET"},"overrides":[]}"#,
+                false,
+            ),
+            (
+                false,
+                "200 OK",
+                r#"{"defaults":"FAKE_RESPONSE_SECRET","overrides":{}}"#,
+                false,
+            ),
+            (
+                false,
+                "503 Service Unavailable",
+                "<html>FAKE_RESPONSE_SECRET</html>",
+                true,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0 && request.len() < 16384);
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with(if oauth {
+                    "POST /v1/oauth/tokens "
+                } else {
+                    "GET /v1/config "
+                }));
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let mut properties = HashMap::from([("uri".into(), format!("http://{address}"))]);
+            if oauth {
+                properties.insert("credential".into(), "client:secret".into());
+            }
+            let catalog = RestCatalogBuilder::default()
+                .with_client(
+                    reqwest::Client::builder()
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .unwrap(),
+                )
+                .load("test", properties)
+                .await
+                .unwrap();
+            let error = catalog.list_namespaces(None).await.unwrap_err();
+            let diagnostics = format!("{error:?}\n{error:#}");
+            assert!(
+                !diagnostics.contains("FAKE_RESPONSE_SECRET"),
+                "{diagnostics}"
+            );
+            if status == "200 OK" {
+                assert!(
+                    diagnostics.contains("line") && diagnostics.contains("column"),
+                    "{diagnostics}"
+                );
+            } else {
+                assert!(diagnostics.contains(status), "{diagnostics}");
+            }
+            assert_eq!(
+                crate::retry::transient(&anyhow::Error::new(error)),
+                transient
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn oauth_transient_status_survives_json_and_proxy_errors() {
         for (status, body, transient) in [
             (
