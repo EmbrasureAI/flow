@@ -697,14 +697,16 @@ pub(crate) async fn validate_publication_membership(
         config,
         true,
         async {
-            // The health connection reconnects independently of capture, so
-            // attribute every answer, not only a violation, to this source.
-            verify_sql_source(client, config).await?;
-            confirmed(&mut LiveContract {
-                client,
+            let identity = sql_identity(client).await?;
+            attributed(
                 config,
-                schemas,
-            })
+                identity,
+                &mut LiveContract {
+                    client,
+                    config,
+                    schemas,
+                },
+            )
             .await
         },
         verify_source(config),
@@ -712,21 +714,68 @@ pub(crate) async fn validate_publication_membership(
     .await
 }
 
-/// Cheap identity proof for an ordinary SQL connection: the server's system
-/// identifier and the database must match the initialized source identity.
-async fn verify_sql_source(client: &Client, config: &Config) -> Result<()> {
-    let path = config.state_dir.join("source-identity.json");
-    let expected: SourceIdentity = serde_json::from_slice(
-        &std::fs::read(&path).context("source identity proof is missing or unreadable")?,
-    )
-    .context("invalid saved source identity")?;
-    let row = client
+/// What an ordinary SQL connection can prove about the server it reached.
+enum SqlIdentity {
+    Observed {
+        system_identifier: String,
+        database: String,
+    },
+    /// The login may not call `pg_control_system()`.
+    Unavailable(String),
+}
+
+async fn sql_identity(client: &Client) -> Result<SqlIdentity> {
+    match client
         .query_one(
             "SELECT system_identifier::text, current_database()::text FROM pg_catalog.pg_control_system()",
             &[],
         )
-        .await?;
-    same_sql_source(&expected, row.get(0), row.get(1))
+        .await
+    {
+        Ok(row) => Ok(SqlIdentity::Observed {
+            system_identifier: row.get(0),
+            database: row.get(1),
+        }),
+        Err(error)
+            if matches!(
+                error.code(),
+                Some(&SqlState::INSUFFICIENT_PRIVILEGE | &SqlState::UNDEFINED_FUNCTION)
+            ) =>
+        {
+            Ok(SqlIdentity::Unavailable(error.to_string()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The health connection reconnects independently of capture, so attribute
+/// each check's answer, not only a violation, to the initialized source when
+/// the login can prove it cheaply. Otherwise skip the comparison this round:
+/// startup proves identity with IDENTIFY_SYSTEM, and recording a marker always
+/// re-proves it over a replication connection.
+async fn attributed(
+    config: &Config,
+    identity: SqlIdentity,
+    contract: &mut impl ContractCheck,
+) -> Result<()> {
+    match identity {
+        SqlIdentity::Observed {
+            system_identifier,
+            database,
+        } => {
+            let path = config.state_dir.join("source-identity.json");
+            let expected: SourceIdentity = serde_json::from_slice(
+                &std::fs::read(&path).context("source identity proof is missing or unreadable")?,
+            )
+            .context("invalid saved source identity")?;
+            same_sql_source(&expected, &system_identifier, &database)?;
+        }
+        SqlIdentity::Unavailable(reason) => tracing::warn!(
+            %reason,
+            "cannot read pg_control_system(); skipping the SQL connection identity check for this publication check"
+        ),
+    }
+    confirmed(contract).await
 }
 
 fn same_sql_source(
@@ -1540,6 +1589,135 @@ mod tests {
         assert!(state.path().join(RESYNC_MARKER).exists());
     }
 
+    struct TraceWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn saved_identity(state_dir: &std::path::Path) -> SourceIdentity {
+        let identity = SourceIdentity {
+            source_id: "orders-primary-v1".into(),
+            slot: "embrasure_flow".into(),
+            system_identifier: "7400000000000000001".into(),
+            database: "orders".into(),
+            timeline: 1,
+        };
+        std::fs::write(
+            state_dir.join("source-identity.json"),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        identity
+    }
+
+    #[tokio::test]
+    async fn unreadable_pg_control_system_falls_back_without_failing_the_check() {
+        let state = tempfile::tempdir().unwrap();
+        let config = state_config(state.path(), "embrasure_flow");
+        saved_identity(state.path());
+        let denied = || {
+            SqlIdentity::Unavailable(
+                "db error: ERROR: permission denied for function pg_control_system".into(),
+            )
+        };
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = trace.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || TraceWriter(writer.clone()))
+                .finish(),
+        );
+
+        // A normal check: healthy, with a warning.
+        let mut reads = std::collections::VecDeque::from([Ok(())]);
+        guard_publication(
+            &config,
+            true,
+            attributed(&config, denied(), &mut reads),
+            not_needed(),
+        )
+        .await
+        .unwrap();
+        let logged = String::from_utf8(trace.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("WARN")
+                && logged.contains("permission denied for function pg_control_system"),
+            "{logged}"
+        );
+
+        // A confirmed violation is recorded only after the replication
+        // connection proves the source.
+        let mut reads = std::collections::VecDeque::from([removed(), removed()]);
+        let error = guard_publication(
+            &config,
+            true,
+            attributed(&config, denied(), &mut reads),
+            async {
+                anyhow::bail!(
+                    "PostgreSQL source system, database, timeline, or slot lineage changed"
+                )
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("could not be attributed"));
+        assert!(!state.path().join(RESYNC_MARKER).exists());
+        let mut reads = std::collections::VecDeque::from([removed(), removed()]);
+        guard_publication(
+            &config,
+            true,
+            attributed(&config, denied(), &mut reads),
+            same_source(),
+        )
+        .await
+        .unwrap_err();
+        assert!(state.path().join(RESYNC_MARKER).exists());
+    }
+
+    #[tokio::test]
+    async fn a_readable_sql_identity_mismatch_is_an_identity_error_without_a_marker() {
+        let state = tempfile::tempdir().unwrap();
+        let config = state_config(state.path(), "embrasure_flow");
+        saved_identity(state.path());
+        let observed = |database: &str| SqlIdentity::Observed {
+            system_identifier: "7400000000000000001".into(),
+            database: database.into(),
+        };
+        // The contract is never consulted through the wrong connection.
+        let mut reads = std::collections::VecDeque::from([removed(), removed()]);
+        let error = guard_publication(
+            &config,
+            true,
+            attributed(&config, observed("postgres"), &mut reads),
+            not_needed(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.is::<PublicationViolation>(), "{error:#}");
+        assert!(error.to_string().contains("different system or database"));
+        assert_eq!(reads.len(), 2);
+        assert!(!state.path().join(RESYNC_MARKER).exists());
+        let mut reads = std::collections::VecDeque::from([Ok(())]);
+        guard_publication(
+            &config,
+            true,
+            attributed(&config, observed("orders"), &mut reads),
+            not_needed(),
+        )
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn sql_connection_identity_compares_system_and_database() {
         let expected = SourceIdentity {
@@ -1606,10 +1784,17 @@ mod tests {
             .await
             .unwrap();
         let mut sql = connect(&config, false).await.unwrap();
-        verify_sql_source(&sql, &config).await.unwrap();
+        let SqlIdentity::Observed {
+            system_identifier,
+            database,
+        } = sql_identity(&sql).await.unwrap()
+        else {
+            panic!("the test login can read pg_control_system()");
+        };
         let path = state.path().join("source-identity.json");
         let mut identity: SourceIdentity =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        same_sql_source(&identity, &system_identifier, &database).unwrap();
         identity.database = format!("{}_initialized_elsewhere", identity.database);
         std::fs::write(&path, serde_json::to_vec(&identity).unwrap()).unwrap();
 
