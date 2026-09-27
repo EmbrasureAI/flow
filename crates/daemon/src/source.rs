@@ -623,7 +623,14 @@ pub(crate) async fn validate_publication(
     schemas: &[TableSchema],
     initialize: bool,
 ) -> Result<()> {
-    validate_publication_membership(client, config, schemas).await?;
+    // Before initialization creates the slot nothing has been captured, so a
+    // violation is a setup error to fix and retry, not a resynchronization.
+    guard_publication(
+        config,
+        !initialize,
+        publication_contract(client, config, schemas),
+    )
+    .await?;
     let replication = connect(config, true).await?;
     verify_source_identity(&replication, config, initialize).await
 }
@@ -668,6 +675,100 @@ struct PublishedTable {
 /// Startup, each capture reconnect and the running health check share this
 /// validation of the configured tables' publication contract.
 pub(crate) async fn validate_publication_membership(
+    client: &Client,
+    config: &Config,
+    schemas: &[TableSchema],
+) -> Result<()> {
+    guard_publication(config, true, publication_contract(client, config, schemas)).await
+}
+
+const RESYNC_MARKER: &str = "publication-resync-required.json";
+
+/// Durable proof that a slot's capture may be incomplete. Restoring the
+/// publication cannot recover changes pgoutput already omitted, so it binds
+/// the slot rather than the publication's current state.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PublicationResyncRequired {
+    source_id: String,
+    slot: String,
+    publication: String,
+    reason: String,
+    recorded_at_ms: u128,
+}
+
+/// Refuse a slot marked for resynchronization, then run the contract check.
+/// With `record`, a definite violation is made durable before it is returned,
+/// so a later restart cannot resume the same slot. Query failures and
+/// interruptions are not violations and leave no marker. The marker is never
+/// removed here; a fresh slot is not affected by it.
+async fn guard_publication(
+    config: &Config,
+    record: bool,
+    check: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    refuse_resync_required(config)?;
+    let checked = check.await;
+    if record
+        && let Err(error) = &checked
+        && error
+            .chain()
+            .any(|cause| cause.is::<PublicationViolation>())
+    {
+        record_resync_required(config, &format!("{error:#}"))?;
+    }
+    checked
+}
+
+fn refuse_resync_required(config: &Config) -> Result<()> {
+    let path = config.state_dir.join(RESYNC_MARKER);
+    let marker: PublicationResyncRequired = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("unreadable publication marker {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("unreadable publication marker {}", path.display()));
+        }
+    };
+    ensure!(
+        marker.slot != config.source.slot,
+        "resynchronization is required: capture through slot {:?} stopped after source publication {:?} changed ({}). Changes to the affected tables may be missing, so restoring the publication does not resume this slot. Resynchronize with a new slot; {} is never cleared automatically",
+        marker.slot,
+        marker.publication,
+        marker.reason,
+        path.display()
+    );
+    Ok(())
+}
+
+fn record_resync_required(config: &Config, reason: &str) -> Result<()> {
+    let marker = PublicationResyncRequired {
+        source_id: config.source.id.clone(),
+        slot: config.source.slot.clone(),
+        publication: config.source.publication.clone(),
+        reason: reason.into(),
+        recorded_at_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    };
+    let path = config.state_dir.join(RESYNC_MARKER);
+    let temporary = path.with_extension("json.tmp");
+    (|| -> Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&serde_json::to_vec_pretty(&marker)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(&config.state_dir)?.sync_all()?;
+        Ok(())
+    })()
+    .with_context(|| {
+        format!(
+            "record publication resynchronization marker {}",
+            path.display()
+        )
+    })
+}
+
+async fn publication_contract(
     client: &Client,
     config: &Config,
     schemas: &[TableSchema],
@@ -1142,5 +1243,115 @@ mod tests {
         let mut published = facts(180000, vec![identity, member(CUSTOMERS, &full)]);
         published.publish_generated = true;
         check(&published).unwrap();
+    }
+
+    fn state_config(state_dir: &std::path::Path, slot: &str) -> Config {
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = state_dir.into();
+        config.source.slot = slot.into();
+        config
+    }
+
+    fn removed() -> Result<()> {
+        Err(PublicationViolation(
+            "publication must contain every configured source table; missing public.orders".into(),
+        )
+        .into())
+    }
+
+    #[tokio::test]
+    async fn publication_violation_durably_blocks_the_slot_until_resynchronized() {
+        let state = tempfile::tempdir().unwrap();
+        let config = state_config(state.path(), "embrasure_flow");
+        let marker = state.path().join(RESYNC_MARKER);
+
+        let error = guard_publication(&config, true, async { removed() })
+            .await
+            .unwrap_err();
+        assert!(error.is::<PublicationViolation>(), "{error:#}");
+        let recorded: PublicationResyncRequired =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(
+            (
+                recorded.source_id.as_str(),
+                recorded.slot.as_str(),
+                recorded.publication.as_str(),
+                recorded.reason.as_str(),
+            ),
+            (
+                "orders-primary-v1",
+                "embrasure_flow",
+                "embrasure_flow",
+                "publication must contain every configured source table; missing public.orders",
+            )
+        );
+
+        // The administrator restores the publication and the daemon restarts:
+        // the check would pass, but the slot's capture may be incomplete.
+        for _ in 0..2 {
+            let error = guard_publication(&config, true, async {
+                unreachable!("a marked slot must not be revalidated")
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.starts_with("resynchronization is required")
+                    && error.contains("missing public.orders")
+                    && error.contains("may be missing"),
+                "{error}"
+            );
+        }
+        assert!(
+            refuse_resync_required(&config).is_err(),
+            "the marker is never cleared automatically"
+        );
+
+        // A fresh slot in the same state directory is not blocked, and a
+        // later violation keeps the original slot's evidence intact.
+        let fresh = state_config(state.path(), "embrasure_flow_resync");
+        guard_publication(&fresh, true, async { Ok(()) })
+            .await
+            .unwrap();
+        let recorded_again: PublicationResyncRequired =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(recorded_again, recorded);
+    }
+
+    #[tokio::test]
+    async fn only_a_definite_violation_after_initialization_is_recorded() {
+        let state = tempfile::tempdir().unwrap();
+        let config = state_config(state.path(), "embrasure_flow");
+        let marker = state.path().join(RESYNC_MARKER);
+
+        // Interrupted and failed catalog queries prove nothing about the slot.
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let interrupted = guard_publication(&config, true, async {
+            Err(anyhow::Error::new(elapsed).context("publication check timed out"))
+        })
+        .await
+        .unwrap_err();
+        assert!(retryable_connection(&interrupted));
+        guard_publication(&config, true, async {
+            Err(anyhow::anyhow!(
+                "permission denied for view pg_publication_tables"
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert!(!marker.exists());
+
+        // Before initialization creates the slot, nothing was captured.
+        let error = guard_publication(&config, false, async { removed() })
+            .await
+            .unwrap_err();
+        assert!(error.is::<PublicationViolation>());
+        assert!(!marker.exists());
+        guard_publication(&config, true, async { Ok(()) })
+            .await
+            .unwrap();
     }
 }
