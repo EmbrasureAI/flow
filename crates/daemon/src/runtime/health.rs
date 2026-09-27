@@ -58,7 +58,7 @@ pub(super) async fn check_health(
         Ok((client, source_health))
     }
     .await;
-    let (client, source_health) = match result {
+    let (mut client, source_health) = match result {
         Ok(checked) => checked,
         Err(error) if retryable_connection(&error) || error.is::<tokio::time::error::Elapsed>() => {
             // Dropping the owned driver closes even an unanswered query.
@@ -80,7 +80,7 @@ pub(super) async fn check_health(
     };
     let checked = tokio::time::timeout(
         PUBLICATION_TIMEOUT,
-        validate_publication_membership(&client.client, &config, &schemas),
+        validate_publication_membership(&mut client.client, &config, &schemas),
     )
     .await
     .context("publication check timed out")

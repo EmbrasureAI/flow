@@ -186,7 +186,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         );
     }
     observation.table_sources(&config, &boot.schemas);
-    let sql = connect(&config, false).await?;
+    let mut sql = connect(&config, false).await?;
     crate::schema::SchemaRegistry::new(
         store.clone(),
         SourceId(config.source.id.clone()),
@@ -194,7 +194,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     )?
     .initialize(&sql, &config.tables)
     .await?;
-    validate_publication(&sql, &config, &boot.schemas, false).await?;
+    validate_publication(&mut sql, &config, &boot.schemas, false).await?;
     let publisher = Arc::new(TablePublisher::new(
         store.clone(),
         catalog.clone(),

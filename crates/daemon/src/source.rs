@@ -183,10 +183,10 @@ pub(crate) async fn capture_loop(
             };
             let started = source_deadline(async {
                 verify_source_identity(&client, &config, false).await?;
-                let (sql, sql_connection) = connect_owned(&config, false).await?;
+                let (mut sql, sql_connection) = connect_owned(&config, false).await?;
                 validate_slot(&sql, &config, journal.durable_lsn()).await?;
                 let effective_schemas = registry.initialize(&sql, &config.tables).await?;
-                validate_publication_membership(&sql, &config, &effective_schemas).await?;
+                validate_publication_membership(&mut sql, &config, &effective_schemas).await?;
                 let mut source = PgOutputSource::start(
                     &client,
                     &config.source.slot,
@@ -618,21 +618,35 @@ async fn validate_slot(client: &Client, config: &Config, durable_lsn: PgLsn) -> 
 }
 
 pub(crate) async fn validate_publication(
-    client: &Client,
+    client: &mut Client,
     config: &Config,
     schemas: &[TableSchema],
     initialize: bool,
 ) -> Result<()> {
-    // Before initialization creates the slot nothing has been captured, so a
-    // violation is a setup error to fix and retry, not a resynchronization.
-    guard_publication(
-        config,
-        !initialize,
-        publication_contract(client, config, schemas),
-    )
-    .await?;
+    if initialize {
+        // Before initialization creates the slot nothing has been captured, so
+        // a violation is a setup error to fix and retry. Check it before the
+        // first identity proof binds the state directory to this source.
+        guard_publication(
+            config,
+            false,
+            publication_contract(client, config, schemas),
+            verify_source(config),
+        )
+        .await?;
+        let replication = connect(config, true).await?;
+        return verify_source_identity(&replication, config, true).await;
+    }
+    // A violation on another server or database says nothing about this slot.
+    verify_source(config).await?;
+    validate_publication_membership(client, config, schemas).await
+}
+
+/// Prove over a replication connection that the configured connection still
+/// reaches the source this state directory was initialized from.
+async fn verify_source(config: &Config) -> Result<()> {
     let replication = connect(config, true).await?;
-    verify_source_identity(&replication, config, initialize).await
+    verify_source_identity(&replication, config, false).await
 }
 
 /// A definite publication contract violation, as opposed to a failed or
@@ -675,11 +689,94 @@ struct PublishedTable {
 /// Startup, each capture reconnect and the running health check share this
 /// validation of the configured tables' publication contract.
 pub(crate) async fn validate_publication_membership(
-    client: &Client,
+    client: &mut Client,
     config: &Config,
     schemas: &[TableSchema],
 ) -> Result<()> {
-    guard_publication(config, true, publication_contract(client, config, schemas)).await
+    guard_publication(
+        config,
+        true,
+        async {
+            // The health connection reconnects independently of capture, so
+            // attribute every answer, not only a violation, to this source.
+            verify_sql_source(client, config).await?;
+            confirmed(&mut LiveContract {
+                client,
+                config,
+                schemas,
+            })
+            .await
+        },
+        verify_source(config),
+    )
+    .await
+}
+
+/// Cheap identity proof for an ordinary SQL connection: the server's system
+/// identifier and the database must match the initialized source identity.
+async fn verify_sql_source(client: &Client, config: &Config) -> Result<()> {
+    let path = config.state_dir.join("source-identity.json");
+    let expected: SourceIdentity = serde_json::from_slice(
+        &std::fs::read(&path).context("source identity proof is missing or unreadable")?,
+    )
+    .context("invalid saved source identity")?;
+    let row = client
+        .query_one(
+            "SELECT system_identifier::text, current_database()::text FROM pg_catalog.pg_control_system()",
+            &[],
+        )
+        .await?;
+    same_sql_source(&expected, row.get(0), row.get(1))
+}
+
+fn same_sql_source(
+    expected: &SourceIdentity,
+    system_identifier: &str,
+    database: &str,
+) -> Result<()> {
+    ensure!(
+        expected.system_identifier == system_identifier && expected.database == database,
+        "PostgreSQL source connection reaches a different system or database than the initialized source; coordinated failover/resynchronization is required"
+    );
+    Ok(())
+}
+
+fn is_violation(checked: &Result<()>) -> bool {
+    checked.as_ref().is_err_and(|error| {
+        error
+            .chain()
+            .any(|cause| cause.is::<PublicationViolation>())
+    })
+}
+
+/// Each check reads in one snapshot, but `pg_publication_tables` resolves
+/// members and column lists from the latest committed catalog state rather
+/// than that snapshot. An ALTER PUBLICATION committed during a check can still
+/// tear it, so a violation stands only when a complete second check agrees;
+/// that check reports the settled state.
+async fn confirmed(contract: &mut impl ContractCheck) -> Result<()> {
+    let first = contract.check().await;
+    if !is_violation(&first) {
+        return first;
+    }
+    contract.check().await
+}
+
+/// One complete publication contract check, repeatable for confirmation.
+trait ContractCheck {
+    fn check(&mut self) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+struct LiveContract<'a> {
+    client: &'a mut Client,
+    config: &'a Config,
+    schemas: &'a [TableSchema],
+}
+
+impl ContractCheck for LiveContract<'_> {
+    async fn check(&mut self) -> Result<()> {
+        publication_contract(self.client, self.config, self.schemas).await
+    }
 }
 
 const RESYNC_MARKER: &str = "publication-resync-required.json";
@@ -698,22 +795,26 @@ struct PublicationResyncRequired {
 
 /// Refuse a slot marked for resynchronization, then run the contract check.
 /// With `record`, a definite violation is made durable before it is returned,
-/// so a later restart cannot resume the same slot. Query failures and
-/// interruptions are not violations and leave no marker. The marker is never
-/// removed here; a fresh slot is not affected by it.
+/// so a later restart cannot resume the same slot. The source identity is
+/// proven first (`verify` runs only then): a violation observed through a
+/// connection to another server or database must not block this slot. Query
+/// failures and interruptions are not violations and leave no marker. The
+/// marker is never removed here; a fresh slot is not affected by it.
 async fn guard_publication(
     config: &Config,
     record: bool,
     check: impl std::future::Future<Output = Result<()>>,
+    verify: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     refuse_resync_required(config)?;
     let checked = check.await;
-    if record
-        && let Err(error) = &checked
-        && error
-            .chain()
-            .any(|cause| cause.is::<PublicationViolation>())
+    if let Err(error) = &checked
+        && record
+        && is_violation(&checked)
     {
+        verify
+            .await
+            .context("publication check could not be attributed to the initialized source")?;
         record_resync_required(config, &format!("{error:#}"))?;
     }
     checked
@@ -769,7 +870,7 @@ fn record_resync_required(config: &Config, reason: &str) -> Result<()> {
 }
 
 async fn publication_contract(
-    client: &Client,
+    client: &mut Client,
     config: &Config,
     schemas: &[TableSchema],
 ) -> Result<()> {
@@ -781,12 +882,30 @@ async fn publication_contract(
         .iter()
         .map(|schema| schema.table_id.0)
         .collect::<Vec<_>>();
-    let facts = publication_facts(client, &config.source.publication, &relations).await?;
+    let snapshot = publication_snapshot(client).await?;
+    let facts = publication_facts(&snapshot, &config.source.publication, &relations).await?;
+    snapshot.commit().await?;
     check_publication(&config.tables, schemas, &facts)
 }
 
+/// All catalog reads of one contract check run in this read-only snapshot, so
+/// the publication's settings and the tables' columns and identities come from
+/// one catalog state. `pg_publication_tables` is the exception (see
+/// [`confirmed`]). Dropping it early, including on cancellation, rolls back
+/// and leaves the connection usable.
+async fn publication_snapshot(
+    client: &mut Client,
+) -> Result<flow_pg_source::tokio_postgres::Transaction<'_>> {
+    Ok(client
+        .build_transaction()
+        .isolation_level(flow_pg_source::tokio_postgres::IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?)
+}
+
 async fn publication_facts(
-    client: &Client,
+    client: &flow_pg_source::tokio_postgres::Transaction<'_>,
     publication: &str,
     relations: &[u32],
 ) -> Result<PublicationFacts> {
@@ -1266,7 +1385,7 @@ mod tests {
         let config = state_config(state.path(), "embrasure_flow");
         let marker = state.path().join(RESYNC_MARKER);
 
-        let error = guard_publication(&config, true, async { removed() })
+        let error = guard_publication(&config, true, async { removed() }, same_source())
             .await
             .unwrap_err();
         assert!(error.is::<PublicationViolation>(), "{error:#}");
@@ -1290,9 +1409,12 @@ mod tests {
         // The administrator restores the publication and the daemon restarts:
         // the check would pass, but the slot's capture may be incomplete.
         for _ in 0..2 {
-            let error = guard_publication(&config, true, async {
-                unreachable!("a marked slot must not be revalidated")
-            })
+            let error = guard_publication(
+                &config,
+                true,
+                async { unreachable!("a marked slot must not be revalidated") },
+                not_needed(),
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1311,7 +1433,7 @@ mod tests {
         // A fresh slot in the same state directory is not blocked, and a
         // later violation keeps the original slot's evidence intact.
         let fresh = state_config(state.path(), "embrasure_flow_resync");
-        guard_publication(&fresh, true, async { Ok(()) })
+        guard_publication(&fresh, true, async { Ok(()) }, not_needed())
             .await
             .unwrap();
         let recorded_again: PublicationResyncRequired =
@@ -1329,29 +1451,277 @@ mod tests {
         let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
             .await
             .unwrap_err();
-        let interrupted = guard_publication(&config, true, async {
-            Err(anyhow::Error::new(elapsed).context("publication check timed out"))
-        })
+        let interrupted = guard_publication(
+            &config,
+            true,
+            async { Err(anyhow::Error::new(elapsed).context("publication check timed out")) },
+            not_needed(),
+        )
         .await
         .unwrap_err();
         assert!(retryable_connection(&interrupted));
-        guard_publication(&config, true, async {
-            Err(anyhow::anyhow!(
-                "permission denied for view pg_publication_tables"
-            ))
-        })
+        guard_publication(
+            &config,
+            true,
+            async {
+                Err(anyhow::anyhow!(
+                    "permission denied for view pg_publication_tables"
+                ))
+            },
+            not_needed(),
+        )
         .await
         .unwrap_err();
         assert!(!marker.exists());
 
         // Before initialization creates the slot, nothing was captured.
-        let error = guard_publication(&config, false, async { removed() })
+        let error = guard_publication(&config, false, async { removed() }, not_needed())
             .await
             .unwrap_err();
         assert!(error.is::<PublicationViolation>());
         assert!(!marker.exists());
-        guard_publication(&config, true, async { Ok(()) })
+        guard_publication(&config, true, async { Ok(()) }, not_needed())
             .await
             .unwrap();
+    }
+
+    /// The identity proof, which runs only before a marker would be written.
+    async fn same_source() -> Result<()> {
+        Ok(())
+    }
+
+    async fn not_needed() -> Result<()> {
+        unreachable!("only a violation to record requires the identity proof")
+    }
+
+    #[tokio::test]
+    async fn violation_seen_through_another_source_never_blocks_the_slot() {
+        let state = tempfile::tempdir().unwrap();
+        let config = state_config(state.path(), "embrasure_flow");
+        let error = guard_publication(&config, true, async { removed() }, async {
+            anyhow::bail!(
+                "PostgreSQL source system, database, timeline, or slot lineage changed; coordinated failover/resynchronization is required"
+            )
+        })
+        .await
+        .unwrap_err();
+        assert!(!error.is::<PublicationViolation>(), "{error:#}");
+        assert!(format!("{error:#}").contains("database"), "{error:#}");
+        assert!(!state.path().join(RESYNC_MARKER).exists());
+        // Once the connection reaches the initialized source again, the slot
+        // is validated normally.
+        guard_publication(&config, true, async { Ok(()) }, not_needed())
+            .await
+            .unwrap();
+    }
+
+    impl ContractCheck for std::collections::VecDeque<Result<()>> {
+        async fn check(&mut self) -> Result<()> {
+            self.pop_front().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_skewed_read_that_rechecks_clean_stays_healthy_without_a_marker() {
+        let state = tempfile::tempdir().unwrap();
+        let config = state_config(state.path(), "embrasure_flow");
+        let mut reads = std::collections::VecDeque::from([removed(), Ok(())]);
+        guard_publication(&config, true, confirmed(&mut reads), not_needed())
+            .await
+            .unwrap();
+        assert!(reads.is_empty(), "the violation was rechecked once");
+        assert!(!state.path().join(RESYNC_MARKER).exists());
+
+        // A lasting violation is confirmed and recorded.
+        let mut reads = std::collections::VecDeque::from([removed(), removed()]);
+        guard_publication(&config, true, confirmed(&mut reads), same_source())
+            .await
+            .unwrap_err();
+        assert!(state.path().join(RESYNC_MARKER).exists());
+    }
+
+    #[test]
+    fn sql_connection_identity_compares_system_and_database() {
+        let expected = SourceIdentity {
+            source_id: "orders-primary-v1".into(),
+            slot: "embrasure_flow".into(),
+            system_identifier: "7400000000000000001".into(),
+            database: "orders".into(),
+            timeline: 1,
+        };
+        same_sql_source(&expected, "7400000000000000001", "orders").unwrap();
+        for (system, database) in [
+            ("7400000000000000002", "orders"),
+            ("7400000000000000001", "postgres"),
+        ] {
+            let error = same_sql_source(&expected, system, database).unwrap_err();
+            assert!(!error.is::<PublicationViolation>());
+            assert!(error.to_string().contains("different system or database"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_violation_stands_only_when_a_second_complete_check_agrees() {
+        async fn run(results: Vec<Result<()>>) -> (Result<()>, usize) {
+            let mut remaining = std::collections::VecDeque::from(results);
+            let checked = confirmed(&mut remaining).await;
+            (checked, remaining.len())
+        }
+        let changed = || -> Result<()> { Err(PublicationViolation("changed".into()).into()) };
+        let settled =
+            || -> Result<()> { Err(PublicationViolation("publication not found".into()).into()) };
+
+        // A torn read followed by a consistent state is not a violation.
+        let (checked, unread) = run(vec![changed(), Ok(()), Ok(())]).await;
+        assert!(checked.is_ok() && unread == 1);
+        // The second check reports the settled state.
+        let (checked, unread) = run(vec![changed(), settled(), Ok(())]).await;
+        assert_eq!(checked.unwrap_err().to_string(), "publication not found");
+        assert_eq!(unread, 1);
+        // Success and non-violations are never rechecked.
+        let (checked, unread) = run(vec![Ok(()), Ok(())]).await;
+        assert!(checked.is_ok() && unread == 1);
+        let (checked, unread) = run(vec![Err(anyhow::anyhow!("query failed")), Ok(())]).await;
+        assert!(!is_violation(&checked) && checked.is_err() && unread == 1);
+    }
+
+    fn live_config(state_dir: &std::path::Path, publication: &str) -> Option<Config> {
+        std::env::var_os("FLOW_POSTGRES_URL")?;
+        let mut config = state_config(state_dir, "flow_live_unused_slot");
+        config.source.publication = publication.into();
+        Some(config)
+    }
+
+    /// State bound to another database, then run against one without the
+    /// publication: identity fails first and nothing blocks the slot.
+    #[tokio::test]
+    #[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+    async fn live_wrong_database_is_an_identity_error_and_leaves_no_marker() {
+        let state = tempfile::tempdir().unwrap();
+        let mut config = live_config(state.path(), "flow_live_missing_publication").unwrap();
+        let (tables, schemas) = configured();
+        config.tables = tables;
+        let replication = connect(&config, true).await.unwrap();
+        verify_source_identity(&replication, &config, true)
+            .await
+            .unwrap();
+        let mut sql = connect(&config, false).await.unwrap();
+        verify_sql_source(&sql, &config).await.unwrap();
+        let path = state.path().join("source-identity.json");
+        let mut identity: SourceIdentity =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        identity.database = format!("{}_initialized_elsewhere", identity.database);
+        std::fs::write(&path, serde_json::to_vec(&identity).unwrap()).unwrap();
+
+        let error = validate_publication(&mut sql, &config, &schemas, false)
+            .await
+            .unwrap_err();
+        assert!(!error.is::<PublicationViolation>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("database, timeline, or slot lineage changed"),
+            "{error:#}"
+        );
+        // The running check proves its own connection's identity first.
+        let error = validate_publication_membership(&mut sql, &config, &schemas)
+            .await
+            .unwrap_err();
+        assert!(!error.is::<PublicationViolation>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("different system or database"),
+            "{error:#}"
+        );
+        assert!(!state.path().join(RESYNC_MARKER).exists());
+    }
+
+    /// Every catalog read of one check sees one snapshot, and an abandoned
+    /// check leaves the connection outside any transaction.
+    #[tokio::test]
+    #[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+    async fn live_contract_reads_share_one_snapshot() {
+        let state = tempfile::tempdir().unwrap();
+        let name = format!(
+            "flow_snapshot_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let config = live_config(state.path(), &name).unwrap();
+        let admin = connect(&config, false).await.unwrap();
+        admin
+            .batch_execute(&format!(
+                "CREATE TABLE {name} (id integer PRIMARY KEY, status text);
+                 CREATE PUBLICATION {name} FOR TABLE {name}"
+            ))
+            .await
+            .unwrap();
+        let relation: u32 = admin
+            .query_one("SELECT to_regclass($1)::oid", &[&name])
+            .await
+            .unwrap()
+            .get(0);
+
+        let mut sql = connect(&config, false).await.unwrap();
+        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let snapshot = publication_snapshot(&mut sql).await?;
+            let before = publication_facts(&snapshot, &name, &[relation]).await?;
+            admin
+                .batch_execute(&format!(
+                    "ALTER PUBLICATION {name} SET (publish = 'insert');
+                     ALTER PUBLICATION {name} SET TABLE {name} (id)"
+                ))
+                .await?;
+            let during = publication_facts(&snapshot, &name, &[relation]).await?;
+            let row = snapshot
+                .query_one(
+                    "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')",
+                    &[],
+                )
+                .await?;
+            let (isolation, read_only): (String, String) = (row.get(0), row.get(1));
+            assert_eq!((isolation.as_str(), read_only.as_str()), ("repeatable read", "on"));
+            assert_eq!(before.operations, Some([true; 4]));
+            // Plain catalog reads keep the check's snapshot. The view's column
+            // list is resolved from the latest catalog state instead, which
+            // `confirmed` covers by rechecking before any marker.
+            assert_eq!(during.operations, before.operations);
+            snapshot.commit().await?;
+
+            let after = {
+                let snapshot = publication_snapshot(&mut sql).await?;
+                publication_facts(&snapshot, &name, &[relation]).await?
+            };
+            assert_eq!(after.operations, Some([true, false, false, false]));
+            assert_eq!(after.members[0].published_columns, ["id"]);
+
+            // Abandon a check mid-transaction, as a timeout would.
+            let abandoned = async {
+                let snapshot = publication_snapshot(&mut sql).await?;
+                publication_facts(&snapshot, &name, &[relation]).await?;
+                std::future::pending::<()>().await;
+                anyhow::Ok(())
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), abandoned)
+                    .await
+                    .is_err()
+            );
+            let isolation: String = sql
+                .query_one("SELECT current_setting('transaction_isolation')", &[])
+                .await?
+                .get(0);
+            assert_eq!(isolation, "read committed");
+            anyhow::Ok(())
+        }))
+        .await;
+        admin
+            .batch_execute(&format!("DROP PUBLICATION {name}; DROP TABLE {name}"))
+            .await
+            .unwrap();
+        // Clean up before surfacing a failed assertion.
+        match result {
+            Ok(result) => result.unwrap(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }
