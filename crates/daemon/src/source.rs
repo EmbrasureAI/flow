@@ -302,6 +302,12 @@ pub(crate) async fn capture_loop(
                     next = source.next() => {
                         match next {
                             Ok(Some(event)) => {
+                                // The publication may contain other tables. Their metadata
+                                // and changes never reach schema selection, quarantine or the
+                                // spool; the enclosing commit proceeds like an empty one.
+                                let Some(event) = event.retain_relations(|id| assembler.is_captured(TableId(id))) else {
+                                    continue;
+                                };
                                 if let SourceEvent::Truncate { xid, subxid, relations, cascade, restart_identity } = &event {
                                     for id in relations {
                                         let table = TableId(*id);
@@ -622,103 +628,233 @@ pub(crate) async fn validate_publication(
     verify_source_identity(&replication, config, initialize).await
 }
 
-async fn validate_publication_membership(
+/// A definite publication contract violation, as opposed to a failed or
+/// interrupted catalog query. pgoutput may already have omitted changes for a
+/// configured table, so neither reconnecting nor restoring the setting repairs it.
+#[derive(Debug)]
+pub(crate) struct PublicationViolation(pub(crate) String);
+
+impl std::fmt::Display for PublicationViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PublicationViolation {}
+
+/// Publication catalog facts for the configured tables only. Other members are
+/// never read: administrators may publish additional tables for other consumers.
+#[derive(Debug, Default)]
+struct PublicationFacts {
+    server_version: i32,
+    /// INSERT, UPDATE, DELETE and TRUNCATE flags; `None` if the publication is missing.
+    operations: Option<[bool; 4]>,
+    publish_generated: bool,
+    members: Vec<PublishedTable>,
+}
+
+/// A configured table found in the publication. Row filters and column lists
+/// exist only on PostgreSQL 15 and later; older servers report membership only.
+#[derive(Debug, Default)]
+struct PublishedTable {
+    relation_id: u32,
+    row_filter: bool,
+    full_replica_identity: bool,
+    published_columns: Vec<String>,
+    current_columns: Vec<String>,
+    generated_columns: Vec<String>,
+}
+
+/// Startup, each capture reconnect and the running health check share this
+/// validation of the configured tables' publication contract.
+pub(crate) async fn validate_publication_membership(
     client: &Client,
     config: &Config,
     schemas: &[TableSchema],
 ) -> Result<()> {
-    let version: i32 = client
+    ensure!(
+        schemas.len() == config.tables.len(),
+        "schema/config table count differs"
+    );
+    let relations = schemas
+        .iter()
+        .map(|schema| schema.table_id.0)
+        .collect::<Vec<_>>();
+    let facts = publication_facts(client, &config.source.publication, &relations).await?;
+    check_publication(&config.tables, schemas, &facts)
+}
+
+async fn publication_facts(
+    client: &Client,
+    publication: &str,
+    relations: &[u32],
+) -> Result<PublicationFacts> {
+    let server_version: i32 = client
         .query_one("SELECT current_setting('server_version_num')::integer", &[])
         .await?
         .get(0);
-    ensure!(
-        (140000..190000).contains(&version),
-        "supported PostgreSQL versions are 14 through 18"
-    );
-    let publication=client.query_opt("SELECT pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_catalog.pg_publication WHERE pubname=$1",&[&config.source.publication]).await?.context("publication not found")?;
-    ensure!(
-        publication.get::<_, bool>(0)
-            && publication.get::<_, bool>(1)
-            && publication.get::<_, bool>(2)
-            && publication.get::<_, bool>(3),
-        "publication must include INSERT, UPDATE, DELETE, and TRUNCATE so unsupported operations cannot be silently skipped"
-    );
-    let mut found = HashSet::new();
-    for row in client.query("SELECT c.oid FROM pg_catalog.pg_publication_tables p JOIN pg_catalog.pg_namespace n ON p.schemaname=n.nspname JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=p.tablename WHERE p.pubname=$1",&[&config.source.publication]).await? {found.insert(row.get::<_,u32>(0));}
-    ensure!(
-        found == schemas.iter().map(|s| s.table_id.0).collect(),
-        "publication must contain exactly the configured source tables"
-    );
-    if version >= 150000 {
-        let filters:bool=client.query_one("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_publication_tables WHERE pubname=$1 AND rowfilter IS NOT NULL)",&[&config.source.publication]).await?.get(0);
-        ensure!(
-            !filters,
-            "publication row filters are not supported by initial COPY"
-        );
-        let publish_generated = if version >= 180000 {
-            client
-                .query_one(
-                    "SELECT pubgencols::text = 's' FROM pg_catalog.pg_publication WHERE pubname=$1",
-                    &[&config.source.publication],
-                )
-                .await?
-                .get::<_, bool>(0)
-        } else {
-            false
-        };
-        if version >= 180000 && !publish_generated {
-            let generated_identity: bool = client.query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_publication_tables p JOIN pg_catalog.pg_namespace n ON n.nspname=p.schemaname JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=p.tablename JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE p.pubname=$1 AND c.relreplident='f' AND a.attnum>0 AND NOT a.attisdropped AND a.attgenerated='s')",
-                &[&config.source.publication]).await?.get(0);
-            ensure!(
-                !generated_identity,
-                "PostgreSQL 18 FULL replica identity requires publish_generated_columns=stored even when generated columns are excluded"
-            );
-        }
+    let mut facts = PublicationFacts {
+        server_version,
+        ..Default::default()
+    };
+    if !(140000..190000).contains(&server_version) {
+        return Ok(facts);
+    }
+    let publish_generated = if server_version >= 180000 {
+        "pubgencols::text = 's'"
+    } else {
+        "false"
+    };
+    let Some(row) = client
+        .query_opt(
+            &format!("SELECT pubinsert, pubupdate, pubdelete, pubtruncate, {publish_generated} FROM pg_catalog.pg_publication WHERE pubname=$1"),
+            &[&publication],
+        )
+        .await?
+    else {
+        return Ok(facts);
+    };
+    facts.operations = Some([row.get(0), row.get(1), row.get(2), row.get(3)]);
+    facts.publish_generated = row.get(4);
+    // Resolve names to the configured relation identities, so a replaced
+    // table is not mistaken for its predecessor.
+    const MEMBERS: &str = "FROM pg_catalog.pg_publication_tables p
+         JOIN pg_catalog.pg_namespace n ON p.schemaname=n.nspname
+         JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=p.tablename
+         WHERE p.pubname=$1 AND c.oid = ANY($2)";
+    if server_version < 150000 {
         for row in client
             .query(
-                "SELECT p.attnames, ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a
-             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND (a.attgenerated = '' OR ($2 AND a.attgenerated = 's')) ORDER BY a.attnum),
-             ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a
-             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND a.attgenerated = 's'), c.oid
-             FROM pg_catalog.pg_publication_tables p
-             JOIN pg_catalog.pg_namespace n ON p.schemaname=n.nspname
-             JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=p.tablename
-             WHERE p.pubname=$1",
-                &[&config.source.publication, &publish_generated],
+                &format!("SELECT c.oid {MEMBERS}"),
+                &[&publication, &relations],
             )
             .await?
         {
-            let mut published: Vec<String> = row.get(0);
-            let full: Vec<String> = row.get(1);
-            let generated: Vec<String> = row.get(2);
-            if version < 180000 {
-                // PG15's catalog view includes generated columns even though
-                // pgoutput omits them; newer views omit them too. Normalize
-                // only these known non-published fields, never ordinary ones.
-                published.retain(|name| !generated.contains(name));
-            }
+            facts.members.push(PublishedTable {
+                relation_id: row.get(0),
+                ..Default::default()
+            });
+        }
+        return Ok(facts);
+    }
+    for row in client
+        .query(
+            &format!(
+                "SELECT c.oid, p.rowfilter IS NOT NULL, c.relreplident = 'f', p.attnames,
+             ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a
+             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND (a.attgenerated = '' OR ($3 AND a.attgenerated = 's')) ORDER BY a.attnum),
+             ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a
+             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND a.attgenerated = 's')
+             {MEMBERS}"
+            ),
+            &[&publication, &relations, &facts.publish_generated],
+        )
+        .await?
+    {
+        facts.members.push(PublishedTable {
+            relation_id: row.get(0),
+            row_filter: row.get(1),
+            full_replica_identity: row.get(2),
+            published_columns: row.get(3),
+            current_columns: row.get(4),
+            generated_columns: row.get(5),
+        });
+    }
+    Ok(facts)
+}
+
+/// The publication must contain every configured table and may contain others.
+/// Only configured tables' filters, columns and identities are considered.
+fn check_publication(
+    tables: &[Table],
+    schemas: &[TableSchema],
+    facts: &PublicationFacts,
+) -> Result<()> {
+    ensure!(
+        (140000..190000).contains(&facts.server_version),
+        "supported PostgreSQL versions are 14 through 18"
+    );
+    let operations = facts
+        .operations
+        .ok_or_else(|| PublicationViolation("publication not found".into()))?;
+    ensure!(
+        operations.iter().all(|published| *published),
+        PublicationViolation(
+            "publication must include INSERT, UPDATE, DELETE, and TRUNCATE so unsupported operations cannot be silently skipped".into()
+        )
+    );
+    let mut members = Vec::with_capacity(schemas.len());
+    let mut missing = Vec::new();
+    for (table, schema) in tables.iter().zip(schemas) {
+        let name = format!("{}.{}", table.source_namespace, table.source_table);
+        match facts
+            .members
+            .iter()
+            .find(|member| member.relation_id == schema.table_id.0)
+        {
+            Some(member) => members.push((name, schema, member)),
+            None => missing.push(name),
+        }
+    }
+    ensure!(
+        missing.is_empty(),
+        PublicationViolation(format!(
+            "publication must contain every configured source table; missing {}",
+            missing.join(", ")
+        ))
+    );
+    if facts.server_version < 150000 {
+        return Ok(());
+    }
+    for (name, _, member) in &members {
+        ensure!(
+            !member.row_filter,
+            PublicationViolation(format!(
+                "publication row filters are not supported by initial COPY ({name})"
+            ))
+        );
+    }
+    if facts.server_version >= 180000 && !facts.publish_generated {
+        for (name, _, member) in &members {
             ensure!(
-                published == full,
-                "publication must include every current source column"
-            );
-            let relation_id: u32 = row.get(3);
-            let schema = schemas
-                .iter()
-                .find(|schema| schema.table_id.0 == relation_id)
-                .context("publication contains an unconfigured relation")?;
-            // Current ordinary columns are covered by the full-publication
-            // check above. Missing historical names belong to the schema
-            // registry's durable table block, so they must not stop healthy
-            // tables on restart. Still reject selected generated fields that
-            // COPY would read but pgoutput would omit.
-            ensure!(
-                schema.columns.iter().all(|column| {
-                    !generated.contains(&column.name) || published.contains(&column.name)
-                }),
-                "publication omits a configured source column; snapshot and CDC must use the same columns"
+                !(member.full_replica_identity && !member.generated_columns.is_empty()),
+                PublicationViolation(format!(
+                    "PostgreSQL 18 FULL replica identity requires publish_generated_columns=stored even when generated columns are excluded ({name})"
+                ))
             );
         }
+    }
+    for (name, schema, member) in &members {
+        // PG15's catalog view includes generated columns even though pgoutput
+        // omits them; newer views omit them too. Normalize only these known
+        // non-published fields, never ordinary ones.
+        let published = member
+            .published_columns
+            .iter()
+            .filter(|column| {
+                facts.server_version >= 180000 || !member.generated_columns.contains(column)
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            published.iter().copied().eq(&member.current_columns),
+            PublicationViolation(format!(
+                "publication must include every current source column ({name})"
+            ))
+        );
+        // Current ordinary columns are covered by the full-publication
+        // check above. Missing historical names belong to the schema
+        // registry's durable table block, so they must not stop healthy
+        // tables on restart. Still reject selected generated fields that
+        // COPY would read but pgoutput would omit.
+        ensure!(
+            schema.columns.iter().all(|column| {
+                !member.generated_columns.contains(&column.name)
+                    || published.contains(&&column.name)
+            }),
+            PublicationViolation(format!(
+                "publication omits a configured source column; snapshot and CDC must use the same columns ({name})"
+            ))
+        );
     }
     Ok(())
 }
@@ -819,5 +955,192 @@ mod tests {
             observed.await.is_err(),
             "driver must release resources on reconnect"
         );
+    }
+
+    const ORDERS: u32 = 11;
+    const CUSTOMERS: u32 = 12;
+    const OTHER: u32 = 99;
+
+    fn configured() -> (Vec<Table>, Vec<TableSchema>) {
+        let config: Config = toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let orders = config.tables[0].clone();
+        let mut customers = orders.clone();
+        customers.source_table = "customers".into();
+        let schema = |id| TableSchema {
+            table_id: TableId(id),
+            version: 1,
+            columns: ["id", "status"]
+                .into_iter()
+                .zip(1..)
+                .map(|(name, field_id)| flow_model::Column {
+                    field_id,
+                    name: name.into(),
+                    data_type: flow_model::ColumnType::String,
+                    nullable: false,
+                })
+                .collect(),
+            primary_key: vec![0],
+            append_only: false,
+        };
+        (
+            vec![orders, customers],
+            vec![schema(ORDERS), schema(CUSTOMERS)],
+        )
+    }
+
+    fn member(relation_id: u32, published: &[&str]) -> PublishedTable {
+        PublishedTable {
+            relation_id,
+            published_columns: published.iter().map(|name| (*name).into()).collect(),
+            current_columns: vec!["id".into(), "status".into()],
+            ..Default::default()
+        }
+    }
+
+    fn facts(server_version: i32, members: Vec<PublishedTable>) -> PublicationFacts {
+        PublicationFacts {
+            server_version,
+            operations: Some([true; 4]),
+            publish_generated: false,
+            members,
+        }
+    }
+
+    fn check(facts: &PublicationFacts) -> Result<()> {
+        let (tables, schemas) = configured();
+        check_publication(&tables, &schemas, facts)
+    }
+
+    /// A definite contract violation, which the running check reports rather
+    /// than retrying.
+    fn violation(facts: &PublicationFacts) -> String {
+        let error = check(facts).unwrap_err();
+        assert!(error.is::<PublicationViolation>(), "{error:#}");
+        error.to_string()
+    }
+
+    #[test]
+    fn publication_may_contain_other_tables_but_must_contain_every_configured_one() {
+        let full = ["id", "status"];
+        for version in [140000, 150000, 170000, 180000] {
+            // Other members, even ones that violate the configured-table
+            // contract, belong to other consumers.
+            let mut other = member(OTHER, &["id"]);
+            other.row_filter = true;
+            other.full_replica_identity = true;
+            other.generated_columns = vec!["total".into()];
+            check(&facts(
+                version,
+                vec![member(CUSTOMERS, &full), other, member(ORDERS, &full)],
+            ))
+            .unwrap();
+
+            let missing = violation(&facts(version, vec![member(ORDERS, &full)]));
+            assert!(
+                missing.contains("missing public.customers") && !missing.contains("orders"),
+                "{missing}"
+            );
+            let missing = violation(&facts(version, vec![member(OTHER, &full)]));
+            assert!(
+                missing.contains("missing public.orders, public.customers"),
+                "{missing}"
+            );
+        }
+        // PostgreSQL 14 has no row filters or column lists, only membership.
+        check(&facts(
+            140000,
+            vec![
+                PublishedTable {
+                    relation_id: ORDERS,
+                    ..Default::default()
+                },
+                PublishedTable {
+                    relation_id: CUSTOMERS,
+                    ..Default::default()
+                },
+            ],
+        ))
+        .unwrap();
+
+        let mut dropped = facts(170000, vec![]);
+        dropped.operations = None;
+        assert_eq!(violation(&dropped), "publication not found");
+        for operation in 0..4 {
+            let mut partial = facts(
+                170000,
+                vec![member(ORDERS, &full), member(CUSTOMERS, &full)],
+            );
+            partial.operations.as_mut().unwrap()[operation] = false;
+            assert!(violation(&partial).contains("INSERT, UPDATE, DELETE, and TRUNCATE"));
+        }
+        // An unsupported server is a configuration error, not a contract change.
+        let error = check(&facts(130000, vec![])).unwrap_err();
+        assert!(!error.is::<PublicationViolation>(), "{error:#}");
+    }
+
+    #[test]
+    fn configured_table_contract_violations_name_the_table() {
+        let full = ["id", "status"];
+        let mut filtered = member(CUSTOMERS, &full);
+        filtered.row_filter = true;
+        assert_eq!(
+            violation(&facts(170000, vec![member(ORDERS, &full), filtered])),
+            "publication row filters are not supported by initial COPY (public.customers)"
+        );
+        assert_eq!(
+            violation(&facts(
+                170000,
+                vec![member(ORDERS, &["id"]), member(CUSTOMERS, &full)]
+            )),
+            "publication must include every current source column (public.orders)"
+        );
+
+        // PostgreSQL 15 lists generated columns that pgoutput omits.
+        let generated = |published: &[&str]| {
+            let mut orders = member(ORDERS, published);
+            orders.generated_columns = vec!["total".into()];
+            orders
+        };
+        check(&facts(
+            150000,
+            vec![
+                generated(&["id", "status", "total"]),
+                member(CUSTOMERS, &full),
+            ],
+        ))
+        .unwrap();
+        let (tables, mut schemas) = configured();
+        let mut total = schemas[0].columns[1].clone();
+        total.field_id = 3;
+        total.name = "total".into();
+        schemas[0].columns.push(total);
+        let error = check_publication(
+            &tables,
+            &schemas,
+            &facts(
+                150000,
+                vec![
+                    generated(&["id", "status", "total"]),
+                    member(CUSTOMERS, &full),
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert!(error.is::<PublicationViolation>());
+        assert!(error.to_string().ends_with("(public.orders)"), "{error}");
+
+        // PostgreSQL 18 FULL identity logs generated columns unless published.
+        let mut identity = generated(&full);
+        identity.full_replica_identity = true;
+        assert!(
+            violation(&facts(180000, vec![identity, member(CUSTOMERS, &full)]))
+                .ends_with("excluded (public.orders)")
+        );
+        let mut identity = generated(&["id", "status", "total"]);
+        identity.full_replica_identity = true;
+        identity.current_columns.push("total".into());
+        let mut published = facts(180000, vec![identity, member(CUSTOMERS, &full)]);
+        published.publish_generated = true;
+        check(&published).unwrap();
     }
 }

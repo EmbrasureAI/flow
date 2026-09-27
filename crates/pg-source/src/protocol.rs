@@ -111,6 +111,42 @@ pub enum SourceEvent {
     Metadata,
 }
 
+impl SourceEvent {
+    /// Drop metadata and changes for relations outside the capture set. A
+    /// publication may contain other tables; pgoutput still sends them. A
+    /// TRUNCATE keeps only its captured relations. Transaction boundaries are
+    /// always retained, so a transaction without captured changes stays empty.
+    pub fn retain_relations(self, mut captured: impl FnMut(u32) -> bool) -> Option<Self> {
+        match self {
+            Self::Relation(Relation { id, .. })
+            | Self::Insert { relation: id, .. }
+            | Self::Update { relation: id, .. }
+            | Self::Delete { relation: id, .. }
+                if !captured(id) =>
+            {
+                None
+            }
+            Self::Truncate {
+                xid,
+                subxid,
+                mut relations,
+                cascade,
+                restart_identity,
+            } => {
+                relations.retain(|id| captured(*id));
+                (!relations.is_empty()).then_some(Self::Truncate {
+                    xid,
+                    subxid,
+                    relations,
+                    cascade,
+                    restart_identity,
+                })
+            }
+            event => Some(event),
+        }
+    }
+}
+
 pub struct Decoder {
     max_message_bytes: usize,
     normal_xid: Option<u32>,

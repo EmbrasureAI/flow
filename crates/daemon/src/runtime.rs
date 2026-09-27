@@ -7,7 +7,7 @@ mod table;
 
 use self::{
     blocked::BlockedTables,
-    health::{HealthCheckResult, check_health},
+    health::{HealthCheckResult, PUBLICATION_CHECK_INTERVAL, check_health},
     pending::{EPOCH_MAX_BYTES, EPOCH_MUTATION_TRIGGER, PendingWork, schedule_transactions},
     table::{
         BuildAdmission, CompactionCandidate, CompletedBuild, CompletedPreparation,
@@ -302,6 +302,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
             .zip(&config.tables)
             .map(|(schema, table)| (schema.table_id, table.priority))
             .collect(),
+        publication_schemas: boot.schemas.clone().into(),
         schemas: boot
             .schemas
             .into_iter()
@@ -380,6 +381,8 @@ struct PublishRuntime {
     work: TableWork,
     schemas: BTreeMap<TableId, TableSchema>,
     profiles: BTreeMap<TableId, Priority>,
+    /// Configuration-ordered schemas for the running publication contract check.
+    publication_schemas: Arc<[TableSchema]>,
 }
 
 /// WAL pressure must reduce warehouse work that cannot advance the source ACK.
@@ -427,6 +430,7 @@ impl PublishRuntime {
             work,
             schemas,
             profiles,
+            publication_schemas,
         } = self;
         let config = &work.config;
         let store = &work.store;
@@ -474,6 +478,8 @@ impl PublishRuntime {
         health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut health_client = None;
         let mut health_checks = FuturesUnordered::new();
+        // Startup just validated the publication; recheck it while running.
+        let mut publication_due = Instant::now() + PUBLICATION_CHECK_INTERVAL;
         let mut checkpoints = FuturesUnordered::new();
         let mut idle_work: VecDeque<_> = schemas
             .keys()
@@ -920,6 +926,15 @@ impl PublishRuntime {
                     if result.source_health == SourceHealthStatus::SlotLost {
                         bail!("replication slot lost WAL; resynchronization required");
                     }
+                    if let Some(violation) = result.publication_violation {
+                        // pgoutput may already have omitted changes. Stop before
+                        // acknowledging more source progress under the new contract.
+                        tracing::error!(event = "source_publication_changed",
+                            publication = %config.source.publication, reason = %format!("{violation:#}"),
+                            "source publication contract changed; resynchronization is required");
+                        bail!("source publication {:?} changed during capture: {violation:#}; resynchronization is required",
+                            config.source.publication);
+                    }
                 }
                 Some(result) = checkpoints.next(), if !checkpoints.is_empty() => {
                     result?;
@@ -1161,7 +1176,11 @@ impl PublishRuntime {
                         checkpoints.push(CheckpointTask::start(config, work.control.clone(), store.clone()));
                     }
                     if health_checks.is_empty() {
-                        health_checks.push(check_health(config.clone(), health_client.take()));
+                        let publication = (Instant::now() >= publication_due).then(|| {
+                            publication_due = Instant::now() + PUBLICATION_CHECK_INTERVAL;
+                            publication_schemas.clone()
+                        });
+                        health_checks.push(check_health(config.clone(), health_client.take(), publication));
                     }
                     // Queue at most one idle check per table. Admission rechecks
                     // for CDC and gives due publication work the available slots.

@@ -41,9 +41,12 @@ CREATE PUBLICATION embrasure_flow FOR TABLE public.orders
   WITH (publish = 'insert, update, delete, truncate');
 ```
 
-Include every configured source table in that publication. Flow validates the
-publication; it does not create or alter it. For PostgreSQL 18 stored generated
-columns, also set `publish_generated_columns = stored`; see the
+Include every configured source table in that publication. It may also contain
+other tables, so an existing administrator-managed publication, including
+`FOR ALL TABLES` or `FOR TABLES IN SCHEMA`, works; Flow ignores changes to the
+other tables. Flow validates the publication; it does not create or alter it.
+For PostgreSQL 18 stored generated columns, also set
+`publish_generated_columns = stored`; see the
 [type guide](postgres-types.md#generated-columns). Initial COPY requires full
 row visibility: a role subject to row-level security is rejected rather than
 silently copying a filtered snapshot. Have the administrator provide appropriate
@@ -87,7 +90,7 @@ writable `state_dir`; do not share it between running Flow processes.
 source permissions, publication membership or service connectivity; `init`
 performs those checks while initializing the pipeline.
 
-Mutable tables require a primary key and `REPLICA IDENTITY FULL`. Publications must include inserts, updates, deletes and truncates, with exactly the configured tables and no row filters. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
+Mutable tables require a primary key and `REPLICA IDENTITY FULL`. Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; other published tables are ignored. While running, Flow rechecks this about once a minute and stops if a configured table leaves the publication or its contract changes, because pgoutput may already have omitted changes. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
 
 An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values block the affected table rather than publishing an incomplete row.
 
@@ -108,7 +111,8 @@ The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,c
 | Error or symptom | Action |
 | --- | --- |
 | Source connection environment variable is missing | Export the variable named by `source.connection_env` in the process running Flow. |
-| Publication not found or table membership differs | Create the named publication in the source database with exactly the configured tables and all four operation flags. |
+| Publication not found or a configured table is missing | Create the named publication in the source database with every configured table and all four operation flags. It may contain other tables. |
+| Source publication changed during capture | A configured table left the publication or gained a row filter or column list while running. Restore the publication, then resynchronize: changes published under the altered contract may be missing. |
 | Replica identity or primary-key validation fails | Set FULL replica identity and match the complete primary key in `primary_key`; keyless tables require append-only mode. |
 | Source column name or type differs | Match column order, names and the type mappings; check `column_selection` if intentionally excluding columns. |
 | Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. A successful `check` does not validate them. |
