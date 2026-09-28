@@ -241,6 +241,10 @@ impl SchemaRegistry {
         relation: &Relation,
         assembler: &mut CaptureAssembler,
     ) -> Result<()> {
+        // Other published tables have no schema lineage here; never query them.
+        if !self.bases.contains_key(&TableId(relation.id)) {
+            return Ok(());
+        }
         // Only relation changes perform catalog I/O. Rows use the cached resolver.
         self.types
             .extend(TypeRegistry::fetch(client, relation).await?);
@@ -266,9 +270,10 @@ impl SchemaRegistry {
             | SourceEvent::Update { relation, row, .. } => (TableId(*relation), row),
             _ => return Ok(()),
         };
-        let current = assembler
-            .schema(id)
-            .context("row for unconfigured source table")?;
+        // Rows for other published tables are ignored rather than decoded.
+        let Some(current) = assembler.schema(id) else {
+            return Ok(());
+        };
         if row.len() != current.columns.len() {
             return Ok(());
         }
@@ -456,7 +461,7 @@ impl SchemaRegistry {
         let table = TableId(relation.id);
         ensure!(
             self.bases.contains_key(&table),
-            "publication contains an unconfigured relation"
+            "schema selection for a relation outside the capture set"
         );
         let mut matching = None;
         for record in self.records(table) {

@@ -264,7 +264,7 @@ async fn prepare_source(
     store: &StateStore,
     catalog: &dyn Catalog,
 ) -> Result<Bootstrap> {
-    let sql = connect(config, false).await?;
+    let mut sql = connect(config, false).await?;
     ensure!(
         slot_cut(&sql, &config.source.slot).await?.is_none(),
         "initialization requires a new permanent replication slot"
@@ -317,7 +317,7 @@ async fn prepare_source(
         store.complete_noop(&schema.table_id, PgLsn(0), schema.version)?;
         schemas.push(schema);
     }
-    validate_publication(&sql, config, &schemas, true).await?;
+    validate_publication(&mut sql, config, &schemas, true).await?;
     let boot = Bootstrap {
         explicit_projections: config
             .tables
@@ -420,14 +420,14 @@ pub(crate) async fn resume(
         return Ok(());
     }
     validate_config(config, boot)?;
-    let sql = connect(config, false).await?;
+    let mut sql = connect(config, false).await?;
     let mut registry = crate::schema::SchemaRegistry::new(
         store.clone(),
         SourceId(config.source.id.clone()),
         &boot.schemas,
     )?;
     let current_schemas = registry.initialize(&sql, &config.tables).await?;
-    validate_publication(&sql, config, &current_schemas, false).await?;
+    validate_publication(&mut sql, config, &current_schemas, false).await?;
     let targets = tables(catalog.as_ref(), boot).await?;
     ensure!(
         boot.target_uuids.len() == boot.schemas.len(),
@@ -607,7 +607,7 @@ pub(crate) async fn resume(
         let copy_schemas = registry
             .initialize(snapshot.transaction(), &config.tables)
             .await?;
-        validate_publication(&sql, config, &copy_schemas, false).await?;
+        validate_publication(&mut sql, config, &copy_schemas, false).await?;
         exported = Some((snapshot.reexport().await?, snapshot.consistent_lsn));
         std::fs::create_dir_all(config.state_dir.join("bootstrap"))?;
         std::fs::File::open(&config.state_dir)?.sync_all()?;

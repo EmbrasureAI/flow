@@ -99,6 +99,12 @@ impl CaptureAssembler {
         self.schemas.get(&table)
     }
 
+    /// Whether a source relation belongs to this capture set. Other tables in
+    /// the publication are ignored rather than treated as source errors.
+    pub fn is_captured(&self, table: TableId) -> bool {
+        self.schemas.contains_key(&table)
+    }
+
     pub fn is_blocked(&self, table: TableId) -> bool {
         self.blocked.contains(&table)
     }
@@ -280,6 +286,22 @@ impl CaptureAssembler {
         received_lsn: PgLsn,
         journal: &mut Journal,
     ) -> Result<()> {
+        let change_xid = match &event {
+            SourceEvent::Insert { xid, .. }
+            | SourceEvent::Update { xid, .. }
+            | SourceEvent::Delete { xid, .. }
+            | SourceEvent::Truncate { xid, .. } => Some(*xid),
+            _ => None,
+        };
+        let Some(event) = event.retain_relations(|id| self.schemas.contains_key(&TableId(id)))
+        else {
+            // Other published tables never reach the spool or journal. Their
+            // transaction still commits, exactly like one without row changes.
+            if change_xid.is_some_and(|xid| !self.transactions.contains_key(&xid)) {
+                return Err(Error::Protocol("mutation outside capture transaction"));
+            }
+            return Ok(());
+        };
         match event {
             SourceEvent::Begin { xid, .. } | SourceEvent::StreamStart { xid, first: true } => {
                 self.flush()?;
@@ -310,9 +332,7 @@ impl CaptureAssembler {
                 let schema = self
                     .schemas
                     .get(&TableId(relation.id))
-                    .ok_or(Error::Config(
-                        "publication contains an unconfigured relation",
-                    ))?;
+                    .ok_or(Error::Config("relation outside the capture set"))?;
                 self.types.validate_relation(schema, &relation)?;
                 self.relations.insert(relation.id, relation);
             }
