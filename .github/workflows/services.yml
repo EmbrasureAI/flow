@@ -53,8 +53,26 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  minio:
+    # Public MinIO images are gone; build the pinned releases from source once for every service job.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build MinIO fixture images
+        run: |
+          docker build -f tests/production/Dockerfile.minio --target server -t flow-test-minio:RELEASE.2025-04-22T22-12-26Z tests/production
+          docker build -f tests/production/Dockerfile.minio --target client -t flow-test-mc:RELEASE.2025-04-16T18-13-26Z tests/production
+          docker save -o "$RUNNER_TEMP/minio-images.tar" flow-test-minio:RELEASE.2025-04-22T22-12-26Z flow-test-mc:RELEASE.2025-04-16T18-13-26Z
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minio-images
+          path: ${{ runner.temp }}/minio-images.tar
+          if-no-files-found: error
+          retention-days: 1
+
   postgres:
-    needs: build
+    needs: [build, minio]
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.suite == 'periodic-single-worker' && 30 || 20 }}
     strategy:
@@ -94,6 +112,12 @@ jobs:
         run: |
           tar -xf "$RUNNER_TEMP/service-binaries/service-binaries.tar"
           sha256sum -c target/service-binaries.sha256
+      - uses: actions/download-artifact@v4
+        with:
+          name: minio-images
+          path: ${{ runner.temp }}/minio-images
+      - name: Load MinIO fixture images
+        run: docker load -i "$RUNNER_TEMP/minio-images/minio-images.tar"
       - uses: astral-sh/setup-uv@v6
       - name: Verify stock reader extensions from an empty cache
         run: uv run tests/local/duckdb_extensions.py
@@ -114,7 +138,7 @@ jobs:
         timeout-minutes: 5
         run: |
           for attempt in 1 2 3; do
-            if docker compose pull --ignore-buildable && docker compose build; then
+            if docker compose pull --ignore-buildable && docker compose build rest; then
               exit 0
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -292,7 +316,7 @@ jobs:
         run: docker compose down -v
 
   pgvector:
-    needs: build
+    needs: [build, minio]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -315,6 +339,12 @@ jobs:
         run: |
           tar -xf "$RUNNER_TEMP/service-binaries/service-binaries.tar"
           sha256sum -c target/service-binaries.sha256
+      - uses: actions/download-artifact@v4
+        with:
+          name: minio-images
+          path: ${{ runner.temp }}/minio-images
+      - name: Load MinIO fixture images
+        run: docker load -i "$RUNNER_TEMP/minio-images/minio-images.tar"
       - uses: astral-sh/setup-uv@v6
       - name: Select free service ports
         run: |
@@ -332,7 +362,7 @@ jobs:
         timeout-minutes: 5
         run: |
           for attempt in 1 2 3; do
-            if docker compose pull --ignore-buildable && docker compose build; then
+            if docker compose pull --ignore-buildable && docker compose build rest; then
               exit 0
             fi
             if [ "$attempt" -eq 3 ]; then
