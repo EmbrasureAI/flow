@@ -195,6 +195,7 @@ pub(crate) async fn capture_loop(
         let mut registry =
             SchemaRegistry::new(store, SourceId(config.source.id.clone()), &schemas)?;
         let mut delay = Duration::from_millis(250);
+        let mut journal_drained_at = None;
         loop {
             let connected = tokio::select! {
                 _ = send.closed() => return Ok(()),
@@ -286,6 +287,7 @@ pub(crate) async fn capture_loop(
             heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             delay = Duration::from_millis(250);
             let mut group_deadline = None;
+            let mut journal_full = None;
             loop {
                 tokio::select! {
                     biased;
@@ -446,6 +448,7 @@ pub(crate) async fn capture_loop(
                                 }
                                 registry.observe_nulls(&event, &mut assembler)?;
                                 let retained = row_table.map(|_| event.clone());
+                                let commit_xid = match &event { SourceEvent::Commit { xid, .. } => Some(*xid), _ => None };
                                 if let Err(error) = assembler.push_buffered_at(event, source.received_lsn, &mut journal) {
                                     if let Some(id) = row_table
                                         && matches!(&error, flow_pg_source::Error::Row(_) | flow_pg_source::Error::Value(_)
@@ -454,6 +457,15 @@ pub(crate) async fn capture_loop(
                                             registry.block_decoder(id, &mut assembler)?;
                                             assembler.quarantine(retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?)?;
                                             continue;
+                                        }
+                                    if let Some(xid) = commit_xid
+                                        && matches!(&error, flow_pg_source::Error::Journal(flow_ingress_journal::Error::Quota { .. })) {
+                                            // Nothing past the durable journal was acknowledged. Drop the
+                                            // partial terminal and replay this commit once publication drains.
+                                            journal.abort(xid)?;
+                                            tracing::warn!(%error, xid, "journal quota reached; pausing capture until publication drains");
+                                            journal_full = Some(xid);
+                                            break;
                                         }
                                     return Err(error.into());
                                 }
@@ -480,6 +492,21 @@ pub(crate) async fn capture_loop(
             flush_capture(&mut assembler, &mut journal, &send)?;
             drop(sql_connection);
             drop(replication_connection);
+            if let Some(xid) = journal_full {
+                if !wait_for_journal_drain(
+                    &mut journal,
+                    &mut ack,
+                    &send,
+                    xid,
+                    config.limits.journal_bytes,
+                    &mut journal_drained_at,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                continue;
+            }
             tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
         }
     };
@@ -513,6 +540,57 @@ async fn acknowledge_and_reclaim(
     .await?;
     journal.reclaim(progress.materialized)?;
     Ok(())
+}
+
+/// A full journal pauses capture instead of stopping the daemon: journaled work
+/// still drains through publication while the slot retains the unjournaled WAL.
+/// The next commit is retried once from a drained journal; failing again at the
+/// same durable frontier means it cannot fit and is fatal. Returns false when
+/// the coordinator stops capture while waiting.
+async fn wait_for_journal_drain(
+    journal: &mut Journal,
+    ack: &mut watch::Receiver<Acknowledgement>,
+    send: &watch::Sender<CaptureProgress>,
+    xid: u32,
+    quota_bytes: u64,
+    drained_at: &mut Option<PgLsn>,
+) -> Result<bool> {
+    let target = journal.durable_lsn();
+    let progress = *ack.borrow_and_update();
+    journal.reclaim(progress.materialized)?;
+    ensure!(
+        *drained_at != Some(target),
+        "source transaction {xid} does not fit in the ingress journal after all journaled work was published; increase limits.journal_bytes (currently {quota_bytes} bytes)"
+    );
+    metrics::gauge!("flow_capture_journal_full").set(1.0);
+    let started = Instant::now();
+    let mut materialized = progress.materialized;
+    let drained = loop {
+        if materialized >= target {
+            break true;
+        }
+        tokio::select! {
+            _ = send.closed() => break false,
+            changed = ack.changed() => {
+                if changed.is_err() {
+                    break false;
+                }
+                materialized = ack.borrow_and_update().materialized;
+                journal.reclaim(materialized)?;
+            }
+        }
+    };
+    metrics::gauge!("flow_capture_journal_full").set(0.0);
+    if drained {
+        *drained_at = Some(target);
+        tracing::info!(
+            xid,
+            paused_seconds = started.elapsed().as_secs_f64(),
+            journal_bytes = journal.bytes_used(),
+            "journal drained; resuming capture"
+        );
+    }
+    Ok(drained)
 }
 
 /// Publish observations only after the shared journal reader frontier is durable.
@@ -617,7 +695,11 @@ struct SourceIdentity {
     timeline: u32,
 }
 
-async fn verify_source_identity(client: &Client, config: &Config, initialize: bool) -> Result<()> {
+pub(crate) async fn verify_source_identity(
+    client: &Client,
+    config: &Config,
+    initialize: bool,
+) -> Result<()> {
     use flow_pg_source::tokio_postgres::SimpleQueryMessage;
     use std::io::Write;
     let response = client.simple_query("IDENTIFY_SYSTEM").await?;
@@ -837,7 +919,7 @@ pub(crate) async fn validate_publication_contract(
 /// The publication must contain every configured table and may contain
 /// others, such as an admin-owned `FOR ALL TABLES` or `FOR TABLES IN SCHEMA`
 /// publication. Only configured tables' filters and columns matter.
-async fn publication_contract(
+pub(crate) async fn publication_contract(
     client: &Client,
     config: &Config,
     schemas: &[TableSchema],
@@ -1109,6 +1191,175 @@ mod tests {
         async fn acknowledge(&mut self, _: Acknowledgement) -> flow_pg_source::Result<()> {
             Ok(())
         }
+    }
+
+    fn commit_test_transaction(journal: &mut Journal, xid: u32, payload: &[u8]) {
+        journal.append_chunk(xid, payload).unwrap();
+        commit_appended(journal, xid);
+    }
+
+    fn commit_appended(journal: &mut Journal, xid: u32) {
+        journal
+            .commit(SourceTransaction {
+                source_id: SourceId("source".into()),
+                xid,
+                begin_lsn: PgLsn(u64::from(xid) * 10 - 2),
+                commit_lsn: PgLsn(u64::from(xid) * 10),
+                end_lsn: PgLsn(u64::from(xid) * 10 + 1),
+                commit_timestamp_micros: 0,
+                schema_versions: vec![TableSchemaVersion {
+                    table_id: TableId(1),
+                    version: 1,
+                }],
+                affected_tables: vec![TableId(1)],
+                mutation_chunks: journal.transaction_chunks(xid),
+                table_mutation_counts: Some(vec![TableMutationCount {
+                    table_id: TableId(1),
+                    mutations: 1,
+                }]),
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_journal_pauses_capture_until_publication_drains() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = JournalConfig {
+            segment_bytes: 600,
+            quota_bytes: 2_400,
+            max_frame_bytes: 400,
+            max_open_transactions: 8,
+        };
+        let (mut journal, _) = Journal::open(directory.path(), config).unwrap();
+        let mut xid = 1;
+        let error = loop {
+            match journal.append_chunk(xid, &[xid as u8; 300]) {
+                Ok(_) => {
+                    commit_appended(&mut journal, xid);
+                    xid += 1;
+                }
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(error, flow_ingress_journal::Error::Quota { .. }));
+        journal.abort(xid).unwrap();
+        let durable = journal.durable_lsn();
+        let (acknowledge, mut ack) = watch::channel(Acknowledgement::default());
+        let (send, _progress) = watch::channel(CaptureProgress {
+            durable_lsn: durable,
+            error: None,
+            publication_changed: false,
+        });
+        let waiting = tokio::spawn(async move {
+            let drained =
+                wait_for_journal_drain(&mut journal, &mut ack, &send, xid, 2_400, &mut None)
+                    .await
+                    .unwrap();
+            (drained, journal)
+        });
+        acknowledge.send_replace(Acknowledgement {
+            received: durable,
+            durable,
+            materialized: PgLsn(11),
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "capture resumed before the journal drained"
+        );
+        acknowledge.send_replace(Acknowledgement {
+            received: durable,
+            durable,
+            materialized: durable,
+        });
+        let (drained, mut journal) = waiting.await.unwrap();
+        assert!(drained);
+        commit_test_transaction(&mut journal, xid, &[xid as u8; 300]);
+    }
+
+    #[tokio::test]
+    async fn transaction_larger_than_a_drained_journal_is_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = JournalConfig {
+            segment_bytes: 600,
+            quota_bytes: 1_200,
+            max_frame_bytes: 400,
+            max_open_transactions: 8,
+        };
+        let (mut journal, _) = Journal::open(directory.path(), config).unwrap();
+        commit_test_transaction(&mut journal, 1, &[1; 300]);
+        let durable = journal.durable_lsn();
+        let (_acknowledge, mut ack) = watch::channel(Acknowledgement {
+            received: durable,
+            durable,
+            materialized: durable,
+        });
+        journal.reclaim(durable).unwrap();
+        let error = loop {
+            match journal.append_chunk(2, &[2; 300]) {
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(error, flow_ingress_journal::Error::Quota { .. }));
+        journal.abort(2).unwrap();
+        let (send, _progress) = watch::channel(CaptureProgress {
+            durable_lsn: durable,
+            error: None,
+            publication_changed: false,
+        });
+        // Retry once from the drained journal; the same failure again is fatal.
+        let mut drained_at = None;
+        assert!(
+            wait_for_journal_drain(&mut journal, &mut ack, &send, 2, 1_200, &mut drained_at)
+                .await
+                .unwrap()
+        );
+        let error = loop {
+            match journal.append_chunk(2, &[2; 300]) {
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(error, flow_ingress_journal::Error::Quota { .. }));
+        journal.abort(2).unwrap();
+        let error =
+            wait_for_journal_drain(&mut journal, &mut ack, &send, 2, 1_200, &mut drained_at)
+                .await
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("increase limits.journal_bytes"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_drain_wait_stops_with_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut journal, _) = Journal::open(
+            directory.path(),
+            JournalConfig {
+                segment_bytes: 600,
+                quota_bytes: 2_400,
+                max_frame_bytes: 400,
+                max_open_transactions: 8,
+            },
+        )
+        .unwrap();
+        commit_test_transaction(&mut journal, 1, &[1; 300]);
+        let (acknowledge, mut ack) = watch::channel(Acknowledgement::default());
+        let (send, progress) = watch::channel(CaptureProgress {
+            durable_lsn: journal.durable_lsn(),
+            error: None,
+            publication_changed: false,
+        });
+        drop(progress);
+        assert!(
+            !wait_for_journal_drain(&mut journal, &mut ack, &send, 2, 2_400, &mut None)
+                .await
+                .unwrap()
+        );
+        drop(acknowledge);
     }
 
     #[tokio::test]

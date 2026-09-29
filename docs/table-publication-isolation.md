@@ -71,7 +71,7 @@ resync/replacement to establish new authoritative state; never clear the block o
 discard journal records manually. This version does not reinterpret quarantined
 mutations automatically. The product's current Full resync replaces the whole
 connection. Journal/spool quotas and source WAL pressure still bound how long
-healthy tables can continue; quota exhaustion fails closed.
+healthy tables can continue; a full journal pauses capture without dropping changes.
 
 Journal corruption, source connection/slot/identity failures, state-store failures,
 invalid shared invariants, and unclassified errors remain connection-wide. Completed bootstrap with intact local authority

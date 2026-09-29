@@ -585,15 +585,15 @@ Recovery must preserve the source slot/control identity, reconstruct the index,
 resolve the pending publication exactly once, and support subsequent key changes.
 Stock DuckDB checks full current rows and retained historical snapshots.
 
-The capacity phase uses a 64 MiB journal quota, the minimum compatible with the
-existing segment size. It holds ingestion POSTs and commits at most ten batches
-of 512 rows with 16 KiB payloads. The test requires the actual encoded-byte quota
-error, an unacknowledged source suffix, and unchanged public rows while held.
-It then releases publication, restores this fixture's ordinary 256 MiB quota,
-and recovers the same slot/state, including committed rows that were not yet
-journaled. This is configured-capacity exhaustion, not a disk-full simulation or
-a performance test. The old quota config, daemon/proxy logs, committed cohort,
-ACK evidence and failures are retained. Only owned processes are stopped; ports
+The capacity phase uses a 256 MiB journal quota (four segments). It holds
+ingestion POSTs and commits 40 batches of 512 rows with 16 KiB payloads. The
+test requires capture to pause on the actual encoded-byte quota error with the
+daemon still running, an unacknowledged source suffix, and unchanged public rows
+while held. It then releases publication and requires the same process to drain
+the journal, resume capture and materialize every committed row, including rows
+that were not yet journaled, on the same slot/state. This is configured-capacity
+exhaustion, not a disk-full simulation or a performance test. The daemon/proxy
+logs, committed cohort, pause evidence and failures are retained. Only owned processes are stopped; ports
 are allocated through the existing proxy helper.
 
 ## Maintenance fairness under queued CDC
