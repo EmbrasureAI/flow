@@ -381,7 +381,7 @@ async fn delete_replay_survives_index_loss_and_rejects_stale_base_and_physical_b
         PgLsn(80)
     );
     assert!(stale.commit(f.catalog.as_ref(), &head).await.is_err());
-    let prefix = format!("owned-artifacts/v1/{}/", head.metadata().uuid());
+    let prefix = format!("owned-artifacts/v2/{}/", head.metadata().uuid());
     assert!(
         f.control
             .source_transactions_after(prefix.as_bytes(), None)

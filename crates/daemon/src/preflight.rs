@@ -265,7 +265,7 @@ async fn tables(sql: &mut Client, config: &Config, report: &mut Report) {
         return;
     }
     match crate::source::publication_contract(sql, config, &schemas).await {
-        Ok(()) => report.add(
+        Ok(violations) if violations.is_empty() => report.add(
             Level::Ok,
             "publication",
             format!(
@@ -273,6 +273,11 @@ async fn tables(sql: &mut Client, config: &Config, report: &mut Report) {
                 config.source.publication
             ),
         ),
+        Ok(violations) => {
+            for violation in violations {
+                report.add(Level::Fail, "publication", violation.reason);
+            }
+        }
         Err(error) => report.add(Level::Fail, "publication", format!("{error:#}")),
     }
 }

@@ -11,7 +11,8 @@ use flow_coordinator::{
 use flow_materializer::iceberg_schema;
 use flow_model::{SourceId, TableId, TableSchema};
 use flow_pg_source::{
-    CaptureAssembler, Relation, TypeRegistry, fetch_table_metadata_selected,
+    CaptureAssembler, Relation, TABLE_METADATA_BATCH_SIZE, TableMetadata, TableMetadataRequest,
+    TypeRegistry, fetch_table_metadata_batch, fetch_table_metadata_selected,
     nullable_successor_with_types, same_wire_schema,
     tokio_postgres::{Client, GenericClient},
     validate_schema_metadata,
@@ -34,6 +35,9 @@ pub(crate) struct SchemaRegistry {
     projections: BTreeMap<TableId, Vec<String>>,
     identities: BTreeMap<(String, String), TableId>,
     blocked: BTreeSet<TableId>,
+    /// Blocked because the publication stopped covering them: capture drops
+    /// their changes instead of quarantining them.
+    dropped: BTreeSet<TableId>,
 }
 impl SchemaRegistry {
     pub(crate) fn new(store: StateStore, source: SourceId, bases: &[TableSchema]) -> Result<Self> {
@@ -47,6 +51,7 @@ impl SchemaRegistry {
         }
         let mut identities = BTreeMap::new();
         let mut blocked = BTreeSet::new();
+        let mut dropped = BTreeSet::new();
         for id in initial.keys().copied() {
             if let Some(entry) = store
                 .source_transactions_after(&schema_prefix(&source, id), None)
@@ -56,13 +61,21 @@ impl SchemaRegistry {
                 let record = SchemaRecord::decode(&bytes)?;
                 identities.insert((record.relation.namespace, record.relation.name), id);
             }
-            if capture_blocked(&store, &source, id)? {
-                blocked.insert(id);
+            match capture_block(&store, &source, id)? {
+                Some(CaptureBlock::PublicationChanged) => {
+                    blocked.insert(id);
+                    dropped.insert(id);
+                }
+                Some(CaptureBlock::SchemaIncompatible) => {
+                    blocked.insert(id);
+                }
+                None => {}
             }
         }
         Ok(Self {
             identities,
             blocked,
+            dropped,
             store,
             source,
             bases: initial,
@@ -87,56 +100,77 @@ impl SchemaRegistry {
         );
         let mut result = Vec::with_capacity(self.bases.len());
         // Configuration order need not be table-OID order.
-        for configured in configured {
-            // Only established table identities can be isolated. Bootstrap and
-            // missing/corrupt authority still require coordinated recovery.
-            let identity = (
-                configured.source_namespace.clone(),
-                configured.source_table.clone(),
-            );
-            let known = self
-                .identities
-                .get(&identity)
-                .map(|id| self.latest(*id).map(|record| record.schema))
-                .transpose()?;
-            if let Some(schema) = &known {
-                if let Some(selected) = configured.projection() {
-                    self.projections.insert(schema.table_id, selected);
+        for chunk in configured.chunks(TABLE_METADATA_BATCH_SIZE) {
+            let requests: Vec<_> = chunk
+                .iter()
+                .filter(|configured| {
+                    let identity = (
+                        configured.source_namespace.clone(),
+                        configured.source_table.clone(),
+                    );
+                    !self
+                        .identities
+                        .get(&identity)
+                        .is_some_and(|id| self.is_blocked(*id))
+                })
+                .map(|configured| TableMetadataRequest {
+                    namespace: configured.source_namespace.clone(),
+                    table: configured.source_table.clone(),
+                    selected: configured.projection(),
+                })
+                .collect();
+            let mut metadata = fetch_table_metadata_batch(client, &requests)
+                .await?
+                .into_iter();
+            for configured in chunk {
+                // Only established table identities can be isolated. Bootstrap and
+                // missing/corrupt authority still require coordinated recovery.
+                let identity = (
+                    configured.source_namespace.clone(),
+                    configured.source_table.clone(),
+                );
+                let known = self
+                    .identities
+                    .get(&identity)
+                    .map(|id| self.latest(*id).map(|record| record.schema))
+                    .transpose()?;
+                if let Some(schema) = &known {
+                    if let Some(selected) = configured.projection() {
+                        self.projections.insert(schema.table_id, selected);
+                    }
+                    if self.is_blocked(schema.table_id) {
+                        result.push(schema.clone());
+                        continue;
+                    }
                 }
-                if self.is_blocked(schema.table_id) {
-                    result.push(schema.clone());
-                    continue;
+                match metadata
+                    .next()
+                    .context("missing requested table metadata")?
+                    .map_err(anyhow::Error::from)
+                    .and_then(|metadata| self.initialize_table(configured, metadata))
+                {
+                    Ok(schema) => {
+                        self.identities.insert(identity, schema.table_id);
+                        result.push(schema);
+                    }
+                    Err(error) if known.is_some() && table_schema_error(&error) => {
+                        let schema = known.expect("checked above");
+                        self.block(schema.table_id, schema_block_reason(&error))?;
+                        result.push(schema);
+                    }
+                    Err(error) => return Err(error),
                 }
-            }
-            match self.initialize_table(client, configured).await {
-                Ok(schema) => {
-                    self.identities.insert(identity, schema.table_id);
-                    result.push(schema);
-                }
-                Err(error) if known.is_some() && table_schema_error(&error) => {
-                    let schema = known.expect("checked above");
-                    self.block(schema.table_id, schema_block_reason(&error))?;
-                    result.push(schema);
-                }
-                Err(error) => return Err(error),
             }
         }
         Ok(result)
     }
 
-    async fn initialize_table(
+    fn initialize_table(
         &mut self,
-        client: &(impl GenericClient + Sync),
         configured: &ConfiguredTable,
+        metadata: TableMetadata,
     ) -> Result<TableSchema> {
         let projection = configured.projection();
-        let metadata = fetch_table_metadata_selected(
-            client,
-            &configured.source_namespace,
-            &configured.source_table,
-            projection.as_deref(),
-        )
-        .await?;
         if let Some(selected) = projection {
             self.projections
                 .insert(TableId(metadata.relation.id), selected);
@@ -200,6 +234,15 @@ impl SchemaRegistry {
         self.blocked.contains(&table)
     }
 
+    pub(crate) fn is_dropped(&self, table: TableId) -> bool {
+        self.dropped.contains(&table)
+    }
+
+    /// Tables whose capture drops changes; see [`CaptureAssembler::drop_table`].
+    pub(crate) fn dropped(&self) -> impl Iterator<Item = TableId> + '_ {
+        self.dropped.iter().copied()
+    }
+
     pub(crate) fn block_decoder(
         &self,
         table: TableId,
@@ -214,21 +257,42 @@ impl SchemaRegistry {
     }
 
     pub(crate) fn block(&mut self, table: TableId, reason: &str) -> Result<()> {
+        self.block_with(table, CaptureBlock::SchemaIncompatible, reason)
+    }
+
+    /// The publication no longer covers this configured table's changes.
+    pub(crate) fn block_publication(&mut self, table: TableId, reason: &str) -> Result<()> {
+        self.block_with(table, CaptureBlock::PublicationChanged, reason)
+    }
+
+    fn block_with(&mut self, table: TableId, cause: CaptureBlock, reason: &str) -> Result<()> {
         ensure!(
             self.bases.contains_key(&table),
             "unconfigured capture block"
         );
+        // The block is durable and only a resync clears it. It keeps its first
+        // cause, except that a publication block supersedes a schema block:
+        // both need a resync, and dropping stops its quarantined changes from
+        // holding the acknowledgement frontier.
+        if self.blocked.contains(&table)
+            && (cause != CaptureBlock::PublicationChanged || self.dropped.contains(&table))
+        {
+            return Ok(());
+        }
         // Prove a recoverable schema before persisting a table-scoped failure.
         self.latest(table)?;
         self.store
-            .put_source_transaction(&capture_block_key(&self.source, table), b"1")?;
+            .put_source_transaction(&capture_block_key(&self.source, table), cause.value())?;
         self.blocked.insert(table);
+        if cause == CaptureBlock::PublicationChanged {
+            self.dropped.insert(table);
+        }
         self.candidates.retain(|(id, _), _| *id != table);
         self.dirty.remove(&table);
         tracing::warn!(
             event = "source_table_blocked",
             table_id = table.0,
-            error_code = "source_schema_incompatible",
+            error_code = cause.code(),
             reason,
             "source table requires schema repair or full resync"
         );
@@ -622,17 +686,59 @@ fn capture_block_key(source: &SourceId, table: TableId) -> Vec<u8> {
     key.extend(table.0.to_be_bytes());
     key
 }
-pub(crate) fn capture_blocked(
+/// Why capture latched a table. The durable value predates the cause, so a
+/// schema block keeps its original encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureBlock {
+    SchemaIncompatible,
+    PublicationChanged,
+}
+
+impl CaptureBlock {
+    fn value(self) -> &'static [u8] {
+        match self {
+            Self::SchemaIncompatible => b"1",
+            Self::PublicationChanged => b"publication_changed",
+        }
+    }
+
+    /// The bounded status code; never remote text.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::SchemaIncompatible => "source_schema_incompatible",
+            Self::PublicationChanged => "publication_changed",
+        }
+    }
+}
+
+/// Latch a durable publication block as capture would, for runtime tests.
+#[cfg(test)]
+pub(crate) fn latch_publication_block(
     store: &StateStore,
     source: &SourceId,
     table: TableId,
-) -> Result<bool> {
+) -> Result<()> {
+    store.put_source_transaction(
+        &capture_block_key(source, table),
+        CaptureBlock::PublicationChanged.value(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn capture_block(
+    store: &StateStore,
+    source: &SourceId,
+    table: TableId,
+) -> Result<Option<CaptureBlock>> {
     match store.source_transaction(&capture_block_key(source, table))? {
-        None => Ok(false),
-        Some(bytes) => {
-            ensure!(bytes == b"1", "invalid durable capture block");
-            Ok(true)
+        None => Ok(None),
+        Some(bytes) if bytes == CaptureBlock::SchemaIncompatible.value() => {
+            Ok(Some(CaptureBlock::SchemaIncompatible))
         }
+        Some(bytes) if bytes == CaptureBlock::PublicationChanged.value() => {
+            Ok(Some(CaptureBlock::PublicationChanged))
+        }
+        Some(_) => anyhow::bail!("invalid durable capture block"),
     }
 }
 
@@ -651,6 +757,7 @@ pub(crate) async fn refresh_table(catalog: &dyn Catalog, table: &Table) -> Resul
 /// Add only the exact nullable suffix, checking upstream-assigned field IDs.
 /// A lost response is resolved by reloading the exact resulting public schema.
 pub(crate) async fn ensure_table_schema(
+    store: &StateStore,
     catalog: &dyn Catalog,
     table: &Table,
     target: &TableSchema,
@@ -694,6 +801,7 @@ pub(crate) async fn ensure_table_schema(
             field.field_type.as_ref().clone(),
         ));
     }
+    flow_coordinator::register_catalog_metadata(store, table, target.table_id).await?;
     let updated = match action.apply(transaction)?.commit(catalog).await {
         Ok(table) => table,
         Err(error) => {
@@ -828,10 +936,14 @@ mod target_identity_tests {
             )
             .await
             .unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(temp.path(), Default::default()).unwrap();
         let mut next = schema.clone();
         next.version = 1;
         next.columns[1].nullable = true;
-        let updated = ensure_table_schema(&catalog, &table, &next).await.unwrap();
+        let updated = ensure_table_schema(&store, &catalog, &table, &next)
+            .await
+            .unwrap();
         assert_eq!(updated.metadata().uuid(), table.metadata().uuid());
         assert_eq!(updated.metadata().last_column_id(), 2);
         assert!(same_iceberg_schema(
@@ -839,7 +951,7 @@ mod target_identity_tests {
             &iceberg_schema(&next).unwrap()
         ));
         assert_eq!(
-            ensure_table_schema(&catalog, &updated, &next)
+            ensure_table_schema(&store, &catalog, &updated, &next)
                 .await
                 .unwrap()
                 .metadata(),
@@ -913,6 +1025,8 @@ mod target_identity_tests {
             )
             .await
             .unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(temp.path(), Default::default()).unwrap();
         assert_ne!(replacement.metadata().uuid(), original.metadata().uuid());
         assert!(
             refresh_table(&catalog, &original)
@@ -924,7 +1038,7 @@ mod target_identity_tests {
         // The replacement already has the expected schema, but is no proof of
         // the failed original table's schema transaction.
         assert!(
-            ensure_table_schema(&catalog, &original, &schema)
+            ensure_table_schema(&store, &catalog, &original, &schema)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -932,5 +1046,87 @@ mod target_identity_tests {
         );
         let after = catalog.load_table(original.identifier()).await.unwrap();
         assert_eq!(after.metadata(), replacement.metadata());
+    }
+
+    #[test]
+    fn publication_block_drops_only_that_table_and_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            root.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let bases = [config.tables[0].schema(11), config.tables[0].schema(12)];
+        let source = SourceId("publication".into());
+        let mut registry = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
+        for base in &bases {
+            registry
+                .persist(&SchemaRecord {
+                    format: 2,
+                    storage_id: base.table_id.0,
+                    attribute_numbers: vec![1, 2],
+                    schema: base.clone(),
+                    relation: Relation {
+                        id: base.table_id.0,
+                        namespace: "public".into(),
+                        name: format!("t{}", base.table_id.0),
+                        replica_identity: b'f',
+                        columns: base
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .map(|(index, column)| flow_pg_source::Column {
+                                name: column.name.clone(),
+                                type_oid: if index == 0 { 20 } else { 25 },
+                                type_modifier: -1,
+                                identity: index == 0,
+                            })
+                            .collect(),
+                    },
+                })
+                .unwrap();
+        }
+        registry
+            .block_publication(TableId(12), "missing: public.t12")
+            .unwrap();
+        assert!(registry.is_dropped(TableId(12)) && !registry.is_blocked(TableId(11)));
+        // The first cause wins; a later schema block cannot turn drop into quarantine.
+        registry.block(TableId(12), "schema").unwrap();
+        assert_eq!(
+            capture_block(&store, &source, TableId(12)).unwrap(),
+            Some(CaptureBlock::PublicationChanged)
+        );
+        registry.block(TableId(11), "schema").unwrap();
+        assert!(registry.is_blocked(TableId(11)) && !registry.is_dropped(TableId(11)));
+        // A publication change supersedes a schema block: both need a resync,
+        // and dropping stops quarantined changes holding acknowledgement.
+        let mut superseded = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
+        superseded
+            .block_publication(TableId(11), "missing: public.t11")
+            .unwrap();
+        assert!(superseded.is_dropped(TableId(11)));
+        assert_eq!(
+            capture_block(&store, &source, TableId(11)).unwrap(),
+            Some(CaptureBlock::PublicationChanged)
+        );
+        // Restore the schema cause for the restart assertions below.
+        store
+            .put_source_transaction(
+                &capture_block_key(&source, TableId(11)),
+                CaptureBlock::SchemaIncompatible.value(),
+            )
+            .unwrap();
+
+        // Durable across restart, whatever the publication looks like then.
+        let restarted = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
+        assert!(restarted.is_dropped(TableId(12)));
+        assert!(restarted.is_blocked(TableId(11)) && !restarted.is_dropped(TableId(11)));
+        assert_eq!(restarted.dropped().collect::<Vec<_>>(), [TableId(12)]);
+        assert_eq!(
+            capture_block(&store, &source, TableId(11)).unwrap(),
+            Some(CaptureBlock::SchemaIncompatible)
+        );
     }
 }

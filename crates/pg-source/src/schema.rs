@@ -39,8 +39,46 @@ pub async fn fetch_table_metadata_selected(
     table: &str,
     selected: Option<&[String]>,
 ) -> Result<TableMetadata> {
-    let rows = client.query(
-        "SELECT c.oid, c.relkind::text, c.relreplident::text, a.attname, a.atttypid, a.atttypmod,
+    let request = TableMetadataRequest {
+        namespace: namespace.to_owned(),
+        table: table.to_owned(),
+        selected: selected.map(<[String]>::to_vec),
+    };
+    fetch_table_metadata_batch(client, &[request])
+        .await?
+        .remove(0)
+}
+
+/// Bound transient catalog rows while retaining the existing refresh cadence.
+pub const TABLE_METADATA_BATCH_SIZE: usize = 32;
+
+pub struct TableMetadataRequest {
+    pub namespace: String,
+    pub table: String,
+    pub selected: Option<Vec<String>>,
+}
+
+/// One catalog snapshot per bounded batch; validation errors remain per table.
+pub async fn fetch_table_metadata_batch(
+    client: &(impl GenericClient + Sync),
+    requests: &[TableMetadataRequest],
+) -> Result<Vec<Result<TableMetadata>>> {
+    let mut output = Vec::with_capacity(requests.len());
+    for batch in requests.chunks(TABLE_METADATA_BATCH_SIZE) {
+        let namespaces: Vec<_> = batch.iter().map(|r| r.namespace.as_str()).collect();
+        let tables: Vec<_> = batch.iter().map(|r| r.table.as_str()).collect();
+        // Keep the indexed singleton lookup used by commit-time validation.
+        let filter = if batch.len() == 1 {
+            "n.nspname=$1 AND c.relname=$2"
+        } else {
+            "(n.nspname, c.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))"
+        };
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = if batch.len() == 1 {
+            [&batch[0].namespace, &batch[0].table]
+        } else {
+            [&namespaces, &tables]
+        };
+        let query = format!("SELECT c.oid, c.relkind::text, c.relreplident::text, a.attname, a.atttypid, a.atttypmod,
                 EXISTS (SELECT 1 FROM pg_catalog.pg_index i
                         CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ordinal)
                         WHERE i.indrelid=c.oid AND i.indisprimary
@@ -49,16 +87,49 @@ pub async fn fetch_table_metadata_selected(
                 (NOT a.atthasdef OR pg_catalog.pg_get_expr(d.adbin, d.adrelid)
                     IN ('NULL', 'NULL::' || pg_catalog.format_type(a.atttypid, a.atttypmod),
                                 'NULL::' || pg_catalog.format_type(a.atttypid, NULL))),
-                (NOT a.atthasmissing OR a.attmissingval IS NULL OR a.attmissingval::text = '{NULL}'), c.relfilenode, a.attnum
+                (NOT a.atthasmissing OR a.attmissingval IS NULL OR a.attmissingval::text = '{{NULL}}'), c.relfilenode, a.attnum, n.nspname, c.relname
          FROM pg_catalog.pg_class c
          JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
          JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
          LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
-         WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind IN ('r','p')
-         ORDER BY a.attnum", &[&namespace, &table]
-    ).await?;
+         WHERE {filter} AND c.relkind IN ('r','p')
+         ORDER BY n.nspname, c.relname, a.attnum");
+        let rows = client.query(&query, &params).await?;
+        let mut grouped =
+            std::collections::BTreeMap::<(String, String), Vec<tokio_postgres::Row>>::new();
+        for row in rows {
+            grouped
+                .entry((row.get(13), row.get(14)))
+                .or_default()
+                .push(row);
+        }
+        for request in batch {
+            let key = (request.namespace.clone(), request.table.clone());
+            let rows = grouped.get(&key).map(Vec::as_slice).unwrap_or_default();
+            output.push(
+                decode_table_metadata(
+                    client,
+                    &request.namespace,
+                    &request.table,
+                    request.selected.as_deref(),
+                    rows,
+                )
+                .await,
+            );
+        }
+    }
+    Ok(output)
+}
+
+async fn decode_table_metadata(
+    client: &(impl GenericClient + Sync),
+    namespace: &str,
+    table: &str,
+    selected: Option<&[String]>,
+    rows: &[tokio_postgres::Row],
+) -> Result<TableMetadata> {
     if let Some(selected) = selected {
-        for row in &rows {
+        for row in rows {
             if row.get::<_, bool>(6) && !selected.contains(&row.get::<_, String>(3)) {
                 return Err(Error::Config(
                     "column selection must include the complete primary key",

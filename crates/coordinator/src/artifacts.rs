@@ -101,7 +101,9 @@ impl OwnedArtifacts {
     }
 }
 pub(super) fn registry_prefix(uuid: uuid::Uuid) -> String {
-    format!("owned-artifacts/v1/{uuid}/")
+    // Older engines do not protect catalog JSON. A distinct registry namespace
+    // makes rollback retain new records instead of deleting a live JSON pointer.
+    format!("owned-artifacts/v2/{uuid}/")
 }
 pub(super) fn now_ms() -> Result<u64> {
     Ok(SystemTime::now()
@@ -114,6 +116,111 @@ fn iceberg_error(error: impl std::fmt::Display) -> iceberg::Error {
         iceberg::ErrorKind::Unexpected,
         format!("artifact ownership: {error}"),
     )
+}
+
+/// Register an authoritative catalog pointer before a metadata-only commit.
+/// This uses the same durable, grace-delayed GC registry as physical rewrites.
+/// Repeated attempts keep the original registration and never reset its grace.
+pub async fn register_catalog_metadata(
+    store: &StateStore,
+    table: &Table,
+    table_id: TableId,
+) -> Result<()> {
+    let Some(path) = table.metadata_location() else {
+        return Ok(());
+    };
+    register_metadata_path(store, table, table_id, path).await
+}
+
+async fn register_metadata_path(
+    store: &StateStore,
+    table: &Table,
+    table_id: TableId,
+    path: &str,
+) -> Result<()> {
+    let identity = uuid::Uuid::new_v5(&table.metadata().uuid(), path.as_bytes());
+    let owner = OwnedArtifacts::new(
+        table,
+        table_id,
+        OperationId(format!("catalog-metadata-{identity}")),
+        ArtifactSet {
+            paths: vec![path.to_owned()],
+            ranges: Vec::new(),
+        },
+    )?;
+    let key = format!("{}catalog-{identity}", registry_prefix(owner.table_uuid)).into_bytes();
+    let store = store.clone();
+    blocking(move || {
+        if store.source_transaction(&key)?.is_none() {
+            store.put_source_transaction(&key, &bincode::serialize(&owner)?)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Adopt a legacy catalog JSON into normal GC, without deleting anything.
+/// The operator must hold exclusive daemon state ownership. Every candidate is
+/// read and checked against the frozen table incarnation; names and age alone
+/// never establish ownership. Newly adopted files start a full GC grace.
+pub async fn import_catalog_metadata(
+    store: &StateStore,
+    table: &Table,
+    table_id: TableId,
+    path: &str,
+    apply: bool,
+) -> Result<()> {
+    ensure!(
+        table.metadata().table_properties()?.gc_enabled,
+        "table GC is disabled"
+    );
+    ensure!(
+        path.starts_with(&format!(
+            "{}/metadata/",
+            table.metadata().location().trim_end_matches('/')
+        )) && path.ends_with(".metadata.json"),
+        "inventory entry is not table metadata JSON"
+    );
+    // Reuse the normal ownership/path validation before any object read.
+    OwnedArtifacts::new(
+        table,
+        table_id,
+        OperationId("metadata-import".into()),
+        ArtifactSet {
+            paths: vec![path.to_owned()],
+            ranges: Vec::new(),
+        },
+    )?;
+    let input = table.file_io().new_input(path)?;
+    let size = input.metadata().await?.size;
+    ensure!(
+        size > 0 && size <= 16 * 1024 * 1024,
+        "metadata JSON exceeds import budget"
+    );
+    let bytes = input.reader().await?.read(0..size).await?;
+    ensure!(
+        bytes.len() as u64 == size,
+        "metadata JSON size changed during import"
+    );
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Identity {
+        table_uuid: uuid::Uuid,
+        location: String,
+        last_updated_ms: i64,
+    }
+    let identity: Identity = serde_json::from_slice(&bytes)?;
+    ensure!(
+        identity.table_uuid == table.metadata().uuid()
+            && identity.location.trim_end_matches('/')
+                == table.metadata().location().trim_end_matches('/')
+            && identity.last_updated_ms <= table.metadata().last_updated_ms(),
+        "metadata JSON does not match the retained table incarnation"
+    );
+    if apply {
+        register_metadata_path(store, table, table_id, path).await?;
+    }
+    Ok(())
 }
 
 /// One metadata publication attempt creates one bounded durable record, even

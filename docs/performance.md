@@ -6,6 +6,16 @@ PostgreSQL-commit-to-Iceberg-publication latency below 1 second at p95 and
 2 seconds at p99, and read time at most 1.25 times a compacted equivalent.
 No 24-hour endurance qualification has completed.
 
+## Expanded load and schema coverage
+
+The [expanded load matrix](benchmarks/load-matrix.md) passed exact data checks
+for all seven cases, including 100 tables, 16 KiB payloads, one-row transactions
+and 10,000-row transactions. The 50k offered case delivered 46,102 mutations/s
+including drain, with publication p99 of 6.02 seconds. Low-rate streaming layouts
+also missed the compacted-reader target. Separate 258-column, 1,502-column and
+approximately MiB-row recovery checks passed. Read the report's workload and
+shared-host limits before using these observations for sizing.
+
 ## V3 deletion-vector results
 
 The latest [v2/v3 comparison](benchmarks/v3-deletion-vectors.md)

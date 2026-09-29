@@ -42,7 +42,7 @@ any planned Flow downtime.
 ## Resynchronize a source
 
 Several changes require resynchronization: a changed table set, a publication
-violation (`publication-resync-required.json`), a lost or invalidated slot, a
+violation (`publication-resync-required.json` or a `publication_changed` block), a lost or invalidated slot, a
 changed source identity (failover, major upgrade, restore), a table blocked for
 a heap rewrite, and incompatible schema changes. Resynchronization starts a new
 incarnation beside the old one:
@@ -72,7 +72,7 @@ for only the new tables. Each instance holds one more slot and WAL sender.
 
 To remove a table, or to merge instances, resynchronize with the new table set.
 Until then, keep the removed table in the publication: removing a configured
-table from the publication stops capture with a resynchronization marker.
+table from the publication blocks that table (`publication_changed`).
 
 ## Planned source maintenance
 
@@ -82,11 +82,13 @@ table from the publication stops capture with a resynchronization marker.
 | Add a nullable column without a default | Captured automatically | None |
 | `VACUUM FULL`, `CLUSTER`, `pg_repack`, rewriting `ALTER TABLE` | The rewritten table is blocked; other tables continue | Resynchronize the source. Plain `VACUUM` is safe |
 | `TRUNCATE` of a configured table | That table is blocked | Resynchronize the source |
-| Publication membership, operation, row filter or column list change for a configured table | Capture stops with a resynchronization marker | Avoid it; otherwise resynchronize |
+| A configured table leaves the publication or gains a row filter or column list | That table is blocked with `publication_changed` | Avoid it; otherwise resynchronize |
+| The publication is dropped or stops publishing an operation | Capture stops with a resynchronization requirement | Avoid it; otherwise resynchronize |
 | Physical standby promotion (failover) | Source timeline changes; capture stops | Resynchronize from the promoted primary |
 | Major upgrade (`pg_upgrade`, dump/restore, logical migration) | Slot history does not carry over; slots migrated by `pg_upgrade` are unsupported | Resynchronize after the upgrade |
 
-A blocked table still holds the shared source acknowledgement, because an
+A table blocked by a schema change, heap rewrite or TRUNCATE still holds the
+shared source acknowledgement, because an
 incomplete transaction cannot be skipped. Healthy tables keep publishing, but
 source WAL and the local journal grow until you resynchronize. Treat a block as
 urgent. `status` reports `blocked_tables` with the reason; see

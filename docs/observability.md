@@ -3,22 +3,34 @@
 `embrasure-flow status` reads an atomic local observation without locking the state database. It reports the source identity, process, readiness, observation timestamp, captured durable LSN, ledger watermarks and registered pending transactions. Readiness expires after fifteen seconds without an update. SIGINT and SIGTERM clear it before shutdown. This file is not recovery authority.
 
 `source_health` reports `unknown` before the first WAL check, then `healthy`,
-`warning`, `at_risk`, `unavailable`, or `slot_lost`. Hard WAL/journal pressure and
-failed monitoring clear readiness while capture and publication can continue.
-A successful later check restores readiness; a lost slot is recorded before the
-process exits for resynchronization. Initial `unknown` permits startup readiness
+`warning`, `at_risk`, `unavailable`, `slot_lost`, or `publication_changed`. Hard
+WAL/journal pressure and failed monitoring clear readiness while capture and
+publication can continue. A successful later check restores readiness; a lost
+slot is recorded before the process exits for resynchronization.
+`source_health: publication_changed` means the publication no longer covers the
+capture contract for every table after slot creation: it is missing, or an
+operation flag was unpublished. The violation writes the durable
+`publication-resync-required.json` marker, records `publication_changed` with `ready: false`,
+then exits with an error naming the publication and the change. Later starts for
+the same slot record it again and exit until a resync.
+
+A change that affects one configured table (removed from the publication, given
+a row filter or column list, or failing PostgreSQL 18's generated-column
+requirement) does not change `source_health` or stop the process. That table
+appears in `blocked_tables` with `error_code: "publication_changed"`, capture
+drops its changes, and the other tables keep publishing and acknowledging. Match
+a record to its table through `table_progress`, which keeps every configured
+table, including blocked ones, with the same `table_id` and its
+`source_namespace` and `source_table`. The block survives restart and only a
+resync clears it.
+
+Startup, `init` resume, every capture reconnect and a check about once a minute
+on capture's session verify the contract. A session that reaches a different
+system or database is an identity error, never `publication_changed`. An
+interrupted check is transient and retried. The check is best effort: it misses a
+configured table removed and re-added between checks, so `healthy` and an empty
+`blocked_tables` do not prove that no change was skipped. Initial `unknown` permits startup readiness
 and is distinguished from a failed check by the health-availability metric.
-
-When PostgreSQL reports a finite remaining WAL budget, health becomes `warning`
-at 25% remaining and `at_risk` at 10% remaining, even when the configured byte
-limits are larger. Configured WAL and journal thresholds still apply.
-
-Source pressure suspends new optional maintenance until a check reports
-`healthy`; a failed check does not clear existing pressure. In-flight candidates
-and required recovery may finish. With multiple table workers, optional work
-also leaves one worker free for queued CDC, including between catalog commit
-permits. A single worker retains its bounded CDC/maintenance alternation while
-the source is healthy.
 
 `state_dir/metrics.prom` uses Prometheus text format for a textfile collector. Its integer LSN text remains exact; Prometheus stores floating-point samples, so use `status` for exact comparisons beyond its integer precision. Metrics reset on process restart. `init` installs its own recorder and flushes bootstrap duration, outcome and I/O diagnostics on success or failure. The next `init` or `run` replaces that process snapshot; archive `metrics.prom` after initialization to retain COPY cost diagnostics. Labels contain configured table IDs, not row keys or object paths.
 
@@ -168,12 +180,15 @@ publish/application intervals. Join the operation ID to
 daemon's busy-lane reservation and ends immediately after release. It includes
 task dispatch, retries, coordinator work, candidate cleanup and scratch removal.
 Its `publication_stall_ms` begins at the earlier preparation handoff and includes
-detached catch-up plus finalization. Deadline and failed-preparation stalls are
+detached catch-up plus finalization while publication remains gated. When the
+750 ms optional gate expires, `compaction_preparation_deferred` reports its stall
+and the same candidate continues without holding CDC. Later activation starts
+a new stall sample. Deadline and failed-preparation stalls are
 reported by `compaction_preparation_deadline` or
 `compaction_preparation_discarded`; a timed-out worker can continue retiring after
-same-table CDC resumes. Optional preparation has a 750 ms budget; preparation
-handed off while hard debt already pauses the table may use the remaining
-original 30-second build age. These are preparation deadlines, not bounds on
+same-table CDC resumes. All preparation remains bounded by the original
+30-second build age. Hard debt keeps its publication gate through that budget.
+These are preparation deadlines, not bounds on
 activation or worker joining. The handoff lane has its own event and histogram so it
 does not dilute finalization samples. Candidate invalidation events include stage,
 bounded reason and the complete error chain.
@@ -361,23 +376,3 @@ consume additional memory. Resource sizing must include that concurrency.
 `limits.table_workers` defaults to four and bounds concurrent table jobs across
 CDC publication and maintenance. Waiting tables retain their source backlog;
 reaching the worker limit does not relax reader-debt or acknowledgement rules.
-
-## Allocator memory
-
-GNU/Linux builds with `--features jemalloc` enable process-wide jemalloc and its
-background reclamation threads during `init` and `run`. The daemon samples the
-allocator at most once every 15 seconds and exports these gauges in `metrics.prom`:
-
-| Gauge | Meaning |
-| --- | --- |
-| `flow_allocator_allocated_bytes` | Bytes currently allocated to application objects |
-| `flow_allocator_active_bytes` | Active allocation pages, including unused space within them |
-| `flow_allocator_resident_bytes` | Allocator resident pages, including allocator metadata and dirty pages |
-
-The values overlap and must not be added together. Allocator resident memory is
-not process RSS: mapped files, thread stacks and other mappings are measured
-separately by the operating system. Compare allocator gauges with process RSS
-when distinguishing live objects from retained pages. Failed samples omit the
-gauges until a later sample succeeds; absence does not mean zero memory.
-Background reclamation does not cap live allocations or replace worker, batch,
-cache and container limits. Default and non-GNU/Linux builds omit these gauges.

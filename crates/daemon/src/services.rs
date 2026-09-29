@@ -31,7 +31,22 @@ pub(crate) fn writer_config(config: &Config) -> flow_materializer::WriterConfig 
         ..Default::default()
     }
 }
+/// Test-only seam: in-process tests run `init` and `run` against an in-memory
+/// catalog registered under the configured catalog `uri`.
+#[cfg(test)]
+pub(crate) static TEST_CATALOGS: std::sync::Mutex<
+    std::collections::BTreeMap<String, Arc<dyn Catalog>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 pub(crate) async fn catalog(config: &Config) -> Result<Arc<dyn Catalog>> {
+    #[cfg(test)]
+    if let Some(catalog) = config
+        .catalog
+        .get("uri")
+        .and_then(|uri| TEST_CATALOGS.lock().unwrap().get(uri).cloned())
+    {
+        return Ok(catalog);
+    }
     Ok(Arc::new(
         RestCatalogBuilder::default()
             .with_client(

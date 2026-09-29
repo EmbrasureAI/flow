@@ -175,7 +175,7 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
         self.trino_container = self.name + "-trino"
         subprocess.run(["docker", "run", "-d", "--name", self.trino_container,
                         "--network", self.args.network, "--cpus=2", "--memory=2g",
-                        "-v", f"{trino}:/etc/trino:ro", TRINO_IMAGE], check=True, capture_output=True, text=True)
+                        "-v", f"{trino}:/etc/trino:ro", TRINO_IMAGE], check=True, text=True)
         deadline = time.monotonic() + self.args.timeout
         while time.monotonic() < deadline:
             result = self.trino_sql("SELECT 1 AS ready", check=False)

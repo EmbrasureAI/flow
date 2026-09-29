@@ -4,6 +4,7 @@ mod bootstrap;
 mod config;
 mod generation;
 mod lifecycle;
+mod metadata_import;
 mod observation;
 mod preflight;
 mod retry;
@@ -51,6 +52,15 @@ enum Command {
     },
     /// Read the latest local service status without opening its state database.
     Status,
+    /// Adopt legacy catalog JSON into grace-delayed GC while the source is paused.
+    MetadataImport {
+        /// NDJSON entries containing table_uuid and path; inventory is operator supplied.
+        #[arg(long)]
+        inventory: PathBuf,
+        /// Default is validation only. No objects are deleted by this command.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -100,5 +110,8 @@ async fn run_cli() -> Result<()> {
             runtime::run(config, roles.iter().any(|r| r == "compactor")).await
         }
         Command::Status => runtime::status(config),
+        Command::MetadataImport { inventory, apply } => {
+            metadata_import::run(config, &inventory, apply).await
+        }
     }
 }

@@ -70,6 +70,7 @@ pub struct GarbageReport {
     pub examined_objects: usize,
     pub protected_objects: usize,
     pub delete_requests: usize,
+    pub metadata_json_delete_requests: usize,
     pub retired_records: usize,
     /// The current forward sweep stopped at a record or time budget. Schedule
     /// another pass without waiting for the periodic garbage interval.
@@ -99,7 +100,11 @@ impl TableMaintenance {
         );
         let started = Instant::now();
         let head = self.catalog.load_table(table.identifier()).await?;
+        if !head.metadata().table_properties()?.gc_enabled {
+            return Ok(GarbageReport::default());
+        }
         let prefix = registry_prefix(head.metadata().uuid()).into_bytes();
+        let legacy_prefix = format!("owned-artifacts/v1/{}/", head.metadata().uuid()).into_bytes();
         let cursor_key = format!("artifact-gc/v1/{}", head.metadata().uuid()).into_bytes();
         let store = self.store.clone();
         let limit = policy.max_records;
@@ -107,7 +112,12 @@ impl TableMaintenance {
         let protected_head = head.clone();
         let (cursor, indexed, pending, records, has_unseen_records, builds) = blocking(move || {
             let cursor = store.source_transaction(&saved_cursor_key)?;
-            let mut entries = store.source_transactions_after(&prefix, cursor.as_deref());
+            // v1 records remain readable across upgrades; new v2 records are
+            // invisible to pre-JSON-protection engines after a rollback. The
+            // full key cursor orders both streams under the same page budget.
+            let mut entries = store
+                .source_transactions_after(&legacy_prefix, cursor.as_deref())
+                .chain(store.source_transactions_after(&prefix, cursor.as_deref()));
             let records = entries
                 .by_ref()
                 .take(limit)
@@ -184,6 +194,9 @@ impl TableMaintenance {
                 let value = bincode::serialize(&owner)?;
                 blocking(move || Ok(store.put_source_transaction(&saved_key, &value)?)).await?;
             }
+            // Keep immature registrations out of the expensive retained-file
+            // walk. The independent reader grace starts once an eligible file
+            // is actually observed unreferenced, never merely from upload age.
             if owner.created_ms > cutoff
                 || owner.unfenced_since_ms.is_some_and(|time| time > cutoff)
             {
@@ -230,13 +243,63 @@ impl TableMaintenance {
             }
             report.examined_objects = candidates.len();
             report.protected_objects = protected.len();
-            for path in candidates.difference(&protected) {
+            let mut deferred = BTreeSet::new();
+            for path in &candidates {
+                let key = format!(
+                    "artifact-unreferenced/v1/{}/{}",
+                    head.metadata().uuid(),
+                    uuid::Uuid::new_v5(&head.metadata().uuid(), path.as_bytes())
+                )
+                .into_bytes();
+                let store = self.store.clone();
+                let saved_key = key.clone();
+                if protected.contains(path) {
+                    // A retained file may stay live long after its upload grace.
+                    // Its next unreferenced observation must start a new grace.
+                    blocking(move || {
+                        if store.source_transaction(&saved_key)?.is_some() {
+                            store.delete_source_transaction(&saved_key)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                    continue;
+                }
+                // A partially live owner is rescanned. Do not repeatedly DELETE
+                // absent siblings: versioned S3 creates a new marker each time.
+                if !head.file_io().exists(path).await? {
+                    blocking(move || {
+                        if store.source_transaction(&saved_key)?.is_some() {
+                            store.delete_source_transaction(&saved_key)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                    continue;
+                }
+                let since = blocking(move || match store.source_transaction(&saved_key)? {
+                    Some(bytes) => Ok(bincode::deserialize::<u64>(&bytes)?),
+                    None => {
+                        store.put_source_transaction(&saved_key, &bincode::serialize(&now)?)?;
+                        Ok(now)
+                    }
+                })
+                .await?;
+                if since > cutoff {
+                    deferred.insert(path.clone());
+                    continue;
+                }
                 head.file_io().delete(path).await?;
                 report.delete_requests += 1;
+                report.metadata_json_delete_requests +=
+                    usize::from(path.ends_with(".metadata.json"));
+                let store = self.store.clone();
+                blocking(move || Ok(store.delete_source_transaction(&key)?)).await?;
             }
             for (key, mut owner, end) in selected {
                 owner.protected |= (owner.cursor..end).any(|ordinal| {
-                    protected.contains(&owner.artifacts.path(ordinal).expect("validated range"))
+                    let path = owner.artifacts.path(ordinal).expect("validated range");
+                    protected.contains(&path) || deferred.contains(&path)
                 });
                 owner.cursor = end;
                 let finished = end == owner.artifacts.len().expect("validated count");

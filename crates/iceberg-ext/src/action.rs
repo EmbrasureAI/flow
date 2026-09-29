@@ -716,13 +716,14 @@ async fn publish(
         let count = rewritten.len()
             + usize::from(!publication.added_data.is_empty() || !removed_data.is_empty())
             + usize::from(!publication.added_deletes.is_empty() || !removed_deletes.is_empty());
-        tracker
-            .register(ArtifactSet::metadata(
-                &root,
-                count,
-                format!("{root}-list.avro"),
-            ))
-            .await?;
+        let mut artifacts = ArtifactSet::metadata(&root, count, format!("{root}-list.avro"));
+        // The catalog writes the next JSON, but its current pointer is already
+        // authoritative. Own it before superseding it, including lost responses
+        // and retries. REST catalogs need not maintain a previous-metadata log.
+        artifacts
+            .paths
+            .extend(table.metadata_location().map(str::to_owned));
+        tracker.register(artifacts).await?;
     }
     let mut manifest_number = 0;
     for (manifest, entries) in rewritten {

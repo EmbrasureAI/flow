@@ -44,7 +44,15 @@ impl Observation {
                     Matcher::Full("flow_journal_commit_group_transactions".into()),
                     &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
                 )?
-                .install_recorder()?,
+                .install_recorder()
+                // Test-only seam: `init` and `run` share one test process.
+                .or_else(|error| {
+                    if cfg!(test) {
+                        Ok(PrometheusBuilder::new().build_recorder().handle())
+                    } else {
+                        Err(error)
+                    }
+                })?,
             last_export: None,
             source_health: SourceHealthStatus::Unknown,
             blocked_tables: Vec::new(),

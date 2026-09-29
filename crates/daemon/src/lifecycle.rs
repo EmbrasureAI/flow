@@ -47,11 +47,17 @@ pub(crate) enum SourceHealthStatus {
     AtRisk,
     Unavailable,
     SlotLost,
+    /// The publication no longer covers the capture contract; changes may
+    /// have been skipped, so the process exits for resynchronization.
+    PublicationChanged,
 }
 
 impl SourceHealthStatus {
     pub(crate) fn permits_readiness(self) -> bool {
-        !matches!(self, Self::AtRisk | Self::Unavailable | Self::SlotLost)
+        !matches!(
+            self,
+            Self::AtRisk | Self::Unavailable | Self::SlotLost | Self::PublicationChanged
+        )
     }
 
     pub(crate) fn check_available(self) -> bool {
@@ -59,7 +65,10 @@ impl SourceHealthStatus {
     }
 
     pub(crate) fn at_risk(self) -> bool {
-        matches!(self, Self::AtRisk | Self::SlotLost)
+        matches!(
+            self,
+            Self::AtRisk | Self::SlotLost | Self::PublicationChanged
+        )
     }
 }
 
@@ -94,6 +103,105 @@ impl Drop for Lifecycle {
             tracing::warn!(%error, "could not mark local status stopped");
         }
     }
+}
+
+/// Persist a definite publication contract violation found before the capture
+/// loop, like a lost slot, so a supervisor can identify it after the exit.
+pub(crate) fn record_publication_changed<T>(config: &Config, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result
+        && error.is::<crate::source::PublicationChanged>()
+    {
+        require_resync(config, &format!("{error:#}"));
+        if let Err(status) = emit(
+            config,
+            None,
+            None,
+            false,
+            Some(SourceHealthStatus::PublicationChanged),
+            None,
+        ) {
+            tracing::warn!(error = %status, "could not record the publication contract violation");
+        }
+    }
+    result
+}
+
+const RESYNC_MARKER: &str = "publication-resync-required.json";
+
+/// Durable proof that this slot's capture may have skipped changes. Restoring
+/// the publication cannot recover them, so only a resync may replace it.
+#[derive(Serialize, Deserialize)]
+struct ResyncRequired {
+    source_id: String,
+    slot: String,
+    publication: String,
+    reason: String,
+}
+
+fn resync_marker(config: &Config) -> Result<Option<ResyncRequired>> {
+    match std::fs::read(config.state_dir.join(RESYNC_MARKER)) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).context("invalid resync-required marker")?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("resync-required marker is unreadable"),
+    }
+}
+
+/// Write the marker before the fatal exit, on the journal's volume. The first
+/// reason for a slot is kept. A failed write is logged; the exit still happens.
+pub(crate) fn require_resync(config: &Config, reason: &str) {
+    let result = (|| -> Result<()> {
+        let postgres = &config.source;
+        if resync_marker(config)?.is_some_and(|marker| marker.slot == postgres.slot) {
+            return Ok(());
+        }
+        let marker = ResyncRequired {
+            source_id: config.source.id.clone(),
+            slot: postgres.slot.clone(),
+            publication: postgres.publication.clone(),
+            reason: reason.to_owned(),
+        };
+        let path = config.state_dir.join(RESYNC_MARKER);
+        let temporary = path.with_extension("json.tmp");
+        let mut file = std::fs::File::create(&temporary)?;
+        std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&marker)?)?;
+        file.sync_all()?;
+        std::fs::rename(temporary, path)?;
+        std::fs::File::open(&config.state_dir)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::error!(%error, "could not persist the resync-required marker");
+    }
+}
+
+/// Refuse to resume a slot whose capture may have skipped changes, even if the
+/// publication now validates. A resync uses a new slot, so only a marker for
+/// the configured slot blocks. The marker is never cleared automatically.
+pub(crate) fn refuse_if_resync_required(config: &Config) -> Result<()> {
+    let postgres = &config.source;
+    let Some(marker) = resync_marker(config)? else {
+        return Ok(());
+    };
+    if marker.slot != postgres.slot {
+        return Ok(());
+    }
+    if let Err(status) = emit(
+        config,
+        None,
+        None,
+        false,
+        Some(SourceHealthStatus::PublicationChanged),
+        None,
+    ) {
+        tracing::warn!(error = %status, "could not record the pending resynchronization");
+    }
+    anyhow::bail!(
+        "replication slot {:?} requires resynchronization before capture can resume; a previous run stopped with: {}",
+        marker.slot,
+        marker.reason
+    )
 }
 
 pub(crate) fn emit(
@@ -175,4 +283,34 @@ pub(crate) async fn shutdown_signal() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod publication_marker_tests {
+    use super::*;
+
+    #[test]
+    fn pre_isolation_publication_marker_still_blocks_the_original_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().to_owned();
+        let marker = serde_json::to_vec(&serde_json::json!({
+            "source_id": config.source.id,
+            "slot": config.source.slot,
+            "publication": config.source.publication,
+            "reason": "configured table removed",
+            "recorded_at_ms": 123456789u64,
+        }))
+        .unwrap();
+        let path = root.path().join("publication-resync-required.json");
+        std::fs::write(&path, &marker).unwrap();
+        let error = refuse_if_resync_required(&config).unwrap_err();
+        assert!(error.to_string().contains("configured table removed"));
+        require_resync(&config, "later violation");
+        assert_eq!(std::fs::read(&path).unwrap(), marker);
+        config.source.slot.push_str("_resync");
+        refuse_if_resync_required(&config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), marker);
+    }
 }

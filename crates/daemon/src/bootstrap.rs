@@ -167,6 +167,7 @@ pub async fn initialize(config: Config) -> Result<()> {
     let observation = crate::observation::Observation::install()?;
     let started = std::time::Instant::now();
     let result = async {
+        crate::lifecycle::refuse_if_resync_required(&config)?;
         let catalog = catalog(&config).await?;
         let store = open_bootstrap_state(&config, catalog.clone()).await?;
         let mut boot = match store.source_transaction(BOOTSTRAP)? {
@@ -177,6 +178,7 @@ pub async fn initialize(config: Config) -> Result<()> {
         resume(&config, store, catalog, &mut boot).await
     }
     .await;
+    let result = crate::lifecycle::record_publication_changed(&config, result);
     let outcome = if result.is_ok() { "success" } else { "error" };
     metrics::counter!("flow_bootstrap_runs_total", "outcome" => outcome).increment(1);
     metrics::histogram!("flow_bootstrap_seconds", "outcome" => outcome)
@@ -234,7 +236,7 @@ pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Re
     Ok(())
 }
 
-pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
+pub(crate) fn validate_identity(config: &Config, boot: &Bootstrap) -> Result<()> {
     validate_column_selection(config, boot)?;
     ensure!(
         boot.source_id == config.source.id
@@ -242,6 +244,11 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
             && boot.publication == config.source.publication,
         "source incarnation differs from durable bootstrap"
     );
+    Ok(())
+}
+
+pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
+    validate_identity(config, boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len() && boot.targets.len() == config.tables.len(),
         "configured source tables differ from durable bootstrap"
@@ -264,7 +271,7 @@ async fn prepare_source(
     store: &StateStore,
     catalog: &dyn Catalog,
 ) -> Result<Bootstrap> {
-    let mut sql = connect(config, false).await?;
+    let sql = connect(config, false).await?;
     ensure!(
         slot_cut(&sql, &config.source.slot).await?.is_none(),
         "initialization requires a new permanent replication slot"
@@ -317,7 +324,7 @@ async fn prepare_source(
         store.complete_noop(&schema.table_id, PgLsn(0), schema.version)?;
         schemas.push(schema);
     }
-    validate_publication(&mut sql, config, &schemas, true).await?;
+    validate_publication(&sql, config, &schemas, true).await?;
     let boot = Bootstrap {
         explicit_projections: config
             .tables
@@ -420,14 +427,18 @@ pub(crate) async fn resume(
         return Ok(());
     }
     validate_config(config, boot)?;
-    let mut sql = connect(config, false).await?;
+    let sql = connect(config, false).await?;
     let mut registry = crate::schema::SchemaRegistry::new(
         store.clone(),
         SourceId(config.source.id.clone()),
         &boot.schemas,
     )?;
     let current_schemas = registry.initialize(&sql, &config.tables).await?;
-    validate_publication(&mut sql, config, &current_schemas, false).await?;
+    // Bootstrap keeps coordinated recovery: a table violation stops everything.
+    crate::source::violations_are_fatal(
+        config,
+        validate_publication(&sql, config, &current_schemas, false).await?,
+    )?;
     let targets = tables(catalog.as_ref(), boot).await?;
     ensure!(
         boot.target_uuids.len() == boot.schemas.len(),
@@ -607,7 +618,10 @@ pub(crate) async fn resume(
         let copy_schemas = registry
             .initialize(snapshot.transaction(), &config.tables)
             .await?;
-        validate_publication(&mut sql, config, &copy_schemas, false).await?;
+        crate::source::violations_are_fatal(
+            config,
+            validate_publication(&sql, config, &copy_schemas, false).await?,
+        )?;
         exported = Some((snapshot.reexport().await?, snapshot.consistent_lsn));
         std::fs::create_dir_all(config.state_dir.join("bootstrap"))?;
         std::fs::File::open(&config.state_dir)?.sync_all()?;
@@ -648,6 +662,7 @@ pub(crate) async fn resume(
     let (progress_send, mut progress) = watch::channel(CaptureProgress {
         durable_lsn: journal.durable_lsn(),
         error: None,
+        publication_changed: false,
     });
     let capture = tokio::spawn(capture_loop(
         config.clone(),
@@ -708,8 +723,8 @@ pub(crate) async fn resume(
             }
             changed = progress.changed(), if !capture_finished => {
                 capture_finished = changed.is_err();
-                if let Some(error) = &progress.borrow_and_update().error {
-                    failure.get_or_insert_with(|| anyhow::anyhow!(error.clone()));
+                if let Some(error) = progress.borrow_and_update().failure() {
+                    failure.get_or_insert(error);
                 } else if capture_finished {
                     failure.get_or_insert_with(|| anyhow::anyhow!("source capture ended before bootstrap completed"));
                 }
@@ -724,8 +739,8 @@ pub(crate) async fn resume(
             materialized: ledger.watermarks().materialized_lsn.min(initial_cut),
         });
     }
-    if let Some(error) = &progress.borrow().error {
-        failure.get_or_insert_with(|| anyhow::anyhow!(error.clone()));
+    if let Some(error) = progress.borrow().failure() {
+        failure.get_or_insert(error);
     }
     drop(progress);
     drop(ack_send);
@@ -937,7 +952,7 @@ async fn copy_and_publish(
         current.metadata().uuid() == table.metadata().uuid(),
         "initial target incarnation changed"
     );
-    let current = crate::schema::ensure_table_schema(catalog, &current, schema).await?;
+    let current = crate::schema::ensure_table_schema(store, catalog, &current, schema).await?;
     let worker_table = current.clone();
     let worker_store = store.clone();
     let worker_schema = schema.clone();

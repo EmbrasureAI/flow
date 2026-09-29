@@ -47,11 +47,11 @@ CREATE PUBLICATION embrasure_flow FOR TABLE public.orders
 ```
 
 Include every configured source table in that publication. It may also contain
-other tables, so an existing administrator-managed publication, including
-`FOR ALL TABLES` or `FOR TABLES IN SCHEMA`, works; Flow ignores changes to the
-other tables. Flow validates the publication; it does not create or alter it.
-For PostgreSQL 18 stored generated columns, also set
-`publish_generated_columns = stored`; see the
+other tables, so an administrator-owned `FOR ALL TABLES` or `FOR TABLES IN
+SCHEMA` publication works; Flow ignores changes to tables it does not capture,
+including their row filters and column lists. Flow validates the publication;
+it does not create or alter it. For PostgreSQL 18 stored generated
+columns, also set `publish_generated_columns = stored`; see the
 [type guide](postgres-types.md#generated-columns). Initial COPY requires full
 row visibility: a role subject to row-level security is rejected rather than
 silently copying a filtered snapshot. Have the administrator provide appropriate
@@ -99,7 +99,7 @@ retention; it exits nonzero when a check fails. Neither verifies catalog or
 object-store access; `init` performs the remaining checks while initializing
 the pipeline. See [operations](operations.md#before-initialization).
 
-Mutable tables require a primary key and `REPLICA IDENTITY FULL`. Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; other published tables are ignored. Flow checks this at startup, on every source reconnect and about once a minute while running. Each check first confirms it reached the initialized source: startup compares the replication connection's `IDENTIFY_SYSTEM` with the saved identity, and each check compares its own connection's `pg_control_system()` system identifier and database. If the login cannot call `pg_control_system()`, Flow logs a warning and skips that comparison for the check; before recording a resynchronization requirement it always proves the source identity over a replication connection, so a connection to another server or database never blocks the slot. When a check finds a configured table missing or its contract changed, Flow stops and writes `publication-resync-required.json` to `state_dir`; it then refuses to start with that slot, even after the publication is restored, until the source is resynchronized with a new slot. The check detects lasting changes only. pgoutput decides publication membership per change, so if a table is removed and re-added between two checks, writes made while it was out are never sent and Flow cannot detect them. Coordinate any publication change that affects configured tables with a resynchronization. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
+Mutable tables require a primary key and `REPLICA IDENTITY FULL`. Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; they may include other tables. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
 
 An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values block the affected table rather than publishing an incomplete row.
 
@@ -120,8 +120,8 @@ The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,c
 | Error or symptom | Action |
 | --- | --- |
 | Source connection environment variable is missing | Export the variable named by `source.connection_env` in the process running Flow. |
-| Publication not found or a configured table is missing | Create the named publication in the source database with every configured table and all four operation flags. It may contain other tables. |
-| Source publication changed during capture, or resynchronization is required for the slot | A configured table left the publication or gained a row filter or column list after capture began. Changes to it may be missing, so restoring the publication does not resume the slot. Restore the publication and resynchronize with a new slot; Flow never removes `publication-resync-required.json` itself. A change reverted between two checks is not detected, so coordinate publication changes that affect configured tables with a resynchronization. |
+| Publication not found or a configured table is missing | Create the named publication in the source database with every configured table and all four operation flags. It may include other tables. |
+| Publication no longer matches the capture contract | A configured table was removed or given a row filter or column list: only that table is blocked with `publication_changed` and needs a resync. A missing publication or unpublished operation stops capture; every start for that slot then fails with "requires resynchronization before capture can resume". Restoring the setting does not clear either; changes may have been skipped. |
 | Replica identity or primary-key validation fails | Set FULL replica identity and match the complete primary key in `primary_key`; keyless tables require append-only mode. |
 | Source column name or type differs | Match column order, names and the type mappings; check `column_selection` if intentionally excluding columns. |
 | Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. `check --source` validates the PostgreSQL side; plain `check` validates none of them. |
@@ -148,4 +148,4 @@ Current support boundaries:
 - Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor for process failures and startup failures. Local fault tests do not establish independent-host durability.
 - Compaction supports unsorted layouts. Z-order-aware compaction, distributed compaction protocols, HA and global autocompaction are outside the early release scope. External compactor reconciliation is included and tested with actual Spark maintenance.
 
-Keep the source publication's table membership, operation flags, column lists and row filters fixed from initialization through streaming. [Operations](operations.md) describes resynchronization, adding tables and planned source maintenance. Coordinate changes by stopping capture and resynchronizing the affected source before resuming. PostgreSQL may silently omit changes under an altered publication, so restoring its settings or restarting the service cannot prove that no rows were missed.
+Keep the source publication's operation flags, and the configured tables' membership, column lists and row filters, fixed from initialization through streaming. Other tables may join or leave the publication. [Operations](operations.md) describes resynchronization, adding tables and planned source maintenance. Coordinate changes by stopping capture and resynchronizing the affected source before resuming. PostgreSQL may silently omit changes under an altered publication, so restoring its settings or restarting the service cannot prove that no rows were missed. Flow re-checks this contract on every reconnect and about once a minute while running. A change to one configured table blocks only that table (`blocked_tables` code `publication_changed`) and drops its changes while the others keep syncing. A missing publication or unpublished operation stops the process and writes `state_dir/publication-resync-required.json`; later starts for that slot refuse until a resync. Neither clears when the publication is restored. The check is best effort: it cannot see a configured table removed and re-added between checks, and the writes made in that gap are never sent. Coordinate every publication change that affects configured tables with a resync.

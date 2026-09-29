@@ -18,6 +18,7 @@ mod publication;
 mod scheduler;
 mod schema;
 
+pub use artifacts::{import_catalog_metadata, register_catalog_metadata};
 pub use ledger::{AckMode, JournalDurability, SourceLedger, Watermarks};
 pub use maintenance::{
     BuildRegistration, DeleteRepairCursor, DeleteRewritePolicy, GarbagePolicy, GarbageProtection,

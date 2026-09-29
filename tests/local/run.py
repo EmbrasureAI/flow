@@ -513,8 +513,10 @@ columns = [\n'''
                 "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = %s", (self.name,)
             ).fetchone()[0]) and lsn(value) >= barrier else None
         ))
-        # Read the latest source-wide gauge after reading PostgreSQL's ACK.
-        assert lsn(confirmed) <= self.metrics()["flow_materialized_lsn"]
+        # The metrics file is periodic; wait for this sampled ACK rather than
+        # treating an earlier export as the current materialization frontier.
+        observed = self.wait_materialized(lsn(confirmed))
+        assert lsn(confirmed) <= observed["flow_materialized_lsn"]
         result["confirmed_flush_lsn"] = confirmed
         return result
 
