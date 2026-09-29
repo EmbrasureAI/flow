@@ -11,7 +11,8 @@ pub use projection::{EventProjector, project_relation};
 mod schema;
 mod snapshot;
 pub use schema::{
-    ColumnMetadata, TableMetadata, fetch_table_metadata, fetch_table_metadata_selected,
+    ColumnMetadata, TABLE_METADATA_BATCH_SIZE, TableMetadata, TableMetadataRequest,
+    fetch_table_metadata, fetch_table_metadata_batch, fetch_table_metadata_selected,
     nullable_successor, nullable_successor_with_types, same_wire_schema, validate_schema_metadata,
 };
 mod spool;

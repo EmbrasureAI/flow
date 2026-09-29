@@ -99,6 +99,12 @@ from pathlib import Path
 root = Path({str(root)!r})
 if sys.argv[1] == 'create':
     (root / 'create-pid').write_text(str(os.getpid()))
+    # Arm the short deadline only after reaching the blocked call. Import and
+    # process startup time varies substantially on loaded developer machines.
+    marker = root / 'run' / '.workload-deadline.json'
+    temporary = marker.with_suffix('.tmp')
+    temporary.write_text(json.dumps({{"deadline": time.monotonic() + .25}}))
+    temporary.replace(marker)
     time.sleep(60)
 elif sys.argv[1] == 'rm':
     (root / 'removed').write_text(sys.argv[-1])
@@ -110,9 +116,9 @@ else:
             # Allow Python/psycopg startup before the deadline so the test
             # actually reaches the stalled Docker child on a busy host.
             result = subprocess.run([sys.executable, str(Path(__file__).with_name("wal_overhead.py")),
-                                     "--artifacts", str(directory), "--timeout", "5"],
+                                     "--artifacts", str(directory), "--timeout", "10"],
                                     env=os.environ | {"PATH": str(root) + os.pathsep + os.environ["PATH"]},
-                                    capture_output=True, text=True, timeout=15)
+                                    capture_output=True, text=True, timeout=20)
             self.assertEqual(result.returncode, 124, result.stderr)
             pid = int((root / "create-pid").read_text())
             # The process group kill also removes the worker's blocked Docker child.
@@ -127,6 +133,7 @@ else:
                 time.sleep(.01)
             report = json.loads((directory / "report.json").read_text())
             self.assertFalse(report["passed"])
+            self.assertIn("workload hard deadline exceeded", report["failure"])
             self.assertTrue(report["cleanup"]["passed"])
             self.assertEqual(report["cleanup"]["container"], (root / "removed").read_text())
 

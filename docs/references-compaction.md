@@ -128,3 +128,35 @@ revision protocol above. A process crash also
 preserves ordinary non-sync WAL appends on supported POSIX filesystems; a machine
 crash may lose unfinished derived work, which is discarded and replayed.
 See [RocksDB synchronous and non-sync writes](https://github.com/facebook/rocksdb/wiki/Basic-Operations#synchronous-writes).
+
+## Catalog JSON ownership
+
+Catalog-generated JSON is independent of snapshot expiration. Before publication
+replaces a catalog pointer, register that immutable JSON with the manifest attempt.
+Schema and expiration-only commits register the same pointer durably before commit.
+A durable per-object clock requires a full grace after first observing an
+unreferenced file, independently of upload/fence age. Retained references reset
+that clock. Check absence before deleting obsolete siblings of a partially live
+owner, so repeat sweeps do not create endless S3 delete markers.
+
+Current metadata and all catalog metadata-log entries are protected by GC; empty
+metadata logs (including Glue REST) do not disable cleanup. JSON-only registry pages
+avoid scanning manifests. `gc.enabled=false` disables all physical collection.
+
+New ownership records use `owned-artifacts/v2/`. The collector reads v1 and v2
+within the same bounded page and cursor. Old engines cannot safely classify JSON,
+so rollback must leave v2 records unread rather than delete their objects. The
+record format and durable control/index ownership protocol are otherwise unchanged.
+
+Pre-registry JSON can be adopted with `metadata-import --inventory <ndjson>` while
+the daemon is stopped and supervisor desired state is paused. Entries contain
+`table_uuid` and `path`. The command checks frozen source/table identities, flat
+metadata paths, each object's UUID/location/timestamp and a 16 MiB read limit.
+Without `--apply`, it only validates. Apply records ownership and starts the normal
+unfenced GC grace; it never deletes objects or commits catalog changes. Import is
+idempotent and refuses a live daemon's state lock. Resume the normal source after
+bounded batches, keeping upstream WAL within its retention headroom.
+
+`flow_garbage_metadata_json_delete_requests_total` reports successful JSON delete
+requests. Versioned object stores can retain noncurrent versions after deletion;
+physical storage reclamation requires a separately scoped version-retention policy.

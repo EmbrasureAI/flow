@@ -553,7 +553,7 @@ async fn real_cdc_after_detached_preparation_replans_without_leaking_publication
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn preparation_deadline_allows_cdc_before_join_and_retires_scratch_ownership() {
+async fn preparation_deadline_allows_cdc_and_rejects_stale_activation() {
     let mut f = Fixture::new().await;
     cdc(&mut f, 90, vec![(16, Change::Insert(row(16)))]).await;
     let base = f.head.clone();
@@ -654,10 +654,16 @@ async fn preparation_deadline_allows_cdc_before_join_and_retires_scratch_ownersh
     );
 
     gate.release.close();
-    tokio::time::timeout(Duration::from_secs(5), retiring.wait())
+    let prepared = tokio::time::timeout(Duration::from_secs(5), retiring.into_running().wait())
         .await
         .unwrap()
         .unwrap();
+    assert!(
+        maintenance
+            .activate_compaction(&advanced, &f.schema, prepared)
+            .await
+            .is_err()
+    );
     let unchanged = f.catalog.load_table(advanced.identifier()).await.unwrap();
     assert_eq!(
         unchanged.metadata().current_snapshot_id(),
@@ -680,6 +686,40 @@ async fn preparation_deadline_allows_cdc_before_join_and_retires_scratch_ownersh
     );
     std::fs::remove_dir_all(&scratch_path).unwrap();
     assert!(!scratch_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preparation_past_stall_budget_can_activate_without_rebuilding_unchanged_inputs() {
+    let mut f = Fixture::new().await;
+    let (ready, _, head) = build_with_late_changes(&mut f).await;
+    let maintenance = maintenance(&f);
+    let operation = ready.operation_id().clone();
+    let before = sorted(scan(&head, &f.schema).await.unwrap());
+    let preparing = maintenance
+        .start_compaction_preparation(&head, &f.schema, ready)
+        .await
+        .unwrap();
+    let PreparationWait::Deadline(deferred) = preparing.wait_for(Duration::ZERO).await.unwrap()
+    else {
+        panic!("zero stall budget must return the owned background worker");
+    };
+    let prepared = deferred.into_running().wait().await.unwrap();
+    assert_eq!(prepared.operation_id(), &operation);
+    assert!(
+        maintenance
+            .activate_compaction(&head, &f.schema, prepared)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let current = f.catalog.load_table(head.identifier()).await.unwrap();
+    assert_eq!(sorted(scan(&current, &f.schema).await.unwrap()), before);
+    assert!(
+        f.index
+            .source_transactions_after(b"active-build/", None)
+            .next()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

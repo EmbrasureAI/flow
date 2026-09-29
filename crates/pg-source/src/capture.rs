@@ -41,6 +41,9 @@ pub struct CaptureAssembler {
     pending_commit_bytes: u64,
     pending_commit_limit: usize,
     blocked: BTreeSet<TableId>,
+    /// Configured tables whose changes are no longer captured, as when the
+    /// publication stopped covering them. They are treated as unconfigured.
+    dropped: BTreeSet<TableId>,
 }
 
 impl CaptureAssembler {
@@ -66,6 +69,7 @@ impl CaptureAssembler {
             source,
             types: crate::TypeRegistry::default(),
             blocked: BTreeSet::new(),
+            dropped: BTreeSet::new(),
             spool,
             schemas: configured,
             relations: HashMap::new(),
@@ -107,6 +111,42 @@ impl CaptureAssembler {
 
     pub fn is_blocked(&self, table: TableId) -> bool {
         self.blocked.contains(&table)
+    }
+
+    pub fn is_configured(&self, relation: u32) -> bool {
+        let table = TableId(relation);
+        self.schemas.contains_key(&table) && !self.dropped.contains(&table)
+    }
+
+    /// Stop capturing a configured table: later metadata, rows and TRUNCATE
+    /// entries are dropped like an unconfigured table's, and rows an open
+    /// transaction already spooled are skipped at its commit. Its changes
+    /// never reach the journal or a transaction's affected tables again.
+    pub fn drop_table(&mut self, table: TableId) -> Result<()> {
+        if !self.schemas.contains_key(&table) {
+            return Err(Error::Config("unconfigured dropped table"));
+        }
+        self.dropped.insert(table);
+        Ok(())
+    }
+
+    /// Admin-managed publications may contain tables this source does not
+    /// capture. Drop their metadata, rows and TRUNCATE entries before any
+    /// decoder, spool or journal state; `None` leaves nothing configured, so a
+    /// transaction of only such changes commits exactly like an empty one.
+    pub fn configured(&self, mut event: SourceEvent) -> Option<SourceEvent> {
+        let relation = match &mut event {
+            SourceEvent::Relation(relation) => relation.id,
+            SourceEvent::Insert { relation, .. }
+            | SourceEvent::Update { relation, .. }
+            | SourceEvent::Delete { relation, .. } => *relation,
+            SourceEvent::Truncate { relations, .. } => {
+                relations.retain(|id| self.is_configured(*id));
+                return (!relations.is_empty()).then_some(event);
+            }
+            _ => return Some(event),
+        };
+        self.is_configured(relation).then_some(event)
     }
 
     pub fn block_table(&mut self, table: TableId) -> Result<()> {
@@ -219,6 +259,7 @@ impl CaptureAssembler {
         Ok(transaction
             .schemas
             .iter()
+            .filter(|(table, _)| !self.dropped.contains(table))
             .flat_map(|(table, versions)| {
                 versions.iter().map(|version| TableSchemaVersion {
                     table_id: *table,
@@ -239,7 +280,9 @@ impl CaptureAssembler {
             }
             let table = TableId(u32::from_le_bytes(bytes[..4].try_into().unwrap()));
             let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-            versions.entry(table).or_default().insert(version);
+            if !self.dropped.contains(&table) {
+                versions.entry(table).or_default().insert(version);
+            }
             Ok(())
         })?;
         Ok(versions
@@ -293,8 +336,7 @@ impl CaptureAssembler {
             | SourceEvent::Truncate { xid, .. } => Some(*xid),
             _ => None,
         };
-        let Some(event) = event.retain_relations(|id| self.schemas.contains_key(&TableId(id)))
-        else {
+        let Some(event) = self.configured(event) else {
             // Other published tables never reach the spool or journal. Their
             // transaction still commits, exactly like one without row changes.
             if change_xid.is_some_and(|xid| !self.transactions.contains_key(&xid)) {
@@ -455,6 +497,10 @@ impl CaptureAssembler {
                         return Err(Error::Protocol("truncated capture chunk"));
                     }
                     let table_id = TableId(u32::from_le_bytes(bytes[..4].try_into().unwrap()));
+                    // Rows spooled before the table was dropped never commit.
+                    if self.dropped.contains(&table_id) {
+                        return Ok(());
+                    }
                     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
                     // The fixed-width bincode Vec length follows the spool-only
                     // table/schema header. Count only chunks surviving rollback.

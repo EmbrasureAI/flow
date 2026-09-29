@@ -414,22 +414,28 @@ impl TableWork {
         // Catalog loading and recovery use the same bounded worker admission as
         // publication. No retry delay holds a worker or its transaction batch.
         let result = async {
-            if crate::schema::capture_blocked(
+            match crate::schema::capture_block(
                 &self.store,
                 &SourceId(self.config.source.id.clone()),
                 schema.table_id,
             )? {
-                return Err(flow_model::SourceTableBlocked.into());
+                None => {}
+                // Resync is the only recovery, but an unfinished operation
+                // would hold its transactions forever. Settle it, then stay
+                // blocked; the runtime completes the rest without publishing.
+                Some(crate::schema::CaptureBlock::PublicationChanged)
+                    if self
+                        .store
+                        .table_state(&schema.table_id)?
+                        .pending_operation
+                        .is_some() =>
+                {
+                    self.settle_blocked_operation(schema.table_id).await?;
+                    return Err(flow_model::SourceTableBlocked.into());
+                }
+                Some(_) => return Err(flow_model::SourceTableBlocked.into()),
             }
-            let (target, uuid) = self
-                .targets
-                .get(&schema.table_id)
-                .context("table has no persisted target identity")?;
-            let table = self.catalog.load_table(target).await?;
-            ensure!(
-                table.metadata().uuid() == *uuid,
-                "target table was replaced; refusing to reuse its source watermark"
-            );
+            let table = self.load_target(schema.table_id).await?;
             self.clone()
                 .run_once(
                     table,
@@ -486,8 +492,18 @@ impl TableWork {
                 TableOutcome::CandidateInvalidated
             }
             Err(error) if publication_error_code(&error).is_some() => {
-                let error_code =
+                let mut error_code =
                     publication_error_code(&error).expect("classified publication error");
+                // A capture block reports the cause capture recorded for it.
+                if error_code == "source_schema_incompatible"
+                    && let Some(cause) = crate::schema::capture_block(
+                        &self.store,
+                        &SourceId(self.config.source.id.clone()),
+                        schema.table_id,
+                    )?
+                {
+                    error_code = cause.code();
+                }
                 tracing::warn!(table = ?schema.table_id, error_code, %error,
                     "table publication blocked; releasing worker until retry");
                 TableOutcome::Blocked { error_code }
@@ -514,6 +530,127 @@ impl TableWork {
         })
     }
 
+    async fn load_target(&self, id: TableId) -> Result<Table> {
+        let (target, uuid) = self
+            .targets
+            .get(&id)
+            .context("table has no persisted target identity")?;
+        let table = self.catalog.load_table(target).await?;
+        ensure!(
+            table.metadata().uuid() == *uuid,
+            "target table was replaced; refusing to reuse its source watermark"
+        );
+        Ok(table)
+    }
+
+    /// Settle the unfinished operation of a table that will never publish again.
+    /// A building operation is discarded without the catalog. Later phases are
+    /// resolved through ordinary recovery, which needs the target. If the target
+    /// is gone or was replaced, whatever an uncertain commit wrote belongs to a
+    /// table this pipeline no longer owns and a resync rebuilds it, so the
+    /// operation is abandoned locally: a prepared one is discarded and a
+    /// committed one is applied to the local index, which needs no catalog.
+    /// Transient catalog errors propagate and the attempt is retried.
+    async fn settle_blocked_operation(&self, id: TableId) -> Result<()> {
+        let Some(operation) = self.store.table_state(&id)?.pending_operation else {
+            return Ok(());
+        };
+        let record = self
+            .store
+            .operation(&operation)?
+            .context("table fence has no operation")?;
+        if record.phase == OperationPhase::Building {
+            self.store.discard_uncommitted(&operation)?;
+            self.store.discard_transaction(&operation.0)?;
+            return Ok(());
+        }
+        if let Some(table) = self.owned_target(id).await? {
+            self.recover_pending(&table, id).await?;
+            return Ok(());
+        }
+        tracing::warn!(table = ?id, operation_id = %operation.0, phase = ?record.phase,
+            "publication-blocked target is gone or replaced; abandoning its unfinished operation");
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            match record.phase {
+                OperationPhase::Prepared => {
+                    store.discard_uncommitted(&operation)?;
+                    store.discard_transaction(&operation.0)?;
+                }
+                OperationPhase::Committed => while !store.apply_committed(&operation)?.complete {},
+                _ => {}
+            }
+            // Ingest operations complete their transactions through the
+            // runtime's applied-operation path; maintenance ones have none.
+            if record.operation.kind != OperationKind::Ingest
+                && store
+                    .operation(&operation)?
+                    .is_some_and(|record| record.phase == OperationPhase::Applied)
+            {
+                store.forget_applied(&operation)?;
+            }
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// The configured target, or `None` when it is gone or was replaced.
+    async fn owned_target(&self, id: TableId) -> Result<Option<Table>> {
+        let (target, uuid) = self
+            .targets
+            .get(&id)
+            .context("table has no persisted target identity")?;
+        let table = match self.catalog.load_table(target).await {
+            Ok(table) => table,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    iceberg::ErrorKind::TableNotFound | iceberg::ErrorKind::NamespaceNotFound
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok((table.metadata().uuid() == *uuid).then_some(table))
+    }
+
+    /// Discard a building operation or resolve a prepared one. Returns true
+    /// when an ingest operation was recovered and must be reconciled first.
+    async fn recover_pending(&self, table: &Table, id: TableId) -> Result<bool> {
+        let Some(operation) = self.store.table_state(&id)?.pending_operation else {
+            return Ok(false);
+        };
+        let record = self
+            .store
+            .operation(&operation)?
+            .context("table fence has no operation")?;
+        match (record.phase, record.operation.kind) {
+            (OperationPhase::Building, _) => {
+                self.store.discard_uncommitted(&operation)?;
+                self.store.discard_transaction(&operation.0)?;
+                Ok(false)
+            }
+            (_, OperationKind::Ingest) => {
+                let recovery = self.publisher.recover(table, &operation).await;
+                discard_unowned_spool(self.store.clone(), operation.clone()).await?;
+                recovery?;
+                Ok(true)
+            }
+            (
+                _,
+                OperationKind::Rewrite | OperationKind::Reconcile | OperationKind::ManifestRewrite,
+            ) => {
+                self.maintenance.recover(table, &operation).await?;
+                let store = self.store.clone();
+                tokio::task::spawn_blocking(move || store.forget_applied(&operation)).await??;
+                Ok(false)
+            }
+            _ => bail!("index reconstruction must finish before publication"),
+        }
+    }
+
     async fn run_once(
         self,
         table: Table,
@@ -531,36 +668,10 @@ impl TableWork {
             );
             return self.probe_build(&table, schema).await;
         }
-        if let Some(operation) = self.store.table_state(&id)?.pending_operation {
-            let record = self
-                .store
-                .operation(&operation)?
-                .context("table fence has no operation")?;
-            match (record.phase, record.operation.kind) {
-                (OperationPhase::Building, _) => {
-                    self.store.discard_uncommitted(&operation)?;
-                    self.store.discard_transaction(&operation.0)?;
-                }
-                (_, OperationKind::Ingest) => {
-                    let recovery = self.publisher.recover(&table, &operation).await;
-                    discard_unowned_spool(self.store.clone(), operation.clone()).await?;
-                    recovery?;
-                    // Reconcile the recovered operation separately from newly
-                    // admitted CDC. Its original batch may differ after restart.
-                    return Ok(TableOutcome::Recovered);
-                }
-                (
-                    _,
-                    OperationKind::Rewrite
-                    | OperationKind::Reconcile
-                    | OperationKind::ManifestRewrite,
-                ) => {
-                    self.maintenance.recover(&table, &operation).await?;
-                    let store = self.store.clone();
-                    tokio::task::spawn_blocking(move || store.forget_applied(&operation)).await??;
-                }
-                _ => bail!("index reconstruction must finish before publication"),
-            }
+        if self.recover_pending(&table, id).await? {
+            // Reconcile the recovered operation separately from newly
+            // admitted CDC. Its original batch may differ after restart.
+            return Ok(TableOutcome::Recovered);
         }
         let indexed = self.store.table_state(&id)?;
         if transactions
@@ -593,8 +704,13 @@ impl TableWork {
             );
         }
         let mut current = crate::schema::refresh_table(self.catalog.as_ref(), &table).await?;
-        current =
-            crate::schema::ensure_table_schema(self.catalog.as_ref(), &current, &schema).await?;
+        current = crate::schema::ensure_table_schema(
+            &self.store,
+            self.catalog.as_ref(),
+            &current,
+            &schema,
+        )
+        .await?;
         let indexed = self.store.table_state(&id)?;
         if indexed.snapshot_id != current.metadata().current_snapshot_id() {
             let path = self
@@ -1006,6 +1122,8 @@ impl TableWork {
             }
             metrics::counter!("flow_garbage_delete_requests_total", "table_id" => id.0.to_string())
                 .increment(report.delete_requests as u64);
+            metrics::counter!("flow_garbage_metadata_json_delete_requests_total", "table_id" => id.0.to_string())
+                .increment(report.metadata_json_delete_requests as u64);
             metrics::histogram!("flow_garbage_collection_seconds", "table_id" => id.0.to_string())
                 .record(started.elapsed().as_secs_f64());
         }
@@ -1142,5 +1260,197 @@ mod publication_retry_tests {
         assert!(retry_table_work(
             &flow_compactor::Error::MaintenanceRequired.into()
         ));
+    }
+
+    /// After a restart, an operation a blocked table left unfinished would
+    /// hold its transactions forever. A recovery-only attempt settles it and
+    /// the table stays blocked, so acknowledgement can advance.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Target {
+        Present,
+        Dropped,
+        Replaced,
+    }
+
+    async fn settle_unfinished_operation(target: Target) {
+        use flow_coordinator::{AckMode, JournalDurability, SourceLedger};
+        use flow_model::{JournalChunks, TableMutationCount};
+        use iceberg::{
+            CatalogBuilder, NamespaceIdent, TableCreation,
+            memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().join("state");
+        let schema = config.tables[0].schema(7);
+        let id = schema.table_id;
+        let source = SourceId(config.source.id.clone());
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(root.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "dropped",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.into(),
+                        "memory://dropped".into(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let namespace = NamespaceIdent::new("replicated".into());
+        catalog
+            .create_namespace(&namespace, std::collections::HashMap::new())
+            .await
+            .unwrap();
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .schema(flow_materializer::iceberg_schema(&schema).unwrap())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let (journal, _) = flow_ingress_journal::Journal::open(
+            root.path().join("journal"),
+            flow_ingress_journal::JournalConfig::default(),
+        )
+        .unwrap();
+        let writer = crate::services::writer_config(&config);
+        let work = TableWork {
+            config: Arc::new(config.clone()),
+            store: store.clone(),
+            control,
+            reader: journal.reader(),
+            catalog: catalog.clone(),
+            targets: Arc::new(BTreeMap::from([(
+                id,
+                (table.identifier().clone(), table.metadata().uuid()),
+            )])),
+            publisher: Arc::new(
+                TablePublisher::new(
+                    store.clone(),
+                    catalog.clone(),
+                    writer.clone(),
+                    config.limits.batch_rows,
+                    config.limits.batch_bytes,
+                )
+                .unwrap(),
+            ),
+            maintenance: Arc::new(
+                TableMaintenance::new(
+                    store.clone(),
+                    catalog.clone(),
+                    config.compaction.clone(),
+                    writer,
+                )
+                .unwrap(),
+            ),
+            garbage_checked: Arc::default(),
+            compaction: false,
+        };
+
+        // Journaled and fenced by an operation before the latch.
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        ledger
+            .journaled(SourceTransaction {
+                source_id: source.clone(),
+                xid: 1,
+                begin_lsn: PgLsn(8),
+                commit_lsn: PgLsn(9),
+                end_lsn: PgLsn(10),
+                commit_timestamp_micros: 0,
+                schema_versions: vec![],
+                affected_tables: vec![id],
+                mutation_chunks: JournalChunks::default(),
+                table_mutation_counts: Some(vec![TableMutationCount {
+                    table_id: id,
+                    mutations: 0,
+                }]),
+            })
+            .unwrap();
+        let operation = OperationId("unfinished-before-latch".into());
+        let prepared = PreparedOperation {
+            id: operation.clone(),
+            table_id: id,
+            kind: OperationKind::Ingest,
+            base_snapshot_id: None,
+            last_lsn: PgLsn(10),
+            schema_version: 1,
+            artifacts: vec![],
+            payload: vec![],
+        };
+        if target == Target::Present {
+            // Building: discarded without consulting the catalog.
+            store.begin_prepare(prepared).unwrap();
+        } else {
+            // Prepared: its commit is uncertain, and its target is gone or
+            // replaced, so it is abandoned locally instead of retried forever.
+            store.prepare(prepared, []).unwrap();
+            let ident = table.identifier().clone();
+            catalog.drop_table(&ident).await.unwrap();
+            if target == Target::Replaced {
+                catalog
+                    .create_table(
+                        &namespace,
+                        TableCreation::builder()
+                            .name("orders".into())
+                            .schema(flow_materializer::iceberg_schema(&schema).unwrap())
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        crate::schema::latch_publication_block(&store, &source, id).unwrap();
+
+        let completion = work
+            .run(
+                schema,
+                Vec::new(),
+                WorkOptions {
+                    periodic_maintenance: false,
+                    build_active: false,
+                    build_admission: BuildAdmission::Wait,
+                    actor_acquired_at: Instant::now(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            completion.outcome,
+            TableOutcome::Blocked {
+                error_code: "publication_changed"
+            }
+        ));
+        assert_eq!(store.table_state(&id).unwrap().pending_operation, None);
+
+        let mut blocked = super::super::blocked::BlockedTables::load(&store, &source).unwrap();
+        blocked.record(id, "publication_changed", None).unwrap();
+        super::super::settle_dropped_table(&mut ledger, &store, &mut blocked, id).unwrap();
+        ledger.drain_completed_prefix().unwrap();
+        assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_table_settles_its_unfinished_operation_and_stays_blocked() {
+        settle_unfinished_operation(Target::Present).await;
+        settle_unfinished_operation(Target::Dropped).await;
+        settle_unfinished_operation(Target::Replaced).await;
     }
 }

@@ -902,3 +902,113 @@ fn nullable_successor_preserves_keys_and_historical_rows_but_rejects_key_relaxat
     next.columns[0].nullable = true;
     assert!(base.validate_successor(&next).is_err());
 }
+
+fn push(assembler: &mut CaptureAssembler, journal: &mut Journal, event: SourceEvent) {
+    assembler.push(event, journal).unwrap();
+}
+
+fn commit(
+    assembler: &mut CaptureAssembler,
+    journal: &mut Journal,
+    xid: u32,
+    lsn: u64,
+) -> flow_model::SourceTransaction {
+    let event = SourceEvent::Commit {
+        xid,
+        commit_lsn: PgLsn(lsn),
+        end_lsn: PgLsn(lsn + 8),
+        commit_timestamp_micros: 1,
+    };
+    let txn = assembler.push(event, journal).unwrap().unwrap();
+    assert_eq!(journal.durable_lsn(), PgLsn(lsn + 8));
+    txn
+}
+
+/// A table the publication stopped covering is dropped like an unconfigured
+/// one, including rows an open transaction spooled before the latch, so its
+/// changes never hold the acknowledgement frontier.
+#[test]
+fn dropped_table_never_reaches_the_journal_even_mid_transaction() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut journal, _) =
+        Journal::open(root.path().join("journal"), JournalConfig::default()).unwrap();
+    let spool = TransactionSpool::open(root.path().join("spool"), SpoolConfig::default()).unwrap();
+    let mut assembler = CaptureAssembler::new(
+        SourceId("source".into()),
+        spool,
+        [schema(11), schema(12)],
+        256,
+    )
+    .unwrap();
+    let (a, b) = (&mut assembler, &mut journal);
+    push(a, b, SourceEvent::Relation(relation(11)));
+    push(a, b, SourceEvent::Relation(relation(12)));
+    let insert = |xid, relation, id| SourceEvent::Insert {
+        xid,
+        subxid: xid,
+        relation,
+        row: row(id, "row"),
+    };
+    push(
+        a,
+        b,
+        SourceEvent::StreamStart {
+            xid: 42,
+            first: true,
+        },
+    );
+    push(a, b, insert(42, 11, "1"));
+    push(a, b, insert(42, 12, "1"));
+    push(a, b, SourceEvent::StreamStop);
+
+    a.drop_table(TableId(12)).unwrap();
+    assert!(!a.is_configured(12) && a.is_configured(11));
+    assert!(a.drop_table(TableId(99)).is_err());
+    push(
+        a,
+        b,
+        SourceEvent::StreamStart {
+            xid: 42,
+            first: false,
+        },
+    );
+    push(a, b, SourceEvent::Relation(relation(12)));
+    push(a, b, insert(42, 12, "2"));
+    push(a, b, insert(42, 11, "2"));
+    push(
+        a,
+        b,
+        SourceEvent::Truncate {
+            xid: 42,
+            subxid: 42,
+            relations: vec![12],
+            cascade: false,
+            restart_identity: false,
+        },
+    );
+    push(a, b, SourceEvent::StreamStop);
+    let streamed = commit(a, b, 42, 100);
+    assert_eq!(streamed.affected_tables, [TableId(11)]);
+    assert_eq!(streamed.mutation_count(TableId(11)), Some(2));
+    assert!(
+        b.chunks(&streamed.mutation_chunks)
+            .unwrap()
+            .flat_map(|bytes| bincode::deserialize::<Vec<Mutation>>(&bytes.unwrap()).unwrap())
+            .all(|mutation| mutation.table_id == TableId(11))
+    );
+
+    // Later transactions of only that table commit empty and still advance.
+    push(
+        a,
+        b,
+        SourceEvent::Begin {
+            xid: 43,
+            final_lsn: PgLsn(0),
+            commit_timestamp_micros: 1,
+        },
+    );
+    push(a, b, insert(43, 12, "3"));
+    let dropped = commit(a, b, 43, 200);
+    assert!(dropped.affected_tables.is_empty());
+    assert_eq!(dropped.mutation_chunks.payload_bytes(), 0);
+}

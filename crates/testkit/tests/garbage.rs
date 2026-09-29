@@ -72,7 +72,8 @@ async fn collect(
     let mut deleted = 0;
     // Three-object passes force durable cursor continuation across restarts and
     // across live owners. Repeated complete scans must remain harmless.
-    for _ in 0..80 {
+    let mut sweeps = 0;
+    for _ in 0..1000 {
         let report = maintenance
             .collect_garbage(
                 table,
@@ -89,7 +90,17 @@ async fn collect(
             .unwrap();
         assert!(report.examined_objects <= 3);
         deleted += report.delete_requests;
+        if !report.continuation_required {
+            sweeps += 1;
+            if sweeps == 3 {
+                break;
+            }
+            // Upload and last-reference grace are independent. Complete real
+            // bounded sweeps, allowing each 1 ms test grace to elapse between them.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
+    assert_eq!(sweeps, 3, "bounded registry sweeps must terminate");
     deleted
 }
 
@@ -152,8 +163,29 @@ async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_
         };
         store
             .put_source_transaction(
-                format!("{prefix}{ordinal:03}").as_bytes(),
+                format!(
+                    "{}{ordinal:03}",
+                    if ordinal < 40 {
+                        prefix.clone()
+                    } else {
+                        prefix.replace("/v1/", "/v2/")
+                    }
+                )
+                .as_bytes(),
                 &bincode::serialize(&record).unwrap(),
+            )
+            .unwrap();
+        // These synthetic orphans were already observed unreferenced before
+        // the grace boundary. New observations are tested separately below.
+        let unreferenced = format!(
+            "artifact-unreferenced/v1/{}/{}",
+            table.metadata().uuid(),
+            uuid::Uuid::new_v5(&table.metadata().uuid(), path.to_string_lossy().as_bytes())
+        );
+        store
+            .put_source_transaction(
+                unreferenced.as_bytes(),
+                &bincode::serialize(&0_u64).unwrap(),
             )
             .unwrap();
         paths.push(path);
@@ -212,6 +244,7 @@ async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_
     assert_eq!(
         store
             .source_transactions_after(prefix.as_bytes(), None)
+            .chain(store.source_transactions_after(prefix.replace("/v1/", "/v2/").as_bytes(), None))
             .count(),
         9
     );
@@ -275,7 +308,7 @@ async fn registered_gc_preserves_readers_checkpoints_and_pending_uploads_across_
         initial_data.len() > 64,
         "exercise ordinal reservation extension"
     );
-    let prefix = format!("owned-artifacts/v1/{}/", table.metadata().uuid());
+    let prefix = format!("owned-artifacts/v2/{}/", table.metadata().uuid());
     let records: Vec<_> = store
         .source_transactions_after(prefix.as_bytes(), None)
         .map(Result::unwrap)
@@ -486,7 +519,7 @@ async fn index_loss_catalog_replay_registers_new_metadata_before_publication() {
         2,
         "new data manifest and manifest list; catalog owns its metadata JSON"
     );
-    let prefix = format!("owned-artifacts/v1/{}/", table.metadata().uuid());
+    let prefix = format!("owned-artifacts/v2/{}/", table.metadata().uuid());
     assert_eq!(
         control
             .source_transactions_after(prefix.as_bytes(), None)
@@ -504,4 +537,374 @@ async fn index_loss_catalog_replay_registers_new_metadata_before_publication() {
     );
     let committed = catalog.load_table(table.identifier()).await.unwrap();
     assert_eq!(scan(&committed, &schema).await.unwrap(), vec![value]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_json_gc_preserves_current_tracked_and_unowned_files_across_restart() {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let temp = TempDir::new().unwrap();
+    let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
+    let schema = schema(1);
+    let table = table(catalog.as_ref(), &schema).await;
+    let tx = Transaction::new(&table);
+    let table = tx
+        .update_table_properties()
+        .set("write.metadata.previous-versions-max".into(), "1".into())
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+    let path = temp.path().join("index");
+    let store = StateStore::open(&path, Default::default()).unwrap();
+    let publisher = TablePublisher::new(
+        store.clone(),
+        catalog.clone(),
+        WriterConfig::default(),
+        100,
+        1 << 20,
+    )
+    .unwrap();
+    let obsolete_json = table.metadata_location().unwrap().to_owned();
+    let mut current = table;
+    for n in 1..=3 {
+        let (e, collapsed) = epoch(
+            &store,
+            &current,
+            &schema,
+            n * 10,
+            vec![(n as i64, Change::Insert(row(n as i64, "kept")))],
+        );
+        publisher
+            .publish(&current, &schema, collapsed)
+            .await
+            .unwrap();
+        store.forget_applied(&e.id).unwrap();
+        current = catalog.load_table(current.identifier()).await.unwrap();
+    }
+    // Also register the head: GC must not delete it even after its grace.
+    flow_coordinator::register_catalog_metadata(&store, &current, schema.table_id)
+        .await
+        .unwrap();
+    let current_json = current.metadata_location().unwrap().to_owned();
+    let tracked_json = current.metadata().metadata_log()[0].metadata_file.clone();
+    let unowned = Path::new(current.metadata().location()).join("metadata/external.metadata.json");
+    std::fs::write(&unowned, b"not owned by Flow").unwrap();
+    drop(publisher);
+    drop(store);
+    let store = StateStore::open(&path, Default::default()).unwrap();
+    let maintenance = TableMaintenance::new(
+        store.clone(),
+        catalog.clone(),
+        Policy::default(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    // gc.enabled=false must disable physical cleanup as well as expiration.
+    let tx = Transaction::new(&current);
+    let disabled = tx
+        .update_table_properties()
+        .set("gc.enabled".into(), "false".into())
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+    flow_coordinator::register_catalog_metadata(&store, &disabled, schema.table_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect(&maintenance, &disabled, &GarbageProtection::default()).await,
+        0
+    );
+    assert!(Path::new(&obsolete_json).exists());
+    let tx = Transaction::new(&disabled);
+    let enabled = tx
+        .update_table_properties()
+        .set("gc.enabled".into(), "true".into())
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+    flow_coordinator::register_catalog_metadata(&store, &enabled, schema.table_id)
+        .await
+        .unwrap();
+    let enabled_json = enabled.metadata_location().unwrap().to_owned();
+    let enabled_previous = enabled.metadata().metadata_log()[0].metadata_file.clone();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(collect(&maintenance, &enabled, &GarbageProtection::default()).await > 0);
+    assert!(
+        !Path::new(&obsolete_json).exists(),
+        "catalog JSON must actually be reclaimed"
+    );
+    assert!(
+        !Path::new(&current_json).exists(),
+        "a once-current JSON becomes collectible"
+    );
+    assert!(
+        !Path::new(&tracked_json).exists(),
+        "a once-tracked JSON becomes collectible"
+    );
+    assert!(Path::new(&enabled_json).exists());
+    assert!(Path::new(&enabled_previous).exists());
+    assert!(unowned.exists());
+    assert_eq!(scan(&enabled, &schema).await.unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_metadata_import_is_scoped_idempotent_and_grace_delayed() {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let temp = TempDir::new().unwrap();
+    let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
+    let schema = schema(1);
+    let original = table(catalog.as_ref(), &schema).await;
+    let old_path = original.metadata_location().unwrap().to_owned();
+    let mut current = original.clone();
+    for n in 0..3 {
+        let tx = Transaction::new(&current);
+        current = tx
+            .update_table_properties()
+            .set("write.metadata.previous-versions-max".into(), "1".into())
+            .set("test.version".into(), n.to_string())
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+    }
+    let store = StateStore::open(temp.path().join("index"), Default::default()).unwrap();
+    let import = |path: String, apply| {
+        let store = store.clone();
+        let table = current.clone();
+        let id = schema.table_id;
+        async move { flow_coordinator::import_catalog_metadata(&store, &table, id, &path, apply).await }
+    };
+    let prefix = format!("owned-artifacts/v2/{}/", current.metadata().uuid());
+    import(old_path.clone(), false).await.unwrap();
+    assert_eq!(
+        store
+            .source_transactions_after(prefix.as_bytes(), None)
+            .count(),
+        0
+    );
+    assert!(
+        import(
+            format!("{}/../sibling.metadata.json", current.metadata().location()),
+            true
+        )
+        .await
+        .is_err()
+    );
+    let foreign = Path::new(current.metadata().location()).join("metadata/foreign.metadata.json");
+    for replacement in [
+        serde_json::json!({"table-uuid": uuid::Uuid::new_v4(), "location": current.metadata().location(), "last-updated-ms": 0}),
+        serde_json::json!({"table-uuid": current.metadata().uuid(), "location": "s3://foreign/table", "last-updated-ms": 0}),
+        serde_json::json!({"table-uuid": current.metadata().uuid(), "location": current.metadata().location(), "last-updated-ms": i64::MAX}),
+    ] {
+        std::fs::write(&foreign, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        assert!(
+            import(foreign.to_string_lossy().into_owned(), true)
+                .await
+                .is_err()
+        );
+    }
+    import(old_path.clone(), true).await.unwrap();
+    let before: Vec<_> = store
+        .source_transactions_after(prefix.as_bytes(), None)
+        .map(Result::unwrap)
+        .collect();
+    import(old_path.clone(), true).await.unwrap();
+    let after: Vec<_> = store
+        .source_transactions_after(prefix.as_bytes(), None)
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        before, after,
+        "repeated imports must not reset grace or duplicate records"
+    );
+    let legacy_prefix = format!("owned-artifacts/v1/{}/", current.metadata().uuid());
+    assert_eq!(
+        store
+            .source_transactions_after(legacy_prefix.as_bytes(), None)
+            .count(),
+        0,
+        "rollback must not expose JSON registrations to an older unsafe collector"
+    );
+    let maintenance = TableMaintenance::new(
+        store,
+        catalog.clone(),
+        Policy::default(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let report = maintenance
+        .collect_garbage(
+            &current,
+            schema.table_id,
+            &GarbagePolicy::default(),
+            &GarbageProtection::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.delete_requests, 0,
+        "adoption starts a fresh 24-hour production grace"
+    );
+    assert!(Path::new(&old_path).exists());
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(
+        collect(&maintenance, &current, &GarbageProtection::default()).await,
+        1
+    );
+    assert!(!Path::new(&old_path).exists());
+    assert!(Path::new(current.metadata_location().unwrap()).exists());
+    assert!(foreign.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history() {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let temp = TempDir::new().unwrap();
+    let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
+    let schema = schema(1);
+    let table = table(catalog.as_ref(), &schema).await;
+    let path = table.metadata_location().unwrap().to_owned();
+    let index = temp.path().join("index");
+    let store = StateStore::open(&index, Default::default()).unwrap();
+    let record = RegistryFixture {
+        table_uuid: table.metadata().uuid(),
+        table_id: schema.table_id,
+        location: table.metadata().location().to_owned(),
+        operation: OperationId("old-upload".into()),
+        created_ms: 0,
+        unfenced_since_ms: Some(0),
+        cursor: 0,
+        protected: false,
+        artifacts: ArtifactSet {
+            paths: vec![path.clone()],
+            ranges: Vec::new(),
+        },
+    };
+    store
+        .put_source_transaction(
+            format!("owned-artifacts/v2/{}/old", table.metadata().uuid()).as_bytes(),
+            &bincode::serialize(&record).unwrap(),
+        )
+        .unwrap();
+    let maintenance = TableMaintenance::new(
+        store.clone(),
+        catalog.clone(),
+        Policy::default(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        collect(&maintenance, &table, &GarbageProtection::default()).await,
+        0
+    );
+    let mut current = table;
+    for n in 0..2 {
+        let tx = Transaction::new(&current);
+        current = tx
+            .update_table_properties()
+            .set("write.metadata.previous-versions-max".into(), "1".into())
+            .set("test.version".into(), n.to_string())
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+    }
+    let report = maintenance
+        .collect_garbage(
+            &current,
+            schema.table_id,
+            &GarbagePolicy::default(),
+            &GarbageProtection::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.delete_requests, 0,
+        "upload age must not substitute for time since unreference"
+    );
+    assert!(Path::new(&path).exists());
+    drop(maintenance);
+    drop(store);
+    let store = StateStore::open(&index, Default::default()).unwrap();
+    let maintenance = TableMaintenance::new(
+        store,
+        catalog.clone(),
+        Policy::default(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let report = maintenance
+        .collect_garbage(
+            &current,
+            schema.table_id,
+            &GarbagePolicy::default(),
+            &GarbageProtection::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.delete_requests, 0,
+        "restart must preserve the reader grace"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(
+        collect(&maintenance, &current, &GarbageProtection::default()).await,
+        1
+    );
+    assert!(!Path::new(&path).exists());
+    assert!(Path::new(current.metadata_location().unwrap()).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partially_live_owner_does_not_redelete_absent_siblings() {
+    let temp = TempDir::new().unwrap();
+    let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
+    let schema = schema(1);
+    let table = table(catalog.as_ref(), &schema).await;
+    let orphan = Path::new(table.metadata().location()).join("metadata/obsolete.avro");
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let store = StateStore::open(temp.path().join("index"), Default::default()).unwrap();
+    let owner = RegistryFixture {
+        table_uuid: table.metadata().uuid(),
+        table_id: schema.table_id,
+        location: table.metadata().location().to_owned(),
+        operation: OperationId("mixed".into()),
+        created_ms: 0,
+        unfenced_since_ms: Some(0),
+        cursor: 0,
+        protected: false,
+        artifacts: ArtifactSet {
+            paths: vec![
+                orphan.to_string_lossy().into_owned(),
+                table.metadata_location().unwrap().into(),
+            ],
+            ranges: Vec::new(),
+        },
+    };
+    store
+        .put_source_transaction(
+            format!("owned-artifacts/v2/{}/mixed", table.metadata().uuid()).as_bytes(),
+            &bincode::serialize(&owner).unwrap(),
+        )
+        .unwrap();
+    let maintenance =
+        TableMaintenance::new(store, catalog, Policy::default(), WriterConfig::default()).unwrap();
+    assert_eq!(
+        collect(&maintenance, &table, &GarbageProtection::default()).await,
+        1
+    );
+    assert_eq!(
+        collect(&maintenance, &table, &GarbageProtection::default()).await,
+        0,
+        "repeat scans must not issue more deletes for an already absent object"
+    );
+    assert!(Path::new(table.metadata_location().unwrap()).exists());
+    assert!(!orphan.exists());
 }

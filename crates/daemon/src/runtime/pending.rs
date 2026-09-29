@@ -206,6 +206,11 @@ impl PendingWork {
         self.unloaded = true;
     }
 
+    /// Whether the table holds any admission reservation or queued work.
+    pub(super) fn holds(&self, table: TableId) -> bool {
+        self.reserved.contains_key(&table) || self.tables.contains_key(&table)
+    }
+
     pub(super) fn has_work(&self) -> bool {
         self.loaded > 0
     }
@@ -551,6 +556,146 @@ mod admission_tests {
                 .map(|txn| txn.xid)
                 .collect::<Vec<_>>(),
             vec![2, 3]
+        );
+    }
+
+    /// A newly blocked table's queued backlog must release its admission
+    /// budget; otherwise healthy tables stall behind it.
+    #[test]
+    fn deferring_a_blocked_backlog_admits_healthy_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(directory.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(directory.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let source = SourceId("deferred".into());
+        let (blocked, healthy) = (TableId(1), TableId(2));
+        let transaction = |xid: u32, table: TableId| SourceTransaction {
+            source_id: source.clone(),
+            xid,
+            begin_lsn: PgLsn(u64::from(xid) * 10 - 1),
+            commit_lsn: PgLsn(u64::from(xid) * 10),
+            end_lsn: PgLsn(u64::from(xid) * 10 + 1),
+            commit_timestamp_micros: 0,
+            schema_versions: vec![],
+            affected_tables: vec![table],
+            mutation_chunks: JournalChunks::default(),
+            table_mutation_counts: Some(vec![TableMutationCount {
+                table_id: table,
+                mutations: 1,
+            }]),
+        };
+        let mut ledger = SourceLedger::open(
+            store,
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        ledger
+            .journaled_batch(&[transaction(1, blocked), transaction(2, blocked)])
+            .unwrap();
+        let mut pending = PendingWork::default();
+        let mut scheduler =
+            Scheduler::new(EPOCH_MUTATION_TRIGGER, EPOCH_MAX_BYTES, 100, Instant::now()).unwrap();
+        let profiles =
+            BTreeMap::from([(blocked, Priority::Realtime), (healthy, Priority::Realtime)]);
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 2, &HashSet::new())
+            .unwrap();
+        ledger.journaled_batch(&[transaction(3, healthy)]).unwrap();
+        let excluded = HashSet::from([blocked]);
+
+        // Without deferral the blocked backlog keeps the whole budget.
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 2, &excluded)
+            .unwrap();
+        assert!(!pending.tables.contains_key(&healthy));
+
+        pending.defer(blocked, &mut scheduler);
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 2, &excluded)
+            .unwrap();
+        assert_eq!(scheduler.take_ready(Instant::now()), Some(healthy));
+        let taken = pending.take_epoch(healthy);
+        assert_eq!(taken.len(), 1);
+        pending.complete(healthy, taken[0].end_lsn).unwrap();
+        assert!(
+            !pending.has_work(),
+            "no queued work remains for the blocked table"
+        );
+    }
+
+    /// A latch that lands while the blocked table's run is in flight: the run
+    /// completes part of its epoch or is deferred, and the rest must still be
+    /// released once no run owns the table.
+    #[test]
+    fn a_latch_during_a_run_still_releases_the_blocked_backlog() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(directory.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(directory.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let source = SourceId("mid-run".into());
+        let (blocked, healthy) = (TableId(1), TableId(2));
+        let transaction = |xid: u32, table: TableId| SourceTransaction {
+            source_id: source.clone(),
+            xid,
+            begin_lsn: PgLsn(u64::from(xid) * 10 - 1),
+            commit_lsn: PgLsn(u64::from(xid) * 10),
+            end_lsn: PgLsn(u64::from(xid) * 10 + 1),
+            commit_timestamp_micros: 0,
+            schema_versions: vec![],
+            affected_tables: vec![table],
+            mutation_chunks: JournalChunks::default(),
+            table_mutation_counts: Some(vec![TableMutationCount {
+                table_id: table,
+                mutations: 1,
+            }]),
+        };
+        let mut ledger = SourceLedger::open(
+            store,
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        ledger
+            .journaled_batch(&[transaction(1, blocked), transaction(2, blocked)])
+            .unwrap();
+        let mut pending = PendingWork::default();
+        let mut scheduler =
+            Scheduler::new(EPOCH_MUTATION_TRIGGER, EPOCH_MAX_BYTES, 100, Instant::now()).unwrap();
+        let profiles =
+            BTreeMap::from([(blocked, Priority::Realtime), (healthy, Priority::Realtime)]);
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 2, &HashSet::new())
+            .unwrap();
+        // The run takes its epoch; the latch lands; the run is deferred.
+        assert_eq!(scheduler.take_ready(Instant::now()), Some(blocked));
+        let taken = pending.take_epoch(blocked);
+        pending.restore(blocked, taken, &mut scheduler, Priority::Realtime);
+        ledger.journaled_batch(&[transaction(3, healthy)]).unwrap();
+        let excluded = HashSet::from([blocked]);
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 2, &excluded)
+            .unwrap();
+        assert!(
+            !pending.tables.contains_key(&healthy),
+            "the leak this fixes"
+        );
+
+        // No run owns it any more, and it still holds reservations.
+        assert!(pending.holds(blocked));
+        pending.defer(blocked, &mut scheduler);
+        assert!(!pending.holds(blocked));
+        pending
+            .refill(&ledger, &mut scheduler, &profiles, 2, &excluded)
+            .unwrap();
+        assert_eq!(
+            pending.tables[&healthy].len(),
+            1,
+            "the healthy table is admitted"
         );
     }
 }

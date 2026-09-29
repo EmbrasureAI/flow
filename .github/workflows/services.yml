@@ -21,7 +21,10 @@ jobs:
       RUST_LOG: info
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - name: Install build dependencies from Ubuntu repositories
+        run: |
+          sudo apt-get update -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
+          sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.97.1'
@@ -31,21 +34,23 @@ jobs:
           shared-key: postgres
       - name: Build service binaries
         run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
-      - name: Build snapshot timeout regression test
+      - name: Build PostgreSQL regression tests
         run: |
-          cargo test --locked -p flow-pg-source --test snapshot_timeout --no-run --message-format=json > target/snapshot-test-build.jsonl
+          cargo test --locked -p flow-pg-source --test snapshot_timeout --test schema_batch --no-run --message-format=json > target/pg-test-build.jsonl
+          cargo test --locked -p flow-daemon --bin embrasure-flow --no-run --message-format=json > target/daemon-test-build.jsonl
           python3 - <<'PYTEST'
           import json
           import shutil
           from pathlib import Path
-          artifacts = [json.loads(line) for line in Path("target/snapshot-test-build.jsonl").read_text().splitlines()]
-          executable, = [item["executable"] for item in artifacts if item.get("executable") and item.get("target", {}).get("name") == "snapshot_timeout"]
-          shutil.copy2(executable, "target/debug/snapshot_timeout_tests")
+          artifacts = [json.loads(line) for name in ("pg", "daemon") for line in Path(f"target/{name}-test-build.jsonl").read_text().splitlines()]
+          for name, output in (("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("embrasure-flow", "daemon_tests")):
+              executable, = [item["executable"] for item in artifacts if item.get("executable") and item.get("profile", {}).get("test") and item.get("target", {}).get("name") == name]
+              shutil.copy2(executable, f"target/debug/{output}")
           PYTEST
       - name: Package service binaries with executable permissions and checksums
         run: |
-          sha256sum target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests > target/service-binaries.sha256
-          tar -cf "$RUNNER_TEMP/service-binaries.tar" target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/service-binaries.sha256
+          sha256sum target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/daemon_tests > target/service-binaries.sha256
+          tar -cf "$RUNNER_TEMP/service-binaries.tar" target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/daemon_tests target/service-binaries.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: service-binaries
@@ -92,6 +97,8 @@ jobs:
             suite: periodic-with-builds
           - postgres: '18.6'
             suite: readers
+          - postgres: '18.6'
+            suite: wide-rows
     env:
       COMPOSE_PROJECT_NAME: flow-ci
       COMPOSE_FILE: tests/production/compose.yaml
@@ -118,6 +125,9 @@ jobs:
           path: ${{ runner.temp }}/minio-images
       - name: Load MinIO fixture images
         run: docker load -i "$RUNNER_TEMP/minio-images/minio-images.tar"
+      - name: Reserve disk for independent reader images
+        if: matrix.suite == 'readers'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
       - uses: astral-sh/setup-uv@v6
       - name: Verify stock reader extensions from an empty cache
         run: uv run tests/local/duckdb_extensions.py
@@ -155,6 +165,12 @@ jobs:
           echo "FLOW_POSTGRES_URL=postgres://flow:local-test-password@127.0.0.1:${pg_port}/flow?sslmode=disable" >> "$GITHUB_ENV"
           echo "FLOW_REST_URL=http://127.0.0.1:${rest_port}" >> "$GITHUB_ENV"
           echo "FLOW_S3_URL=http://127.0.0.1:${s3_port}" >> "$GITHUB_ENV"
+      - name: Batched catalog metadata preserves identity and DDL checks
+        if: matrix.suite == 'compatibility'
+        run: target/debug/schema_batch_tests batched_metadata --ignored
+      - name: Publication changes isolate tables and preserve restart blocks
+        if: matrix.postgres == '17.11' && matrix.suite == 'compatibility'
+        run: target/debug/daemon_tests live_ --ignored --test-threads=1
       - name: Snapshot COPY survives inherited statement timeouts
         if: matrix.suite == 'compatibility'
         run: target/debug/snapshot_timeout_tests --ignored
@@ -228,6 +244,18 @@ jobs:
               --unsafe-case "$unsafe_case" --artifacts "$RUNNER_TEMP/service-unsafe-${unsafe_case}" || unsafe_status=1
           done
           exit "$unsafe_status"
+      - name: Many-column and MiB-row COPY, CDC and restart
+        if: matrix.suite == 'wide-rows'
+        run: |
+          for dimensions in "256 256 1000 200" "1500 1 1000 200" "8 131072 128 4"; do
+            read -r columns value_bytes rows transaction_rows <<< "$dimensions"
+            uv run tests/production/wide_rows.py \
+              --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+              --binary target/debug/embrasure-flow --timeout 600 \
+              --columns "$columns" --value-bytes "$value_bytes" --rows "$rows" \
+              --transactions 12 --transaction-rows "$transaction_rows" \
+              --artifacts "$RUNNER_TEMP/service-wide-${columns}"
+          done
       - name: Hard reader debt and automatic external compactor recovery
         if: matrix.suite == 'lifecycle'
         run: >-
@@ -264,6 +292,13 @@ jobs:
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-maintenance-fairness"
+      - name: Quiet-table compaction after restart beside queued CDC
+        if: matrix.suite == 'compaction'
+        run: >-
+          uv run tests/production/maintenance_fairness.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow --cold-table
+          --artifacts "$RUNNER_TEMP/service-maintenance-cold-table"
       - name: Periodic cleanup with a single shared worker
         if: matrix.suite == 'periodic-single-worker'
         run: >-

@@ -181,6 +181,11 @@ async fn unfenced_build_protects_ancestry_and_uploads_through_index_loss_until_s
     assert!(head.file_io().exists(&path).await.unwrap());
     tokio::time::sleep(Duration::from_millis(3)).await;
     collect(&f, &head).await;
+    // Once the upload/fence grace passes, an unreferenced observation starts
+    // the independent reader grace. Recovery must not bypass either window.
+    assert!(head.file_io().exists(&path).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    collect(&f, &head).await;
     assert!(!head.file_io().exists(&path).await.unwrap());
     assert_eq!(
         sorted(scan(&head, &f.schema).await.unwrap()),

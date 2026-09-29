@@ -9,7 +9,7 @@ points, PostgreSQL framing, binary COPY framing, and `CopyBothDuplex`. Our
 `PostgresSource` boundary owns protocol-2 transaction semantics; changing the
 transport need not change the journal, coordinator, or materializer.
 
-## Idle publications
+## Idle publications and upgrades
 
 Capture emits a transactional `pg_logical_emit_message` heartbeat immediately on
 connect and every 30 seconds. The source role needs EXECUTE permission on that
@@ -19,6 +19,12 @@ and materialized through the ordinary ledger path before feedback advances.
 Nontransactional messages and server keepalive WAL ends never advance progress.
 This prevents an idle publication from retaining unrelated database WAL forever;
 long source transactions or blocked materialization can still retain WAL.
+
+The internal engine reads verified format-2 source schema records from the
+previous Postgres-only engine, retaining their full column-incarnation proof.
+The generic format-3 envelope is an in-memory compatibility view; existing records
+are not rewritten. Unknown formats, truncated records and invalid incarnation
+proofs fail closed. Preserve state, source slots and destination during upgrades.
 
 ## Standards that determine behavior
 
@@ -158,12 +164,37 @@ over missing transactions, or removes an existing source snapshot.
   base values, exact numeric strings, and published PostgreSQL 18 stored generated
   columns. Native `Uuid` remains available for existing non-Athena targets. No
   decimal-to-float conversion or silent numeric rounding is used.
-* Snapshot copy uses the verified current publication projection. Publication row
-  filters are rejected at setup/reconnect. Keep publication membership, published
-  operations and column/filter settings fixed from slot creation through capture;
-  pgoutput can omit changes after publication DDL without notifying the consumer.
-  A contract violation requires coordinated resynchronization, even if the settings
-  are restored. Incompatible table DDL and received TRUNCATE stop capture.
+* Snapshot copy uses the verified current publication projection. The publication
+  must contain every configured table and may contain others, such as an
+  administrator-owned `FOR ALL TABLES` or `FOR TABLES IN SCHEMA` publication.
+  Capture drops other tables' relation metadata, rows and TRUNCATE entries before
+  decoding; a transaction that only touched them commits as empty source progress.
+  Configured tables must publish every current column without a row filter. Keep published
+  operations and the configured tables' membership and column/filter settings
+  fixed from slot creation through capture; pgoutput can omit changes after
+  publication DDL without notifying the consumer. Setup, every capture reconnect
+  and a running check about once a minute on capture's session verify this
+  contract; each violation must be confirmed by a second read in a fresh
+  repeatable-read snapshot. A violation that affects one configured table
+  (missing from the publication, a row filter or column list on it, or the
+  PostgreSQL 18 generated-column requirement) blocks only that table with
+  `publication_changed`: capture drops its changes like an unconfigured table's,
+  including rows an open transaction spooled before the latch, and its journaled
+  transactions complete at its unchanged snapshot, so other tables keep
+  publishing and acknowledging. A missing publication or an unpublished
+  operation affects every table: capture stops and
+  `state_dir/publication-resync-required.json` records the slot and reason, and every later
+  start for that slot refuses until a resync replaces it. Neither kind clears
+  when the settings are restored; only a resync does. During bootstrap every
+  violation stays connection-wide. Source identity is proven on the replication
+  connection and the SQL session before any verdict, so a connection that
+  reaches a different system or database fails as an identity error, blocks no
+  table and writes no marker. The check is best effort. It catches lasting
+  changes, not a configured table removed and re-added between checks: pgoutput
+  decides membership as of each change, so writes made while the table was out
+  are never sent, and checks on either side of the gap both pass. Coordinate
+  every publication change that affects
+  configured tables with a resync. Incompatible table DDL and received TRUNCATE stop capture.
   A failed initial-copy slot is retained for operator diagnosis.
   Publication must include TRUNCATE messages so such a source operation pauses
   capture rather than disappearing silently.

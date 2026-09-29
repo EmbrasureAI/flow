@@ -123,9 +123,13 @@ class BoundaryRun(Run):
 
     def ack_reached(self, barrier):
         self.until("source slot ACK did not resume", lambda: lsn(self.slot()["confirmed_flush_lsn"]) >= barrier)
-        metrics = self.wait_materialized(barrier)
         confirmed = self.slot()["confirmed_flush_lsn"]
-        assert lsn(confirmed) <= self.metrics()["flow_materialized_lsn"]
+        # Metrics export once per second. ACK can already include a later
+        # no-row transaction while the file still reflects the original
+        # barrier. Catch the sampled ACK in the exported observation instead
+        # of comparing a newer database read with an older metrics snapshot.
+        metrics = self.wait_materialized(lsn(confirmed))
+        assert lsn(confirmed) <= metrics["flow_materialized_lsn"]
         return {"confirmed_flush_lsn": confirmed, "materialized_lsn": metrics["flow_materialized_lsn"]}
 
     def ack_held(self, barrier):
