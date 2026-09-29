@@ -27,6 +27,14 @@ pub(crate) struct Status {
     table_progress: Vec<TableProgress>,
 }
 
+impl Status {
+    /// Readiness written by this process, not a previous one that shared the
+    /// state directory and exited within the expiry window.
+    pub(crate) fn ready_in(&self, process_id: u32) -> bool {
+        self.ready && self.process_id == process_id
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TableProgress {
     pub(crate) table_id: TableId,

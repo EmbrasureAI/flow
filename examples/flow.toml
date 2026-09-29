@@ -45,6 +45,12 @@ row_group_fetch_bytes = 134217728
 row_group_uncompressed_bytes = 268435456
 batch_bytes = 134217728
 
+# Optional HTTP probes and metrics: GET /healthz, /readyz and /metrics.
+# Unauthenticated; bind to a private interface.
+# [http]
+# listen = "0.0.0.0:9464"
+
+# Generate these blocks with `embrasure-flow --config flow.toml discover`.
 [[tables]]
 source_namespace = "public"
 source_table = "orders"

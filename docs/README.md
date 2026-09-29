@@ -7,6 +7,8 @@
 - [Docker demo](../demo/README.md): a complete local stack with standard Trino reads.
 - [Observability](observability.md): status, watermarks, metrics and operational diagnosis.
 - [Operations](operations.md): source preflight, resynchronization, adding tables, planned maintenance and capacity.
+- [Upgrading](upgrading.md): release compatibility policy and upgrade procedure.
+- [Changelog](../CHANGELOG.md) and [security policy](../SECURITY.md).
 - [Iceberg v3](iceberg-v3.md): deletion vectors, upgrades and compatibility checks.
 - [Performance](performance.md): recorded throughput, publication latency and reader overhead.
 

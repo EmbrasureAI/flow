@@ -15,6 +15,10 @@ cargo build --locked --release -p flow-daemon
 cargo run --locked -p flow-daemon -- --config examples/flow.toml check
 ```
 
+Tagged releases also publish Linux binaries for x86-64 and arm64 and a
+container image, `ghcr.io/embrasureai/flow`; see the
+[releases page](https://github.com/EmbrasureAI/flow/releases).
+
 ## Prepare PostgreSQL
 
 Flow supports PostgreSQL 14–18. Enable `wal_level = logical` and reserve enough
@@ -45,6 +49,24 @@ ALTER TABLE public.orders REPLICA IDENTITY FULL;
 CREATE PUBLICATION embrasure_flow FOR TABLE public.orders
   WITH (publish = 'insert, update, delete, truncate');
 ```
+
+### Replica identity
+
+Mutable tables need a primary key and one of two replica identities:
+
+- `REPLICA IDENTITY FULL` works for every supported column type. PostgreSQL
+  logs the complete old row for each update and delete, so it writes more WAL.
+- `REPLICA IDENTITY DEFAULT` (PostgreSQL's default) also works when every
+  replicated column has a fixed-width type: `boolean`, `smallint`, `integer`,
+  `bigint`, `real`, `double precision`, `date`, `time`, `timestamp`,
+  `timestamptz`, `uuid`, an enum, or a domain over one of these. Such values
+  cannot be TOASTed, so every update carries the complete new row without the
+  extra old-row WAL. A table with any variable-width replicated column (`text`,
+  `numeric`, `jsonb`, arrays and so on) needs FULL; excluding such a column with
+  explicit `column_selection` does not change this.
+
+`check --source` and `discover` report which identity each table needs. Tables
+without a primary key can only be replicated in append-only mode.
 
 Include every configured source table in that publication. It may also contain
 other tables, so an administrator-owned `FOR ALL TABLES` or `FOR TABLES IN
@@ -84,7 +106,24 @@ values. Catalog errors similarly omit response bodies, including OAuth error
 descriptions; use the HTTP status and server-side diagnostics when investigating
 an authentication failure.
 
-The configured column list defines the initial source schema; use the [type mappings](postgres-types.md) when filling it in. `primary_key` contains zero-based positions in that list. New nullable columns without a non-null backfill are discovered automatically; keep the original prefix in the configuration across restarts. Field IDs are stable destination identities, while PostgreSQL attribute identity is checked separately to detect drop-and-recreate changes.
+Generate the `[[tables]]` blocks instead of writing them by hand. With the
+`[source]`, `[catalog]` and `state_dir` settings in place and the publication
+created, run:
+
+```sh
+./target/release/embrasure-flow --config flow.toml discover >> flow.toml
+```
+
+By default `discover` describes the publication's tables that are not yet
+configured. Name tables (`discover sales.orders sales.customers`) or pass
+`--schema sales` to choose others, and `--target-namespace` to change the Iceberg
+namespace, which defaults to the source schema. It is read-only. It maps types
+with the same rules as `init`, excludes unsupported columns through explicit
+column selection, marks tables without a primary key append-only, and adds a
+comment above any table that `init` would still reject. Review the output before
+initializing; the column list and field IDs are fixed once `init` runs.
+
+The configured column list defines the initial source schema; see the [type mappings](postgres-types.md). `primary_key` contains zero-based positions in that list. New nullable columns without a non-null backfill are discovered automatically; keep the original prefix in the configuration across restarts. Field IDs are stable destination identities, while PostgreSQL attribute identity is checked separately to detect drop-and-recreate changes.
 
 Configure the REST catalog URI, warehouse and object-store endpoint for your own
 services. Flow needs catalog access to load/create tables and commit snapshots,
@@ -99,7 +138,7 @@ retention; it exits nonzero when a check fails. Neither verifies catalog or
 object-store access; `init` performs the remaining checks while initializing
 the pipeline. See [operations](operations.md#before-initialization).
 
-Mutable tables require a primary key and `REPLICA IDENTITY FULL`. Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; they may include other tables. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
+Mutable tables require a primary key and a [supported replica identity](#replica-identity). Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; they may include other tables. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
 
 An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values block the affected table rather than publishing an incomplete row.
 
@@ -113,7 +152,17 @@ export FLOW_POSTGRES_URL='postgres://user:password@host/database?sslmode=require
 
 The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,coordinator` disables built-in compaction. At a hard reader-debt limit the affected table pauses publication and retries, while capture continues within its disk budget. External maintenance can clear that debt and resume publication without restarting the daemon. An optional `[compaction]` section configures the thresholds. Workers and rebuild facilities are also available as Rust libraries.
 
-`status` reads an atomic status file without locking the index. It reports exact source watermarks, readiness, process identity and freshness while running or stopped. `state_dir/metrics.prom` supports a Prometheus textfile collector. See [observability](observability.md) for latency definitions, reader debt and the distinction between SDK operations and billed requests.
+`status` reads an atomic status file without locking the index. It reports exact source watermarks, readiness, process identity and freshness while running or stopped. `state_dir/metrics.prom` supports a Prometheus textfile collector. To serve probes and metrics over HTTP instead, add:
+
+```toml
+[http]
+listen = "0.0.0.0:9464"
+```
+
+`init` and `run` then serve `GET /healthz` (the process is up), `GET /readyz`
+(200 while this process reports ready, otherwise 503, with the status JSON) and
+`GET /metrics` (the same Prometheus text as `metrics.prom`). The listener has no
+authentication; bind it to a private interface. See [observability](observability.md) for latency definitions, reader debt and the distinction between SDK operations and billed requests.
 
 ## Common setup errors
 
@@ -122,7 +171,7 @@ The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,c
 | Source connection environment variable is missing | Export the variable named by `source.connection_env` in the process running Flow. |
 | Publication not found or a configured table is missing | Create the named publication in the source database with every configured table and all four operation flags. It may include other tables. |
 | Publication no longer matches the capture contract | A configured table was removed or given a row filter or column list: only that table is blocked with `publication_changed` and needs a resync. A missing publication or unpublished operation stops capture; every start for that slot then fails with "requires resynchronization before capture can resume". Restoring the setting does not clear either; changes may have been skipped. |
-| Replica identity or primary-key validation fails | Set FULL replica identity and match the complete primary key in `primary_key`; keyless tables require append-only mode. |
+| Replica identity or primary-key validation fails | Set FULL replica identity, or DEFAULT when every replicated column is [fixed-width](#replica-identity), and match the complete primary key in `primary_key`; keyless tables require append-only mode. `discover` generates matching blocks. |
 | Source column name or type differs | Match column order, names and the type mappings; check `column_selection` if intentionally excluding columns. |
 | Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. `check --source` validates the PostgreSQL side; plain `check` validates none of them. |
 | Source slot is missing, lost WAL, or source identity changed | Preserve local state and diagnose the source change. Restoring the slot name alone cannot recover missing changes; coordinated resynchronization is required. |
@@ -142,10 +191,10 @@ Automatic snapshot expiration is enabled by default. Once a table has at least 1
 Current support boundaries:
 
 - Unpartitioned Iceberg v2 position deletes and v3 deletion vectors. Set `format_version = 3` on a table to create a v3 target; see [v3 configuration and compatibility](iceberg-v3.md). Partitioning remains planned work.
-- Mutable tables require a stable primary key and FULL replica identity. Keyless tables support append-only ingestion and equivalent external physical rewrites, including duplicate rows.
+- Mutable tables require a stable primary key and a [supported replica identity](#replica-identity). Keyless tables support append-only ingestion and equivalent external physical rewrites, including duplicate rows.
 - Automatic DDL supports nullable column additions without a non-null backfill and compatible required-to-nullable changes. During streaming, classified table schema/row errors and TRUNCATE durably block that table. Healthy tables can continue within the journal/WAL budgets, but shared acknowledgement cannot pass an incomplete transaction. Source connection/slot/identity failures remain connection-wide. See [table isolation and recovery](table-publication-isolation.md).
-- Initial COPY uses up to four workers. Recovery needs capacity for one additional temporary replication slot. Transaction metadata and row payloads spill to disk; configured journal, spool, message and row-size budgets still apply.
-- Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor for process failures and startup failures. Local fault tests do not establish independent-host durability.
-- Compaction supports unsorted layouts. Z-order-aware compaction, distributed compaction protocols, HA and global autocompaction are outside the early release scope. External compactor reconciliation is included and tested with actual Spark maintenance.
+- Initial COPY copies up to four tables concurrently; each table is read by one worker. Recovery needs capacity for one additional temporary replication slot. Transaction metadata and row payloads spill to disk; configured journal, spool, message and row-size budgets still apply.
+- Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor (systemd, Kubernetes or similar) that restarts it after a crash or failed start. The `state_dir` must be on persistent storage; Flow does not replicate it to another host.
+- Compaction supports unsorted layouts. Z-order-aware compaction, distributed compaction and high availability are not supported yet. Flow reconciles rewrites made by external compactors, and this is tested against Spark's maintenance procedures.
 
 Keep the source publication's operation flags, and the configured tables' membership, column lists and row filters, fixed from initialization through streaming. Other tables may join or leave the publication. [Operations](operations.md) describes resynchronization, adding tables and planned source maintenance. Coordinate changes by stopping capture and resynchronizing the affected source before resuming. PostgreSQL may silently omit changes under an altered publication, so restoring its settings or restarting the service cannot prove that no rows were missed. Flow re-checks this contract on every reconnect and about once a minute while running. A change to one configured table blocks only that table (`blocked_tables` code `publication_changed`) and drops its changes while the others keep syncing. A missing publication or unpublished operation stops the process and writes `state_dir/publication-resync-required.json`; later starts for that slot refuse until a resync. Neither clears when the publication is restored. The check is best effort: it cannot see a configured table removed and re-added between checks, and the writes made in that gap are never sent. Coordinate every publication change that affects configured tables with a resync.
