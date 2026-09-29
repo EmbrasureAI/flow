@@ -1,25 +1,19 @@
-//! WAL retention and publication contract checks with an independently owned
-//! source connection.
+//! PostgreSQL WAL retention observations. The
+//! publication contract is checked on capture's identity-proven session.
 
 use crate::{
     config::Config,
     lifecycle::SourceHealthStatus,
-    source::{
-        PublicationViolation, connect_owned, retryable_connection, validate_publication_membership,
-    },
+    observation::Observation,
+    source::{connect_owned, retryable_connection},
 };
-use anyhow::{Context, Result};
-use flow_coordinator::{SourceHealth, WalPressure};
-use flow_model::TableSchema;
+use anyhow::{Context, Result, bail};
+use flow_coordinator::{SourceHealth, SourceLedger, WalPressure};
+use flow_model::PgLsn;
 use flow_pg_source::tokio_postgres::Client;
 use std::{sync::Arc, time::Duration};
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
-// Several catalog reads; a large FOR ALL TABLES publication may take longer.
-const PUBLICATION_TIMEOUT: Duration = Duration::from_secs(15);
-/// pgoutput silently omits changes after some publication DDL, so startup
-/// validation alone cannot keep proving a long-running capture complete.
-pub(super) const PUBLICATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(super) struct HealthConnection {
     client: Client,
@@ -29,16 +23,11 @@ pub(super) struct HealthConnection {
 pub(super) struct HealthCheckResult {
     pub(super) connection: Option<HealthConnection>,
     pub(super) source_health: SourceHealthStatus,
-    /// A configured table's publication contract changed while running.
-    pub(super) publication_violation: Option<anyhow::Error>,
 }
 
-/// `publication` carries the configured schemas, in configuration order, when
-/// the publication contract check is due. It reuses the WAL health connection.
 pub(super) async fn check_health(
     config: Arc<Config>,
     client: Option<HealthConnection>,
-    publication: Option<Arc<[TableSchema]>>,
 ) -> Result<HealthCheckResult> {
     let result: Result<(HealthConnection, SourceHealth)> = async {
         let client = match client {
@@ -58,71 +47,55 @@ pub(super) async fn check_health(
         Ok((client, source_health))
     }
     .await;
-    let (mut client, source_health) = match result {
-        Ok(checked) => checked,
+    match result {
+        Ok((client, source_health)) => Ok(HealthCheckResult {
+            connection: Some(client),
+            source_health: source_health.into(),
+        }),
         Err(error) if retryable_connection(&error) || error.is::<tokio::time::error::Elapsed>() => {
             // Dropping the owned driver closes even an unanswered query.
             tracing::warn!(%error, "WAL health check interrupted; reconnecting on next check");
-            return Ok(HealthCheckResult {
+            Ok(HealthCheckResult {
                 connection: None,
                 source_health: SourceHealthStatus::Unavailable,
-                publication_violation: None,
-            });
+            })
         }
-        Err(error) => return Err(error),
-    };
-    let Some(schemas) = publication else {
-        return Ok(HealthCheckResult {
-            connection: Some(client),
-            source_health: source_health.into(),
-            publication_violation: None,
-        });
-    };
-    let checked = tokio::time::timeout(
-        PUBLICATION_TIMEOUT,
-        validate_publication_membership(&mut client.client, &config, &schemas),
-    )
-    .await
-    .context("publication check timed out")
-    .and_then(|checked| checked);
-    let (connection, publication_violation) = match classify_publication_check(checked)? {
-        PublicationCheck::Satisfied => (Some(client), None),
-        PublicationCheck::Violated(error) => (Some(client), Some(error)),
-        PublicationCheck::Interrupted(error) => {
-            // Not evidence of a contract change, and WAL health remains valid.
-            // Dropping the owned driver closes a possibly unanswered query.
-            tracing::warn!(%error, "publication check interrupted; retrying on a later check");
-            (None, None)
-        }
-    };
-    Ok(HealthCheckResult {
-        connection,
-        source_health: source_health.into(),
-        publication_violation,
-    })
-}
-
-#[derive(Debug)]
-enum PublicationCheck {
-    Satisfied,
-    Violated(anyhow::Error),
-    Interrupted(anyhow::Error),
-}
-
-/// Only a definite catalog answer is a violation. Connection loss and timeouts
-/// use the source's retryable classification; other query failures stay fatal.
-fn classify_publication_check(result: Result<()>) -> Result<PublicationCheck> {
-    match result {
-        Ok(()) => Ok(PublicationCheck::Satisfied),
-        Err(error)
-            if error
-                .chain()
-                .any(|cause| cause.is::<PublicationViolation>()) =>
-        {
-            Ok(PublicationCheck::Violated(error))
-        }
-        Err(error) if retryable_connection(&error) => Ok(PublicationCheck::Interrupted(error)),
         Err(error) => Err(error),
+    }
+}
+
+/// Record one completed check. A lost slot is persisted before the runtime
+/// exits with it.
+pub(super) fn observe_health(
+    result: Result<HealthCheckResult>,
+    observation: &mut Observation,
+    config: &Config,
+    ledger: &SourceLedger,
+    captured: PgLsn,
+) -> Result<HealthCheckResult> {
+    let result = result?;
+    observation.record_source_health(result.source_health);
+    observation.write(config, ledger, captured, true)?;
+    if result.source_health == SourceHealthStatus::SlotLost {
+        bail!("replication slot lost WAL; resynchronization required");
+    }
+    Ok(result)
+}
+
+/// The durable resync marker blocks the next start; the status value clears
+/// readiness and survives the exit, like `slot_lost`. A failed write must not
+/// hide the violation itself.
+pub(super) fn record_publication_changed(
+    observation: &mut Observation,
+    config: &Config,
+    ledger: &SourceLedger,
+    captured: PgLsn,
+    error: &anyhow::Error,
+) {
+    crate::lifecycle::require_resync(config, &format!("{error:#}"));
+    observation.record_source_health(SourceHealthStatus::PublicationChanged);
+    if let Err(error) = observation.write(config, ledger, captured, true) {
+        tracing::warn!(%error, "could not record the publication contract violation");
     }
 }
 
@@ -179,39 +152,4 @@ async fn check_wal(client: &Client, config: &Config) -> Result<SourceHealth> {
         ),
     }
     Ok(health)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn only_a_definite_publication_answer_stops_capture() {
-        assert!(matches!(
-            classify_publication_check(Ok(())).unwrap(),
-            PublicationCheck::Satisfied
-        ));
-        let changed = Err::<(), _>(anyhow::Error::new(PublicationViolation(
-            "publication not found".into(),
-        )))
-        .context("running check");
-        assert!(matches!(
-            classify_publication_check(changed).unwrap(),
-            PublicationCheck::Violated(error) if error.root_cause().to_string() == "publication not found"
-        ));
-        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
-            .await
-            .unwrap_err();
-        let timed_out =
-            Err::<(), _>(anyhow::Error::new(elapsed)).context("publication check timed out");
-        assert!(matches!(
-            classify_publication_check(timed_out).unwrap(),
-            PublicationCheck::Interrupted(_)
-        ));
-        // A failed catalog query is neither a contract change nor retryable.
-        let failed = Err(anyhow::anyhow!(
-            "permission denied for view pg_publication_tables"
-        ));
-        assert!(classify_publication_check(failed).is_err());
-    }
 }

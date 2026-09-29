@@ -6,8 +6,8 @@ mod pending;
 mod table;
 
 use self::{
-    blocked::BlockedTables,
-    health::{HealthCheckResult, PUBLICATION_CHECK_INTERVAL, check_health},
+    blocked::{BlockedTables, PUBLICATION_CHANGED},
+    health::{HealthCheckResult, check_health, observe_health, record_publication_changed},
     pending::{EPOCH_MAX_BYTES, EPOCH_MUTATION_TRIGGER, PendingWork, schedule_transactions},
     table::{
         BuildAdmission, CompactionCandidate, CompletedBuild, CompletedPreparation,
@@ -20,7 +20,7 @@ use crate::{
     config::Config,
     lifecycle::SourceHealthStatus,
     services::{catalog, journal_config, ledger},
-    source::{CaptureProgress, capture_loop, connect, validate_publication},
+    source::{CaptureProgress, PublicationChanged, capture_loop, connect, validate_publication},
 };
 use anyhow::{Context, Result, bail, ensure};
 use flow_coordinator::{
@@ -31,9 +31,9 @@ use flow_ingress_journal::Journal;
 use flow_model::{PgLsn, SourceId, TableId, TableSchema};
 use flow_pg_source::Acknowledgement;
 use flow_state_store::{ControlStore, OperationKind, StateStore};
-use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -61,14 +61,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let control = ControlStore::open(config.state_dir.join("control"))?;
     let opened = crate::generation::open(&config, control.clone());
     let _lifecycle = crate::lifecycle::Lifecycle::start(&config)?;
+    crate::lifecycle::refuse_if_resync_required(&config)?;
     let mut boot = bootstrap(&control)?;
-    crate::bootstrap::validate_column_selection(&config, &boot)?;
-    ensure!(
-        boot.source_id == config.source.id
-            && boot.slot == config.source.slot
-            && boot.publication == config.source.publication,
-        "source identity changed; use a new state directory and slot incarnation"
-    );
+    crate::bootstrap::validate_identity(&config, &boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len(),
         "configured tables changed; explicit resynchronization is required"
@@ -170,7 +165,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     // targets on admission, so do not retain this inventory for the daemon's lifetime.
     drop(tables);
     if !boot.copied || boot.layout == 0 {
-        crate::bootstrap::resume(&config, store.clone(), catalog.clone(), &mut boot).await?;
+        let resumed =
+            crate::bootstrap::resume(&config, store.clone(), catalog.clone(), &mut boot).await;
+        crate::lifecycle::record_publication_changed(&config, resumed)?;
     }
     let (journal, recovery) =
         Journal::open(config.state_dir.join("journal"), journal_config(&config))?;
@@ -186,15 +183,21 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         );
     }
     observation.table_sources(&config, &boot.schemas);
-    let mut sql = connect(&config, false).await?;
-    crate::schema::SchemaRegistry::new(
-        store.clone(),
-        SourceId(config.source.id.clone()),
-        &boot.schemas,
-    )?
-    .initialize(&sql, &config.tables)
-    .await?;
-    validate_publication(&mut sql, &config, &boot.schemas, false).await?;
+    {
+        let sql = connect(&config, false).await?;
+        let mut registry = crate::schema::SchemaRegistry::new(
+            store.clone(),
+            SourceId(config.source.id.clone()),
+            &boot.schemas,
+        )?;
+        let validated = validate_publication(&sql, &config, &boot.schemas, false).await;
+        // Table-scoped violations block only those tables; the rest start.
+        // Latch them before schema refresh, which could otherwise quarantine.
+        for violation in crate::lifecycle::record_publication_changed(&config, validated)? {
+            registry.block_publication(violation.table, &violation.reason)?;
+        }
+        registry.initialize(&sql, &config.tables).await?;
+    }
     let publisher = Arc::new(TablePublisher::new(
         store.clone(),
         catalog.clone(),
@@ -250,6 +253,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let (events, mut receive) = watch::channel(CaptureProgress {
         durable_lsn: journal.durable_lsn(),
         error: None,
+        publication_changed: false,
     });
     let (ack_send, ack_receive) = watch::channel(feedback(&ledger));
     let capture_config = config.clone();
@@ -302,7 +306,6 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
             .zip(&config.tables)
             .map(|(schema, table)| (schema.table_id, table.priority))
             .collect(),
-        publication_schemas: boot.schemas.clone().into(),
         schemas: boot
             .schemas
             .into_iter()
@@ -323,6 +326,64 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         Err(_) => tracing::warn!("capture shutdown timed out; journal remains replayable"),
     }
     result
+}
+
+/// Capture drops a `publication_changed` table's changes; only a resync
+/// recovers it. Call only while no run owns the table: its outcome may still
+/// complete its transactions at a new snapshot, which must not race an earlier
+/// completion. Builds and preparations never complete transactions.
+/// - An unfinished operation first needs a recovery-only attempt; its
+///   transactions complete through the ordinary applied-operation path.
+/// - Otherwise one bounded page of transactions the table journaled before the
+///   latch completes at its unchanged snapshot, so they stop holding the
+///   acknowledgement frontier. Returns whether a page was completed.
+fn settle_dropped_table(
+    ledger: &mut SourceLedger,
+    store: &StateStore,
+    blocked: &mut BlockedTables,
+    table: TableId,
+) -> Result<bool> {
+    let state = store.table_state(&table)?;
+    if state.pending_operation.is_some() {
+        blocked.schedule_recovery(table);
+        return Ok(false);
+    }
+    let ends = ledger
+        .pending_table_transactions_after(table, PgLsn(0))
+        .take(ledger.batch_capacity())
+        .map(|transaction| transaction.map(|transaction| transaction.end_lsn))
+        .collect::<Result<Vec<_>>>()?;
+    if ends.is_empty() {
+        return Ok(false);
+    }
+    ledger.table_materialized_batch(&ends, table, state.snapshot_id.unwrap_or(0))?;
+    Ok(true)
+}
+
+/// A table that will never publish again cannot activate compaction, and its
+/// finished candidates would hold build slots forever. Take them for
+/// retirement and release the table's build state. A build or preparation
+/// still running completes into these maps and is released on a later tick.
+fn release_blocked_candidates<B, P>(
+    table: TableId,
+    ready_builds: &mut BTreeMap<TableId, B>,
+    ready_preparations: &mut BTreeMap<TableId, P>,
+    build_active: &mut HashSet<TableId>,
+    activation_pending: &mut HashSet<TableId>,
+    waiting_for_build: &mut HashSet<TableId>,
+    retiring_builds: &mut HashSet<TableId>,
+) -> (Option<B>, Option<P>) {
+    let released = (
+        ready_builds.remove(&table),
+        ready_preparations.remove(&table),
+    );
+    if released.0.is_some() || released.1.is_some() {
+        build_active.remove(&table);
+        activation_pending.remove(&table);
+        waiting_for_build.remove(&table);
+        retiring_builds.insert(table);
+    }
+    released
 }
 
 fn feedback(ledger: &SourceLedger) -> Acknowledgement {
@@ -381,8 +442,6 @@ struct PublishRuntime {
     work: TableWork,
     schemas: BTreeMap<TableId, TableSchema>,
     profiles: BTreeMap<TableId, Priority>,
-    /// Configuration-ordered schemas for the running publication contract check.
-    publication_schemas: Arc<[TableSchema]>,
 }
 
 /// WAL pressure must reduce warehouse work that cannot advance the source ACK.
@@ -398,7 +457,8 @@ impl MaintenanceAdmission {
             SourceHealthStatus::Healthy => self.source_pressure = false,
             SourceHealthStatus::Warning
             | SourceHealthStatus::AtRisk
-            | SourceHealthStatus::SlotLost => {
+            | SourceHealthStatus::SlotLost
+            | SourceHealthStatus::PublicationChanged => {
                 self.source_pressure = true;
             }
             // Losing the health connection is not proof that WAL pressure cleared.
@@ -430,7 +490,6 @@ impl PublishRuntime {
             work,
             schemas,
             profiles,
-            publication_schemas,
         } = self;
         let config = &work.config;
         let store = &work.store;
@@ -470,24 +529,31 @@ impl PublishRuntime {
         // but are no longer candidates that may pause foreground publication.
         // New builds wait until every retiring worker has joined.
         let mut retiring_builds = HashSet::new();
-        // Preparation reads a frozen index snapshot. Hold only this table's
-        // next CDC epoch until that candidate activates or is retired.
+        // Preparation reads a frozen index snapshot. Briefly gate this table's
+        // next epoch, then allow CDC while slower candidates finish off-lane.
         let mut activation_pending = HashSet::new();
+        // Publication-blocked tables with journaled transactions left to settle.
+        let mut settling = BTreeSet::new();
         let mut fenced_fallback = HashSet::new();
         let mut health = tokio::time::interval(Duration::from_secs(5));
         health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut health_client = None;
         let mut health_checks = FuturesUnordered::new();
-        // Startup just validated the publication; recheck it while running.
-        let mut publication_due = Instant::now() + PUBLICATION_CHECK_INTERVAL;
         let mut checkpoints = FuturesUnordered::new();
         let mut idle_work: VecDeque<_> = schemas
             .keys()
             .filter(|id| !excluded.contains(id) && blocked.get(**id).is_none())
             .copied()
             .collect();
-        let mut maintenance_due = BTreeMap::<TableId, Instant>::new();
-        let mut periodic_due = BTreeMap::<TableId, Instant>::new();
+        // Quiet tables also retain maintenance debt across restart. The idle
+        // queue yields to CDC and may be cleared during catch-up; seed the
+        // bounded fair-admission queues without requiring a new source write.
+        let first_maintenance = Instant::now() + OPTIONAL_MAINTENANCE_DELAY;
+        let mut maintenance_due: BTreeMap<TableId, Instant> = idle_work
+            .iter()
+            .map(|id| (*id, first_maintenance))
+            .collect();
+        let mut periodic_due = maintenance_due.clone();
         let mut periodic_active = false;
         let mut periodic_yield_to_cdc = false;
         let mut retry_yield_to_cdc = false;
@@ -577,7 +643,12 @@ impl PublishRuntime {
                 }
                 changed = receive.changed() => {
                     let progress = receive.borrow_and_update().clone();
-                    if let Some(error) = progress.error { bail!("source capture stopped: {error}"); }
+                    if let Some(error) = progress.failure() {
+                        if error.is::<PublicationChanged>() {
+                            record_publication_changed(observation, config, ledger, capture_goal, &error);
+                        }
+                        bail!("source capture stopped: {error}");
+                    }
                     changed.context("source actor stopped")?;
                     capture_goal = capture_goal.max(progress.durable_lsn).max(ledger.watermarks().journal_durable_lsn);
                 }
@@ -595,6 +666,15 @@ impl PublishRuntime {
                     // The disk cursor may observe a just-synced terminal before
                     // its coalesced notification reaches this task.
                     capture_goal = capture_goal.max(ledger.watermarks().journal_durable_lsn);
+                    ack.send(feedback(ledger))?;
+                }
+                _ = tokio::task::yield_now(), if settling.iter().any(|id| !busy.contains(id)) => {
+                    // One bounded page per loop iteration, like other completion work.
+                    let id = *settling.iter().find(|id| !busy.contains(*id)).expect("settling table");
+                    if !settle_dropped_table(ledger, store, &mut blocked, id)? {
+                        settling.remove(&id);
+                    }
+                    ledger.drain_completed_prefix()?;
                     ack.send(feedback(ledger))?;
                 }
                 _ = tokio::task::yield_now(), if !recovering.is_empty() || ledger.has_completed_prefix()? => {
@@ -710,6 +790,7 @@ impl PublishRuntime {
                                     path,
                                     started,
                                     activation_stall_started,
+                                    publication_resumed: false,
                                     result: running.wait_for(remaining).await,
                                 }
                             }));
@@ -815,11 +896,17 @@ impl PublishRuntime {
                         id,
                         path,
                         started,
-                        activation_stall_started,
+                        mut activation_stall_started,
+                        publication_resumed,
                         result,
                     } = completion;
                     match result {
                         Ok(PreparationWait::Ready(prepared)) => {
+                            if publication_resumed {
+                                ensure!(activation_pending.insert(id), "duplicate deferred preparation");
+                                scheduler.stall(id, true);
+                                activation_stall_started = Instant::now();
+                            }
                             metrics::counter!(
                                 "flow_compaction_preparations_total",
                                 "table_id" => id.0.to_string(),
@@ -832,24 +919,55 @@ impl PublishRuntime {
                                 activation_stall_started,
                             });
                         }
+                        Ok(PreparationWait::Deadline(retiring))
+                            if !publication_resumed && started.elapsed() < BUILD_MAX_AGE =>
+                        {
+                            // The immutable candidate can outlive the short CDC
+                            // stall budget. Keep its worker and ownership instead
+                            // of repeatedly rebuilding the same unchanged inputs.
+                            let stall = activation_stall_started.elapsed();
+                            metrics::counter!("flow_compaction_preparations_total",
+                                "table_id" => id.0.to_string(), "result" => "deferred").increment(1);
+                            metrics::histogram!("flow_compaction_publication_stall_seconds",
+                                "table_id" => id.0.to_string())
+                                .record(stall.as_secs_f64());
+                            tracing::info!(event = "compaction_preparation_deferred",
+                                operation_id = %retiring.operation_id().0, table = ?id,
+                                publication_stall_ms = stall.as_secs_f64() * 1000.0,
+                                "resuming publication while the same preparation completes");
+                            activation_pending.remove(&id);
+                            scheduler.stall(id, busy.contains(&id));
+                            preparations.push(Box::pin(async move {
+                                let remaining = BUILD_MAX_AGE.saturating_sub(started.elapsed());
+                                PreparationCompletion {
+                                    id, path, started, activation_stall_started,
+                                    publication_resumed: true,
+                                    result: retiring.into_running().wait_for(remaining).await,
+                                }
+                            }));
+                        }
                         Ok(PreparationWait::Deadline(retiring)) => {
                             let operation_id = retiring.operation_id().clone();
-                            let stall = activation_stall_started.elapsed();
+                            let stall = if publication_resumed { Duration::ZERO }
+                                else { activation_stall_started.elapsed() };
                             metrics::counter!(
                                 "flow_compaction_preparations_total",
                                 "table_id" => id.0.to_string(),
                                 "result" => "deadline"
                             ).increment(1);
-                            metrics::histogram!(
-                                "flow_compaction_publication_stall_seconds",
-                                "table_id" => id.0.to_string()
-                            ).record(stall.as_secs_f64());
+                            if !publication_resumed {
+                                metrics::histogram!(
+                                    "flow_compaction_publication_stall_seconds",
+                                    "table_id" => id.0.to_string()
+                                ).record(stall.as_secs_f64());
+                            }
                             tracing::warn!(
                                 event = "compaction_preparation_deadline",
                                 operation_id = %operation_id.0,
                                 table = ?id,
+                                publication_resumed,
                                 publication_stall_ms = stall.as_secs_f64() * 1000.0,
-                                "resuming table publication while the preparation worker retires"
+                                "joining preparation after its build-age limit"
                             );
                             activation_pending.remove(&id);
                             build_active.remove(&id);
@@ -877,10 +995,12 @@ impl PublishRuntime {
                                 "table_id" => id.0.to_string(),
                                 "result" => "invalidated"
                             ).increment(1);
-                            metrics::histogram!(
-                                "flow_compaction_publication_stall_seconds",
-                                "table_id" => id.0.to_string()
-                            ).record(activation_stall_started.elapsed().as_secs_f64());
+                            if !publication_resumed {
+                                metrics::histogram!(
+                                    "flow_compaction_publication_stall_seconds",
+                                    "table_id" => id.0.to_string()
+                                ).record(activation_stall_started.elapsed().as_secs_f64());
+                            }
                             tracing::warn!(
                                 event = "compaction_preparation_discarded",
                                 table = ?id,
@@ -918,23 +1038,9 @@ impl PublishRuntime {
                     maintenance_due.insert(id, Instant::now());
                 }
                 Some(result) = health_checks.next(), if !health_checks.is_empty() => {
-                    let result: HealthCheckResult = result?;
-                    health_client = result.connection;
+                    let result: HealthCheckResult = observe_health(result, observation, config, ledger, capture_goal)?;
                     maintenance_admission.observe(result.source_health);
-                    observation.record_source_health(result.source_health);
-                    observation.write(config, ledger, capture_goal, true)?;
-                    if result.source_health == SourceHealthStatus::SlotLost {
-                        bail!("replication slot lost WAL; resynchronization required");
-                    }
-                    if let Some(violation) = result.publication_violation {
-                        // pgoutput may already have omitted changes. Stop before
-                        // acknowledging more source progress under the new contract.
-                        tracing::error!(event = "source_publication_changed",
-                            publication = %config.source.publication, reason = %format!("{violation:#}"),
-                            "source publication contract changed; resynchronization is required");
-                        bail!("source publication {:?} changed during capture: {violation:#}; resynchronization is required",
-                            config.source.publication);
-                    }
+                    health_client = result.connection;
                 }
                 Some(result) = checkpoints.next(), if !checkpoints.is_empty() => {
                     result?;
@@ -1009,6 +1115,7 @@ impl PublishRuntime {
                                 .find(|id| !busy.contains(id) && !recovering.contains(id))
                         };
                         if let Some(id) = retry
+                            && blocked.get(id).is_none_or(|record| record.error_code != PUBLICATION_CHANGED)
                             && store.table_state(&id)?.pending_operation.is_none()
                             && ledger.pending_table_transactions_after(id, PgLsn(0)).next().transpose()?.is_some()
                         {
@@ -1161,8 +1268,41 @@ impl PublishRuntime {
                 }
                 _ = health.tick() => {
                     for id in schemas.keys().copied() {
-                        if blocked.get(id).is_none() && crate::schema::capture_blocked(store, &SourceId(config.source.id.clone()), id)? {
-                            blocked.record(id, "source_schema_incompatible", None)?;
+                        let cause = crate::schema::capture_block(store, &SourceId(config.source.id.clone()), id)?;
+                        let recorded = blocked.get(id).map(|record| record.error_code.clone());
+                        // A publication block supersedes an earlier schema block.
+                        if let Some(cause) = cause
+                            && (recorded.is_none()
+                                || cause == crate::schema::CaptureBlock::PublicationChanged
+                                    && recorded.as_deref() != Some(PUBLICATION_CHANGED))
+                        {
+                            blocked.record(id, cause.code(), None)?;
+                            // Queued work stops counting against the admission budget.
+                            if !busy.contains(&id) {
+                                pending.defer(id, &mut scheduler);
+                            }
+                        }
+                        if blocked.get(id).is_some_and(|record| record.error_code == PUBLICATION_CHANGED) {
+                            let (build, preparation) = release_blocked_candidates(
+                                id, &mut ready_builds, &mut ready_preparations, &mut build_active,
+                                &mut activation_pending, &mut waiting_for_build, &mut retiring_builds);
+                            if build.is_some() || preparation.is_some() {
+                                scheduler.stall(id, busy.contains(&id));
+                            }
+                            for (path, discard) in [
+                                build.map(|build| (build.path, build.ready.discard().boxed())),
+                                preparation.map(|candidate| (candidate.path, candidate.prepared.discard().boxed())),
+                            ].into_iter().flatten() {
+                                retirements.push(Box::pin(async move {
+                                    RetirementCompletion { id, path, result: discard.await }
+                                }));
+                            }
+                            // Whenever no run owns it, its reservations (including ones a
+                            // completed or deferred run left) stop counting against admission.
+                            if !busy.contains(&id) && pending.holds(id) {
+                                pending.defer(id, &mut scheduler);
+                            }
+                            settling.insert(id);
                         }
                     }
                     // Keep durability visible while a catalog publication is stalled.
@@ -1176,11 +1316,7 @@ impl PublishRuntime {
                         checkpoints.push(CheckpointTask::start(config, work.control.clone(), store.clone()));
                     }
                     if health_checks.is_empty() {
-                        let publication = (Instant::now() >= publication_due).then(|| {
-                            publication_due = Instant::now() + PUBLICATION_CHECK_INTERVAL;
-                            publication_schemas.clone()
-                        });
-                        health_checks.push(check_health(config.clone(), health_client.take(), publication));
+                        health_checks.push(check_health(config.clone(), health_client.take()));
                     }
                     // Queue at most one idle check per table. Admission rechecks
                     // for CDC and gives due publication work the available slots.
@@ -1405,6 +1541,7 @@ struct PreparationCompletion {
     path: PathBuf,
     started: Instant,
     activation_stall_started: Instant,
+    publication_resumed: bool,
     result: Result<PreparationWait>,
 }
 
@@ -1600,4 +1737,228 @@ mod startup_recovery_tests {
         assert_eq!(ledger.acknowledgement(), end);
         assert_eq!(ledger.pending_count(), 0);
     }
+
+    fn dropped_table_fixture() -> (
+        tempfile::TempDir,
+        StateStore,
+        SourceLedger,
+        BlockedTables,
+        impl Fn(u64, &[TableId]) -> SourceTransaction,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(
+                root.path().join("index"),
+                StateStoreOptions {
+                    apply_batch_rows: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let source = SourceId("dropped-table".into());
+        let ledger = SourceLedger::open(
+            store.clone(),
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        let mut blocked = BlockedTables::load(&store, &source).unwrap();
+        blocked
+            .record(TableId(8), PUBLICATION_CHANGED, None)
+            .unwrap();
+        let transaction = move |end: u64, tables: &[TableId]| SourceTransaction {
+            source_id: source.clone(),
+            xid: end as u32,
+            begin_lsn: PgLsn(end - 2),
+            commit_lsn: PgLsn(end - 1),
+            end_lsn: PgLsn(end),
+            commit_timestamp_micros: 0,
+            schema_versions: vec![],
+            affected_tables: tables.to_vec(),
+            mutation_chunks: JournalChunks::default(),
+            table_mutation_counts: Some(
+                tables
+                    .iter()
+                    .map(|table_id| TableMutationCount {
+                        table_id: *table_id,
+                        mutations: 0,
+                    })
+                    .collect(),
+            ),
+        };
+        (root, store, ledger, blocked, transaction)
+    }
+
+    /// A table the publication stopped covering never holds acknowledgement:
+    /// its already-journaled share completes at its unchanged snapshot, one
+    /// bounded page per tick.
+    #[test]
+    fn dropped_table_transactions_stop_holding_the_acknowledgement_frontier() {
+        let (_root, store, mut ledger, mut blocked, transaction) = dropped_table_fixture();
+        let (healthy, dropped) = (TableId(7), TableId(8));
+        ledger
+            .journaled_batch(&[
+                transaction(10, &[healthy, dropped]),
+                transaction(20, &[dropped]),
+            ])
+            .unwrap();
+        ledger
+            .journaled_batch(&[transaction(30, &[dropped]), transaction(40, &[healthy])])
+            .unwrap();
+        ledger
+            .table_materialized_batch(&[PgLsn(10), PgLsn(40)], healthy, 5)
+            .unwrap();
+        ledger.drain_completed_prefix().unwrap();
+        assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(0));
+
+        // The batch capacity is two: one tick settles one page.
+        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        ledger.drain_completed_prefix().unwrap();
+        assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(20));
+        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        ledger.drain_completed_prefix().unwrap();
+        assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(40));
+        assert_eq!(ledger.pending_count(), 0);
+        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+    }
+
+    /// A run admitted before the latch may still commit its transactions at a
+    /// new snapshot. Settling first would make that completion a replay
+    /// conflict that stops the daemon, so only a table no run owns settles.
+    #[test]
+    fn settling_a_dropped_table_waits_for_its_in_flight_run() {
+        let (_root, store, mut ledger, mut blocked, transaction) = dropped_table_fixture();
+        let dropped = TableId(8);
+        ledger
+            .journaled_batch(&[transaction(10, &[dropped])])
+            .unwrap();
+        // While the run owns the table it is never settled; the run commits
+        // snapshot 9 and completes normally.
+        ledger
+            .table_materialized_batch(&[PgLsn(10)], dropped, 9)
+            .unwrap();
+        // A completed publication does not clear the resync-only block.
+        blocked.clear(dropped).unwrap();
+        assert_eq!(
+            blocked.get(dropped).unwrap().error_code,
+            PUBLICATION_CHANGED
+        );
+        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        ledger.drain_completed_prefix().unwrap();
+        assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
+
+        // The race this avoids: behind an incomplete earlier transaction,
+        // completing at the old snapshot first makes the run's completion fail.
+        let (_root, _store, mut ledger, _blocked, transaction) = dropped_table_fixture();
+        ledger
+            .journaled_batch(&[transaction(5, &[TableId(7)]), transaction(10, &[dropped])])
+            .unwrap();
+        ledger
+            .table_materialized_batch(&[PgLsn(10)], dropped, 0)
+            .unwrap();
+        let error = ledger
+            .table_materialized_batch(&[PgLsn(10)], dropped, 9)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("table publication changed on replay")
+        );
+    }
+
+    /// An unfinished operation is settled by a recovery-only attempt; its
+    /// transactions do not complete at the old snapshot meanwhile.
+    #[test]
+    fn a_prepared_operation_on_a_dropped_table_schedules_recovery() {
+        let (_root, store, mut ledger, mut blocked, transaction) = dropped_table_fixture();
+        let dropped = TableId(8);
+        ledger
+            .journaled_batch(&[transaction(10, &[dropped])])
+            .unwrap();
+        let id = OperationId("prepared-before-latch".into());
+        store
+            .begin_prepare(PreparedOperation {
+                id: id.clone(),
+                table_id: dropped,
+                kind: OperationKind::Ingest,
+                base_snapshot_id: None,
+                last_lsn: PgLsn(10),
+                schema_version: 1,
+                artifacts: vec![],
+                payload: vec![],
+            })
+            .unwrap();
+        assert_eq!(blocked.deadline_for(dropped), None);
+        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        assert!(
+            blocked.deadline_for(dropped).is_some(),
+            "recovery-only attempt admitted"
+        );
+        assert_eq!(ledger.pending_count(), 1);
+        // A transient recovery failure keeps the code and retries later.
+        blocked
+            .record(dropped, "catalog_unavailable", Some(id.clone()))
+            .unwrap();
+        assert_eq!(
+            blocked.get(dropped).unwrap().error_code,
+            PUBLICATION_CHANGED
+        );
+        assert!(blocked.deadline_for(dropped).is_some());
+        // Once the attempt discards the building operation, the rest settles.
+        store.discard_uncommitted(&id).unwrap();
+        blocked.record(dropped, PUBLICATION_CHANGED, None).unwrap();
+        assert_eq!(blocked.deadline_for(dropped), None);
+        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        ledger.drain_completed_prefix().unwrap();
+        assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
+    }
+
+    /// Finished compaction candidates for a table that will never publish
+    /// again are retired; a still-running build is left to complete first.
+    /// Neither holds the acknowledgement frontier.
+    #[test]
+    fn a_ready_build_on_a_dropped_table_is_retired_and_the_watermark_advances() {
+        let (_root, store, mut ledger, mut blocked, transaction) = dropped_table_fixture();
+        let (healthy, dropped, running) = (TableId(7), TableId(8), TableId(9));
+        ledger
+            .journaled_batch(&[transaction(10, &[dropped]), transaction(20, &[healthy])])
+            .unwrap();
+        ledger
+            .table_materialized_batch(&[PgLsn(20)], healthy, 5)
+            .unwrap();
+        let mut ready_builds = BTreeMap::from([(dropped, "built")]);
+        let mut ready_preparations = BTreeMap::<TableId, &str>::new();
+        let mut build_active = HashSet::from([dropped, running]);
+        let mut activation_pending = HashSet::from([running]);
+        let mut waiting_for_build = HashSet::from([dropped]);
+        let mut retiring_builds = HashSet::new();
+        let mut release = |table| {
+            release_blocked_candidates(
+                table,
+                &mut ready_builds,
+                &mut ready_preparations,
+                &mut build_active,
+                &mut activation_pending,
+                &mut waiting_for_build,
+                &mut retiring_builds,
+            )
+        };
+        assert_eq!(release(dropped), (Some("built"), None));
+        // Still running: nothing to retire yet, and its state stays owned.
+        assert_eq!(release(running), (None, None));
+        assert!(build_active.contains(&running) && activation_pending.contains(&running));
+        assert!(!build_active.contains(&dropped) && !waiting_for_build.contains(&dropped));
+        assert!(retiring_builds.contains(&dropped) && ready_builds.is_empty());
+
+        // Only a run owns the table's ledger share, so settling proceeds.
+        while settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap() {}
+        ledger.drain_completed_prefix().unwrap();
+        assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(20));
+    }
 }
+
+#[cfg(test)]
+#[path = "publication_live_tests.rs"]
+mod publication_live_tests;

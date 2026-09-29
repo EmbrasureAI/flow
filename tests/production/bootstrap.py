@@ -50,9 +50,9 @@ class BootstrapRun(Run):
         self.log = self.log_path.open("wb")
         self.process = subprocess.Popen(self.command("init"), env=self.environment | {"RUST_LOG": "info"}, stdout=self.log, stderr=subprocess.STDOUT)
 
-    def events(self, log_path=None):
+    def events(self):
         events = []
-        for line in (log_path or self.log_path).read_text().splitlines():
+        for line in self.log_path.read_text().splitlines():
             try:
                 events.append(json.loads(line).get("fields", {}))
             except json.JSONDecodeError:
@@ -198,25 +198,24 @@ class BootstrapRun(Run):
 
     def index_loss(self):
         self.stop(crash=True)
-        index = self.directory / "state" / "index"
-        # A previous bootstrap crash may already have selected a rebuilt index.
-        # Remove the active generation, not its retained predecessor.
-        for generation in range(1, self.generation + 1):
-            for kind in ("init", "daemon"):
-                log = self.directory / f"{kind}-{generation}.log"
-                if not log.exists():
-                    continue
-                for event in self.events(log):
-                    if event.get("event") == "index_generation_activated":
-                        index = Path(event["path"])
-        assert index.resolve().is_relative_to((self.directory / "state").resolve())
-        index.rename(index.with_name("index-lost-for-test"))
+        # Earlier bootstrap recovery may already have activated a generation.
+        # Removing only the legacy directory would leave the active index intact.
+        missing = self.directory / "lost-row-index"
+        missing.mkdir()
+        moved = []
+        for name in ("index", "index-generations"):
+            index = self.directory / "state" / name
+            if index.exists():
+                index.rename(missing / name)
+                moved.append(name)
+        assert moved, "no replaceable row index was removed"
+        assert (self.directory / "state" / "control" / "CURRENT").exists()
         self.start()
         self.until("index reconstruction did not finish", lambda: '"index_generation_activated"' in (self.directory / f"daemon-{self.generation}.log").read_text())
         barrier = self.transaction(["UPDATE orders SET amount = amount + 3 WHERE id IN (1, 9001)", "DELETE FROM orders WHERE id = 9000", "UPDATE accounts SET amount = amount + 4 WHERE id = 1"])
         self.wait_materialized(barrier)
         self.verify("index-loss")
-        return {"post_rebuild_updates_and_delete": True}
+        return {"post_rebuild_updates_and_delete": True, "removed_index_directories": moved}
 
     def execute(self):
         try:

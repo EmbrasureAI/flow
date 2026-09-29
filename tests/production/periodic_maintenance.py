@@ -8,6 +8,7 @@
 import argparse
 import json
 import os
+import subprocess
 from pathlib import Path
 import time
 import traceback
@@ -52,6 +53,9 @@ class PeriodicRun(FairnessRun):
         uri = f"{self.args.catalog_uri.rstrip('/')}/v1/namespaces/{self.name}/tables/orders"
         with urlopen(Request(uri, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}), timeout=10) as response:
             assert response.status == 200
+        # The previous catalog pointer was registered by the last native commit.
+        # It must eventually leave the catalog log as well as its reader grace.
+        self.expirable_json = self.before_metadata["metadata"]["metadata-log"][-1]["metadata-file"]
         self.expirable = self.before_metadata["metadata"]["current-snapshot-id"]
         self.expirable_manifest = next(s["manifest-list"] for s in self.before_metadata["metadata"]["snapshots"]
                                       if s["snapshot-id"] == self.expirable)
@@ -59,7 +63,8 @@ class PeriodicRun(FairnessRun):
         self.catalog_proxy.delay_seconds = .01
         return result | {"retained_tag_snapshot": snapshot,
                          "expirable_snapshot": self.expirable,
-                         "expirable_manifest_list": self.expirable_manifest}
+                         "expirable_manifest_list": self.expirable_manifest,
+                         "expirable_metadata_json": self.expirable_json}
 
     def missing(self, path):
         uri = urlsplit(path)
@@ -86,6 +91,7 @@ class PeriodicRun(FairnessRun):
         saw_rewrite = False
         saw_expiration = False
         saw_reclamation = False
+        saw_json_reclamation = False
         while time.monotonic() - started < self.args.timeout:
             assert self.process.poll() is None, "daemon exited during periodic maintenance"
             metadata = self.table("orders")["metadata"]
@@ -97,11 +103,13 @@ class PeriodicRun(FairnessRun):
                           for event in events)
             expired = all(s["snapshot-id"] != self.expirable for s in metadata["snapshots"])
             reclaimed = expired and self.missing(self.expirable_manifest)
+            json_reclaimed = self.missing(self.expirable_json)
+            saw_json_reclamation |= json_reclaimed
             if (rewrite and not saw_rewrite) or (expired and not saw_expiration) or (reclaimed and not saw_reclamation):
                 observations.append({"seconds": round(time.monotonic() - started, 3),
                                      "orders_lsn": source_lsn, "status": status,
                                      "manifest_rewrite": rewrite, "snapshot_expired": expired,
-                                     "manifest_list_deleted": reclaimed})
+                                     "manifest_list_deleted": reclaimed, "metadata_json_deleted": json_reclaimed})
             saw_rewrite |= rewrite
             saw_expiration |= expired
             saw_reclamation |= reclaimed
@@ -110,7 +118,7 @@ class PeriodicRun(FairnessRun):
             data_work = builds if self.args.table_workers > 1 else [
                 event for event in events if event.get("event") == "compaction_completed"
                 and event.get("candidate_kind") == "data_rewrite"]
-            if (saw_rewrite and saw_expiration and saw_reclamation and len(checkpoints) >= 3
+            if (saw_rewrite and saw_expiration and saw_reclamation and saw_json_reclamation and len(checkpoints) >= 3
                     and data_work):
                 # Catalog reads and S3 HEAD are separate observations. Prove
                 # the table still has work after all reclamation checks finish.
@@ -122,6 +130,7 @@ class PeriodicRun(FairnessRun):
                 break
             time.sleep(.1)
         assert saw_rewrite and saw_expiration and saw_reclamation, "periodic maintenance failed to reclaim old metadata"
+        assert saw_json_reclamation, "obsolete catalog JSON was not reclaimed"
         assert len(checkpoints) >= 3, "checkpoint rotation did not overlap the backlog"
         assert data_work, "native data maintenance did not compete with periodic work"
         before = self.status()["watermarks"]["materialized_lsn"]
@@ -137,7 +146,13 @@ class PeriodicRun(FairnessRun):
         tagged = self.initial_metadata["metadata"]["current-snapshot-id"]
         assert metadata["metadata"]["refs"]["retained-initial"]["snapshot-id"] == tagged
         assert any(s["snapshot-id"] == tagged for s in metadata["metadata"]["snapshots"])
-        assert self.rows("orders", self.initial_metadata) == self.initial_rows
+        # A tag protects the snapshot in CURRENT metadata, not a stale JSON
+        # location retained past the reader window. Plan the historical read anew.
+        tagged_rows = self.duck.execute(
+            "SELECT * FROM iceberg_scan(?, snapshot_from_id = ?) ORDER BY id",
+            [metadata["metadata-location"], tagged],
+        ).fetchall()
+        assert tagged_rows == self.initial_rows
         self.until("obsolete checkpoint directories were not retired", lambda:
                    len(list((self.directory / "state/checkpoints").glob("*/CURRENT"))) == 2)
         active = set()
@@ -153,12 +168,54 @@ class PeriodicRun(FairnessRun):
                          "reclamation_boundary": boundary, "retained_initial_rows": len(self.initial_rows),
                          "confirmed_lsn": self.confirmed()}
 
+    def legacy_json_import(self):
+        metadata = self.table("orders")
+        paths = [metadata["metadata"]["location"].rstrip("/") +
+                 f"/metadata/legacy-import-fixture-{index}.metadata.json" for index in range(12)]
+        for path in paths:
+            uri = urlsplit(path)
+            self.s3.put_object(Bucket=uri.netloc, Key=uri.path.lstrip("/"),
+                              Body=json.dumps(metadata["metadata"]).encode())
+        inventory = self.directory / "metadata-inventory.jsonl"
+        inventory.write_text("".join(json.dumps({"table_uuid": metadata["metadata"]["table-uuid"], "path": path}) + "\n"
+                                     for path in paths))
+        command = [str(self.args.binary.resolve()), "--config", str(self.config),
+                   "metadata-import", "--inventory", str(inventory)]
+        busy = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        assert busy.returncode != 0, "import must refuse the running daemon's state"
+        self.stop_clean()
+        preview = subprocess.run(command, capture_output=True, text=True, timeout=60, check=True)
+        assert json.loads(preview.stdout.splitlines()[-1]) == {"checked": len(paths), "applied": False, "deleted": 0}
+        # A failing concurrent batch may have registered valid earlier entries,
+        # but must never adopt a file with another table incarnation in its body.
+        invalid_path = paths[-1].replace(".metadata.json", "-invalid.metadata.json")
+        invalid_uri = urlsplit(invalid_path)
+        invalid = dict(metadata["metadata"], **{"table-uuid": "00000000-0000-0000-0000-000000000000"})
+        self.s3.put_object(Bucket=invalid_uri.netloc, Key=invalid_uri.path.lstrip("/"), Body=json.dumps(invalid).encode())
+        valid_inventory = inventory.read_text()
+        inventory.write_text(valid_inventory + json.dumps({"table_uuid": metadata["metadata"]["table-uuid"], "path": invalid_path}) + "\n")
+        rejected = subprocess.run(command + ["--apply"], capture_output=True, text=True, timeout=60)
+        assert rejected.returncode != 0 and "retained table incarnation" in rejected.stderr
+        inventory.write_text(valid_inventory)
+        applied = subprocess.run(command + ["--apply"], capture_output=True, text=True, timeout=60, check=True)
+        assert json.loads(applied.stdout.splitlines()[-1]) == {"checked": len(paths), "applied": True, "deleted": 0}
+        # Replaying a completed batch is safe, including after a lost CLI response.
+        subprocess.run(command + ["--apply"], capture_output=True, text=True, timeout=60, check=True)
+        assert all(not self.missing(path) for path in paths), "import itself must never delete objects"
+        self.start()
+        self.until("imported catalog JSON was not reclaimed after restart", lambda: all(self.missing(path) for path in paths))
+        assert not self.missing(invalid_path), "rejected foreign metadata must not enter GC ownership"
+        self.s3.delete_object(Bucket=invalid_uri.netloc, Key=invalid_uri.path.lstrip("/"))
+        result = self.compare("legacy-json-import-restart")
+        return result | {"exclusive_state_lock": True, "preview": True, "deleted_after_resume": True}
+
     def execute(self):
         try:
             self.phase("seed", self.seed)
             self.phase("initial-copy", self.initialize)
             self.phase("queue-source-and-prime-durable-backlog", self.queued_backlog)
             self.phase("periodic-reclamation-with-continuously-ready-cdc", self.admission_and_progress)
+            self.phase("legacy-catalog-json-import", self.legacy_json_import)
             self.phase("clean-shutdown", lambda: {"exit_code": self.stop_clean()})
             self.check_worker_panics()
             self.report["passed"] = True

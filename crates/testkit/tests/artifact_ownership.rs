@@ -15,11 +15,17 @@ struct RegistrationGate {
     io: FileIO,
     reject: AtomicBool,
     registered: Mutex<Vec<ArtifactSet>>,
+    catalog_pointer: Mutex<Option<String>>,
 }
 impl ArtifactTracker for RegistrationGate {
     fn register(&self, artifacts: ArtifactSet) -> BoxFuture<'_, iceberg::Result<()>> {
         Box::pin(async move {
             for index in 0..artifacts.len().unwrap() {
+                let path = artifacts.path(index).unwrap();
+                if self.catalog_pointer.lock().unwrap().as_deref() == Some(&path) {
+                    assert!(self.io.exists(&path).await.unwrap());
+                    continue;
+                }
                 assert!(
                     !self
                         .io
@@ -51,6 +57,11 @@ impl RegistrationGate {
         assert!(!groups.is_empty());
         for group in groups {
             for ordinal in 0..group.len().unwrap() {
+                let path = group.path(ordinal).unwrap();
+                if self.catalog_pointer.lock().unwrap().as_deref() == Some(&path) {
+                    assert!(self.io.exists(&path).await.unwrap());
+                    continue;
+                }
                 assert_eq!(
                     self.io.exists(&group.path(ordinal).unwrap()).await.unwrap(),
                     present
@@ -70,6 +81,7 @@ async fn registration_failure_prevents_data_delete_and_catalog_metadata_uploads(
         io: table.file_io().clone(),
         reject: AtomicBool::new(true),
         registered: Mutex::new(Vec::new()),
+        catalog_pointer: Mutex::new(table.metadata_location().map(str::to_owned)),
     });
     let config = WriterConfig {
         artifact_tracker: Some(gate.clone()),
@@ -107,6 +119,7 @@ async fn registration_failure_prevents_data_delete_and_catalog_metadata_uploads(
     gate.reject.store(false, Ordering::SeqCst);
     let initial = action.commit(&catalog, &table).await.unwrap().table;
     gate.verify_outputs(true).await;
+    *gate.catalog_pointer.lock().unwrap() = initial.metadata_location().map(str::to_owned);
     let make_delete = |name: &str| {
         DeleteWriter::new(
             table.file_io().clone(),
@@ -139,6 +152,7 @@ async fn registration_failure_prevents_data_delete_and_catalog_metadata_uploads(
         .unwrap()
         .table;
     gate.verify_outputs(true).await;
+    *gate.catalog_pointer.lock().unwrap() = updated.metadata_location().map(str::to_owned);
     let mut writer = make_writer("rewrite-data");
     writer.write(&rows[1..], PgLsn(20)).await.unwrap();
     let replacement = writer.close().await.unwrap();

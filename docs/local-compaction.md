@@ -48,10 +48,12 @@ work retain their existing paths.
    ambiguous-outcome recovery applies. Never redo catch-up after an unknown
    commit outcome.
 7. Remove BUILD only after Prepared is durable, or after a failed/cancelled worker
-   has actually finished. Optional preparation has a 750 ms budget. If hard debt
-   already pauses publication at handoff, preparation may use the remaining
-   original 30-second build age. Expiry releases the same-table CDC gate;
-   a timed-out blocking worker retains BUILD, scratch and a
+   has actually finished. Optional preparation uses a 750 ms CDC stall budget,
+   then releases that gate while the same immutable candidate finishes within
+   its original 30-second build age. Activation still requires exact head H;
+   concurrent CDC can invalidate the candidate. If hard debt already pauses
+   publication at handoff, preparation keeps that gate for the remaining build
+   age. At the total age limit, a timed-out blocking worker retains BUILD, scratch and a
    worker slot while it joins and retires asynchronously. It no longer counts as
    a viable candidate for foreground pressure decisions. Dropping a blocking-task
    handle is not proof of join.

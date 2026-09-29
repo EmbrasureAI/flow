@@ -66,8 +66,10 @@ and translates late position deletes to output positions. The daemon briefly
 gates the next same-table epoch, then activates only if catalog identity/location
 and the complete `TableState` still equal H. Activation atomically installs the
 ordinary Building fence before staging and sealing Prepared. The preparation
-gate expires after 750 ms; its worker keeps BUILD and scratch while retiring in
-the background, without continuing to pause CDC. BUILD protects files and
+gate expires after 750 ms; its worker keeps BUILD and scratch while completing in
+the background within the original build-age limit. The same candidate can
+activate if H remains current, avoiding repeated uploads of unchanged inputs.
+BUILD protects files and
 required history until the worker joins or ownership moves to Prepared. See
 [local compaction](local-compaction.md) for the proof, bounds and tests.
 

@@ -497,6 +497,7 @@ impl TableMaintenance {
             .snapshots()
             .map(|snapshot| snapshot.snapshot_id())
             .collect();
+        artifacts::register_catalog_metadata(&self.store, &head, table_id).await?;
         let transaction = Transaction::new(&head);
         let updated = transaction
             .expire_snapshots()

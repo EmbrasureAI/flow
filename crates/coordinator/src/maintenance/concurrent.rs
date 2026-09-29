@@ -121,15 +121,28 @@ pub enum PreparationWait {
 }
 
 /// A timed-out preparation whose blocking worker still owns scratch artifacts.
-/// CDC may resume while this handle joins and retires that work in the background.
+/// CDC may resume while this handle joins and retires that work, or transfers it
+/// back to a running preparation for later exact-head activation.
 #[must_use = "join the worker before releasing its scratch directory"]
 pub struct RetiringCompactionPreparation {
     worker: tokio::task::JoinHandle<Result<PreparedData>>,
     ownership: BuildRegistration,
     started: Instant,
+    worker_ms: f64,
 }
 
 impl RetiringCompactionPreparation {
+    /// Continue the same immutable preparation after releasing the table lane.
+    /// Activation still requires its exact captured catalog and index head.
+    pub fn into_running(self) -> RunningCompactionPreparation {
+        RunningCompactionPreparation {
+            worker: self.worker,
+            ownership: self.ownership,
+            started: self.started,
+            worker_ms: self.worker_ms,
+        }
+    }
+
     pub fn operation_id(&self) -> &OperationId {
         self.ownership.operation_id()
     }
@@ -170,6 +183,7 @@ impl RunningCompactionPreparation {
                 worker: self.worker,
                 ownership: self.ownership,
                 started: self.started,
+                worker_ms: self.worker_ms,
             }));
         }
         let outcome = match tokio::time::timeout(deadline, &mut self.worker).await {
@@ -181,6 +195,7 @@ impl RunningCompactionPreparation {
                     worker: self.worker,
                     ownership: self.ownership,
                     started: self.started,
+                    worker_ms: self.worker_ms,
                 }));
             }
         };

@@ -219,8 +219,20 @@ class ConcurrentRun(Run):
         assert self.head() != build["base_snapshot"]
         before_release = self.compare("cdc-while-build-read-held")
         confirmed_while_held = self.confirmed()
-        self.object_proxy.release_reads.set()
+        # An unchanged candidate must survive the optional 750ms stall budget.
+        # Resume CDC while its original worker completes; do not upload the same
+        # data repeatedly just because preparation is slower than that budget.
+        self.catalog_proxy.delay_seconds = 1.25
+        try:
+            self.object_proxy.release_reads.set()
+            self.until("soft preparation was not deferred past its stall budget", lambda:
+                next((event for event in self.log_fields()
+                      if event.get("event") == "compaction_preparation_deferred"
+                      and event.get("operation_id") == build["operation_id"]), None), timeout=15)
+        finally:
+            self.catalog_proxy.delay_seconds = 0
         metadata, compact = self.wait_compaction(build)
+        assert compact['summary']['flow.operation-id'] == build['operation_id']
         translated = self.translated_deletes(metadata, compact, build)
         result = self.compare("speculative-catchup-complete")
         assert self.rows("orders", self.initial_metadata) == self.initial_rows

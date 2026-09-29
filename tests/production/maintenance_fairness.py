@@ -35,10 +35,12 @@ class FairnessRun(ConcurrentRun):
         text = text.replace("commits_per_second = 100", "commits_per_second = 10000")
         self.config.write_text(text)
         self.set_compaction_policy(self.policy)
+        self.cold_table = getattr(args, "cold_table", False)
         self.report.update(compaction_policy=self.policy, table_workers=2,
                            pending_transactions=16, commits_per_second=10000,
                            queued_transactions=1025,
-                           hot_tables=["orders", "accounts"] if args.two_hot_tables else ["orders"],
+                           hot_tables=(["accounts"] if self.cold_table else
+                                       ["orders", "accounts"] if args.two_hot_tables else ["orders"]),
                            planned_phases=5)
 
     def seed(self):
@@ -74,13 +76,13 @@ class FairnessRun(ConcurrentRun):
         # All source commits precede native restart; publication cannot rely on
         # gaps between a live producer's arrivals to run optional maintenance.
         for index in range(1024):
-            statements = [
+            statements = ["UPDATE accounts SET amount=amount+0.0001 WHERE id=1"] if self.cold_table else [
                 f"INSERT INTO orders (id, tenant, payload) VALUES ({100000 + index}, 2, 'queued-{index}')",
             ]
             if self.args.two_hot_tables:
                 statements.append("UPDATE accounts SET amount=amount+0.0001 WHERE id=1")
             self.transaction(statements)
-        self.barrier = self.transaction([
+        self.barrier = self.transaction(["UPDATE accounts SET amount=amount+0.25 WHERE id=1"] if self.cold_table else [
             "DELETE FROM orders WHERE id BETWEEN 101020 AND 101023",
             "UPDATE orders SET id=id+100000 WHERE id BETWEEN 100000 AND 100003",
             "UPDATE accounts SET amount=amount+0.25 WHERE id=1",
@@ -89,7 +91,7 @@ class FairnessRun(ConcurrentRun):
 
         # Prime the durable queue without native compaction. A held POST keeps
         # the first source page from draining while capture registers the rest.
-        self.catalog_proxy.hold_commits("ingest", table="orders")
+        self.catalog_proxy.hold_commits("ingest", table="accounts" if self.cold_table else "orders")
         self.start()
         self.until("backlog did not reach the held publication", self.catalog_proxy.commit_held.is_set)
         def registered_backlog():
@@ -196,8 +198,12 @@ def main():
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--two-hot-tables", action="store_true",
                         help="also update accounts in every transaction to cover two-worker contention")
+    parser.add_argument("--cold-table", action="store_true",
+                        help="leave orders unchanged after restart while accounts has a durable CDC backlog")
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()
+    if args.cold_table and args.two_hot_tables:
+        parser.error("--cold-table and --two-hot-tables are mutually exclusive")
     FairnessRun(args).execute()
     print(f"PASS: {args.artifacts.resolve() / 'report.json'}", flush=True)
 

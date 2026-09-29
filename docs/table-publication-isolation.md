@@ -57,8 +57,8 @@ proved at commit before publication; streamed NULL rows may select a provisional
 decoder while the committed catalog proof is still pending.
 
 Incompatible names/types, selected-column loss, primary-key/replica-identity drift,
-row decoding failures, and TRUNCATE latch a source-table block in the authoritative
-control store. Subsequent selected row images and wire metadata are retained as
+row decoding failures, and TRUNCATE latch a source-table block
+(`source_schema_incompatible`) in the authoritative control store. Subsequent selected row images and wire metadata are retained as
 opaque quarantined mutations in the existing transaction spool/journal. Commit
 proof failures quarantine that table's decoded evidence too. The failed table
 remains in every affected transaction descriptor, including mixed transactions;
@@ -69,16 +69,60 @@ are projected out before quarantine, including when a selected column disappears
 A source-table block persists across restart and source repair. Use an explicit
 resync/replacement to establish new authoritative state; never clear the block or
 discard journal records manually. This version does not reinterpret quarantined
-mutations automatically. Reinitialize the connection with a new state directory
-and verified targets. Journal/spool quotas and source WAL pressure still bound how long
+mutations automatically. The product's current Full resync replaces the whole
+connection. Journal/spool quotas and source WAL pressure still bound how long
 healthy tables can continue; quota exhaustion fails closed.
 
 Journal corruption, source connection/slot/identity failures, state-store failures,
 invalid shared invariants, and unclassified errors remain connection-wide. Completed bootstrap with intact local authority
 can load and recover targets independently. Initial snapshot/bootstrap, legacy
 target-identity adoption, and whole-index reconstruction still require their
-existing coordinated recovery path. Unknown/replaced source identities and
-publication-membership changes also retain coordinated recovery.
+existing coordinated recovery path. Unknown/replaced source identities also
+retain coordinated recovery.
+
+### Publication changes
+
+A publication change that affects one configured table blocks only that table
+with `publication_changed`; the other tables keep capturing, publishing and
+acknowledging. This covers a configured table removed from the publication, a
+row filter or a column list added to it, and PostgreSQL 18's generated-column
+requirement failing for it. Startup, every capture reconnect and a running
+check about once a minute on capture's identity-proven session detect these,
+and each needs a confirming second read. A change that affects every table (the
+publication is missing, or INSERT, UPDATE, DELETE or TRUNCATE is unpublished)
+stays connection-wide: `publication_changed` source health, a slot resync
+marker and exit. During bootstrap every publication change stays
+connection-wide.
+
+Unlike a schema block, a `publication_changed` block drops the table's changes
+instead of quarantining them, because the publication may already have skipped
+some and only a resync can recover the table. Capture discards its relation
+metadata, row images and TRUNCATE entries before spool and journal, exactly like
+an unconfigured table, and skips its rows that an open transaction spooled
+before the latch. Transactions it journaled before the latch are completed in
+the ledger at the table's unchanged snapshot, one bounded page per loop
+iteration and only while no run owns the table, so an admitted run's own
+completion is never contradicted. Its finished compaction candidates are
+retired and its queued work stops counting against admission. An operation
+the table left unfinished first gets a recovery-only attempt: a building
+operation is discarded, and a prepared or committed one is resolved through
+the ordinary recovery path without publishing new changes. If the table's
+target is gone or was replaced, that operation is abandoned locally instead,
+since whatever it may have committed belongs to a table this pipeline no
+longer owns and a resync rebuilds it. So the
+blocked table stops holding the acknowledgement frontier and source WAL is not
+retained for it. Usage receipts still count rows journaled before the latch.
+The block persists across restart even after the publication is restored;
+completing a publication or recovery never clears it, and only a resync does.
+A publication block supersedes an earlier schema block on the same table, since
+both need a resync, and releases its quarantined changes the same way. The
+publication check runs before schema refresh at startup and reconnect, so a
+removed table is dropped rather than first quarantined.
+
+The check is best effort. It cannot detect a configured table removed and
+re-added between checks, whose interim writes pgoutput never sends; coordinate
+such publication changes with a resync. Other tables may join or leave the
+publication.
 
 ## Acknowledgements, limits, and observations
 
@@ -95,9 +139,6 @@ apply, and reaching them does not permit dropping changes. Journal usage is not
 total disk usage: the row index, control database, reference index, and retained
 operation artifacts consume additional storage. Independent remote capture
 durability and total-storage budgeting are separate contracts.
-
-Once recovery releases a large completed source prefix, acknowledgement and
-cleanup advance in bounded pages so they yield to other work.
 
 Table observations distinguish last successful materialized progress from a
 current publication block. A connection-wide checkpoint must not be presented as

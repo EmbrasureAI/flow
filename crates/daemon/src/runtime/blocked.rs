@@ -51,7 +51,7 @@ impl BlockedTables {
             let delay = Duration::from_millis(record.retry_at_ms.saturating_sub(wall_ms))
                 .min(MAX_RETRY_DELAY);
             record.retry_at_ms = wall_ms.saturating_add(delay.as_millis() as u64);
-            if record.error_code != "source_schema_incompatible" {
+            if !requires_resync(&record.error_code) {
                 deadlines.insert(record.table_id, now + delay);
             }
             records.insert(record.table_id, record);
@@ -76,6 +76,15 @@ impl BlockedTables {
         );
         let wall_ms = now_ms()?;
         let previous = self.records.get(&id);
+        // Only a resync clears a publication block. A transient failure while
+        // settling its unfinished operation keeps the code and retries.
+        let incoming = error_code;
+        let error_code = if previous.is_some_and(|record| record.error_code == PUBLICATION_CHANGED)
+        {
+            PUBLICATION_CHANGED
+        } else {
+            error_code
+        };
         let attempts = previous.map_or(1, |record| record.attempts.saturating_add(1));
         let delay = crate::retry::delay(attempts - 1).min(MAX_RETRY_DELAY);
         let record = BlockedTable {
@@ -90,7 +99,7 @@ impl BlockedTables {
         self.store
             .put_source_transaction(&record_key(&self.prefix, id), &serde_json::to_vec(&record)?)?;
         // Never alter scheduler-visible state before its durable write succeeds.
-        if error_code == "source_schema_incompatible" {
+        if requires_resync(incoming) {
             self.deadlines.remove(&id);
         } else {
             self.deadlines.insert(id, Instant::now() + delay);
@@ -99,8 +108,14 @@ impl BlockedTables {
         Ok(())
     }
 
+    /// A completed publication cannot clear a publication block: the table's
+    /// changes may have been skipped, so only a resync replaces it.
     pub(crate) fn clear(&mut self, id: TableId) -> Result<()> {
-        if !self.records.contains_key(&id) {
+        if self
+            .records
+            .get(&id)
+            .is_none_or(|record| record.error_code == PUBLICATION_CHANGED)
+        {
             return Ok(());
         }
         self.store
@@ -133,6 +148,14 @@ impl BlockedTables {
             .collect()
     }
 
+    /// Admit one recovery-only attempt for a publication block's unfinished
+    /// operation; the block itself never retries.
+    pub(crate) fn schedule_recovery(&mut self, id: TableId) {
+        if self.records.contains_key(&id) && !self.deadlines.contains_key(&id) {
+            self.deadlines.insert(id, Instant::now());
+        }
+    }
+
     /// The attempt owns a worker now; keep its block visible without a hot timer.
     pub(crate) fn release_due(&mut self, id: TableId) {
         self.deadlines.remove(&id);
@@ -159,10 +182,18 @@ fn now_ms() -> Result<u64> {
     )?)
 }
 
+pub(crate) const PUBLICATION_CHANGED: &str = "publication_changed";
+
+/// Capture latched these tables; retrying publication cannot clear them.
+fn requires_resync(code: &str) -> bool {
+    matches!(code, "source_schema_incompatible" | "publication_changed")
+}
+
 fn valid_error_code(code: &str) -> bool {
     matches!(
         code,
         "source_schema_incompatible"
+            | "publication_changed"
             | "publication_replan"
             | "maintenance_pressure"
             | "catalog_unavailable"
@@ -418,5 +449,29 @@ mod tests {
             publication_error_code(&flow_compactor::Error::InvalidInventory("corrupt").into()),
             None
         );
+    }
+
+    #[test]
+    fn publication_changed_is_permanent_and_survives_reload() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(root.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let source = SourceId("publication".into());
+        let mut blocked = BlockedTables::load(&store, &source).unwrap();
+        blocked
+            .record(TableId(12), "publication_changed", None)
+            .unwrap();
+        assert_eq!(
+            blocked.deadline_for(TableId(12)),
+            None,
+            "no retry clears it"
+        );
+        let reloaded = BlockedTables::load(&store, &source).unwrap();
+        let record = reloaded.get(TableId(12)).unwrap();
+        assert_eq!(record.error_code, "publication_changed");
+        assert_eq!(reloaded.deadline_for(TableId(12)), None);
+        assert!(reloaded.get(TableId(11)).is_none());
     }
 }

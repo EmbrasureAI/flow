@@ -71,7 +71,8 @@ impl ArtifactSet {
 
 /// Persist object ownership before a writer can issue its first PUT. Metadata
 /// writers reserve a whole bounded group at once; data writers may reserve
-/// ordinal blocks. Unmanaged callers can omit tracking entirely.
+/// ordinal blocks. Catalog replacement also registers the existing authoritative
+/// JSON before superseding it. Unmanaged callers can omit tracking entirely.
 pub trait ArtifactTracker: std::fmt::Debug + Send + Sync {
     fn register(&self, artifacts: ArtifactSet) -> BoxFuture<'_, Result<()>>;
 }
@@ -121,6 +122,26 @@ pub async fn retained_artifacts(
     let mut protected = std::collections::BTreeSet::new();
     let mut visited = ManifestDedup::default();
     if candidates.is_empty() {
+        return Ok(protected);
+    }
+    // Catalog JSON is independent of snapshot expiration. Protect the current
+    // pointer and every version the catalog still advertises for readers.
+    for path in table.metadata_location().into_iter().chain(
+        table
+            .metadata()
+            .metadata_log()
+            .iter()
+            .map(|entry| entry.metadata_file.as_str()),
+    ) {
+        if candidates.contains(path) {
+            protected.insert(path.to_owned());
+        }
+    }
+    // JSON-only pages do not require reading any manifests or data descriptors.
+    if candidates
+        .iter()
+        .all(|path| path.ends_with(".metadata.json"))
+    {
         return Ok(protected);
     }
     for snapshot in table.metadata().snapshots() {
