@@ -6,6 +6,7 @@
 - [PostgreSQL type mappings](postgres-types.md): supported types, JSON semantics and schema changes.
 - [Docker demo](../demo/README.md): a complete local stack with standard Trino reads.
 - [Observability](observability.md): status, watermarks, metrics and operational diagnosis.
+- [Operations](operations.md): source preflight, resynchronization, adding tables, planned maintenance and capacity.
 - [Iceberg v3](iceberg-v3.md): deletion vectors, upgrades and compatibility checks.
 - [Performance](performance.md): recorded throughput, publication latency and reader overhead.
 

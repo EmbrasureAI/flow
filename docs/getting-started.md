@@ -31,6 +31,11 @@ of `pg_catalog.pg_logical_emit_message` for idle-source heartbeats. On PostgreSQ
 has `(boolean, text, text)`. Managed services may expose replication privileges
 through provider-specific roles. See [PostgreSQL's privilege requirements](https://www.postgresql.org/docs/18/logical-replication-security.html).
 
+PostgreSQL's default `max_slot_wal_keep_size = -1` lets a stalled slot retain
+WAL until the source disk fills. Set a cap the source volume can hold; reaching
+it invalidates the slot and requires resynchronization. See
+[bounding source WAL retention](operations.md#bound-source-wal-retention).
+
 As the table owner or administrator, prepare the existing example table before
 running `init`:
 
@@ -86,9 +91,13 @@ services. Flow needs catalog access to load/create tables and commit snapshots,
 and object access to read, write, list and delete its files. Use a persistent,
 writable `state_dir`; do not share it between running Flow processes.
 
-`check` validates the configuration locally. It does not verify credentials,
-source permissions, publication membership or service connectivity; `init`
-performs those checks while initializing the pipeline.
+`check` validates the configuration locally. `check --source` also connects to
+PostgreSQL read-only and reports server settings, slot and sender capacity,
+replication and heartbeat permissions, each table's key, replica identity,
+access and row-level security, the publication contract, and the slot's WAL
+retention; it exits nonzero when a check fails. Neither verifies catalog or
+object-store access; `init` performs the remaining checks while initializing
+the pipeline. See [operations](operations.md#before-initialization).
 
 Mutable tables require a primary key and `REPLICA IDENTITY FULL`. Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; other published tables are ignored. Flow checks this at startup, on every source reconnect and about once a minute while running. Each check first confirms it reached the initialized source: startup compares the replication connection's `IDENTIFY_SYSTEM` with the saved identity, and each check compares its own connection's `pg_control_system()` system identifier and database. If the login cannot call `pg_control_system()`, Flow logs a warning and skips that comparison for the check; before recording a resynchronization requirement it always proves the source identity over a replication connection, so a connection to another server or database never blocks the slot. When a check finds a configured table missing or its contract changed, Flow stops and writes `publication-resync-required.json` to `state_dir`; it then refuses to start with that slot, even after the publication is restored, until the source is resynchronized with a new slot. The check detects lasting changes only. pgoutput decides publication membership per change, so if a table is removed and re-added between two checks, writes made while it was out are never sent and Flow cannot detect them. Coordinate any publication change that affects configured tables with a resynchronization. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
 
@@ -115,7 +124,7 @@ The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,c
 | Source publication changed during capture, or resynchronization is required for the slot | A configured table left the publication or gained a row filter or column list after capture began. Changes to it may be missing, so restoring the publication does not resume the slot. Restore the publication and resynchronize with a new slot; Flow never removes `publication-resync-required.json` itself. A change reverted between two checks is not detected, so coordinate publication changes that affect configured tables with a resynchronization. |
 | Replica identity or primary-key validation fails | Set FULL replica identity and match the complete primary key in `primary_key`; keyless tables require append-only mode. |
 | Source column name or type differs | Match column order, names and the type mappings; check `column_selection` if intentionally excluding columns. |
-| Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. A successful `check` does not validate them. |
+| Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. `check --source` validates the PostgreSQL side; plain `check` validates none of them. |
 | Source slot is missing, lost WAL, or source identity changed | Preserve local state and diagnose the source change. Restoring the slot name alone cannot recover missing changes; coordinated resynchronization is required. |
 
 Inspect `status`, `blocked_tables` and the structured process logs together.
@@ -128,7 +137,7 @@ failures, including cases where healthy tables continue publishing.
 
 Keep snapshot history covering unfinished prepared operations, reader retention windows and useful checkpoints. The garbage collector protects retained snapshots, checkpoints and in-flight operations, and deletes only registered service-owned artifacts after a grace period. Index loss does not impair reads; startup restores a matching checkpoint or scans standard data and deletes, then atomically activates the rebuilt generation before restoring writes. Source lineage or unexplained external logical changes stop publication.
 
-Automatic snapshot expiration defaults to disabled. Set `limits.snapshot_expiration = true` only when external branch/tag creation and retention-policy changes are excluded or coordinated with this service's expiration. Coordinate catalog retention-policy changes with ingestion and maintenance commits too: a policy-only update does not move a snapshot head. Standard Iceberg REST cannot atomically assert the complete reference set and its policies; assertions on existing reference heads alone do not cover newly created tags. With expiration disabled, retained history and its files accumulate; arrange catalog-side coordinated expiration if automatic cleanup is required. Data compaction, manifest rewriting and collection of unreferenced owned artifacts still run.
+Automatic snapshot expiration is enabled by default. Once a table has at least 128 snapshots, snapshots older than `limits.snapshot_retention_secs` (one hour by default) are expired, and garbage collection later deletes Flow-owned files that no retained snapshot references after `limits.orphan_grace_secs`. Without expiration every commit stays in table metadata and compaction cannot reclaim the files it replaces, so metadata and storage grow without bound. Expiration retains snapshots referenced by branches and tags, the indexed snapshot, checkpoints and unfinished operations. Raise the retention to cover the time-travel window readers need; each retained snapshot enlarges the metadata file that every commit rewrites. Standard Iceberg REST cannot atomically assert the complete reference set during expiration, so a branch or tag created concurrently on a snapshot being expired may be lost. If external tools create branches or tags, coordinate them with Flow maintenance, or set `limits.snapshot_expiration = false` and run coordinated expiration elsewhere. Coordinate catalog retention-policy changes with ingestion and maintenance commits too: a policy-only update does not move a snapshot head. Data compaction, manifest rewriting and collection of unreferenced owned artifacts run in either mode.
 
 Current support boundaries:
 
@@ -139,4 +148,4 @@ Current support boundaries:
 - Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor for process failures and startup failures. Local fault tests do not establish independent-host durability.
 - Compaction supports unsorted layouts. Z-order-aware compaction, distributed compaction protocols, HA and global autocompaction are outside the early release scope. External compactor reconciliation is included and tested with actual Spark maintenance.
 
-Keep the source publication's table membership, operation flags, column lists and row filters fixed from initialization through streaming. Coordinate changes by stopping capture and resynchronizing the affected source before resuming. PostgreSQL may silently omit changes under an altered publication, so restoring its settings or restarting the service cannot prove that no rows were missed.
+Keep the source publication's table membership, operation flags, column lists and row filters fixed from initialization through streaming. [Operations](operations.md) describes resynchronization, adding tables and planned source maintenance. Coordinate changes by stopping capture and resynchronizing the affected source before resuming. PostgreSQL may silently omit changes under an altered publication, so restoring its settings or restarting the service cannot prove that no rows were missed.

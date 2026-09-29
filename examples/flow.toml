@@ -33,10 +33,11 @@ journal_bytes = 68719476736
 spool_bytes = 34359738368
 wal_soft_bytes = 17179869184
 wal_hard_bytes = 34359738368
+# Time-travel window. Every retained snapshot enlarges the metadata file each commit rewrites.
 snapshot_retention_secs = 3600
-# Opt in only when external branch/tag creation and retention changes are coordinated.
-# Standard REST cannot assert the complete reference set during expiration.
-snapshot_expiration = false
+# Disable only when another process performs coordinated expiration; without it
+# table metadata and files replaced by compaction are never reclaimed.
+snapshot_expiration = true
 
 [parquet_read]
 footer_bytes = 8388608

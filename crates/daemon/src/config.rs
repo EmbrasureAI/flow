@@ -106,7 +106,8 @@ pub struct Limits {
     pub wal_soft_bytes: u64,
     pub wal_hard_bytes: u64,
     pub snapshot_retention_secs: u64,
-    /// Enable only when external reference creation and retention changes are coordinated.
+    /// Without expiration, table metadata and replaced files grow without bound.
+    /// Disable only when another coordinated process expires snapshots.
     pub snapshot_expiration: bool,
     pub checkpoint_interval_secs: u64,
     pub retained_checkpoints: usize,
@@ -131,7 +132,7 @@ impl Default for Limits {
             wal_soft_bytes: 16 << 30,
             wal_hard_bytes: 32 << 30,
             snapshot_retention_secs: 3600,
-            snapshot_expiration: false,
+            snapshot_expiration: true,
             checkpoint_interval_secs: 300,
             retained_checkpoints: 2,
             manifest_max_count: 64,

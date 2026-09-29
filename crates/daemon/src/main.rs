@@ -5,6 +5,7 @@ mod config;
 mod generation;
 mod lifecycle;
 mod observation;
+mod preflight;
 mod retry;
 mod runtime;
 mod schema;
@@ -30,8 +31,13 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Validate configuration without contacting services.
-    Check,
+    /// Validate configuration; with --source, also run read-only PostgreSQL
+    /// readiness checks (settings, permissions, tables, publication and slot).
+    Check {
+        /// Connect to the source and report its readiness without changing it.
+        #[arg(long)]
+        source: bool,
+    },
     /// Create a logical slot and copy a consistent initial snapshot, then exit.
     Init,
     /// Recover durable work and continuously capture and publish changes.
@@ -72,8 +78,11 @@ async fn run_cli() -> Result<()> {
         allocator::initialize();
     }
     match cli.command {
-        Command::Check => {
+        Command::Check { source } => {
             println!("configuration valid: {} tables", config.tables.len());
+            if source {
+                preflight::check_source(&config).await?;
+            }
             Ok(())
         }
         Command::Init => runtime::initialize(config).await,

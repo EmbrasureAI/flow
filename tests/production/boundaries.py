@@ -23,9 +23,10 @@ from proxy import CatalogProxy
 
 
 class BoundaryRun(Run):
-    QUOTA_BYTES = 64 << 20  # The existing journal segment is 64 MiB.
-    RECOVERY_BYTES = 256 << 20
-    QUOTA_BATCHES = 10
+    # Four 64 MiB journal segments: after publication drains, every segment but
+    # the active one is reclaimed, leaving room for the paused 8 MiB transaction.
+    QUOTA_BYTES = 256 << 20
+    QUOTA_BATCHES = 40
     QUOTA_ROWS = 512
     PAYLOAD_BYTES = 16384
 
@@ -226,8 +227,8 @@ class BoundaryRun(Run):
             assert self.proxy.commit_held.wait(timeout=20), "quota case never held a real ingestion POST"
             self.until("held quota transaction was not journaled", lambda:
                        self.metrics().get("flow_journal_durable_lsn", 0) >= first, timeout=20)
-            # At most 80 MiB of committed row payloads; actual encoded journal
-            # accounting, not this nominal payload size, must trigger the error.
+            # At most 320 MiB of committed row payloads; actual encoded journal
+            # accounting, not this nominal payload size, must pause capture.
             for batch in range(self.QUOTA_BATCHES):
                 start = 2000000 + batch * self.QUOTA_ROWS
                 barrier = self.transaction([
@@ -236,38 +237,39 @@ class BoundaryRun(Run):
                 ])
                 cohort.append({"first_id": start, "rows": self.QUOTA_ROWS, "barrier": barrier})
                 dump(self.directory / "report.json", self.report)
-                if self.process.poll() is not None:
+                if self.metrics().get("flow_capture_journal_full") == 1:
                     break
-            code = self.process.wait(timeout=20)
-            assert code != 0, "capture quota exhaustion did not fail the daemon"
-            log = (self.directory / f"daemon-{self.generation}.log").read_text()
-            quota = re.search(r"journal quota exhausted: (\d+) bytes in use, (\d+) requested, (\d+) quota", log)
-            assert quota is not None, "daemon did not report the configured journal quota failure"
+            self.until("journal quota did not pause capture", lambda:
+                       self.metrics().get("flow_capture_journal_full") == 1, timeout=30)
+            assert self.process.poll() is None, "journal quota exhaustion stopped the daemon"
+            paused = [event for event in self.events()
+                      if event.get("message") == "journal quota reached; pausing capture until publication drains"]
+            assert paused, "daemon did not report the journal quota pause"
+            quota = re.search(r"journal quota exhausted: (\d+) bytes in use, (\d+) requested, (\d+) quota",
+                              paused[-1].get("error", ""))
+            assert quota is not None, "journal quota pause did not report the configured quota"
             used, requested, capacity = map(int, quota.groups())
             assert used <= capacity == self.QUOTA_BYTES and used + requested > capacity
             durable = max(lsn(event["end_lsn"]) for event in self.events() if event.get("event") == "transaction_journaled")
             assert first <= durable < cohort[-1]["barrier"], "quota case did not leave committed source work beyond the durable journal"
             evidence = self.ack_held(first)
-            evidence.update(exit_code=code, used_bytes=used, requested_bytes=requested,
+            evidence.update(used_bytes=used, requested_bytes=requested,
                             capacity_bytes=capacity, last_logged_durable_lsn=durable)
             for table, (metadata, expected) in self.histories["before-quota"].items():
                 assert self.rows(table) == expected, "held quota work changed public rows"
-            self.stop(crash=True)  # Already exited: close the owned log/process handle.
         finally:
             self.proxy.release_commits.set()
         released = self.release_held(event_start)
-        (self.directory / "flow-quota-limited.toml").write_text(self.config.read_text())
-        self.config.write_text(self.config.read_text().replace(
-            f"journal_bytes = {self.QUOTA_BYTES}", f"journal_bytes = {self.RECOVERY_BYTES}"))
-        dump(self.directory / "quota-failure-evidence.json", evidence)
-        self.start_ready()
+        dump(self.directory / "quota-pause-evidence.json", evidence)
         final_barrier = cohort[-1]["barrier"]
         self.wait_materialized(final_barrier)
+        assert self.process.poll() is None, "daemon stopped while draining the journal quota"
+        assert self.metrics().get("flow_capture_journal_full") == 0
+        assert any(event.get("message") == "journal drained; resuming capture" for event in self.events())
         assert self.identity() == self.source_identity
         assert {key: value for key, value in self.slot().items() if key != "confirmed_flush_lsn"} == self.slot_identity
         return {"before_rows": before, "during_fault": evidence, "released_requests": released,
-                "recovery_capacity_bytes": self.RECOVERY_BYTES,
-                "rows": self.compare("same-slot-quota-recovery"),
+                "rows": self.compare("same-process-quota-recovery"),
                 "ack": self.ack_reached(final_barrier), "history": self.history()}
 
     def final_restart(self):
@@ -292,7 +294,7 @@ class BoundaryRun(Run):
             self.phase("snapshot-wal-handoff", self.handoff)
             self.phase("composite-components-and-delete-reinsert", self.composite_changes)
             self.phase("pending-composite-work-crash-and-index-rebuild", self.composite_recovery)
-            self.phase("journal-quota-ack-fence-and-same-slot-recovery", self.quota_recovery)
+            self.phase("journal-quota-pause-and-same-process-recovery", self.quota_recovery)
             self.phase("clean-restart-and-final-key-changes", self.final_restart)
             process = self.process
             self.stop()
