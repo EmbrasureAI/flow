@@ -39,6 +39,12 @@ snapshot_retention_secs = 3600
 # table metadata and files replaced by compaction are never reclaimed.
 snapshot_expiration = true
 
+[storage]
+# Capture pauses below this much free space on the state volume (0 disables).
+min_free_bytes = 4294967296
+# Verify every row index checksum on each start, not only after an unclean exit.
+verify_index_on_start = false
+
 [parquet_read]
 footer_bytes = 8388608
 row_group_fetch_bytes = 134217728

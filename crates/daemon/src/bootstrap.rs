@@ -179,6 +179,9 @@ pub async fn initialize(config: Config) -> Result<()> {
     }
     .await;
     let result = crate::lifecycle::record_publication_changed(&config, result);
+    if result.is_ok() {
+        crate::generation::record_clean_shutdown(&config.state_dir);
+    }
     let outcome = if result.is_ok() { "success" } else { "error" };
     metrics::counter!("flow_bootstrap_runs_total", "outcome" => outcome).increment(1);
     metrics::histogram!("flow_bootstrap_seconds", "outcome" => outcome)

@@ -325,6 +325,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         }
         Err(_) => tracing::warn!("capture shutdown timed out; journal remains replayable"),
     }
+    if result.is_ok() {
+        crate::generation::record_clean_shutdown(&config.state_dir);
+    }
     result
 }
 

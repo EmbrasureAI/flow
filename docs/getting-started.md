@@ -130,7 +130,9 @@ services. Flow needs catalog access to load/create tables and commit snapshots,
 and object access to read, write, list and delete its files. Use a persistent,
 writable `state_dir`; do not share it between running Flow processes.
 
-`check` validates the configuration locally. `check --source` also connects to
+`check` validates the configuration locally and reports whether the state
+volume has room for the configured journal and spool quotas (see
+[disk capacity](operations.md#disk-capacity)). `check --source` also connects to
 PostgreSQL read-only and reports server settings, slot and sender capacity,
 replication and heartbeat permissions, each table's key, replica identity,
 access and row-level security, the publication contract, and the slot's WAL

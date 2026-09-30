@@ -289,6 +289,7 @@ pub(crate) async fn capture_loop(
             delay = Duration::from_millis(250);
             let mut group_deadline = None;
             let mut journal_full = None;
+            let mut disk_low = false;
             loop {
                 tokio::select! {
                     biased;
@@ -332,6 +333,10 @@ pub(crate) async fn capture_loop(
                         // Do not hold a validated group across SQL/network waits.
                         flush_capture(&mut assembler, &mut journal, &send)?;
                         group_deadline = None;
+                        if crate::disk::capture_should_pause(&crate::disk::available_space, &config.state_dir, config.storage.min_free_bytes) {
+                            disk_low = true;
+                            break;
+                        }
                         if let Err(error) = source_deadline(registry.initialize(&sql, &config.tables)).await {
                             if retryable_connection(&error) {
                                 tracing::warn!(%error, "source schema refresh interrupted; reconnecting");
@@ -493,6 +498,21 @@ pub(crate) async fn capture_loop(
             flush_capture(&mut assembler, &mut journal, &send)?;
             drop(sql_connection);
             drop(replication_connection);
+            if disk_low {
+                if !wait_for_free_space(
+                    &mut journal,
+                    &mut ack,
+                    &send,
+                    &config.state_dir,
+                    config.storage.min_free_bytes,
+                    &crate::disk::available_space,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                continue;
+            }
             if let Some(xid) = journal_full {
                 if !wait_for_journal_drain(
                     &mut journal,
@@ -592,6 +612,50 @@ async fn wait_for_journal_drain(
         );
     }
     Ok(drained)
+}
+
+/// Low free space on the state volume pauses capture like a full journal:
+/// journaled work keeps draining through publication (reclaiming segments)
+/// while the slot retains the unjournaled WAL. Returns false when the
+/// coordinator stops capture while waiting.
+async fn wait_for_free_space(
+    journal: &mut Journal,
+    ack: &mut watch::Receiver<Acknowledgement>,
+    send: &watch::Sender<CaptureProgress>,
+    state_dir: &std::path::Path,
+    min_free_bytes: u64,
+    available: &crate::disk::SpaceProbe,
+) -> Result<bool> {
+    journal.reclaim(ack.borrow_and_update().materialized)?;
+    metrics::gauge!("flow_capture_disk_low").set(1.0);
+    let started = Instant::now();
+    let mut poll = tokio::time::interval(Duration::from_secs(5));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let resumed = loop {
+        tokio::select! {
+            _ = send.closed() => break false,
+            changed = ack.changed() => {
+                if changed.is_err() {
+                    break false;
+                }
+                journal.reclaim(ack.borrow_and_update().materialized)?;
+            }
+            _ = poll.tick() => {
+                if crate::disk::capture_may_resume(available, state_dir, min_free_bytes) {
+                    break true;
+                }
+            }
+        }
+    };
+    metrics::gauge!("flow_capture_disk_low").set(0.0);
+    if resumed {
+        tracing::info!(
+            paused_seconds = started.elapsed().as_secs_f64(),
+            journal_bytes = journal.bytes_used(),
+            "state volume free space recovered; resuming capture"
+        );
+    }
+    Ok(resumed)
 }
 
 /// Publish observations only after the shared journal reader frontier is durable.
@@ -1331,6 +1395,84 @@ mod tests {
         assert!(
             error.to_string().contains("increase limits.journal_bytes"),
             "{error:#}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn low_free_space_pauses_capture_until_the_volume_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut journal, _) = Journal::open(
+            directory.path(),
+            JournalConfig {
+                segment_bytes: 600,
+                quota_bytes: 2_400,
+                max_frame_bytes: 400,
+                max_open_transactions: 8,
+            },
+        )
+        .unwrap();
+        for xid in 1..=3 {
+            commit_test_transaction(&mut journal, xid, &[xid as u8; 300]);
+        }
+        let durable = journal.durable_lsn();
+        let journaled_bytes = journal.bytes_used();
+        let (acknowledge, mut ack) = watch::channel(Acknowledgement::default());
+        let (send, _progress) = watch::channel(CaptureProgress {
+            durable_lsn: durable,
+            error: None,
+            publication_changed: false,
+        });
+        let free = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(99));
+        let probe_free = free.clone();
+        let probe =
+            move |_: &std::path::Path| Ok(probe_free.load(std::sync::atomic::Ordering::SeqCst));
+        let state_dir = directory.path().to_owned();
+        assert!(crate::disk::capture_should_pause(&probe, &state_dir, 100));
+        let waiting = tokio::spawn(async move {
+            let resumed =
+                wait_for_free_space(&mut journal, &mut ack, &send, &state_dir, 100, &probe)
+                    .await
+                    .unwrap();
+            (resumed, journal)
+        });
+        // Publication progress still reclaims the journal while paused.
+        acknowledge.send_replace(Acknowledgement {
+            received: durable,
+            durable,
+            materialized: durable,
+        });
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(
+            !waiting.is_finished(),
+            "capture resumed below the watermark"
+        );
+        // At the watermark is not enough; resume a quarter above it.
+        free.store(110, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(!waiting.is_finished(), "capture flapped at the watermark");
+        free.store(125, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let (resumed, journal) = waiting.await.unwrap();
+        assert!(resumed);
+        assert!(journal.bytes_used() < journaled_bytes);
+    }
+
+    #[tokio::test]
+    async fn free_space_wait_stops_with_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut journal, _) = Journal::open(directory.path(), JournalConfig::default()).unwrap();
+        let (_acknowledge, mut ack) = watch::channel(Acknowledgement::default());
+        let (send, progress) = watch::channel(CaptureProgress {
+            durable_lsn: journal.durable_lsn(),
+            error: None,
+            publication_changed: false,
+        });
+        drop(progress);
+        let low = |_: &std::path::Path| Ok(0);
+        assert!(
+            !wait_for_free_space(&mut journal, &mut ack, &send, directory.path(), 100, &low)
+                .await
+                .unwrap()
         );
     }
 

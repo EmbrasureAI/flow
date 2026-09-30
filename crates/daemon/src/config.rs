@@ -27,6 +27,27 @@ pub struct Config {
     /// Optional HTTP endpoints for probes and Prometheus scraping.
     #[serde(default)]
     pub http: Option<Http>,
+    /// Local state volume safety.
+    #[serde(default)]
+    pub storage: Storage,
+}
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Storage {
+    /// Capture pauses while the state volume has fewer free bytes, and resumes
+    /// a quarter above it. Zero disables the watermark.
+    pub min_free_bytes: u64,
+    /// Verify every index checksum on each start. Otherwise the full scan runs
+    /// only after an unclean exit or `check --storage`.
+    pub verify_index_on_start: bool,
+}
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: 4 << 30,
+            verify_index_on_start: false,
+        }
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

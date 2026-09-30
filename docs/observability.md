@@ -61,6 +61,9 @@ No separate export task is created.
 | `flow_source_health_check_available` | Whether the latest WAL check returned a result; zero before the first result or after a monitoring failure |
 | `flow_source_at_risk` | Latest check found hard WAL/journal pressure or a lost slot; inspect availability before interpreting zero as healthy |
 | `flow_capture_journal_full` | 1 while capture is paused because the journal quota is full; publication keeps draining and capture resumes automatically |
+| `flow_capture_disk_low` | 1 while capture is paused because the state volume has less than `storage.min_free_bytes` free; see [disk capacity](operations.md#disk-capacity) |
+| `flow_state_volume_available_bytes` | Free bytes on the state volume at the last startup or capture check (about every five seconds) |
+| `flow_observation_write_skipped_total` | `status.json`/`metrics.prom` updates skipped because the state volume was full |
 | `flow_commit_to_journal_seconds` | Source commit timestamp to successful journal durability |
 | `flow_journal_committed_payload_bytes_total` | Serialized mutation-chunk payload bytes in successfully synced source transactions; excludes aborted subtransactions, journal framing and terminal records |
 | `flow_source_registration_seconds` | Successful dispatcher page read and durable source-ledger registration, before feedback; includes blocking database work |

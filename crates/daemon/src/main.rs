@@ -3,6 +3,7 @@ mod allocator;
 mod bootstrap;
 mod config;
 mod discover;
+mod disk;
 mod generation;
 mod http;
 mod lifecycle;
@@ -34,12 +35,16 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Validate configuration; with --source, also run read-only PostgreSQL
-    /// readiness checks (settings, permissions, tables, publication and slot).
+    /// Validate configuration and the state volume's free space; with --source,
+    /// also run read-only PostgreSQL readiness checks (settings, permissions,
+    /// tables, publication and slot).
     Check {
         /// Connect to the source and report its readiness without changing it.
         #[arg(long)]
         source: bool,
+        /// Verify every row index checksum. Stop the service first.
+        #[arg(long)]
+        storage: bool,
     },
     /// Print [[tables]] configuration for existing source tables (read-only).
     /// Defaults to the configured publication's tables not yet configured.
@@ -106,8 +111,12 @@ async fn run_cli() -> Result<()> {
         allocator::initialize();
     }
     match cli.command {
-        Command::Check { source } => {
+        Command::Check { source, storage } => {
             println!("configuration valid: {} tables", config.tables.len());
+            disk::check(&config);
+            if storage {
+                generation::check_storage(&config)?;
+            }
             if source {
                 preflight::check_source(&config).await?;
             }
