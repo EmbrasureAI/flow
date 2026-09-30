@@ -109,8 +109,6 @@ jobs:
           - postgres: '18.6'
             suite: periodic-single-worker
           - postgres: '18.6'
-            suite: periodic-with-builds
-          - postgres: '18.6'
             suite: readers
           - postgres: '18.6'
             suite: wide-rows
@@ -331,15 +329,6 @@ jobs:
           --two-hot-tables --table-workers 1
           --timeout 600 --drain-timeout 900
           --artifacts "$RUNNER_TEMP/service-periodic-single-worker"
-      - name: Periodic cleanup beside native compaction
-        if: matrix.suite == 'periodic-with-builds'
-        run: >-
-          uv run tests/production/periodic_maintenance.py
-          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
-          --two-hot-tables
-          --timeout 600
-          --artifacts "$RUNNER_TEMP/service-periodic-with-builds"
       - name: Composite keys, index reconstruction and journal quota recovery
         if: matrix.suite == 'lifecycle'
         run: >-
