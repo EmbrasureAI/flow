@@ -1449,6 +1449,7 @@ dependencies = [
  "flow-model",
  "flow-pg-source",
  "flow-state-store",
+ "fs2",
  "futures",
  "iceberg",
  "iceberg-catalog-rest",

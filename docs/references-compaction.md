@@ -109,11 +109,14 @@ The pinned RocksDB 10.4.2
 synchronizes all live log files in order for a synchronous write, including log
 rotation during a large staged transaction.
 
-Controlled stores instead write the index batch without a sync, then synchronize
-the separate control database with the same revision and authoritative operation
-record. This does not synchronize the index WAL. Reopening checks revision
-equality; missing derived index writes require reconstruction from control and
-catalog authority before publication or ACK. The index retains its WAL and atomic
+Controlled stores synchronize the revision-bearing index batch (and with it
+every earlier staged batch in the index WAL), then synchronize the separate
+control database with the same revision and authoritative operation record. A
+durable transition therefore costs two WAL syncs, one per database, and a host
+crash or power loss between transitions leaves equal revisions. Reopening checks
+revision equality; a crash between the two syncs leaves the index ahead, and
+missing derived index writes require reconstruction from control and catalog
+authority before publication or ACK. The index retains its WAL and atomic
 flush configuration for consistency across column families, as described in
 [RocksDB's atomic-flush contract](https://github.com/facebook/rocksdb/wiki/Atomic-flush).
 Both modes avoid a disk barrier for every small staging chunk while preserving

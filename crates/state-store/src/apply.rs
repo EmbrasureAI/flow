@@ -80,13 +80,13 @@ struct ApplyBatchStats {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ApplyBatchOutcome {
+pub(crate) struct ApplyBatchOutcome {
     result: ApplyResult,
     stats: ApplyBatchStats,
 }
 
 impl ApplyBatchOutcome {
-    fn into_result(self) -> ApplyResult {
+    pub(crate) fn into_result(self) -> ApplyResult {
         let _ = self.stats;
         self.result
     }
@@ -105,7 +105,11 @@ impl StateStore {
         Ok(self.apply_batch(id, true)?.into_result())
     }
 
-    fn apply_batch(&self, id: &OperationId, sync_progress: bool) -> Result<ApplyBatchOutcome> {
+    pub(crate) fn apply_batch(
+        &self,
+        id: &OperationId,
+        sync_progress: bool,
+    ) -> Result<ApplyBatchOutcome> {
         let lock_started = Instant::now();
         let guard = self.lock()?;
         let lock_held = Instant::now();

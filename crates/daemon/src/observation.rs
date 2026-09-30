@@ -142,7 +142,15 @@ impl Observation {
         captured: PgLsn,
         ready: bool,
     ) -> Result<bool> {
-        self.write_at(config, ledger, captured, ready, Instant::now())
+        // These files are observations, never recovery authority. A full
+        // volume must not stop the service; capture pauses on its own watermark.
+        match self.write_at(config, ledger, captured, ready, Instant::now()) {
+            Err(error) if crate::disk::is_storage_full(&error) => {
+                crate::disk::warn_observation_skipped(&error);
+                Ok(false)
+            }
+            result => result,
+        }
     }
 
     fn write_at(

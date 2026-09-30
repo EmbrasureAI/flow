@@ -105,6 +105,9 @@ No separate export task is created.
 | `flow_capture_connected` | 1 while replication is streaming, 0 while capture is retrying its connection or replication start |
 | `flow_capture_reconnect_failures_total{reason}` | Failed capture (re)connect attempts: `slot_in_use` (SQLSTATE 55006), `too_many_connections` (53300) or `unavailable` |
 | `flow_capture_reconnect_stalled` | 1 once reconnects have failed for 5 minutes, or twice `wal_sender_timeout` if longer; an error log names the slot's `active_pid`. Retries continue and it resets on reconnect. Alert on it: no changes are captured meanwhile |
+| `flow_capture_disk_low` | 1 while capture is paused because the state volume has less than `storage.min_free_bytes` free; see [disk capacity](operations.md#disk-capacity) |
+| `flow_state_volume_available_bytes` | Free bytes on the state volume at the last startup or capture check (about every five seconds) |
+| `flow_observation_write_skipped_total` | `status.json`/`metrics.prom` updates skipped because the state volume was full |
 | `flow_commit_to_journal_seconds` | Source commit timestamp to successful journal durability |
 | `flow_journal_committed_payload_bytes_total` | Serialized mutation-chunk payload bytes in successfully synced source transactions; excludes aborted subtransactions, journal framing and terminal records |
 | `flow_source_registration_seconds` | Successful dispatcher page read and durable source-ledger registration, before feedback; includes blocking database work |

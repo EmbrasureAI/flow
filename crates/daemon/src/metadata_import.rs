@@ -1,7 +1,7 @@
 //! Operator adoption of pre-registry catalog JSON. Normal GC owns deletion.
 use crate::{bootstrap, config::Config, services};
 use anyhow::{Context, Result, ensure};
-use flow_state_store::{ControlStore, StateStore, StateStoreOptions};
+use flow_state_store::ControlStore;
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::Deserialize;
 use std::{
@@ -34,17 +34,13 @@ pub(crate) async fn run(config: Config, inventory: &Path, apply: bool) -> Result
             && boot.targets.len() == boot.schemas.len(),
         "metadata import requires completed, identified targets"
     );
-    let active = control
-        .active_generation()?
-        .context("metadata import requires an existing index")?;
-    let store = StateStore::open_with_control(
-        active.path,
-        StateStoreOptions {
-            apply_batch_rows: config.limits.batch_rows,
-            ..Default::default()
-        },
-        control,
-    )?;
+    ensure!(
+        control.active_generation()?.is_some(),
+        "metadata import requires an existing index"
+    );
+    // The shared open consumes the clean-shutdown marker, verifies the index
+    // after an unclean exit, and applies the descriptor budget.
+    let store = crate::generation::open(&config, control)?;
     let targets: BTreeMap<_, _> = boot
         .target_uuids
         .iter()
@@ -123,5 +119,8 @@ pub(crate) async fn run(config: Config, inventory: &Path, apply: bool) -> Result
         "{}",
         serde_json::json!({"checked": checked, "applied": apply, "deleted": 0})
     );
+    drop(pending);
+    drop(store);
+    crate::generation::record_clean_shutdown(&config.state_dir);
     Ok(())
 }
