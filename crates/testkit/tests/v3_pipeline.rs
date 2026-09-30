@@ -41,16 +41,25 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(version: FormatVersion) -> Self {
+        Self::create(version, false).await
+    }
+    // Object-store URIs sort after `dv:` file IDs, unlike bare local paths.
+    async fn with_uri_location(version: FormatVersion) -> Self {
+        Self::create(version, true).await
+    }
+    async fn create(version: FormatVersion, uri: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let catalog = Arc::new(LostResponseCatalog::new(
             catalog(&temp.path().join("lake")).await,
         ));
         let schema = schema(1);
+        let location = uri.then(|| format!("file://{}", temp.path().join("uri-table").display()));
         let head = catalog
             .create_table(
                 &NamespaceIdent::new("test".into()),
                 TableCreation::builder()
                     .name("v3_pipeline".into())
+                    .location_opt(location)
                     .format_version(version)
                     .schema(iceberg_schema(&schema).unwrap())
                     .build(),
@@ -1049,4 +1058,98 @@ async fn sparse_vectors_in_shared_puffin_do_not_pause_healthy_tables() {
     assert_eq!(live.len(), 198);
     assert_eq!(live[&1].0, row(1, "still-running"));
     assert!(!live.contains_key(&0) && !live.contains_key(&100));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_rewrite_of_vector_targets_replans_speculative_compaction() {
+    let mut f = Fixture::with_uri_location(FormatVersion::V3).await;
+    for (lsn, ids) in [(10, 1..=6), (20, 7..=12)] {
+        f.publish(
+            lsn,
+            ids.map(|id| (id, Change::Insert(row(id, "initial"))))
+                .collect(),
+        )
+        .await;
+    }
+    f.publish(30, vec![(1, Change::Delete), (7, Change::Delete)])
+        .await;
+    let maintenance = f.maintenance();
+    let ready = maintenance
+        .start_compaction(&f.head, &f.schema, f.scratch())
+        .await
+        .unwrap()
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let before = f.live().await;
+    let view = SnapshotView::current(&f.head).await.unwrap();
+    // Catch-up visits required files in ID order; reach a vector before its target.
+    assert!(view.live_files.iter().any(|(id, entry)| {
+        entry.file_format() == DataFileFormat::Puffin
+            && entry
+                .data_file()
+                .referenced_data_file()
+                .is_some_and(|target| id.as_str() < target.as_str())
+    }));
+    // An external rewrite retires every selected input together with its vector.
+    let operation = OperationId("external-v3-input-rewrite".into());
+    let mut writer = DataWriter::new(
+        f.head.file_io().clone(),
+        f.head.metadata().location(),
+        &operation,
+        f.schema.clone(),
+        0,
+        WriterConfig::default(),
+    )
+    .unwrap()
+    .with_row_lineage()
+    .unwrap();
+    let rows: Vec<_> = before.values().map(|(row, _)| row.clone()).collect();
+    let lineage: Vec<_> = before
+        .values()
+        .map(|(_, (row_id, last_updated_sequence_number))| RowLineage {
+            row_id: *row_id,
+            last_updated_sequence_number: *last_updated_sequence_number,
+        })
+        .collect();
+    writer
+        .write_with_lineage(&rows, Some(&lineage), PgLsn(0))
+        .await
+        .unwrap();
+    f.head = RewriteFilesAction::new(&f.head, operation.0)
+        .with_operation_id_key("external.operation-id")
+        .unwrap()
+        .remove_data_files(
+            view.live_files
+                .iter()
+                .filter(|(_, e)| e.content_type() == DataContentType::Data)
+                .map(|(id, _)| id.clone()),
+        )
+        .remove_delete_files(
+            view.live_files
+                .iter()
+                .filter(|(_, e)| e.content_type() == DataContentType::PositionDeletes)
+                .map(|(id, _)| id.clone()),
+        )
+        .add_data_files(writer.close().await.unwrap())
+        .commit(f.catalog.as_ref(), &f.head)
+        .await
+        .unwrap()
+        .table;
+    f.maintenance()
+        .reconcile(&f.head, &f.schema, f.scratch())
+        .await
+        .unwrap();
+    let rejected = maintenance
+        .finish_compaction(&f.head, &f.schema, ready)
+        .await
+        .unwrap_err();
+    assert!(
+        rejected.is::<flow_coordinator::ReplanRequired>(),
+        "{rejected:#}"
+    );
+    assert!(f.store.pending_operations().unwrap().is_empty());
+    f.refresh().await;
+    assert_eq!(f.live().await, before);
 }
