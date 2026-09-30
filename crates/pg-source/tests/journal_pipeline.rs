@@ -1200,3 +1200,67 @@ fn blocked_replay_splits_grown_quarantine_into_bounded_chunks() {
     let (_, recovered) = Journal::open(root.path().join("journal"), journal_config).unwrap();
     assert_eq!(recovered.transactions.len(), 1);
 }
+
+/// The largest admissible row still fits a chunk after commit replay wraps it
+/// as decoded quarantine, so blocking its table never discards its evidence.
+#[test]
+fn largest_admitted_row_keeps_decoded_quarantine_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let journal_config = JournalConfig {
+        max_frame_bytes: 512,
+        ..JournalConfig::default()
+    };
+    let (mut journal, _) = Journal::open(root.path().join("journal"), journal_config).unwrap();
+    let spool = TransactionSpool::open(root.path().join("spool"), SpoolConfig::default()).unwrap();
+    let mut assembler =
+        CaptureAssembler::new(SourceId("source".into()), spool, [schema(11)], 512).unwrap();
+    let (a, b) = (&mut assembler, &mut journal);
+    push(a, b, SourceEvent::Relation(relation(11)));
+    push(
+        a,
+        b,
+        SourceEvent::Begin {
+            xid: 42,
+            final_lsn: PgLsn(0),
+            commit_timestamp_micros: 1,
+        },
+    );
+    // Find the longest body the 512-byte chunk admits.
+    let mut admitted = None;
+    for length in (400..512).rev() {
+        let body: &'static str = Box::leak("x".repeat(length).into_boxed_str());
+        let event = SourceEvent::Insert {
+            xid: 42,
+            subxid: 42,
+            relation: 11,
+            row: row("1", body),
+        };
+        match a.push_buffered_at(event, PgLsn(0), b) {
+            Ok(()) => {
+                admitted = Some(length);
+                break;
+            }
+            Err(flow_pg_source::Error::RowLimit { .. }) => {}
+            Err(error) => panic!("{error}"),
+        }
+    }
+    let admitted = admitted.unwrap();
+    a.block_table(TableId(11)).unwrap();
+    let transaction = commit(a, b, 42, 100);
+    let mutations = journal_mutations(b, &transaction);
+    assert_eq!(mutations.len(), 1);
+    let MutationKind::Quarantined { format, payload } = &mutations[0].kind else {
+        panic!("blocked row must be quarantined");
+    };
+    assert_eq!(*format, flow_model::QuarantineFormat::DecodedMutationV1);
+    let original: Mutation = bincode::deserialize(payload).unwrap();
+    let MutationKind::Insert { row } = &original.kind else {
+        panic!("decoded evidence lost");
+    };
+    assert_eq!(row[1], Value::String("x".repeat(admitted)));
+    // The reserve is exactly the wrapper's encoded overhead.
+    assert_eq!(
+        bincode::serialized_size(&mutations[0]).unwrap(),
+        bincode::serialized_size(&original).unwrap() + flow_pg_source::QUARANTINE_WRAP_BYTES
+    );
+}

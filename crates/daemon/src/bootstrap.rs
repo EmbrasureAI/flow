@@ -500,11 +500,7 @@ pub(crate) async fn resume(
         .consistent_lsn
         .context("missing initial snapshot cut")?;
     let mut ledger = ledger(&store, config)?;
-    let (mut journal, _) = Journal::open_with_floor(
-        config.state_dir.join("journal"),
-        journal_config(config),
-        ledger.watermarks().journal_durable_lsn,
-    )?;
+    let (mut journal, _) = crate::source::open_source_journal(config, &ledger)?;
     if journal.durable_lsn() < initial_cut {
         ensure!(
             journal.durable_lsn() == PgLsn(0),
@@ -810,8 +806,32 @@ fn staged_copy(
         if !path.is_dir() {
             return Ok(None);
         }
-        let (journal, _) = Journal::open(path, journal_config(config))?;
-        journal.reader()
+        match Journal::open(&path, journal_config(config)) {
+            Ok((journal, _)) => journal.reader(),
+            // An unpublished staging copy is disposable, like a missing one:
+            // the caller recopies the table from a new snapshot instead.
+            Err(
+                error @ (flow_ingress_journal::Error::SegmentCorrupt { .. }
+                | flow_ingress_journal::Error::DurableTail { .. }
+                | flow_ingress_journal::Error::Corrupt),
+            ) => {
+                tracing::warn!(
+                    table_id = schema.table_id.0,
+                    %error,
+                    "initial COPY staging journal is damaged; discarding it and copying the table again"
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "open initial COPY staging journal for table {} at {}",
+                        schema.table_id.0,
+                        path.display()
+                    )
+                });
+            }
+        }
     };
     let transaction = reader
         .transactions_after(PgLsn(copy.cut.0.saturating_sub(1)))?
@@ -894,7 +914,13 @@ async fn copy_and_publish(
         let stream = BinaryCopyOutStream::new(output, &types);
         tokio::pin!(stream);
         let (mut journal, recovered) =
-            Journal::open(copy.path(config, schema.table_id)?, journal_config(config))?;
+            Journal::open(copy.path(config, schema.table_id)?, journal_config(config))
+                .with_context(|| {
+                    format!(
+                        "open new initial COPY staging journal for table {}",
+                        schema.table_id.0
+                    )
+                })?;
         ensure!(
             recovered.transactions.is_empty(),
             "new COPY staging directory is not empty"
@@ -1185,5 +1211,41 @@ mod tests {
         recover_published_copy(&config, &store, &mut ledger, table, &copy, cut, 0).unwrap();
         assert_eq!(ledger.acknowledgement(), cut);
         assert!(!staging.exists());
+    }
+
+    /// Unpublished COPY staging is disposable: a damaged staging journal means
+    /// "copy this table again", not "restore or resynchronize the source".
+    #[test]
+    fn damaged_unpublished_copy_staging_is_recopied() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().to_owned();
+        let table = TableId(17);
+        let schema = config.tables[0].schema(table.0);
+        let copy = TableCopy {
+            cut: PgLsn(41),
+            staging: format!("table-{}-{}", table.0, uuid::Uuid::new_v4()),
+            phase: CopyPhase::Staged,
+            rows: 3,
+            schema_version: 0,
+        };
+        let staging = copy.path(&config, table).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        // A damaged closed segment followed by the active one.
+        std::fs::write(staging.join("00000000000000000000.segment"), [7; 64]).unwrap();
+        std::fs::write(staging.join("00000000000000000001.segment"), []).unwrap();
+        let (main, _) =
+            Journal::open(root.path().join("journal"), journal_config(&config)).unwrap();
+        assert!(
+            staged_copy(&config, &schema, &copy, &main.reader())
+                .unwrap()
+                .is_none()
+        );
+        // Damage is only discarded by the recopy that replaces the directory.
+        assert_eq!(
+            std::fs::read(staging.join("00000000000000000000.segment")).unwrap(),
+            [7; 64]
+        );
     }
 }

@@ -19,7 +19,7 @@ use crate::{
     bootstrap::{bootstrap, persist_bootstrap, tables},
     config::Config,
     lifecycle::SourceHealthStatus,
-    services::{catalog, journal_config, ledger},
+    services::{catalog, ledger},
     source::{CaptureProgress, PublicationChanged, capture_loop, connect, validate_publication},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -27,7 +27,6 @@ use flow_coordinator::{
     PreparationWait, Priority, ReadyCompaction, ReplanRequired, Scheduler, SourceLedger,
     TableMaintenance, TablePublisher,
 };
-use flow_ingress_journal::Journal;
 use flow_model::{PgLsn, SourceId, TableId, TableSchema};
 use flow_pg_source::Acknowledgement;
 use flow_state_store::{ControlStore, OperationKind, StateStore};
@@ -171,11 +170,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     }
     // Recovery may truncate only a torn tail above what the ledger recorded.
     let mut ledger = ledger(&store, &config)?;
-    let (journal, recovery) = Journal::open_with_floor(
-        config.state_dir.join("journal"),
-        journal_config(&config),
-        ledger.watermarks().journal_durable_lsn,
-    )?;
+    let (journal, recovery) = crate::source::open_source_journal(&config, &ledger)?;
     ensure!(
         journal.durable_lsn() >= ledger.watermarks().journal_durable_lsn,
         "journal lost previously durable transactions; source recovery is required before acknowledgement"

@@ -61,8 +61,11 @@ row decoding failures, UPDATE or DELETE on an `append_only` table, a single row
 change larger than `limits.chunk_bytes`, and TRUNCATE latch a source-table block
 (`source_schema_incompatible`) in the authoritative control store; the logged
 reason names the cause. Subsequent selected row images and wire metadata are retained as
-opaque quarantined mutations in the existing transaction spool/journal. Evidence
-too large for one chunk is replaced by a bounded marker recording its size. Commit
+opaque quarantined mutations in the existing transaction spool/journal. Row
+limits reserve room to wrap any admitted decoded row as quarantine. Only raw
+wire evidence larger than one chunk (text-encoded row images, or the row that
+exceeded `limits.chunk_bytes` itself) is replaced by a bounded marker recording
+its table and size. Commit
 proof failures quarantine that table's decoded evidence too. The failed table
 remains in every affected transaction descriptor, including mixed transactions;
 its publications and the shared completed acknowledgement frontier cannot advance.
@@ -82,7 +85,9 @@ spool limits, a replication message larger than `limits.source_message_bytes`
 unclassified errors remain connection-wide. A replication slot still held by a
 previous session (SQLSTATE 55006) and a server out of connection slots (53300)
 are retried with backoff like a disconnect; PostgreSQL releases a stale
-walsender's slot within `wal_sender_timeout`. Completed bootstrap with intact local authority
+walsender's slot within `wal_sender_timeout`. Retries never stop, so after five
+minutes (or twice `wal_sender_timeout`) of failures capture logs an error with
+the slot holder's `active_pid` and sets `flow_capture_reconnect_stalled`. Completed bootstrap with intact local authority
 can load and recover targets independently. Initial snapshot/bootstrap, legacy
 target-identity adoption, and whole-index reconstruction still require their
 existing coordinated recovery path. Unknown/replaced source identities also

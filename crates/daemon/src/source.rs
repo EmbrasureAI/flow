@@ -47,6 +47,19 @@ fn spool_config(config: &Config) -> SpoolConfig {
     }
 }
 
+/// Open the source's CDC journal. Recovery may truncate only a torn tail above
+/// the position the source ledger recorded as durable, never below it.
+pub(crate) fn open_source_journal(
+    config: &Config,
+    ledger: &flow_coordinator::SourceLedger,
+) -> Result<(Journal, flow_ingress_journal::Recovery)> {
+    Ok(Journal::open_with_floor(
+        config.state_dir.join("journal"),
+        crate::services::journal_config(config),
+        ledger.watermarks().journal_durable_lsn,
+    )?)
+}
+
 /// FULL replica identity describes row images, not the uniqueness contract.
 /// Check the actual primary key before COPY, on reconnect, and when pgoutput
 /// invalidates relation metadata, before any changed rows enter the journal.
@@ -197,6 +210,7 @@ pub(crate) async fn capture_loop(
         let mut registry =
             SchemaRegistry::new(store, SourceId(config.source.id.clone()), &schemas)?;
         let mut delay = Duration::from_millis(250);
+        let mut stall = ReconnectStall::default();
         let mut journal_drained_at = None;
         metrics::gauge!("flow_capture_journal_full").set(0.0);
         loop {
@@ -208,6 +222,7 @@ pub(crate) async fn capture_loop(
                 Ok(client) => client,
                 Err(error) if retryable_connection(&error) => {
                     tracing::warn!(%error, hint = retry_hint(&error), "source reconnect pending");
+                    stall.failed(&config, &error).await;
                     tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
                     delay = (delay * 2).min(Duration::from_secs(30));
                     continue;
@@ -247,10 +262,14 @@ pub(crate) async fn capture_loop(
             })
             .await;
             let (mut source, sql, sql_connection, effective_schemas) = match started {
-                Ok(source) => source,
+                Ok(source) => {
+                    stall.connected();
+                    source
+                }
                 Err(error) if retryable_connection(&error) => {
                     drop(replication_connection);
                     tracing::warn!(%error, hint = retry_hint(&error), "source disconnected during replication setup");
+                    stall.failed(&config, &error).await;
                     tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
                     delay = (delay * 2).min(Duration::from_secs(30));
                     continue;
@@ -720,14 +739,17 @@ fn retryable_sqlstate(code: &SqlState) -> bool {
     )
 }
 
-/// Operator guidance for retried conditions that are not disconnects.
-fn retry_hint(error: &anyhow::Error) -> &'static str {
-    let code = error.chain().find_map(|cause| {
+fn retry_code(error: &anyhow::Error) -> Option<&SqlState> {
+    error.chain().find_map(|cause| {
         cause
             .downcast_ref::<flow_pg_source::tokio_postgres::Error>()
             .and_then(|error| error.code())
-    });
-    match code {
+    })
+}
+
+/// Operator guidance for retried conditions that are not disconnects.
+fn retry_hint(error: &anyhow::Error) -> &'static str {
+    match retry_code(error) {
         Some(&SqlState::OBJECT_IN_USE) => {
             "the replication slot is active in another session, usually this daemon's previous walsender; retrying until PostgreSQL releases it (at most wal_sender_timeout). If it persists, find the holder in pg_replication_slots.active_pid"
         }
@@ -735,6 +757,102 @@ fn retry_hint(error: &anyhow::Error) -> &'static str {
             "PostgreSQL has no free connection slots for this role, database or server; retrying"
         }
         _ => "retrying with backoff",
+    }
+}
+
+/// Reconnect retries have no attempt bound, so a slot that stays held or a
+/// server that stays full would otherwise stall capture with only warnings.
+/// Past this, or twice `wal_sender_timeout` when readable, it is reported.
+const RECONNECT_STALL_AFTER: Duration = Duration::from_secs(300);
+
+/// Tracks one run of failed (re)connect attempts for capture.
+#[derive(Default)]
+struct ReconnectStall {
+    since: Option<tokio::time::Instant>,
+    /// Raised to twice `wal_sender_timeout` once that has been read.
+    threshold: Option<Duration>,
+    reported: bool,
+}
+
+impl ReconnectStall {
+    fn connected(&mut self) {
+        if self.reported {
+            tracing::info!(
+                stalled_seconds = self
+                    .since
+                    .map_or(0.0, |since| since.elapsed().as_secs_f64()),
+                "source capture reconnected"
+            );
+        }
+        *self = Self::default();
+        metrics::gauge!("flow_capture_connected").set(1.0);
+        metrics::gauge!("flow_capture_reconnect_stalled").set(0.0);
+    }
+
+    /// Count a failed attempt. Returns how long attempts have been failing
+    /// once that first reaches the report threshold.
+    fn record_failure(&mut self, error: &anyhow::Error) -> Option<Duration> {
+        let reason = match retry_code(error) {
+            Some(&SqlState::OBJECT_IN_USE) => "slot_in_use",
+            Some(&SqlState::TOO_MANY_CONNECTIONS) => "too_many_connections",
+            _ => "unavailable",
+        };
+        metrics::counter!("flow_capture_reconnect_failures_total", "reason" => reason).increment(1);
+        metrics::gauge!("flow_capture_connected").set(0.0);
+        let elapsed = self
+            .since
+            .get_or_insert_with(tokio::time::Instant::now)
+            .elapsed();
+        (!self.reported && elapsed >= self.threshold.unwrap_or(RECONNECT_STALL_AFTER))
+            .then_some(elapsed)
+    }
+
+    /// Returns true when this stall should be reported now; false defers it
+    /// until a stale walsender could still be releasing the slot.
+    fn should_report(&mut self, elapsed: Duration, wal_sender_timeout: Option<Duration>) -> bool {
+        let threshold = wal_sender_timeout.map_or(RECONNECT_STALL_AFTER, |timeout| {
+            RECONNECT_STALL_AFTER.max(timeout * 2)
+        });
+        if elapsed < threshold {
+            self.threshold = Some(threshold);
+            return false;
+        }
+        self.reported = true;
+        true
+    }
+
+    async fn failed(&mut self, config: &Config, error: &anyhow::Error) {
+        let Some(elapsed) = self.record_failure(error) else {
+            return;
+        };
+        // Best effort: a full server or an outage can also refuse this query.
+        let holder = source_deadline(async {
+            let (sql, _connection) = connect_owned(config, false).await?;
+            let row = sql
+                .query_one(
+                    "SELECT (SELECT active_pid FROM pg_catalog.pg_replication_slots WHERE slot_name = $1), (SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name = 'wal_sender_timeout')",
+                    &[&config.source.slot],
+                )
+                .await?;
+            Ok((row.get::<_, Option<i32>>(0), row.get::<_, Option<i64>>(1)))
+        })
+        .await;
+        let (active_pid, timeout_ms) = holder.as_ref().map_or((None, None), |held| *held);
+        let wal_sender_timeout = timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| Duration::from_millis(ms as u64));
+        if !self.should_report(elapsed, wal_sender_timeout) {
+            return;
+        }
+        metrics::gauge!("flow_capture_reconnect_stalled").set(1.0);
+        tracing::error!(
+            %error,
+            hint = retry_hint(error),
+            slot = %config.source.slot,
+            active_pid,
+            stalled_seconds = elapsed.as_secs_f64(),
+            "source capture cannot reconnect; no changes are being captured while retries continue"
+        );
     }
 }
 
@@ -1504,6 +1622,86 @@ mod tests {
             observed.await.is_err(),
             "driver must release resources on reconnect"
         );
+    }
+
+    /// Runtime and bootstrap open the CDC journal through this helper, so a
+    /// torn tail below the ledger's durable position refuses startup untouched.
+    #[test]
+    fn source_journal_refuses_to_truncate_below_the_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().to_owned();
+        config.source.id = "source".into();
+        let store = StateStore::open(
+            root.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let mut ledger = crate::services::ledger(&store, &config).unwrap();
+        let (mut journal, _) = open_source_journal(&config, &ledger).unwrap();
+        for xid in 1..=3 {
+            commit_test_transaction(&mut journal, xid, &[xid as u8; 100]);
+        }
+        let transactions = journal
+            .transactions()
+            .iter()
+            .unwrap()
+            .collect::<flow_ingress_journal::Result<Vec<_>>>()
+            .unwrap();
+        ledger.journaled_batch(&transactions).unwrap();
+        assert_eq!(ledger.watermarks().journal_durable_lsn, PgLsn(31));
+        drop(journal);
+        let segment = root
+            .path()
+            .join("journal")
+            .join("00000000000000000000.segment");
+        let length = std::fs::metadata(&segment).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .unwrap()
+            .set_len(length - 5)
+            .unwrap();
+        let torn = std::fs::read(&segment).unwrap();
+        let error = open_source_journal(&config, &ledger).err().unwrap();
+        assert!(
+            matches!(
+                error.downcast_ref::<flow_ingress_journal::Error>(),
+                Some(flow_ingress_journal::Error::DurableTail {
+                    recovered: PgLsn(21),
+                    floor: PgLsn(31),
+                    ..
+                })
+            ),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&segment).unwrap(), torn);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_reconnect_failure_is_reported_after_a_bounded_time() {
+        let error = anyhow::anyhow!("slot held");
+        let mut stall = ReconnectStall::default();
+        assert_eq!(stall.record_failure(&error), None);
+        tokio::time::advance(RECONNECT_STALL_AFTER - Duration::from_secs(1)).await;
+        assert_eq!(stall.record_failure(&error), None);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let elapsed = stall.record_failure(&error).unwrap();
+        // A long wal_sender_timeout may still be releasing a stale slot.
+        assert!(!stall.should_report(elapsed, Some(Duration::from_secs(600))));
+        tokio::time::advance(Duration::from_secs(599)).await;
+        assert_eq!(stall.record_failure(&error), None);
+        tokio::time::advance(Duration::from_secs(301)).await;
+        let elapsed = stall.record_failure(&error).unwrap();
+        assert!(stall.should_report(elapsed, Some(Duration::from_secs(600))));
+        // Reported once per stall, and a successful start resets it.
+        assert_eq!(stall.record_failure(&error), None);
+        stall.connected();
+        assert_eq!(stall.record_failure(&error), None);
+        tokio::time::advance(RECONNECT_STALL_AFTER).await;
+        let elapsed = stall.record_failure(&error).unwrap();
+        assert!(stall.should_report(elapsed, None));
     }
 
     #[test]

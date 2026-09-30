@@ -704,12 +704,13 @@ impl Journal {
             removed += index_bytes;
             self.terminal_writer.remove_segment(id);
             fs::remove_file(segment_path(&self.root, id))?;
+            // Persist removals oldest first. Recovery rejects a sequence gap
+            // before the final segment, which an older segment reappearing
+            // after a crash, next to a removed newer one, would create.
+            sync_dir(&self.root)?;
             self.segments.remove(&id);
             self.bytes -= size;
             removed += size;
-        }
-        if removed > 0 {
-            sync_dir(&self.root)?;
         }
         Ok(removed)
     }

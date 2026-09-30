@@ -16,7 +16,7 @@ pub use schema::{
     nullable_successor, nullable_successor_with_types, same_wire_schema, validate_schema_metadata,
 };
 mod spool;
-pub use capture::{CaptureAssembler, decode_row, decode_row_with_types};
+pub use capture::{CaptureAssembler, QUARANTINE_WRAP_BYTES, decode_row, decode_row_with_types};
 pub use protocol::{Cell, Column, Decoder, Relation, SourceEvent, Tuple};
 pub use snapshot::{
     SnapshotSession, TablePreflight, decode_copy_row, decode_copy_row_with_types, export_snapshot,
@@ -79,7 +79,7 @@ pub enum Error {
     AppendOnly { table: u32, operation: &'static str },
     /// Table-scoped: one row change cannot fit a journal chunk.
     #[error(
-        "a row change on table {table} encodes to {bytes} bytes, exceeding limits.chunk_bytes ({limit} bytes); raise limits.chunk_bytes and resynchronize the table"
+        "a row change on table {table} needs {bytes} bytes including 40 bytes of chunk framing, exceeding limits.chunk_bytes ({limit} bytes); raise limits.chunk_bytes and resynchronize the table"
     )]
     RowLimit { table: u32, bytes: u64, limit: u64 },
     #[error("ingress journal: {0}")]

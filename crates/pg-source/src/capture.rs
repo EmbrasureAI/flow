@@ -10,6 +10,11 @@ use std::{
     time::Instant,
 };
 
+/// Bytes that wrapping a decoded mutation as `DecodedMutationV1` quarantine
+/// adds: the outer table, version, kind and format tags and the payload length.
+/// Rows reserve it so a blocked table keeps every row's complete evidence.
+pub const QUARANTINE_WRAP_BYTES: u64 = 24;
+
 struct Buffer {
     xid: u32,
     subxid: u32,
@@ -644,10 +649,15 @@ impl CaptureAssembler {
             return Err(Error::Protocol("mutation outside capture transaction"));
         }
         let bytes = bincode::serialized_size(&mutation)?;
-        if bytes + 16 > self.chunk_bytes {
+        let reserve = if matches!(mutation.kind, MutationKind::Quarantined { .. }) {
+            0
+        } else {
+            QUARANTINE_WRAP_BYTES
+        };
+        if bytes + 16 + reserve > self.chunk_bytes {
             return Err(Error::RowLimit {
                 table: mutation.table_id.0,
-                bytes: bytes + 16,
+                bytes: bytes + 16 + reserve,
                 limit: self.chunk_bytes,
             });
         }
