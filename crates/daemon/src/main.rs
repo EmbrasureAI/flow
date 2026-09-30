@@ -3,6 +3,7 @@ mod allocator;
 mod bootstrap;
 mod config;
 mod discover;
+mod exit;
 mod generation;
 mod hardening;
 mod http;
@@ -17,9 +18,9 @@ mod services;
 mod source;
 mod source_tls;
 mod storage_observer;
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::{io::IsTerminal, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +67,7 @@ enum Command {
         roles: Vec<String>,
     },
     /// Read the latest local service status without opening its state database.
+    /// Exits 0 when ready and 3 when not ready.
     Status,
     /// Adopt legacy catalog JSON into grace-delayed GC while the source is paused.
     MetadataImport {
@@ -77,11 +79,18 @@ enum Command {
         apply: bool,
     },
 }
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     hardening::restrict_umask();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(exit::FAILURE);
+        }
+    };
     let result = runtime.block_on(run_cli());
     // A started blocking compactor can still own network I/O after its async
     // handle is dropped. Keep BUILD durable until process exit; startup retires
@@ -90,7 +99,7 @@ fn main() -> Result<()> {
     result
 }
 
-async fn run_cli() -> Result<()> {
+async fn run_cli() -> ExitCode {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -101,14 +110,59 @@ async fn run_cli() -> Result<()> {
         .with(hardening::secret_log_filter())
         .init();
     let cli = Cli::parse();
+    // Services log only structured events; command-line tools also print the
+    // plain error, as does any command attached to a terminal.
+    let plain = !matches!(cli.command, Command::Init | Command::Run { .. })
+        || std::io::stderr().is_terminal();
+    command(cli)
+        .await
+        .unwrap_or_else(|error| fatal(&error, plain))
+}
+
+/// One structured event, in the same JSON stream as every other log line.
+fn fatal(error: &anyhow::Error, plain: bool) -> ExitCode {
+    let (class, _) = exit::classify(error);
+    tracing::error!(
+        event = "fatal",
+        exit_code = class.code(),
+        class = class.name(),
+        error = %format!("{error:#}"),
+        "embrasure-flow stopped"
+    );
+    // A RUST_LOG that filters out this target must not hide why it stopped.
+    if plain || !tracing::enabled!(tracing::Level::ERROR) {
+        eprintln!("error: {error:#}");
+    }
+    ExitCode::from(class.code())
+}
+
+/// Keep why `init` or `run` stopped in `status`, after its cleanup ran; a
+/// clean exit replaces an earlier failure.
+fn record_exit(config: &config::Config, result: Result<()>) -> Result<ExitCode> {
+    match &result {
+        Ok(()) => lifecycle::record_clean_exit(config),
+        Err(error) => lifecycle::record_exit(config, error),
+    }
+    result.map(|()| ExitCode::SUCCESS)
+}
+
+async fn command(cli: Cli) -> Result<ExitCode> {
     let config = if matches!(cli.command, Command::Discover { .. }) {
-        config::Config::load_without_tables(&cli.config)?
+        config::Config::load_without_tables(&cli.config)
     } else {
-        config::Config::load(&cli.config)?
-    };
+        config::Config::load(&cli.config)
+    }
+    .map_err(|error| exit::config(format!("{error:#}")))?;
     #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
     if matches!(&cli.command, Command::Init | Command::Run { .. }) {
         allocator::initialize();
+    }
+    if matches!(&cli.command, Command::Init | Command::Run { .. }) {
+        tracing::info!(
+            config = %cli.config.display(),
+            state_dir = %config.state_dir.display(),
+            "starting"
+        );
     }
     match cli.command {
         Command::Check { source } => {
@@ -116,7 +170,7 @@ async fn run_cli() -> Result<()> {
             if source {
                 preflight::check_source(&config).await?;
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Discover {
             tables,
@@ -129,33 +183,42 @@ async fn run_cli() -> Result<()> {
                 schema.as_deref(),
                 target_namespace.as_deref(),
             )
-            .await
+            .await?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::Init => {
             hardening::secure_state_dir(&config.state_dir)?;
             source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
-            runtime::initialize(config).await
+            record_exit(&config, runtime::initialize(config.clone()).await)
         }
         Command::Run { roles } => {
-            anyhow::ensure!(
+            ensure!(
                 roles
                     .iter()
                     .all(|r| ["ingest", "coordinator", "compactor"].contains(&r.as_str())),
-                "unknown role"
+                exit::config("unknown role")
             );
-            anyhow::ensure!(
+            ensure!(
                 roles.iter().any(|r| r == "ingest") && roles.iter().any(|r| r == "coordinator"),
-                "this binary currently requires ingest and coordinator together; compactor workers are exposed through the library API"
+                exit::config(
+                    "this binary currently requires ingest and coordinator together; compactor workers are exposed through the library API"
+                )
             );
             hardening::secure_state_dir(&config.state_dir)?;
             source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
-            runtime::run(config, roles.iter().any(|r| r == "compactor")).await
+            let compaction = roles.iter().any(|r| r == "compactor");
+            record_exit(&config, runtime::run(config.clone(), compaction).await)
         }
-        Command::Status => runtime::status(config),
+        Command::Status => Ok(if runtime::status(config)? {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(exit::NOT_READY)
+        }),
         Command::MetadataImport { inventory, apply } => {
-            metadata_import::run(config, &inventory, apply).await
+            metadata_import::run(config, &inventory, apply).await?;
+            Ok(ExitCode::SUCCESS)
         }
     }
 }

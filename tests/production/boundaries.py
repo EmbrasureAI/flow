@@ -35,7 +35,7 @@ class BoundaryRun(Run):
         self.proxy = CatalogProxy(args.catalog_uri, self.directory / "catalog-proxy.jsonl")
         self.config.write_text(self.config.read_text().replace(
             json.dumps(args.catalog_uri), json.dumps(self.proxy.url)))
-        self.environment["RUST_LOG"] = "info"
+        self.environment["RUST_LOG"] = "info,flow_events=debug"
         self.histories = {}
         self.report.update(primary_key=["id", "tenant"], journal_quota_bytes=self.QUOTA_BYTES,
                            quota_source_rows_max=self.QUOTA_BATCHES * self.QUOTA_ROWS,

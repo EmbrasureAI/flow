@@ -192,7 +192,7 @@ columns = [
         self.config = self.directory / "flow.toml"
         self.config.write_text(text)
         # Timing events are required evidence, independent of the caller's logging preference.
-        self.environment = os.environ | {"FLOW_LOCAL_POSTGRES_URL": self.args.postgres_url, "RUST_LOG": "info"}
+        self.environment = os.environ | {"FLOW_LOCAL_POSTGRES_URL": self.args.postgres_url, "RUST_LOG": "info,flow_events=debug"}
         self.store = BenchmarkStore(self.directory / "evidence.sqlite3")
 
     def verify_runtime_inputs(self):

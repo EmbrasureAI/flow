@@ -36,7 +36,7 @@ class ContractRun(Run):
         self.configure()
         self.config.write_text(self.config.read_text().replace(
             "snapshot_retention_secs = 3600", "snapshot_retention_secs = 3600\ncheckpoint_interval_secs = 2\nretained_checkpoints = 2"))
-        self.environment["RUST_LOG"] = "info"
+        self.environment["RUST_LOG"] = "info,flow_events=debug"
 
     def fields(self, table):
         metadata = self.table(table)["metadata"]

@@ -87,8 +87,23 @@ async fn handle(config: &Config, mut stream: TcpStream) {
 
 fn route(config: &Config, path: &str) -> (u16, &'static str, Vec<u8>) {
     match path {
-        // The process is serving requests; stuck work is reported by /readyz.
-        "/healthz" | "/livez" => (200, "text/plain", b"ok\n".to_vec()),
+        // Fails only when the running service's main loop stops advancing.
+        // Blocked tables and source outages are readiness and alert signals.
+        "/healthz" | "/livez" => {
+            let timeout = config
+                .http
+                .as_ref()
+                .map_or(0, |http| http.liveness_timeout_secs);
+            match crate::lifecycle::liveness(Duration::from_secs(timeout)) {
+                Ok(()) => (200, "text/plain", b"ok\n".to_vec()),
+                Err(stalled) => (
+                    503,
+                    "text/plain",
+                    format!("run loop has not progressed for {}s\n", stalled.as_secs())
+                        .into_bytes(),
+                ),
+            }
+        }
         "/readyz" => match crate::lifecycle::read(config) {
             Ok(status) => {
                 let ready = status.ready_in(std::process::id());
@@ -178,6 +193,7 @@ mod tests {
         config.state_dir = directory.path().to_owned();
         config.http = Some(crate::config::Http {
             listen: "127.0.0.1:0".parse().unwrap(),
+            liveness_timeout_secs: 1,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -202,11 +218,24 @@ mod tests {
         let head = get(address, "HEAD /metrics HTTP/1.1\r\n\r\n").await;
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n") && head.ends_with("\r\n\r\n"));
 
+        let _serial = crate::lifecycle::LIVENESS_TEST_LOCK.lock().await;
         let lifecycle = crate::lifecycle::Lifecycle::start(&config).unwrap();
         crate::lifecycle::emit(&config, None, None, true, None, None).unwrap();
         let ready = get(address, "GET /readyz HTTP/1.1\r\n\r\n").await;
         assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"), "{ready}");
+
+        // A run loop that stops advancing fails liveness after its timeout.
+        crate::lifecycle::run_loop_progress();
+        let live = get(address, "GET /livez HTTP/1.1\r\n\r\n").await;
+        assert!(live.starts_with("HTTP/1.1 200 OK\r\n"), "{live}");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let stalled = get(address, "GET /healthz HTTP/1.1\r\n\r\n").await;
+        assert!(stalled.starts_with("HTTP/1.1 503"), "{stalled}");
+        assert!(stalled.contains("run loop has not progressed"), "{stalled}");
+        // Leaving the run loop (here, dropping its lifecycle) ends judgement.
         drop(lifecycle);
+        let health = get(address, "GET /healthz HTTP/1.1\r\n\r\n").await;
+        assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
 
         assert!(
             get(address, "POST /metrics HTTP/1.1\r\n\r\n")

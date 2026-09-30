@@ -53,11 +53,14 @@ pub(crate) fn persist_bootstrap(store: &StateStore, bootstrap: &Bootstrap) -> Re
     store.put_source_transaction(BOOTSTRAP, &serde_json::to_vec(bootstrap)?)?;
     Ok(())
 }
-pub(crate) fn bootstrap(store: &ControlStore) -> Result<Bootstrap> {
+pub(crate) fn bootstrap(store: &ControlStore, config: &Config) -> Result<Bootstrap> {
     Ok(serde_json::from_slice(
-        &store
-            .source_transaction(BOOTSTRAP)?
-            .context("source is not initialized; run init first")?,
+        &store.source_transaction(BOOTSTRAP)?.ok_or_else(|| {
+            crate::exit::config(format!(
+                "source is not initialized in state_dir {}; run init first (a relative state_dir resolves against the configuration file's directory)",
+                config.state_dir.display()
+            ))
+        })?,
     )?)
 }
 pub(crate) async fn tables(
@@ -168,8 +171,9 @@ pub async fn initialize(config: Config) -> Result<()> {
     let started = std::time::Instant::now();
     let result = async {
         crate::lifecycle::refuse_if_resync_required(&config)?;
-        let catalog = catalog(&config).await?;
+        let catalog = crate::retry::startup("catalog", || catalog(&config)).await?;
         let store = open_bootstrap_state(&config, catalog.clone()).await?;
+        crate::lifecycle::state_lock_acquired();
         let mut boot = match store.source_transaction(BOOTSTRAP)? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => prepare_source(&config, &store, catalog.as_ref()).await?,
@@ -202,7 +206,8 @@ async fn open_bootstrap_state(config: &Config, catalog: Arc<dyn Catalog>) -> Res
                 .is_some_and(flow_state_store::Error::requires_index_rebuild) =>
         {
             let control = ControlStore::open(config.state_dir.join("control"))?;
-            let boot = bootstrap(&control)?;
+            crate::lifecycle::state_lock_acquired();
+            let boot = bootstrap(&control, config)?;
             validate_config(config, &boot)?;
             ensure!(
                 boot.target_uuids.len() == boot.schemas.len(),
@@ -231,7 +236,9 @@ pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Re
                 .enumerate()
                 .filter_map(|(index, table)| table.projection().map(|_| index))
                 .collect::<Vec<_>>(),
-        "column selection mode differs from durable bootstrap; resynchronization is required"
+        crate::exit::config(
+            "column selection mode differs from durable bootstrap; resynchronization is required"
+        )
     );
     Ok(())
 }
@@ -242,7 +249,7 @@ pub(crate) fn validate_identity(config: &Config, boot: &Bootstrap) -> Result<()>
         boot.source_id == config.source.id
             && boot.slot == config.source.slot
             && boot.publication == config.source.publication,
-        "source incarnation differs from durable bootstrap"
+        crate::exit::config("source incarnation differs from durable bootstrap")
     );
     Ok(())
 }
@@ -251,7 +258,7 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
     validate_identity(config, boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len() && boot.targets.len() == config.tables.len(),
-        "configured source tables differ from durable bootstrap"
+        crate::exit::config("configured source tables differ from durable bootstrap")
     );
     for (index, configured) in config.tables.iter().enumerate() {
         ensure!(
@@ -260,7 +267,7 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
                     configured.target_namespace.clone(),
                     configured.target_table.clone()
                 ) == boot.targets[index],
-            "configured schema or target differs from durable bootstrap"
+            crate::exit::config("configured schema or target differs from durable bootstrap")
         );
     }
     Ok(())
@@ -271,11 +278,17 @@ async fn prepare_source(
     store: &StateStore,
     catalog: &dyn Catalog,
 ) -> Result<Bootstrap> {
-    let sql = connect(config, false).await?;
-    ensure!(
-        slot_cut(&sql, &config.source.slot).await?.is_none(),
-        "initialization requires a new permanent replication slot"
-    );
+    let sql = crate::retry::startup("source connection", || connect(config, false)).await?;
+    let slot = &config.source.slot;
+    if let Some(row) = sql
+        .query_opt(
+            "SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[slot],
+        )
+        .await?
+    {
+        return Err(existing_slot(config, row.get(0)));
+    }
     let mut schemas = Vec::new();
     let mut target_uuids = Vec::new();
     for configured in &config.tables {
@@ -352,6 +365,22 @@ async fn prepare_source(
     Ok(boot)
 }
 
+/// `init` never adopts an existing slot. Never suggest dropping one that a
+/// consumer is streaming from.
+fn existing_slot(config: &Config, active: bool) -> anyhow::Error {
+    let slot = &config.source.slot;
+    let state_dir = config.state_dir.display();
+    crate::exit::config(if active {
+        format!(
+            "replication slot {slot:?} already exists and is in use by a connected consumer; init only creates a new slot. If a Flow instance owns it, keep using that instance's state_dir with run; otherwise set a new source.slot. state_dir {state_dir} has no initialization record for it"
+        )
+    } else {
+        format!(
+            "replication slot {slot:?} already exists, but state_dir {state_dir} has no initialization record for it; init only creates a new slot. To resume an initialized source, set state_dir to its original state directory and use run. Otherwise set a new source.slot, or drop the stale slot after confirming no Flow instance uses it: SELECT pg_drop_replication_slot('{slot}');"
+        )
+    })
+}
+
 async fn slot_cut(
     sql: &flow_pg_source::tokio_postgres::Client,
     slot: &str,
@@ -363,7 +392,9 @@ async fn slot_cut(
             && row.get::<_, Option<bool>>(3) == Some(true)
             && !row.get::<_, bool>(4)
             && !row.get::<_, bool>(5),
-        "bootstrap slot is active or differs from its recorded source contract"
+        crate::exit::config(
+            "bootstrap slot is active or differs from its recorded source contract"
+        )
     );
     Ok(Some(
         row.get::<_, Option<String>>(0)
@@ -427,7 +458,7 @@ pub(crate) async fn resume(
         return Ok(());
     }
     validate_config(config, boot)?;
-    let sql = connect(config, false).await?;
+    let sql = crate::retry::startup("source connection", || connect(config, false)).await?;
     let mut registry = crate::schema::SchemaRegistry::new(
         store.clone(),
         SourceId(config.source.id.clone()),
@@ -1024,6 +1055,30 @@ mod tests {
     use super::*;
     use flow_coordinator::{AckMode, JournalDurability};
     use flow_state_store::StateStoreOptions;
+
+    #[test]
+    fn operator_messages_name_the_state_directory_and_spare_active_slots() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().join("state");
+        let control = ControlStore::open(config.state_dir.join("control")).unwrap();
+        let error = bootstrap(&control, &config).err().unwrap();
+        assert_eq!(crate::exit::classify(&error).0, crate::exit::Class::Config);
+        let message = error.to_string();
+        assert!(message.contains(&config.state_dir.display().to_string()));
+        assert!(message.contains("relative state_dir resolves against the configuration"));
+
+        let stale = existing_slot(&config, false).to_string();
+        assert!(
+            stale.contains("pg_drop_replication_slot('embrasure_flow')"),
+            "{stale}"
+        );
+        let active = existing_slot(&config, true);
+        assert_eq!(crate::exit::classify(&active).0, crate::exit::Class::Config);
+        assert!(!active.to_string().contains("drop"), "{active}");
+        assert!(active.to_string().contains("in use"), "{active}");
+    }
 
     #[tokio::test]
     async fn bootstrap_rebuild_preserves_control_and_rejects_replaced_targets() {

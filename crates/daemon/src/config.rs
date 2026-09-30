@@ -12,6 +12,7 @@ use std::{
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// A relative path is resolved against the configuration file's directory.
     pub state_dir: PathBuf,
     pub source: Source,
     pub catalog: HashMap<String, String>,
@@ -33,6 +34,14 @@ pub struct Config {
 pub struct Http {
     /// For example `0.0.0.0:9464`; serves /healthz, /readyz and /metrics.
     pub listen: std::net::SocketAddr,
+    /// /healthz fails once the running service's main loop has not advanced
+    /// for this long; zero disables the check. Startup, index rebuild and
+    /// initial COPY are never judged.
+    #[serde(default = "default_liveness_timeout_secs")]
+    pub liveness_timeout_secs: u64,
+}
+fn default_liveness_timeout_secs() -> u64 {
+    300
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,6 +168,26 @@ impl Default for Limits {
         }
     }
 }
+/// Anchor a relative `state_dir` to the configuration file, not the working
+/// directory, so every command and supervisor finds the same state.
+fn resolve_state_dir(config: &std::path::Path, state_dir: &std::path::Path) -> Result<PathBuf> {
+    if state_dir.is_absolute() {
+        return Ok(state_dir.to_owned());
+    }
+    let config = std::path::absolute(config).context("resolve configuration path")?;
+    let directory = config
+        .parent()
+        .context("configuration path has no parent directory")?;
+    let relative = state_dir
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect::<PathBuf>();
+    Ok(if relative.as_os_str().is_empty() {
+        directory.to_owned()
+    } else {
+        directory.join(relative)
+    })
+}
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let config = Self::load_without_tables(path)?;
@@ -169,7 +198,7 @@ impl Config {
     /// Validate everything except the table list, for `discover`.
     pub fn load_without_tables(path: &std::path::Path) -> Result<Self> {
         let input = std::fs::read_to_string(path).context("read configuration")?;
-        let config: Self = toml::from_str(&input).map_err(|error: toml::de::Error| {
+        let mut config: Self = toml::from_str(&input).map_err(|error: toml::de::Error| {
             // Both source excerpts and serde messages can contain secret values.
             // Retain the location without chaining the original error.
             let offset = error.span().map_or(0, |span| span.start).min(input.len());
@@ -185,6 +214,7 @@ impl Config {
             anyhow::anyhow!("invalid configuration at line {line}, column {column}")
         })?;
         config.validate_source()?;
+        config.state_dir = resolve_state_dir(path, &config.state_dir)?;
         Ok(config)
     }
 
@@ -202,13 +232,13 @@ impl Config {
             if let Some(name) = properties.remove(&format!("{key}_env")) {
                 // EnvVarError::NotUnicode can include the secret in its Debug output.
                 let value = lookup(&name).ok_or_else(|| {
-                    anyhow::anyhow!(
+                    crate::exit::config(format!(
                         "catalog.{key}_env must name a set, Unicode environment variable"
-                    )
+                    ))
                 })?;
                 ensure!(
                     !value.is_empty(),
-                    "catalog.{key}_env resolved to an empty value"
+                    crate::exit::config(format!("catalog.{key}_env resolved to an empty value"))
                 );
                 properties.insert(key.to_owned(), value);
             }
@@ -329,6 +359,26 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_state_dir_resolves_against_the_configuration_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let example = include_str!("../../../examples/flow.toml");
+        assert!(example.contains("\nstate_dir = \"./data\"\n"));
+        let path = root.path().join("flow.toml");
+        std::fs::write(&path, example).unwrap();
+        let root = std::path::absolute(root.path()).unwrap();
+        assert_eq!(Config::load(&path).unwrap().state_dir, root.join("data"));
+        std::fs::write(&path, example.replacen("./data", "..", 1)).unwrap();
+        assert_eq!(Config::load(&path).unwrap().state_dir, root.join(".."));
+        std::fs::write(&path, example.replacen("./data", ".", 1)).unwrap();
+        assert_eq!(Config::load(&path).unwrap().state_dir, root);
+        std::fs::write(&path, example.replacen("./data", "/srv/flow", 1)).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().state_dir,
+            PathBuf::from("/srv/flow")
+        );
+    }
 
     fn valid_config() -> Config {
         toml::from_str(include_str!("../../../examples/flow.toml")).unwrap()
