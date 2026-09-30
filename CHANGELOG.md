@@ -131,6 +131,9 @@ directories and configurations keep working; no resynchronization is needed.
   longer claimed or deleted and no longer fails publication.
 - A full disk no longer stops the service when writing `status.json` or
   `metrics.prom`.
+- Compaction catch-up replans instead of stopping the daemon when an external
+  rewrite removes a v3 deletion vector's target data file.
+- Iceberg v3 row-lineage rewrites of binary columns are fixed.
 - Snapshot keepers survive `idle_in_transaction_session_timeout` and
   `transaction_timeout`; heartbeats commit with `synchronous_commit = local`.
 
