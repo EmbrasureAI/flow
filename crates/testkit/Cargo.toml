@@ -27,7 +27,7 @@ workspace = true
 
 [dev-dependencies]
 parquet.workspace = true
-reqsign-core = "=3.3.1"
+reqsign-core = "=3.3.2"
 bytes.workspace = true
 typetag = "0.2"
 flow-pg-source.workspace = true
