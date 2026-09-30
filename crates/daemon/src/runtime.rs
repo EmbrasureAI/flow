@@ -1962,3 +1962,7 @@ mod startup_recovery_tests {
 #[cfg(test)]
 #[path = "publication_live_tests.rs"]
 mod publication_live_tests;
+
+#[cfg(test)]
+#[path = "storage_guard_live_tests.rs"]
+mod storage_guard_live_tests;

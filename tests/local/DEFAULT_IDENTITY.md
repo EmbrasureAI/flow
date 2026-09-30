@@ -31,6 +31,21 @@ unresolved markers fail. Invalid events cannot produce a successful capture
 commit. The materialized checkpoint and source acknowledgement remain behind
 quarantined/unapplied changes; the ingress journal may safely retain later WAL.
 
+## Engine-only run
+
+`default_identity.py` runs against any disposable PostgreSQL/REST/MinIO
+services, such as the local or production Compose fixtures. CI runs it on
+PostgreSQL 14 and 18:
+
+```sh
+uv run tests/local/default_identity.py --catalog-uri "$FLOW_REST_URL" \
+  --s3-endpoint "$FLOW_S3_URL" --binary target/debug/embrasure-flow \
+  --product-preflight skip --artifacts /tmp/new-default-identity-run
+```
+
+It creates `run/` and `identity-change/` below the artifact directory. The product
+CDC preflight phase runs only where the product runner package is importable.
+
 ## Repeatable local qualification
 
 From the **internal engine worktree** matching the product's local source pin:

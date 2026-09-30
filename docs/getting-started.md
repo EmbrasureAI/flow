@@ -182,7 +182,7 @@ failures, including cases where healthy tables continue publishing.
 
 ## Recovery and operational limits
 
-`materialized` acknowledgement is the default. `journaled` mode requires an explicit declaration of independently durable storage. Selecting that mode does not replicate a local disk. Disk loss and a process crash are different failure models.
+`materialized` acknowledgement is the default. `journaled` mode requires an explicit declaration of independently durable storage. Selecting that mode does not replicate a local disk. Disk loss and a process crash are different failure models. Journaled mode lets PostgreSQL release WAL as soon as a transaction is in the local journal, so losing that journal loses those transactions. It is covered by source-ledger tests and a CI crash and outage run, but has far less production mileage than the default; prefer `materialized` unless WAL retention during catalog outages is the constraint.
 
 Keep snapshot history covering unfinished prepared operations, reader retention windows and useful checkpoints. The garbage collector protects retained snapshots, checkpoints and in-flight operations, and deletes only registered service-owned artifacts after a grace period. Index loss does not impair reads; startup restores a matching checkpoint or scans standard data and deletes, then atomically activates the rebuilt generation before restoring writes. Source lineage or unexplained external logical changes stop publication.
 

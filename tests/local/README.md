@@ -74,6 +74,9 @@ responses, and commits completed after the caller is killed. Ordinary table
 failures must preserve the daemon PID. Native manifest audits verify unique
 operation identities and exact reader results. Source connection/slot/identity failure remains global. Classified table schema/row errors and TRUNCATE are isolated.
 
+CI runs both cases on PostgreSQL 14 and 18 (`isolation` shard), together with
+[`default_identity.py`](DEFAULT_IDENTITY.md#engine-only-run).
+
 Run it again with `--quota` and a new artifact directory for the separate 64 MiB
 journal-limit scenario. That run verifies a safe stop with unpublished changes
 retained, then explicitly increases the fixture limit and checks exact replay.

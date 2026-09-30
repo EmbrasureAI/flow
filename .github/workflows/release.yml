@@ -48,8 +48,66 @@ jobs:
             echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/flow"
           } >> "$GITHUB_OUTPUT"
 
-  binaries:
+  test:
+    # Test the artifacts' build profile on both release architectures; the
+    # everyday CI job tests only the x86_64 debug profile.
     needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+      - name: Test in the release profile
+        run: cargo test --locked --release --workspace --all-targets
+
+  services:
+    # The service integration workflow runs on the same tag push; publish only
+    # after it passed for this exact commit.
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Wait for passing service integration on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          for _ in $(seq 1 170); do
+            conclusions=$(gh run list --workflow services.yml --commit "$sha" --json status,conclusion \
+              --jq '[.[] | select(.status == "completed") | .conclusion] | join(" ")')
+            case " $conclusions " in
+              *" success "*) echo "Service integration passed for $sha"; exit 0 ;;
+            esac
+            pending=$(gh run list --workflow services.yml --commit "$sha" --json status --jq '[.[] | select(.status != "completed")] | length')
+            if [ -n "$conclusions" ] && [ "$pending" = 0 ]; then
+              echo "::error::service integration did not pass for $sha: $conclusions"; exit 1
+            fi
+            sleep 30
+          done
+          echo "::error::no completed service integration run for $sha"; exit 1
+
+  binaries:
+    needs: [verify, test]
     strategy:
       fail-fast: true
       matrix:
@@ -94,7 +152,7 @@ jobs:
           if-no-files-found: error
 
   image:
-    needs: verify
+    needs: [verify, test]
     strategy:
       fail-fast: true
       matrix:
@@ -150,7 +208,7 @@ jobs:
           if-no-files-found: error
 
   manifest:
-    needs: [verify, image]
+    needs: [verify, image, services]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -181,7 +239,7 @@ jobs:
           docker buildx imagetools inspect "$IMAGE:$VERSION"
 
   release:
-    needs: [verify, binaries, manifest]
+    needs: [verify, test, services, binaries, manifest]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

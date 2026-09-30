@@ -77,7 +77,7 @@ source_namespace = "{self.name}"
 source_table = "duplicates"
 target_namespace = ["{self.name}"]
 target_table = "duplicates"
-primary_key = []
+{self.format_line()}primary_key = []
 append_only = true
 columns = [
   {{ field_id = 1, name = "id", data_type = "Int64", nullable = false }},
@@ -91,6 +91,7 @@ columns = [
         self.last_external = None
         self.report.update(native_compaction=self.args.native_compaction,
                            keyless_duplicates=self.args.keyless_duplicates,
+                           format_version=self.args.format_version,
                            compaction_age_ms={"soft": 60000, "hard": 300000})
 
     def command(self, command):
@@ -394,12 +395,19 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
                 initial = next(snapshot for snapshot in self.initial_metadata["metadata"]["snapshots"]
                                if snapshot["snapshot-id"] == self.initial_metadata["metadata"]["current-snapshot-id"])
                 self.phase("native-compaction-before-external", lambda: self.wait_native_compaction("orders", initial["sequence-number"]))
-            for number, procedure in enumerate(("rewrite_position_delete_files", "rewrite_data_files", "rewrite_manifests"), 1):
+            procedures = ["rewrite_position_delete_files", "rewrite_data_files", "rewrite_manifests"]
+            if self.args.format_version >= 3:
+                # V3 deletes are deletion vectors, which that procedure does not
+                # rewrite; data-file rewrites below still consume them.
+                procedures.remove("rewrite_position_delete_files")
+                self.report["skipped_procedures"] = ["rewrite_position_delete_files"]
+            for number, procedure in enumerate(procedures, 1):
                 if procedure == "rewrite_position_delete_files":
                     self.phase("fresh-protected-delete-inputs", self.prepare_delete_rewrite)
                 self.phase(procedure, lambda procedure=procedure: self.rewrite(procedure))
                 self.restore_native()
-                self.phase(f"cdc-after-{procedure}", lambda number=number: self.followup(number, restart=number == 3))
+                self.phase(f"cdc-after-{procedure}",
+                           lambda number=number: self.followup(number, restart=number == len(procedures)))
             if self.args.keyless_duplicates:
                 self.phase("keyless-external-data-rewrite", lambda: self.rewrite("rewrite_data_files", "duplicates"))
                 self.restore_native()
@@ -446,6 +454,8 @@ def main():
     parser.add_argument("--jar-cache", type=Path, default=Path("target/reader-jars"))
     parser.add_argument("--native-compaction", action="store_true",
                         help="require native compaction before and after independently attributed Spark rewrites")
+    parser.add_argument("--format-version", type=int, choices=(2, 3), default=2,
+                        help="create v3 targets; their deletes are deletion vectors")
     parser.add_argument("--keyless-duplicates", action="store_true",
                         help="include an append-only table with duplicate complete rows and retained history")
     args = parser.parse_args()
