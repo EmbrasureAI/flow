@@ -4,6 +4,7 @@ mod bootstrap;
 mod config;
 mod discover;
 mod generation;
+mod hardening;
 mod http;
 mod lifecycle;
 mod metadata_import;
@@ -77,6 +78,7 @@ enum Command {
     },
 }
 fn main() -> Result<()> {
+    hardening::restrict_umask();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -89,11 +91,14 @@ fn main() -> Result<()> {
 }
 
 async fn run_cli() -> Result<()> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .json()
+        .finish()
+        .with(hardening::secret_log_filter())
         .init();
     let cli = Cli::parse();
     let config = if matches!(cli.command, Command::Discover { .. }) {
@@ -127,6 +132,8 @@ async fn run_cli() -> Result<()> {
             .await
         }
         Command::Init => {
+            hardening::secure_state_dir(&config.state_dir)?;
+            source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
             runtime::initialize(config).await
         }
@@ -141,6 +148,8 @@ async fn run_cli() -> Result<()> {
                 roles.iter().any(|r| r == "ingest") && roles.iter().any(|r| r == "coordinator"),
                 "this binary currently requires ingest and coordinator together; compactor workers are exposed through the library API"
             );
+            hardening::secure_state_dir(&config.state_dir)?;
+            source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
             runtime::run(config, roles.iter().any(|r| r == "compactor")).await
         }

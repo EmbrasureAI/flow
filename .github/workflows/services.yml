@@ -20,15 +20,15 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       RUST_LOG: info
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build dependencies from Ubuntu repositories
         run: |
           sudo apt-get update -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
           sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1 (master); the toolchain input selects Rust
         with:
           toolchain: '1.97.1'
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Retain the existing service-build dependency cache across this job split.
           shared-key: postgres
@@ -51,7 +51,7 @@ jobs:
         run: |
           sha256sum target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/daemon_tests > target/service-binaries.sha256
           tar -cf "$RUNNER_TEMP/service-binaries.tar" target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/daemon_tests target/service-binaries.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: service-binaries
           path: ${{ runner.temp }}/service-binaries.tar
@@ -63,13 +63,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build MinIO fixture images
         run: |
           docker build -f tests/production/Dockerfile.minio --target server -t flow-test-minio:RELEASE.2025-04-22T22-12-26Z tests/production
           docker build -f tests/production/Dockerfile.minio --target client -t flow-test-mc:RELEASE.2025-04-16T18-13-26Z tests/production
           docker save -o "$RUNNER_TEMP/minio-images.tar" flow-test-minio:RELEASE.2025-04-22T22-12-26Z flow-test-mc:RELEASE.2025-04-16T18-13-26Z
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: minio-images
           path: ${{ runner.temp }}/minio-images.tar
@@ -110,8 +110,8 @@ jobs:
       AWS_REGION: us-east-1
       RUST_LOG: info
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: service-binaries
           path: ${{ runner.temp }}/service-binaries
@@ -119,7 +119,7 @@ jobs:
         run: |
           tar -xf "$RUNNER_TEMP/service-binaries/service-binaries.tar"
           sha256sum -c target/service-binaries.sha256
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: minio-images
           path: ${{ runner.temp }}/minio-images
@@ -128,7 +128,7 @@ jobs:
       - name: Reserve disk for independent reader images
         if: matrix.suite == 'readers'
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Verify stock reader extensions from an empty cache
         run: uv run tests/local/duckdb_extensions.py
       - name: Select free ports that survive service restarts
@@ -334,7 +334,7 @@ jobs:
       - name: Service logs
         if: always()
         run: docker compose logs --no-color > "$RUNNER_TEMP/service-containers.log"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: services-pg-${{ matrix.postgres }}-${{ matrix.suite }}
@@ -365,8 +365,8 @@ jobs:
       AWS_REGION: us-east-1
       RUST_LOG: info
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: service-binaries
           path: ${{ runner.temp }}/service-binaries
@@ -374,13 +374,13 @@ jobs:
         run: |
           tar -xf "$RUNNER_TEMP/service-binaries/service-binaries.tar"
           sha256sum -c target/service-binaries.sha256
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: minio-images
           path: ${{ runner.temp }}/minio-images
       - name: Load MinIO fixture images
         run: docker load -i "$RUNNER_TEMP/minio-images/minio-images.tar"
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Select free service ports
         run: |
           python3 - <<'PYPORTS'
@@ -423,7 +423,7 @@ jobs:
       - name: Service logs
         if: always()
         run: docker compose logs --no-color > "$RUNNER_TEMP/service-containers.log"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: services-pgvector

@@ -1,0 +1,18 @@
+# cargo-audit configuration, read by `cargo audit` and the Audit workflow.
+# Every ignored advisory needs a justification and a condition for removal.
+
+[advisories]
+ignore = [
+    # quick-xml 0.39.4 (NsReader namespace-declaration allocation; quadratic
+    # duplicate-attribute check). It is reached only through opendal-core and
+    # opendal-service-s3 =0.57.0, which parse XML responses from the configured
+    # S3-compatible endpoint. Exploiting it requires a malicious or compromised
+    # object store, or tampering with a plaintext (http://) endpoint; the
+    # impact is memory or CPU exhaustion of Flow, not data corruption. The fix
+    # (quick-xml >= 0.41) requires opendal >= 0.58, and opendal is pinned to
+    # match the vendored iceberg-storage-opendal adapter. Remove these entries
+    # when opendal is upgraded.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+informational_warnings = ["unmaintained", "unsound", "notice"]

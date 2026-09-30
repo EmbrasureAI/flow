@@ -17,7 +17,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libstdc++6 && rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --create-home flow
 COPY --from=build /usr/local/bin/embrasure-flow /usr/local/bin/embrasure-flow
 COPY --from=build /licenses /usr/share/licenses/embrasure-flow
-RUN mkdir /data && chown flow:flow /data
+RUN install -d -m 0700 -o flow -g flow /data
 USER flow
 WORKDIR /data
 ENTRYPOINT ["embrasure-flow"]

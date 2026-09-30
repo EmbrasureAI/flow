@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-patch:
+        update-types: [patch]
+    ignore:
+      # Pinned to match the vendored Iceberg storage adapter; upgrade together
+      # (see vendor/iceberg-storage-opendal/LOCAL_CHANGES.md).
+      - dependency-name: opendal
+      - dependency-name: iceberg-storage-opendal
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ['*']
