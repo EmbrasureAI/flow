@@ -1,0 +1,104 @@
+name: embrasure-flow-demo
+services:
+  postgres:
+    image: postgres:18.6-bookworm
+    cpus: 2
+    mem_limit: 1g
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    environment:
+      POSTGRES_USER: flow
+      POSTGRES_PASSWORD: demo-password
+      POSTGRES_DB: flow
+    volumes:
+      - postgres:/var/lib/postgresql
+      - ./init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flow -d flow"]
+      interval: 2s
+      retries: 30
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    cpus: 1
+    mem_limit: 512m
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: demo-access
+      MINIO_ROOT_PASSWORD: demo-secret-key
+    volumes: ["objects:/data"]
+  bucket:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on: [minio]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until mc alias set demo http://minio:9000 demo-access demo-secret-key; do sleep 1; done
+        mc mb --ignore-existing demo/warehouse
+  rest:
+    build:
+      context: ../tests/production
+      dockerfile: Dockerfile.catalog
+    cpus: 2
+    mem_limit: 1g
+    depends_on:
+      bucket:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: demo-access
+      AWS_SECRET_ACCESS_KEY: demo-secret-key
+      AWS_REGION: us-east-1
+      JAVA_TOOL_OPTIONS: -Xmx512m
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_URI: jdbc:postgresql://postgres:5432/catalog
+      CATALOG_JDBC_USER: catalog
+      CATALOG_JDBC_PASSWORD: catalog-test-password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 2s
+      retries: 30
+  initialize:
+    build: ..
+    image: embrasure-flow:local
+    cpus: 2
+    mem_limit: 1g
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rest:
+        condition: service_healthy
+    environment: &flow-environment
+      FLOW_POSTGRES_URL: postgres://flow:demo-password@postgres:5432/flow?sslmode=disable
+      AWS_ACCESS_KEY_ID: demo-access
+      AWS_SECRET_ACCESS_KEY: demo-secret-key
+      AWS_REGION: us-east-1
+    volumes: &flow-volumes
+      - flow:/data
+      - ./flow.toml:/etc/flow.toml:ro
+    command: ["--config", "/etc/flow.toml", "init"]
+  flow:
+    build: ..
+    image: embrasure-flow:local
+    cpus: 2
+    mem_limit: 1g
+    stop_grace_period: 30s
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+    environment: *flow-environment
+    volumes: *flow-volumes
+  trino:
+    image: trinodb/trino:470
+    cpus: 2
+    mem_limit: 2g
+    depends_on:
+      rest:
+        condition: service_healthy
+    volumes: ["./trino/catalog:/etc/trino/catalog:ro"]
+volumes:
+  postgres:
+  objects:
+  flow:

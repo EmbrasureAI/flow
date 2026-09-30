@@ -1,0 +1,20 @@
+[package]
+name = "flow-catalog-watch"
+description = "External Iceberg snapshot reconciliation for Embrasure Flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flow-model.workspace = true
+flow-state-store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

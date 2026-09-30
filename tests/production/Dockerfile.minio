@@ -1,0 +1,20 @@
+# Build the same qualification releases from upstream source. The corresponding
+# public registry images and binary downloads are no longer available.
+FROM golang:1.24.2-bookworm AS server-build
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go install github.com/minio/minio@RELEASE.2025-04-22T22-12-26Z
+
+FROM golang:1.24.2-bookworm AS client-build
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go install github.com/minio/mc@RELEASE.2025-04-16T18-13-26Z
+
+FROM debian:bookworm-slim AS base
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+FROM base AS server
+COPY --from=server-build /go/bin/minio /usr/local/bin/minio
+ENTRYPOINT ["minio"]
+
+FROM base AS client
+COPY --from=client-build /go/bin/mc /usr/local/bin/mc
+ENTRYPOINT ["mc"]

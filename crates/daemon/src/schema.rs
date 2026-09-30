@@ -1,0 +1,1420 @@
+//! Durable source schema versions and the serialized Iceberg schema barrier.
+//! Relation messages choose a decoder; only surviving committed source changes
+//! authorize a public schema transition or, from a streamed transaction, a
+//! durable table block.
+
+use crate::config::Table as ConfiguredTable;
+use anyhow::{Context, Result, ensure};
+use flow_coordinator::{
+    SourceSchemaRecord as SchemaRecord, same_iceberg_schema, source_schema_key as schema_key,
+    source_schema_prefix as schema_prefix, store_source_schema,
+};
+use flow_materializer::iceberg_schema;
+use flow_model::{SourceId, TableId, TableSchema};
+use flow_pg_source::{
+    CaptureAssembler, Relation, TABLE_METADATA_BATCH_SIZE, TableMetadata, TableMetadataRequest,
+    TypeRegistry, fetch_table_metadata_batch, fetch_table_metadata_selected,
+    nullable_successor_with_types, same_wire_schema,
+    tokio_postgres::{Client, GenericClient},
+    validate_schema_metadata,
+};
+use flow_state_store::StateStore;
+use iceberg::{
+    Catalog,
+    table::Table,
+    transaction::{AddColumn, ApplyTransactionAction, Transaction},
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) struct SchemaRegistry {
+    store: StateStore,
+    source: SourceId,
+    bases: BTreeMap<TableId, TableSchema>,
+    candidates: BTreeMap<(TableId, u32), SchemaRecord>,
+    dirty: BTreeSet<TableId>,
+    types: TypeRegistry,
+    projections: BTreeMap<TableId, Vec<String>>,
+    identities: BTreeMap<(String, String), TableId>,
+    blocked: BTreeSet<TableId>,
+    /// Blocked because the publication stopped covering them: capture drops
+    /// their changes instead of quarantining them.
+    dropped: BTreeSet<TableId>,
+}
+impl SchemaRegistry {
+    pub(crate) fn new(store: StateStore, source: SourceId, bases: &[TableSchema]) -> Result<Self> {
+        let mut initial = BTreeMap::new();
+        for schema in bases {
+            schema.validate()?;
+            ensure!(
+                initial.insert(schema.table_id, schema.clone()).is_none(),
+                "duplicate source table"
+            );
+        }
+        let mut identities = BTreeMap::new();
+        let mut blocked = BTreeSet::new();
+        let mut dropped = BTreeSet::new();
+        for id in initial.keys().copied() {
+            if let Some(entry) = store
+                .source_transactions_after(&schema_prefix(&source, id), None)
+                .next()
+            {
+                let (_, bytes) = entry?;
+                let record = SchemaRecord::decode(&bytes)?;
+                identities.insert((record.relation.namespace, record.relation.name), id);
+            }
+            match capture_block(&store, &source, id)? {
+                Some(CaptureBlock::PublicationChanged) => {
+                    blocked.insert(id);
+                    dropped.insert(id);
+                }
+                Some(CaptureBlock::SchemaIncompatible) => {
+                    blocked.insert(id);
+                }
+                None => {}
+            }
+        }
+        Ok(Self {
+            identities,
+            blocked,
+            dropped,
+            store,
+            source,
+            bases: initial,
+            candidates: BTreeMap::new(),
+            dirty: BTreeSet::new(),
+            types: TypeRegistry::default(),
+            projections: BTreeMap::new(),
+        })
+    }
+
+    /// Keep configuration as the bootstrap prefix contract. A restarted decoder
+    /// can select the current catalog shape while replaying older Relation
+    /// messages against their persisted historical versions.
+    pub(crate) async fn initialize(
+        &mut self,
+        client: &(impl GenericClient + Sync),
+        configured: &[ConfiguredTable],
+    ) -> Result<Vec<TableSchema>> {
+        ensure!(
+            configured.len() == self.bases.len(),
+            "schema/config table count differs"
+        );
+        let mut result = Vec::with_capacity(self.bases.len());
+        // Configuration order need not be table-OID order.
+        for chunk in configured.chunks(TABLE_METADATA_BATCH_SIZE) {
+            let requests: Vec<_> = chunk
+                .iter()
+                .filter(|configured| {
+                    let identity = (
+                        configured.source_namespace.clone(),
+                        configured.source_table.clone(),
+                    );
+                    !self
+                        .identities
+                        .get(&identity)
+                        .is_some_and(|id| self.is_blocked(*id))
+                })
+                .map(|configured| TableMetadataRequest {
+                    namespace: configured.source_namespace.clone(),
+                    table: configured.source_table.clone(),
+                    selected: configured.projection(),
+                })
+                .collect();
+            let mut metadata = fetch_table_metadata_batch(client, &requests)
+                .await?
+                .into_iter();
+            for configured in chunk {
+                // Only established table identities can be isolated. Bootstrap and
+                // missing/corrupt authority still require coordinated recovery.
+                let identity = (
+                    configured.source_namespace.clone(),
+                    configured.source_table.clone(),
+                );
+                let known = self
+                    .identities
+                    .get(&identity)
+                    .map(|id| self.latest(*id).map(|record| record.schema))
+                    .transpose()?;
+                if let Some(schema) = &known {
+                    if let Some(selected) = configured.projection() {
+                        self.projections.insert(schema.table_id, selected);
+                    }
+                    if self.is_blocked(schema.table_id) {
+                        result.push(schema.clone());
+                        continue;
+                    }
+                }
+                match metadata
+                    .next()
+                    .context("missing requested table metadata")?
+                    .map_err(anyhow::Error::from)
+                    .and_then(|metadata| self.initialize_table(configured, metadata))
+                {
+                    Ok(schema) => {
+                        self.identities.insert(identity, schema.table_id);
+                        result.push(schema);
+                    }
+                    Err(error) if known.is_some() && table_schema_error(&error) => {
+                        let schema = known.expect("checked above");
+                        self.block(schema.table_id, schema_block_reason(&error))?;
+                        result.push(schema);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn initialize_table(
+        &mut self,
+        configured: &ConfiguredTable,
+        metadata: TableMetadata,
+    ) -> Result<TableSchema> {
+        let projection = configured.projection();
+        if let Some(selected) = projection {
+            self.projections
+                .insert(TableId(metadata.relation.id), selected);
+        }
+        self.types.extend(metadata.types.clone());
+        let base = self
+            .bases
+            .get(&TableId(metadata.relation.id))
+            .context(SchemaChange(
+                "source table was replaced; resynchronization is required",
+            ))?
+            .clone();
+        if self.record(base.table_id, base.version)?.is_none() {
+            ensure!(
+                metadata.relation.columns.len() >= base.columns.len(),
+                SchemaChange("source dropped bootstrap columns")
+            );
+            let mut relation = metadata.relation.clone();
+            relation.columns.truncate(base.columns.len());
+            self.types.validate_relation(&base, &relation)?;
+            validate_schema_metadata(&base, &base, &relation, &metadata)?;
+            self.persist(&SchemaRecord {
+                format: 2,
+                storage_id: metadata.storage_id,
+                attribute_numbers: metadata.attribute_numbers[..base.columns.len()].to_vec(),
+                schema: base.clone(),
+                relation,
+            })?;
+        }
+        let mut record = self.select(&metadata.relation)?;
+        let parent = if self
+            .persisted(record.schema.table_id, record.schema.version)?
+            .is_some()
+        {
+            record.schema.clone()
+        } else {
+            self.latest(record.schema.table_id)?.schema
+        };
+        let latest = self.latest(record.schema.table_id)?;
+        if latest.schema != record.schema {
+            latest.schema.validate_successor(&record.schema)?;
+        }
+        record = self.relax(record, &metadata)?;
+        verify_storage(&record, &metadata)?;
+        validate_schema_metadata(&parent, &record.schema, &record.relation, &metadata)?;
+        // The SQL catalog sees only committed DDL. This also makes idle
+        // nullable additions visible without inventing a source LSN.
+        record.attribute_numbers =
+            metadata.attribute_numbers[..record.schema.columns.len()].to_vec();
+        self.persist(&record)?;
+        self.candidates
+            .remove(&(record.schema.table_id, record.schema.version));
+        Ok(record.schema)
+    }
+
+    pub(crate) fn saved_relation(&self, table: TableId) -> Result<Relation> {
+        Ok(self.latest(table)?.relation)
+    }
+
+    pub(crate) fn is_blocked(&self, table: TableId) -> bool {
+        self.blocked.contains(&table)
+    }
+
+    pub(crate) fn is_dropped(&self, table: TableId) -> bool {
+        self.dropped.contains(&table)
+    }
+
+    /// Tables whose capture drops changes; see [`CaptureAssembler::drop_table`].
+    pub(crate) fn dropped(&self) -> impl Iterator<Item = TableId> + '_ {
+        self.dropped.iter().copied()
+    }
+
+    pub(crate) fn block_decoder(
+        &self,
+        table: TableId,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        if assembler.is_blocked(table) {
+            return Ok(());
+        }
+        assembler.set_schema(self.latest(table)?.schema)?;
+        assembler.block_table(table)?;
+        Ok(())
+    }
+
+    pub(crate) fn block(&mut self, table: TableId, reason: &str) -> Result<()> {
+        self.block_with(table, CaptureBlock::SchemaIncompatible, reason)
+    }
+
+    /// Quarantine one change and block its table. pgoutput streams changes of
+    /// transactions that may still roll back, so a decision inside a streamed
+    /// transaction stays provisional: it blocks the table only when that
+    /// transaction commits with the change, see [`Self::commit_provisional`].
+    /// Other transactions keep publishing the table meanwhile.
+    pub(crate) fn quarantine(
+        &mut self,
+        table: TableId,
+        event: flow_pg_source::SourceEvent,
+        relation: &Relation,
+        reason: &str,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        if !self.is_blocked(table) && assembler.streaming().is_some() {
+            assembler.quarantine_provisionally(event, relation, reason)?;
+            return Ok(());
+        }
+        self.block(table, reason)?;
+        self.block_decoder(table, assembler)?;
+        assembler.quarantine(event, relation)?;
+        Ok(())
+    }
+
+    /// A Relation capture cannot decode. Inside a streamed transaction it only
+    /// quarantines that transaction's later changes of the table.
+    pub(crate) fn reject_relation(
+        &mut self,
+        table: TableId,
+        reason: &str,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        if !self.is_blocked(table) && assembler.streaming().is_some() {
+            assembler.set_undecodable(table, Some(reason))?;
+            return Ok(());
+        }
+        self.block(table, reason)
+    }
+
+    /// Called at every Commit before schema validation and the assembler: make
+    /// the committed transaction's surviving provisional blocks durable, so its
+    /// quarantined and earlier decoded changes of those tables commit quarantined.
+    pub(crate) fn commit_provisional(
+        &mut self,
+        xid: u32,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        for (table, reason) in assembler.provisional_blocks(xid) {
+            self.block(table, &reason)?;
+            self.block_decoder(table, assembler)?;
+        }
+        Ok(())
+    }
+
+    /// The publication no longer covers this configured table's changes.
+    pub(crate) fn block_publication(&mut self, table: TableId, reason: &str) -> Result<()> {
+        self.block_with(table, CaptureBlock::PublicationChanged, reason)
+    }
+
+    fn block_with(&mut self, table: TableId, cause: CaptureBlock, reason: &str) -> Result<()> {
+        ensure!(
+            self.bases.contains_key(&table),
+            "unconfigured capture block"
+        );
+        // The block is durable and only a resync clears it. It keeps its first
+        // cause, except that a publication block supersedes a schema block:
+        // both need a resync, and dropping stops its quarantined changes from
+        // holding the acknowledgement frontier.
+        if self.blocked.contains(&table)
+            && (cause != CaptureBlock::PublicationChanged || self.dropped.contains(&table))
+        {
+            return Ok(());
+        }
+        // Prove a recoverable schema before persisting a table-scoped failure.
+        self.latest(table)?;
+        self.store
+            .put_source_transaction(&capture_block_key(&self.source, table), cause.value())?;
+        self.blocked.insert(table);
+        if cause == CaptureBlock::PublicationChanged {
+            self.dropped.insert(table);
+        }
+        self.candidates.retain(|(id, _), _| *id != table);
+        self.dirty.remove(&table);
+        tracing::warn!(
+            event = "source_table_blocked",
+            table_id = table.0,
+            error_code = cause.code(),
+            reason,
+            "source table requires schema repair or full resync"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn observe_relation(
+        &mut self,
+        client: &Client,
+        relation: &Relation,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        // Other published tables have no schema lineage here; never query them.
+        if !self.bases.contains_key(&TableId(relation.id)) {
+            return Ok(());
+        }
+        // Only relation changes perform catalog I/O. Rows use the cached resolver.
+        self.types
+            .extend(TypeRegistry::fetch(client, relation).await?);
+        let table = TableId(relation.id);
+        let known: BTreeSet<_> = self
+            .candidates
+            .keys()
+            .filter(|(id, _)| *id == table)
+            .copied()
+            .collect();
+        let record = self.select(relation)?;
+        let key = (table, record.schema.version);
+        let selected = self
+            .types
+            .validate_relation(&record.schema, relation)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                assembler.set_types(self.types.clone());
+                assembler.set_schema(record.schema)?;
+                Ok(())
+            });
+        if selected.is_err() && !known.contains(&key) {
+            // A rejected Relation must not leave a candidate that keeps every
+            // later commit flushing for a schema proof.
+            self.candidates.remove(&key);
+        }
+        selected?;
+        self.dirty.insert(table);
+        Ok(())
+    }
+
+    /// After a transaction ends, forget unpersisted schema candidates that no
+    /// open transaction or decoder references, such as those a rolled-back
+    /// streamed transaction selected. A later Relation re-selects one if needed.
+    /// Otherwise [`Self::validation_may_query`] would flush every later commit.
+    pub(crate) fn forget_unused_candidates(&mut self, assembler: &CaptureAssembler) {
+        if self.candidates.is_empty() {
+            return;
+        }
+        let in_use = assembler.schema_versions_in_use();
+        self.candidates.retain(|key, _| in_use.contains(key));
+    }
+
+    /// A streamed DROP NOT NULL can send NULL rows before its catalog change
+    /// is visible to our SQL session. Stage a decoder only; COMMIT still proves
+    /// and persists the version before any journal terminal/publication.
+    pub(crate) fn observe_nulls(
+        &mut self,
+        event: &flow_pg_source::SourceEvent,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        use flow_pg_source::{Cell, SourceEvent};
+        let (id, row) = match event {
+            SourceEvent::Insert { relation, row, .. }
+            | SourceEvent::Update { relation, row, .. } => (TableId(*relation), row),
+            _ => return Ok(()),
+        };
+        // Rows for other published tables are ignored rather than decoded.
+        let Some(current) = assembler.schema(id) else {
+            return Ok(());
+        };
+        if row.len() != current.columns.len() {
+            return Ok(());
+        }
+        let relaxed: Vec<_> = current
+            .columns
+            .iter()
+            .zip(row)
+            .enumerate()
+            .filter_map(|(index, (column, cell))| {
+                (!column.nullable
+                    && matches!(cell, Cell::Null)
+                    && !current.primary_key.contains(&index))
+                .then_some(index)
+            })
+            .collect();
+        if relaxed.is_empty() {
+            return Ok(());
+        }
+        let mut record = self
+            .record(id, current.version)?
+            .context("decoder schema proof missing")?;
+        for index in relaxed {
+            record.schema.columns[index].nullable = true;
+        }
+        record.schema.version = self
+            .latest(id)?
+            .schema
+            .version
+            .max(current.version)
+            .checked_add(1)
+            .context("source schema version overflow")?;
+        current.validate_successor(&record.schema)?;
+        self.candidates
+            .insert((id, record.schema.version), record.clone());
+        self.dirty.insert(id);
+        assembler.set_schema(record.schema)?;
+        Ok(())
+    }
+
+    /// Let capture seal an earlier group before a schema proof may await SQL.
+    pub(crate) fn validation_may_query(&self) -> bool {
+        !self.dirty.is_empty() || !self.candidates.is_empty()
+    }
+
+    /// Called before CaptureAssembler receives COMMIT, so every schema referenced
+    /// by the resulting durable journal terminal is already recoverable.
+    pub(crate) async fn validate_commit(
+        &mut self,
+        client: &Client,
+        xid: u32,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        let hints = assembler.schema_hints(xid)?;
+        for hint in &hints {
+            if self.is_blocked(hint.table_id) {
+                self.block_decoder(hint.table_id, assembler)?;
+            }
+        }
+        let needs_validation = hints.iter().any(|hint| {
+            self.dirty.contains(&hint.table_id)
+                || self.candidates.contains_key(&(hint.table_id, hint.version))
+        });
+        if !needs_validation {
+            return Ok(());
+        }
+        let versions = assembler.surviving_schema_versions(xid)?;
+        let mut metadata = BTreeMap::new();
+        let mut publish = Vec::new();
+        for version in versions {
+            if self.is_blocked(version.table_id) {
+                self.block_decoder(version.table_id, assembler)?;
+                continue;
+            }
+            let validated: Result<()> = async {
+                let mut record = self
+                    .record(version.table_id, version.version)?
+                    .context("transaction references an unknown schema version")?;
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    metadata.entry(version.table_id)
+                {
+                    entry.insert(
+                        fetch_table_metadata_selected(
+                            client,
+                            &record.relation.namespace,
+                            &record.relation.name,
+                            self.projections.get(&version.table_id).map(Vec::as_slice),
+                        )
+                        .await?,
+                    );
+                }
+                let known = self.persisted(version.table_id, version.version)?.is_some();
+                let parent = if known {
+                    record.schema.clone()
+                } else {
+                    self.latest(version.table_id)?.schema
+                };
+                if !known && parent != record.schema {
+                    if parent.version < record.schema.version {
+                        parent.validate_successor(&record.schema)?;
+                    } else {
+                        record.schema.validate_successor(&parent)?;
+                    }
+                }
+                verify_storage(&record, &metadata[&version.table_id])?;
+                let mut prefix = metadata[&version.table_id].relation.clone();
+                let latest = self.latest(version.table_id)?;
+                ensure!(
+                    prefix.columns.len() >= latest.relation.columns.len(),
+                    SchemaChange("source dropped committed columns")
+                );
+                prefix.columns.truncate(latest.relation.columns.len());
+                ensure!(
+                    same_wire_schema(&prefix, &latest.relation),
+                    SchemaChange("source changed a committed column's type or name")
+                );
+                let validation_base = if parent.version > record.schema.version {
+                    &record.schema
+                } else {
+                    &parent
+                };
+                validate_schema_metadata(
+                    validation_base,
+                    &record.schema,
+                    &record.relation,
+                    &metadata[&version.table_id],
+                )?;
+                if !known {
+                    record.attribute_numbers = metadata[&version.table_id].attribute_numbers
+                        [..record.schema.columns.len()]
+                        .to_vec();
+                    publish.push(record);
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = validated {
+                if !table_schema_error(&error) {
+                    return Err(error);
+                }
+                self.block(version.table_id, schema_block_reason(&error))?;
+                self.block_decoder(version.table_id, assembler)?;
+                publish.retain(|record| record.schema.table_id != version.table_id);
+            }
+        }
+        for record in publish {
+            self.persist(&record)?;
+            self.candidates
+                .remove(&(record.schema.table_id, record.schema.version));
+        }
+        for table in metadata.keys() {
+            self.dirty.remove(table);
+        }
+        Ok(())
+    }
+
+    fn relax(
+        &mut self,
+        mut record: SchemaRecord,
+        metadata: &flow_pg_source::TableMetadata,
+    ) -> Result<SchemaRecord> {
+        let old = record.schema.clone();
+        for (column, attributes) in record.schema.columns.iter_mut().zip(&metadata.columns) {
+            column.nullable |= attributes.nullable;
+        }
+        if record.schema.columns != old.columns {
+            record.schema.version = self
+                .latest(old.table_id)?
+                .schema
+                .version
+                .checked_add(1)
+                .context("source schema version overflow")?
+                .max(
+                    old.version
+                        .checked_add(1)
+                        .context("source schema version overflow")?,
+                );
+            old.validate_successor(&record.schema)?;
+            self.candidates
+                .insert((old.table_id, record.schema.version), record.clone());
+        }
+        Ok(record)
+    }
+
+    fn select(&mut self, relation: &Relation) -> Result<SchemaRecord> {
+        let table = TableId(relation.id);
+        ensure!(
+            self.bases.contains_key(&table),
+            "schema selection for a relation outside the capture set"
+        );
+        let mut matching = None;
+        for record in self.records(table) {
+            let record = record?;
+            if same_wire_schema(&record.relation, relation) {
+                matching = Some(record);
+            }
+        }
+        if let Some(record) = matching {
+            return Ok(record);
+        }
+        if let Some(record) = self
+            .candidates
+            .values()
+            .find(|record| same_wire_schema(&record.relation, relation))
+        {
+            return Ok(record.clone());
+        }
+        let latest = self.latest(table)?;
+        let base = &self.bases[&table];
+        let added = relation
+            .columns
+            .len()
+            .checked_sub(base.columns.len())
+            .context(SchemaChange("source dropped bootstrap columns"))?;
+        let version = if relation.columns.len() < latest.relation.columns.len() {
+            base.version.checked_add(u32::try_from(added)?)
+        } else {
+            latest.schema.version.checked_add(
+                u32::try_from(relation.columns.len() - latest.relation.columns.len())?.max(1),
+            )
+        }
+        .context("source schema version overflow")?;
+        let schema = if relation.columns.len() < latest.relation.columns.len() {
+            let mut historical_wire = latest.relation.clone();
+            historical_wire.columns.truncate(relation.columns.len());
+            ensure!(
+                same_wire_schema(&historical_wire, relation),
+                SchemaChange("historical relation is not a verified nullable prefix")
+            );
+            let mut historical = latest.schema.clone();
+            historical.version = version;
+            historical.columns.truncate(relation.columns.len());
+            historical.validate_successor(&latest.schema)?;
+            historical
+        } else {
+            nullable_successor_with_types(
+                &latest.schema,
+                &latest.relation,
+                relation,
+                version,
+                &self.types,
+            )?
+        };
+        let mut attribute_numbers = latest.attribute_numbers;
+        attribute_numbers.resize(schema.columns.len(), 0);
+        let record = SchemaRecord {
+            format: 2,
+            storage_id: latest.storage_id,
+            attribute_numbers,
+            schema,
+            relation: relation.clone(),
+        };
+        self.candidates.insert((table, version), record.clone());
+        Ok(record)
+    }
+    fn persisted(&self, table: TableId, version: u32) -> Result<Option<SchemaRecord>> {
+        self.store
+            .source_transaction(&schema_key(&self.source, table, version))?
+            .map(|bytes| SchemaRecord::decode(&bytes))
+            .transpose()
+    }
+    fn record(&self, table: TableId, version: u32) -> Result<Option<SchemaRecord>> {
+        match self.candidates.get(&(table, version)) {
+            Some(record) => Ok(Some(record.clone())),
+            None => self.persisted(table, version),
+        }
+    }
+    fn records(&self, table: TableId) -> impl Iterator<Item = Result<SchemaRecord>> + '_ {
+        self.store
+            .source_transactions_after(&schema_prefix(&self.source, table), None)
+            .map(|item| {
+                let (_, value) = item?;
+                SchemaRecord::decode(&value)
+            })
+    }
+    fn latest(&self, table: TableId) -> Result<SchemaRecord> {
+        let mut latest = None;
+        for record in self.records(table) {
+            latest = Some(record?);
+        }
+        latest.context("source schema baseline is missing")
+    }
+    fn persist(&self, record: &SchemaRecord) -> Result<()> {
+        store_source_schema(&self.store, &self.source, record)
+    }
+}
+
+#[derive(Debug)]
+struct SchemaChange(&'static str);
+impl std::fmt::Display for SchemaChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for SchemaChange {}
+
+/// Only vetted schema diagnostics may reach logs. DEFAULT eligibility names
+/// columns, but row/value errors and outer contexts may contain source data,
+/// URLs or credentials and must keep their static summaries.
+pub(crate) fn schema_block_reason(error: &anyhow::Error) -> &str {
+    for cause in error.chain() {
+        if let Some(change) = cause.downcast_ref::<SchemaChange>() {
+            return change.0;
+        }
+        if let Some(error) = cause.downcast_ref::<flow_pg_source::Error>() {
+            return match error {
+                flow_pg_source::Error::Config(reason) => reason,
+                flow_pg_source::Error::DefaultIdentity(reason) => reason,
+                flow_pg_source::Error::ReplicaIdentity(_) => {
+                    "source requires REPLICA IDENTITY FULL"
+                }
+                flow_pg_source::Error::UnchangedToast(_) => {
+                    "source row has unresolved unchanged TOAST values"
+                }
+                flow_pg_source::Error::Row(_) => "source row does not match the selected schema",
+                flow_pg_source::Error::Value(_) => "source value cannot be decoded",
+                _ => "source schema validation failed",
+            };
+        }
+    }
+    "source schema validation failed"
+}
+
+/// Explicit source-table validation failures only. Shared storage, transport,
+/// corrupted proofs and unknown errors must never be turned into quarantine.
+pub(crate) fn table_schema_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<SchemaChange>()
+            || matches!(
+                cause.downcast_ref::<flow_pg_source::Error>(),
+                Some(
+                    flow_pg_source::Error::Config(_)
+                        | flow_pg_source::Error::ReplicaIdentity(_)
+                        | flow_pg_source::Error::DefaultIdentity(_)
+                        | flow_pg_source::Error::UnchangedToast(_)
+                        | flow_pg_source::Error::Value(_)
+                        | flow_pg_source::Error::Row(_)
+                )
+            )
+    })
+}
+
+fn capture_block_key(source: &SourceId, table: TableId) -> Vec<u8> {
+    let mut key = b"flow-capture-block/v1/".to_vec();
+    key.extend((source.0.len() as u64).to_be_bytes());
+    key.extend(source.0.as_bytes());
+    key.extend(table.0.to_be_bytes());
+    key
+}
+/// Why capture latched a table. The durable value predates the cause, so a
+/// schema block keeps its original encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureBlock {
+    SchemaIncompatible,
+    PublicationChanged,
+}
+
+impl CaptureBlock {
+    fn value(self) -> &'static [u8] {
+        match self {
+            Self::SchemaIncompatible => b"1",
+            Self::PublicationChanged => b"publication_changed",
+        }
+    }
+
+    /// The bounded status code; never remote text.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::SchemaIncompatible => "source_schema_incompatible",
+            Self::PublicationChanged => "publication_changed",
+        }
+    }
+}
+
+/// Latch a durable publication block as capture would, for runtime tests.
+#[cfg(test)]
+pub(crate) fn latch_publication_block(
+    store: &StateStore,
+    source: &SourceId,
+    table: TableId,
+) -> Result<()> {
+    store.put_source_transaction(
+        &capture_block_key(source, table),
+        CaptureBlock::PublicationChanged.value(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn capture_block(
+    store: &StateStore,
+    source: &SourceId,
+    table: TableId,
+) -> Result<Option<CaptureBlock>> {
+    match store.source_transaction(&capture_block_key(source, table))? {
+        None => Ok(None),
+        Some(bytes) if bytes == CaptureBlock::SchemaIncompatible.value() => {
+            Ok(Some(CaptureBlock::SchemaIncompatible))
+        }
+        Some(bytes) if bytes == CaptureBlock::PublicationChanged.value() => {
+            Ok(Some(CaptureBlock::PublicationChanged))
+        }
+        Some(_) => anyhow::bail!("invalid durable capture block"),
+    }
+}
+
+pub(crate) use flow_coordinator::latest_source_schema as latest_schema;
+
+/// Reload a target without adopting a replacement under the same catalog name.
+pub(crate) async fn refresh_table(catalog: &dyn Catalog, table: &Table) -> Result<Table> {
+    let refreshed = catalog.load_table(table.identifier()).await?;
+    ensure!(
+        refreshed.metadata().uuid() == table.metadata().uuid(),
+        "Iceberg target UUID changed; resynchronization is required"
+    );
+    Ok(refreshed)
+}
+
+/// Add only the exact nullable suffix, checking upstream-assigned field IDs.
+/// A lost response is resolved by reloading the exact resulting public schema.
+pub(crate) async fn ensure_table_schema(
+    store: &StateStore,
+    catalog: &dyn Catalog,
+    table: &Table,
+    target: &TableSchema,
+) -> Result<Table> {
+    let expected = iceberg_schema(target)?;
+    let current = table.metadata().current_schema();
+    if same_iceberg_schema(current, &expected) {
+        return Ok(table.clone());
+    }
+    let old_fields = current.as_struct().fields();
+    let fields = expected.as_struct().fields();
+    ensure!(
+        fields.len() >= old_fields.len()
+            && old_fields.iter().zip(fields).all(|(old, new)| {
+                let mut relaxed = old.as_ref().clone();
+                relaxed.required = new.required;
+                (!new.required || old.required) && relaxed == **new
+            })
+            && current.identifier_field_ids().collect::<BTreeSet<_>>()
+                == expected.identifier_field_ids().collect(),
+        "Iceberg schema diverged from the source nullable-column lineage"
+    );
+    let mut next_id = table.metadata().last_column_id();
+    let transaction = Transaction::new(table);
+    let mut action = transaction.update_schema();
+    for (old, new) in old_fields.iter().zip(fields) {
+        if old.required && !new.required {
+            action = action.make_column_optional(old.id);
+        }
+    }
+    for field in &fields[old_fields.len()..] {
+        next_id = next_id
+            .checked_add(1)
+            .context("Iceberg field ID overflow")?;
+        ensure!(
+            !field.required && field.id == next_id,
+            "Iceberg field ID allocation differs from durable source schema"
+        );
+        action = action.add_column(AddColumn::optional(
+            &field.name,
+            field.field_type.as_ref().clone(),
+        ));
+    }
+    flow_coordinator::register_catalog_metadata(store, table, target.table_id).await?;
+    let updated = match action.apply(transaction)?.commit(catalog).await {
+        Ok(table) => table,
+        Err(error) => {
+            let refreshed = refresh_table(catalog, table).await?;
+            if !same_iceberg_schema(refreshed.metadata().current_schema(), &expected) {
+                return Err(error.into());
+            }
+            refreshed
+        }
+    };
+    ensure!(
+        updated.metadata().uuid() == table.metadata().uuid(),
+        "Iceberg target UUID changed during schema update"
+    );
+    ensure!(
+        same_iceberg_schema(updated.metadata().current_schema(), &expected),
+        "catalog schema differs from the validated source schema"
+    );
+    Ok(updated)
+}
+
+fn verify_storage(record: &SchemaRecord, metadata: &flow_pg_source::TableMetadata) -> Result<()> {
+    ensure!(
+        record.storage_id == metadata.storage_id,
+        SchemaChange("source heap was rewritten; resynchronization is required")
+    );
+    ensure!(
+        record.attribute_numbers.len() == record.schema.columns.len()
+            && metadata.attribute_numbers.len() >= record.attribute_numbers.len()
+            && record
+                .attribute_numbers
+                .iter()
+                .zip(&metadata.attribute_numbers)
+                .all(|(expected, actual)| *expected == 0 || expected == actual),
+        SchemaChange("source column was dropped or replaced; resynchronization is required")
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod target_identity_tests {
+    use super::*;
+    use flow_model::{Column, ColumnType};
+    use iceberg::{
+        CatalogBuilder, NamespaceIdent, TableCreation,
+        memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
+        spec::FormatVersion,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn only_classified_source_errors_are_table_scoped() {
+        assert!(table_schema_error(
+            &SchemaChange("source heap changed").into()
+        ));
+        assert!(table_schema_error(
+            &flow_pg_source::Error::Config("selected column disappeared").into()
+        ));
+        assert!(!table_schema_error(&anyhow::anyhow!("unknown invariant")));
+        assert!(!table_schema_error(
+            &std::io::Error::other("local disk failed").into()
+        ));
+        assert!(!table_schema_error(
+            &flow_pg_source::Error::Protocol("malformed frame").into()
+        ));
+    }
+
+    #[test]
+    fn block_diagnostics_explain_heap_rewrites_without_exposing_source_values() {
+        let rewrite = anyhow::Error::new(SchemaChange(
+            "source heap was rewritten; resynchronization is required",
+        ))
+        .context("private connection URL");
+        assert_eq!(
+            schema_block_reason(&rewrite),
+            "source heap was rewritten; resynchronization is required"
+        );
+        let value = anyhow::Error::new(flow_pg_source::Error::Value("secret row value".into()))
+            .context("private connection URL");
+        assert_eq!(
+            schema_block_reason(&value),
+            "source value cannot be decoded"
+        );
+        assert_eq!(
+            schema_block_reason(&anyhow::anyhow!("secret unknown error")),
+            "source schema validation failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn nullable_catalog_transition_keeps_field_ids_and_rejects_identifier_relaxation() {
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "nullable",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://nullable".into())]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("test".into());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = TableSchema {
+            table_id: TableId(1),
+            version: 0,
+            primary_key: vec![0],
+            append_only: false,
+            columns: vec![
+                Column {
+                    field_id: 1,
+                    name: "id".into(),
+                    data_type: ColumnType::Int64,
+                    nullable: false,
+                },
+                Column {
+                    field_id: 2,
+                    name: "value".into(),
+                    data_type: ColumnType::String,
+                    nullable: false,
+                },
+            ],
+        };
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("rows".into())
+                    .format_version(FormatVersion::V2)
+                    .schema(iceberg_schema(&schema).unwrap())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(temp.path(), Default::default()).unwrap();
+        let mut next = schema.clone();
+        next.version = 1;
+        next.columns[1].nullable = true;
+        let updated = ensure_table_schema(&store, &catalog, &table, &next)
+            .await
+            .unwrap();
+        assert_eq!(updated.metadata().uuid(), table.metadata().uuid());
+        assert_eq!(updated.metadata().last_column_id(), 2);
+        assert!(same_iceberg_schema(
+            updated.metadata().current_schema(),
+            &iceberg_schema(&next).unwrap()
+        ));
+        assert_eq!(
+            ensure_table_schema(&store, &catalog, &updated, &next)
+                .await
+                .unwrap()
+                .metadata(),
+            updated.metadata()
+        );
+        assert!(
+            Transaction::new(&updated)
+                .update_schema()
+                .make_column_optional(1)
+                .apply(Transaction::new(&updated))
+                .unwrap()
+                .commit(&catalog)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_schema_does_not_resolve_an_original_tables_failed_commit() {
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "identity",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://identity".into())]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("test".into());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let mut schema = TableSchema {
+            table_id: TableId(1),
+            version: 0,
+            columns: vec![Column {
+                field_id: 1,
+                name: "id".into(),
+                data_type: ColumnType::Int64,
+                nullable: false,
+            }],
+            primary_key: vec![0],
+            append_only: false,
+        };
+        let original = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("rows".into())
+                    .format_version(FormatVersion::V2)
+                    .schema(iceberg_schema(&schema).unwrap())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        schema.version = 1;
+        schema.columns.push(Column {
+            field_id: 2,
+            name: "value".into(),
+            data_type: ColumnType::String,
+            nullable: true,
+        });
+        catalog.drop_table(original.identifier()).await.unwrap();
+        let replacement = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("rows".into())
+                    .format_version(FormatVersion::V2)
+                    .schema(iceberg_schema(&schema).unwrap())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(temp.path(), Default::default()).unwrap();
+        assert_ne!(replacement.metadata().uuid(), original.metadata().uuid());
+        assert!(
+            refresh_table(&catalog, &original)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("UUID changed")
+        );
+        // The replacement already has the expected schema, but is no proof of
+        // the failed original table's schema transaction.
+        assert!(
+            ensure_table_schema(&store, &catalog, &original, &schema)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("UUID changed")
+        );
+        let after = catalog.load_table(original.identifier()).await.unwrap();
+        assert_eq!(after.metadata(), replacement.metadata());
+    }
+
+    fn persist_base(registry: &SchemaRegistry, base: &TableSchema) {
+        registry
+            .persist(&SchemaRecord {
+                format: 2,
+                storage_id: base.table_id.0,
+                attribute_numbers: vec![1, 2],
+                schema: base.clone(),
+                relation: Relation {
+                    id: base.table_id.0,
+                    namespace: "public".into(),
+                    name: format!("t{}", base.table_id.0),
+                    replica_identity: b'f',
+                    columns: base
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, column)| flow_pg_source::Column {
+                            name: column.name.clone(),
+                            type_oid: if index == 0 { 20 } else { 25 },
+                            type_modifier: -1,
+                            identity: index == 0,
+                        })
+                        .collect(),
+                },
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn streamed_decisions_block_only_when_their_transaction_commits() {
+        use flow_pg_source::{SourceEvent, SpoolConfig, TransactionSpool};
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            root.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let bases = [config.tables[0].schema(11), config.tables[0].schema(12)];
+        let source = SourceId("streamed".into());
+        let mut registry = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
+        for base in &bases {
+            persist_base(&registry, base);
+        }
+        let (mut journal, _) = flow_ingress_journal::Journal::open(
+            root.path().join("journal"),
+            flow_ingress_journal::JournalConfig::default(),
+        )
+        .unwrap();
+        let spool =
+            TransactionSpool::open(root.path().join("spool"), SpoolConfig::default()).unwrap();
+        let mut assembler =
+            CaptureAssembler::new(source.clone(), spool, bases.clone(), 1 << 16).unwrap();
+        let mut push = |assembler: &mut CaptureAssembler, event| {
+            assembler
+                .push_buffered_at(event, flow_model::PgLsn(0), &mut journal)
+                .unwrap()
+        };
+        let truncate = |xid, subxid| SourceEvent::Truncate {
+            xid,
+            subxid,
+            relations: vec![11],
+            cascade: false,
+            restart_identity: false,
+        };
+        let commit = |xid, lsn| SourceEvent::Commit {
+            xid,
+            commit_lsn: flow_model::PgLsn(lsn),
+            end_lsn: flow_model::PgLsn(lsn + 1),
+            commit_timestamp_micros: 0,
+        };
+        let (table, other) = (TableId(11), TableId(12));
+        let relation = registry.saved_relation(table).unwrap();
+        let unblocked = |registry: &SchemaRegistry, assembler: &CaptureAssembler| {
+            !registry.is_blocked(table)
+                && !assembler.is_blocked(table)
+                && capture_block(&store, &source, table).unwrap().is_none()
+        };
+
+        // A rolled-back streamed TRUNCATE and undecodable Relation leave no block.
+        push(
+            &mut assembler,
+            SourceEvent::StreamStart {
+                xid: 42,
+                first: true,
+            },
+        );
+        registry
+            .quarantine(
+                table,
+                truncate(42, 42),
+                &relation,
+                "truncated",
+                &mut assembler,
+            )
+            .unwrap();
+        registry
+            .reject_relation(other, "type changed", &mut assembler)
+            .unwrap();
+        assert!(assembler.is_undecodable(other) && !registry.is_blocked(other));
+        assert!(unblocked(&registry, &assembler));
+        push(&mut assembler, SourceEvent::StreamStop);
+        push(
+            &mut assembler,
+            SourceEvent::Abort {
+                xid: 42,
+                subxid: 42,
+            },
+        );
+        registry.commit_provisional(42, &mut assembler).unwrap();
+        assert!(unblocked(&registry, &assembler));
+
+        // Committed, it blocks durably before the commit reaches the assembler.
+        push(
+            &mut assembler,
+            SourceEvent::StreamStart {
+                xid: 43,
+                first: true,
+            },
+        );
+        registry
+            .quarantine(
+                table,
+                truncate(43, 43),
+                &relation,
+                "truncated",
+                &mut assembler,
+            )
+            .unwrap();
+        push(&mut assembler, SourceEvent::StreamStop);
+        assert!(unblocked(&registry, &assembler));
+        registry.commit_provisional(43, &mut assembler).unwrap();
+        assert!(registry.is_blocked(table) && assembler.is_blocked(table));
+        assert_eq!(
+            capture_block(&store, &source, table).unwrap(),
+            Some(CaptureBlock::SchemaIncompatible)
+        );
+        push(&mut assembler, commit(43, 100));
+        assert!(!registry.is_blocked(other));
+
+        // Outside a stream, PostgreSQL has already committed: block at once.
+        push(
+            &mut assembler,
+            SourceEvent::Begin {
+                xid: 44,
+                final_lsn: flow_model::PgLsn(200),
+                commit_timestamp_micros: 0,
+            },
+        );
+        registry
+            .reject_relation(other, "type changed", &mut assembler)
+            .unwrap();
+        assert!(registry.is_blocked(other) && !assembler.is_undecodable(other));
+        assert_eq!(
+            capture_block(&store, &source, other).unwrap(),
+            Some(CaptureBlock::SchemaIncompatible)
+        );
+    }
+
+    #[test]
+    fn ended_transactions_leave_no_unused_schema_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            root.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let base = config.tables[0].schema(11);
+        let source = SourceId("candidates".into());
+        let mut registry =
+            SchemaRegistry::new(store, source.clone(), std::slice::from_ref(&base)).unwrap();
+        persist_base(&registry, &base);
+        let spool =
+            flow_pg_source::TransactionSpool::open(root.path().join("spool"), Default::default())
+                .unwrap();
+        let mut assembler = CaptureAssembler::new(source, spool, [base.clone()], 1 << 16).unwrap();
+        // A streamed ADD COLUMN selects an unpersisted candidate.
+        let mut added = registry.saved_relation(base.table_id).unwrap();
+        added.columns.push(flow_pg_source::Column {
+            name: "note".into(),
+            type_oid: 25,
+            type_modifier: -1,
+            identity: false,
+        });
+        let candidate = registry.select(&added).unwrap();
+        assert!(registry.validation_may_query());
+        // While a decoder uses it, it stays.
+        assembler.set_schema(candidate.schema.clone()).unwrap();
+        registry.forget_unused_candidates(&assembler);
+        assert!(registry.validation_may_query());
+        // Once nothing references it, e.g. after its transaction aborted and
+        // another transaction's Relation restored the committed decoder, it goes.
+        assembler.set_schema(base.clone()).unwrap();
+        registry.forget_unused_candidates(&assembler);
+        assert!(!registry.validation_may_query());
+        // A later Relation of that shape selects it again.
+        assert_eq!(registry.select(&added).unwrap().schema, candidate.schema);
+    }
+
+    #[test]
+    fn publication_block_drops_only_that_table_and_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            root.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let bases = [config.tables[0].schema(11), config.tables[0].schema(12)];
+        let source = SourceId("publication".into());
+        let mut registry = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
+        for base in &bases {
+            registry
+                .persist(&SchemaRecord {
+                    format: 2,
+                    storage_id: base.table_id.0,
+                    attribute_numbers: vec![1, 2],
+                    schema: base.clone(),
+                    relation: Relation {
+                        id: base.table_id.0,
+                        namespace: "public".into(),
+                        name: format!("t{}", base.table_id.0),
+                        replica_identity: b'f',
+                        columns: base
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .map(|(index, column)| flow_pg_source::Column {
+                                name: column.name.clone(),
+                                type_oid: if index == 0 { 20 } else { 25 },
+                                type_modifier: -1,
+                                identity: index == 0,
+                            })
+                            .collect(),
+                    },
+                })
+                .unwrap();
+        }
+        registry
+            .block_publication(TableId(12), "missing: public.t12")
+            .unwrap();
+        assert!(registry.is_dropped(TableId(12)) && !registry.is_blocked(TableId(11)));
+        // The first cause wins; a later schema block cannot turn drop into quarantine.
+        registry.block(TableId(12), "schema").unwrap();
+        assert_eq!(
+            capture_block(&store, &source, TableId(12)).unwrap(),
+            Some(CaptureBlock::PublicationChanged)
+        );
+        registry.block(TableId(11), "schema").unwrap();
+        assert!(registry.is_blocked(TableId(11)) && !registry.is_dropped(TableId(11)));
+        // A publication change supersedes a schema block: both need a resync,
+        // and dropping stops quarantined changes holding acknowledgement.
+        let mut superseded = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
+        superseded
+            .block_publication(TableId(11), "missing: public.t11")
+            .unwrap();
+        assert!(superseded.is_dropped(TableId(11)));
+        assert_eq!(
+            capture_block(&store, &source, TableId(11)).unwrap(),
+            Some(CaptureBlock::PublicationChanged)
+        );
+        // Restore the schema cause for the restart assertions below.
+        store
+            .put_source_transaction(
+                &capture_block_key(&source, TableId(11)),
+                CaptureBlock::SchemaIncompatible.value(),
+            )
+            .unwrap();
+
+        // Durable across restart, whatever the publication looks like then.
+        let restarted = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
+        assert!(restarted.is_dropped(TableId(12)));
+        assert!(restarted.is_blocked(TableId(11)) && !restarted.is_dropped(TableId(11)));
+        assert_eq!(restarted.dropped().collect::<Vec<_>>(), [TableId(12)]);
+        assert_eq!(
+            capture_block(&store, &source, TableId(11)).unwrap(),
+            Some(CaptureBlock::SchemaIncompatible)
+        );
+    }
+}

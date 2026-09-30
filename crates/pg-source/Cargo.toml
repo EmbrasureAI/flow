@@ -1,0 +1,37 @@
+[package]
+name = "flow-pg-source"
+description = "PostgreSQL snapshot and logical replication source for Embrasure Flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flow-model.workspace = true
+flow-ingress-journal.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+postgres-protocol = { git = "https://github.com/iambriccardo/rust-postgres", rev = "c4b8de06aaa99f71800126bedcca6e623d368357" }
+fallible-iterator = "0.2"
+bigdecimal = "0.4"
+base64 = "0.22"
+bincode.workspace = true
+uuid.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+crc32fast.workspace = true
+metrics.workspace = true
+fs2 = "0.4"
+tokio-postgres = { git = "https://github.com/iambriccardo/rust-postgres", rev = "c4b8de06aaa99f71800126bedcca6e623d368357", features = ["runtime"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

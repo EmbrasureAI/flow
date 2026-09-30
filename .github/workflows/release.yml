@@ -1,0 +1,314 @@
+name: Release
+# Publishes a GitHub release with Linux binaries and a multi-architecture image
+# at ghcr.io/<owner>/flow for a version tag. The tag must match the workspace
+# version and have a CHANGELOG.md entry. Tags with a hyphen are prereleases
+# and do not move the `latest` image tag; neither does any version below the
+# highest released version. Re-publishing an existing release fails in verify,
+# before any build or image push, unless replace_assets is set.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to (re)publish, for example v0.1.0
+        required: true
+      replace_assets:
+        description: Overwrite assets already attached to an existing release
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      latest: ${{ steps.version.outputs.latest }}
+      image: ${{ steps.version.outputs.image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - id: version
+        name: Match tag, workspace version and changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPLACE_ASSETS: ${{ github.event.inputs.replace_assets == 'true' }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$TAG is not a version tag such as v0.1.0"; exit 1
+          fi
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG does not exist"; exit 1
+          fi
+          # Fail before building or moving any image tag, not in the final job.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$REPLACE_ASSETS" != true ]; then
+            echo "::error::release $TAG already exists; rerun with replace_assets to republish it"; exit 1
+          fi
+          version="${TAG#v}"
+          workspace=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "$version" != "$workspace" ]; then
+            echo "::error::tag $TAG does not match workspace version $workspace"; exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' entry"; exit 1
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          # Only the highest stable version may own `latest`, so re-publishing
+          # or patching an older line never moves it backwards.
+          highest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref' \
+            | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          latest=false
+          if [ "$prerelease" = false ] && [ "$TAG" = "$highest" ]; then latest=true; fi
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "latest=$latest"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/flow"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    # Test the artifacts' build profile on both release architectures; the
+    # everyday CI job tests only the x86_64 debug profile.
+    needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TAG }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1 (master); the toolchain input selects Rust
+        with:
+          toolchain: '1.97.1'
+      - name: Test in the release profile
+        run: cargo test --locked --release --workspace --all-targets
+
+  services:
+    # The service integration workflow runs on the same tag push; publish only
+    # after it passed for this exact commit.
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TAG }}
+      - name: Wait for passing service integration on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          for _ in $(seq 1 170); do
+            conclusions=$(gh run list --workflow services.yml --commit "$sha" --json status,conclusion \
+              --jq '[.[] | select(.status == "completed") | .conclusion] | join(" ")')
+            case " $conclusions " in
+              *" success "*) echo "Service integration passed for $sha"; exit 0 ;;
+            esac
+            pending=$(gh run list --workflow services.yml --commit "$sha" --json status --jq '[.[] | select(.status != "completed")] | length')
+            if [ -n "$conclusions" ] && [ "$pending" = 0 ]; then
+              echo "::error::service integration did not pass for $sha: $conclusions"; exit 1
+            fi
+            sleep 30
+          done
+          echo "::error::no completed service integration run for $sha"; exit 1
+
+  binaries:
+    needs: [verify, test]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1 (master); the toolchain input selects Rust
+        with:
+          toolchain: '1.97.1'
+      - name: Build
+        run: cargo build --locked --release -p flow-daemon
+      - name: Package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="embrasure-flow-${VERSION}-${TARGET}"
+          mkdir -p "dist/$name"
+          cp target/release/embrasure-flow LICENSE NOTICE README.md CHANGELOG.md "dist/$name/"
+          cp examples/flow.toml "dist/$name/flow.example.toml"
+          cargo fetch --locked
+          python3 -B scripts/package_licenses.py --target "$TARGET" --output "dist/$name/licenses"
+          "dist/$name/embrasure-flow" --version
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  image:
+    needs: [verify, test]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ needs.verify.outputs.image }}
+          labels: |
+            org.opencontainers.image.title=Embrasure Flow
+            org.opencontainers.image.description=Stream PostgreSQL changes into Apache Iceberg
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+      # Native runners per architecture; each pushes by digest and the manifest
+      # job below joins them under the version tag.
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: CARGO_BUILD_JOBS=4
+          outputs: type=image,name=${{ needs.verify.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: digests/*
+          if-no-files-found: error
+
+  manifest:
+    needs: [verify, image, services]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-architecture tags
+        env:
+          IMAGE: ${{ needs.verify.outputs.image }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          LATEST: ${{ needs.verify.outputs.latest }}
+        run: |
+          tags=(-t "$IMAGE:$VERSION")
+          if [ "$LATEST" = true ]; then tags+=(-t "$IMAGE:latest"); fi
+          sources=()
+          for digest in digests/*; do sources+=("$IMAGE@sha256:$(basename "$digest")"); done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+  release:
+    needs: [verify, test, services, binaries, manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          LATEST: ${{ needs.verify.outputs.latest }}
+          IMAGE: ${{ needs.verify.outputs.image }}
+          REPLACE_ASSETS: ${{ github.event.inputs.replace_assets == 'true' }}
+        run: |
+          awk -v version="$VERSION" '
+            $0 ~ "^## \\[" version "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          printf '\n### Container image\n\n~~~sh\ndocker pull %s:%s\n~~~\n' "$IMAGE" "$VERSION" >> notes.md
+          flags=(--latest="$LATEST")
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Published assets are not overwritten unless explicitly requested;
+            # without --clobber, gh fails if any asset name already exists.
+            if [ "$REPLACE_ASSETS" = true ]; then
+              gh release upload "$TAG" dist/* --clobber
+            else
+              gh release upload "$TAG" dist/*
+            fi
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "Embrasure Flow $VERSION" --notes-file notes.md "${flags[@]}"
+          fi

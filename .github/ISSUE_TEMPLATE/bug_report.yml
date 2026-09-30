@@ -1,0 +1,47 @@
+name: Bug report
+description: Flow behaved incorrectly, lost or duplicated data, or failed to start or recover.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove credentials, connection strings and source row data from everything you paste.
+        Report security vulnerabilities privately instead; see SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: SQL, configuration and commands that reproduce the problem, if known.
+  - type: input
+    id: version
+    attributes:
+      label: Flow version or commit
+      description: Output of `embrasure-flow --version`, the image tag, or the commit.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: PostgreSQL version and provider, Iceberg catalog, object store, and reader engines involved.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Status and logs
+      description: Output of `embrasure-flow status` and the relevant structured log lines.
+      render: text
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration
+      description: The relevant parts of flow.toml, with secrets removed.
+      render: toml

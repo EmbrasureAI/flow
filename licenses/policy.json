@@ -1,0 +1,175 @@
+{
+  "format_version": 1,
+  "scope": "Locked flow-daemon normal/build dependency closure and the explicitly reviewed bundled native components. Excludes a compatibility verdict on Rust toolchain reports, OS image packages and Apple SDK redistribution rights; see README.md and the preserved objc2 upstream license qualification. Original metadata and all collected notices remain intact.",
+  "targets": [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu"
+  ],
+  "reviewed_expressions": {
+    "(MIT OR Apache-2.0) AND Apache-2.0": "Apache-2.0",
+    "(MIT OR Apache-2.0) AND Unicode-3.0": "Apache-2.0 AND Unicode-3.0",
+    "0BSD OR MIT OR Apache-2.0": "Apache-2.0",
+    "Apache-2.0": "Apache-2.0",
+    "Apache-2.0 / MIT": "Apache-2.0",
+    "Apache-2.0 AND ISC": "Apache-2.0 AND ISC",
+    "Apache-2.0 AND MIT": "Apache-2.0 AND MIT",
+    "Apache-2.0 OR BSL-1.0": "Apache-2.0",
+    "Apache-2.0 OR BSL-1.0 OR MIT": "Apache-2.0",
+    "Apache-2.0 OR ISC OR MIT": "Apache-2.0",
+    "Apache-2.0 OR MIT": "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT": "Apache-2.0",
+    "Apache-2.0/MIT": "Apache-2.0",
+    "BSD-2-Clause OR Apache-2.0 OR MIT": "Apache-2.0",
+    "BSD-3-Clause": "BSD-3-Clause",
+    "BSD-3-Clause AND MIT": "BSD-3-Clause AND MIT",
+    "BSD-3-Clause/MIT": "BSD-3-Clause AND MIT",
+    "CC0-1.0": "CC0-1.0",
+    "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception": "Apache-2.0",
+    "CC0-1.0 OR MIT-0 OR Apache-2.0": "Apache-2.0",
+    "ISC": "ISC",
+    "ISC AND (Apache-2.0 OR ISC)": "ISC AND Apache-2.0",
+    "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)": "ISC AND Apache-2.0 AND MIT AND BSD-3-Clause",
+    "MIT": "MIT",
+    "MIT AND Apache-2.0": "MIT AND Apache-2.0",
+    "MIT OR Apache-2.0": "Apache-2.0",
+    "MIT OR Apache-2.0 OR Zlib": "Apache-2.0",
+    "MIT OR Zlib OR Apache-2.0": "Apache-2.0",
+    "MIT/Apache-2.0": "Apache-2.0",
+    "MIT/Apache-2.0/BSD-3-Clause": "Apache-2.0 AND BSD-3-Clause",
+    "Unicode-3.0": "Unicode-3.0",
+    "Unlicense OR MIT": "MIT",
+    "Zlib": "Zlib",
+    "Zlib OR Apache-2.0 OR MIT": "Apache-2.0"
+  },
+  "bundled_native": {
+    "tikv-jemalloc-sys": {
+      "version": "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7",
+      "links": "jemalloc",
+      "review": "Select Apache-2.0 for the Rust wrapper and retain the bundled jemalloc BSD-2-Clause copyright, conditions and disclaimer. The wrapper license does not replace the native allocator terms.",
+      "files": {
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397",
+        "jemalloc/COPYING": "94aa2caa98c25d942f58b956c71dba6a99ff98fc3a31cbc669fe2a4cd0268b53"
+      }
+    },
+    "aws-lc-sys": {
+      "version": "0.45.0",
+      "links": "aws_lc_0_45_0",
+      "review": "Retain aggregate AWS-LC terms: ISC, Apache-2.0, MIT and BSD-3-Clause, including the documented alternatives for imported code; Fiat uses MIT. This version documents OpenSSL-derived code under Apache-2.0.",
+      "files": {
+        "LICENSE": "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e",
+        "aws-lc/LICENSE": "977c541bd25ffe36975dde25c028c0cd15ddf3d08243983b58e8a6a3d9447523",
+        "aws-lc/third_party/fiat/LICENSE": "43e358d7b6eb109d0f51f7b3a090fd82607965767c25fadee39e922475de2061"
+      }
+    },
+    "bzip2-sys": {
+      "version": "0.1.13+1.0.8",
+      "links": "bzip2",
+      "review": "The Rust wrapper license does not cover libbzip2. Its 1.0.8 source carries the bzip2 license (SPDX bzip2-1.0.6 family); retain its unmodified text, origin and modification conditions.",
+      "files": {
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "c8c6324cf2f0f076e3ed5dea4a21f00bd4dd6fce44f72b110bc52e7fe06f6e1e",
+        "bzip2-1.0.8/LICENSE": "c6dbbf828498be844a89eaa3b84adbab3199e342eb5cb2ed2f0d4ba7ec0f38a3"
+      }
+    },
+    "librocksdb-sys": {
+      "version": "0.17.3+10.4.2",
+      "links": "rocksdb",
+      "review": "Select Apache-2.0 for RocksDB and retain BSD terms for LevelDB, xxHash and Snappy. Snappy COPYING also describes CC-BY benchmark data; those testdata files are not packaged or compiled by this daemon. This decision does not approve shipping that data.",
+      "files": {
+        "rocksdb/AUTHORS": "8915c3700b0d6397bdb462cbba30915383be7b1ca0475f83441ecc5994651b55",
+        "rocksdb/LICENSE.Apache": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "rocksdb/LICENSE.leveldb": "b568f1f37a5a1d37a3e981e7c8b7fc4856ca33b2ca0a45bc8e847aaaf7afe485",
+        "rocksdb/util/xxhash.cc": "45ba37e13c2bf7b79f4e9df5c26c7839dfcdda217111866493de4f3aba15a467",
+        "rocksdb/util/xxhash.h": "df1d356391f717b04cfa093f5a351366c301945a2aa61113fef730a20c93350c",
+        "rocksdb/utilities/transactions/lock/range/range_tree/lib/COPYING.APACHEv2": "81932e77fef4cec306da54caf7d4d221dfd0f6fb6da214c712e36cb95ac47906",
+        "snappy/AUTHORS": "710c0a3a4681c8c40f5a59eb794f61093fa142935c647c92f46ea595f0591833",
+        "snappy/COPYING": "55172044f7e241207117448a4d9d6ba1d0925c8ad66b5d4c08c70adfa9cc3de6"
+      }
+    },
+    "libz-sys": {
+      "version": "1.1.29",
+      "links": "z",
+      "review": "Retain the separate zlib license texts for bundled zlib and zlib-ng; the Rust wrapper choice does not replace them. System-library linkage retains the system package terms.",
+      "files": {
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "34c467b6945a22696d060b8fdd2379d464acb3408d4c599d3dc5fe4fa1b4c84f",
+        "src/zlib-ng/LICENSE.md": "6c9f0d975b41afaa34d22f55bb8986ce69e5cb7ad327cb2b28820cd425edf5ee",
+        "src/zlib/LICENSE": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2"
+      }
+    },
+    "lz4-sys": {
+      "version": "1.11.1+lz4-1.10.0",
+      "links": "lz4",
+      "review": "Select the BSD-2-Clause LZ4 library license. The separately licensed GPL command-line programs are not built or packaged by the daemon.",
+      "files": {
+        "LICENSE": "77633124ac69bf094e06cf9f3157c54d6e51d6b58a38d4f28141947815ecadfa",
+        "liblz4/lib/LICENSE": "8b58c446121a109ccf32edc094bba3010a3d85e4ee3702950db55e4d3e87736c"
+      }
+    },
+    "ring": {
+      "version": "0.17.14",
+      "links": "ring_core_0_17_14_",
+      "review": "Retain Apache-2.0 and ISC aggregate terms and the supplied Fiat and once_cell notices.",
+      "files": {
+        "LICENSE": "b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a",
+        "LICENSE-BoringSSL": "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d",
+        "LICENSE-other-bits": "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f",
+        "src/polyfill/once_cell/LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "src/polyfill/once_cell/LICENSE-MIT": "6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc",
+        "third_party/fiat/LICENSE": "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
+      }
+    },
+    "zstd-sys": {
+      "version": "2.0.16+zstd.1.5.7",
+      "links": "zstd",
+      "review": "Select the BSD-3-Clause Zstandard library license and retain xxHash BSD notices; do not infer a GPL requirement from the alternative license or command-line source.",
+      "files": {
+        "LICENSE": "a77b7cfeaf911ed410ffbe76f0cb2b24ad8a4d94e7ead5727e914425c416cc63",
+        "LICENSE.Apache-2.0": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+        "LICENSE.BSD-3-Clause": "48341f685c87304089aa099b23c386f8bacc519ef555aa7a13e239908907b3fd",
+        "LICENSE.Mit": "129e8edef29e9abcd2ebabe252f4ef1b1289cdca356bf0040284a2fbccfb96c8",
+        "zstd/LICENSE": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8",
+        "zstd/lib/common/xxhash.h": "8cb837b21a8fe9a6b9dbcd0961ab16e733bfcbfa9e003f3a496ce07ae80aa8ee"
+      }
+    },
+    "blake3": {
+      "version": "1.8.7",
+      "links": null,
+      "review": "Select Apache-2.0 for the Rust and bundled C/assembly implementations; this native build has no Cargo links field.",
+      "files": {
+        "LICENSE_A2": "00fcc7a934ddbc9ece2a7cc063ac788e284b703b1d705ccbba72d462aa97921e",
+        "LICENSE_A2LLVM": "a5695f57ea0c221e0e8b7d784ff774c35e88c3d3270353646a925880bb3492cc",
+        "LICENSE_CC0": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+      }
+    }
+  },
+  "other_links": {
+    "aws-lc-rs": {
+      "version": "1.18.1",
+      "links": "aws_lc_rs_1_18_1_sys",
+      "review": "Rust wrapper and Cargo metadata forwarding; native AWS-LC is separately reviewed under aws-lc-sys."
+    },
+    "clang-sys": {
+      "version": "1.9.1",
+      "links": "clang",
+      "review": "Build dependency dynamically loading the installed libclang; the runtime image does not package libclang. Its system installation retains its own license."
+    },
+    "defmt": {
+      "version": "1.1.1",
+      "links": "defmt",
+      "review": "Cargo links metadata for the Rust logging implementation; no bundled native library in this package."
+    },
+    "openssl-sys": {
+      "version": "0.9.117",
+      "links": "openssl",
+      "review": "Links system OpenSSL from libssl-dev; Docker installs libssl3 separately. The MIT wrapper license does not relicense OpenSSL or certify arbitrary system installations."
+    },
+    "prettyplease": {
+      "version": "0.3.0",
+      "links": "prettyplease03",
+      "review": "Cargo links metadata for a Rust build dependency; no bundled native library in this package."
+    }
+  }
+}

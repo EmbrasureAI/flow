@@ -1,0 +1,548 @@
+--- a/src/arrow/delete_filter.rs
++++ b/src/arrow/delete_filter.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -16,9 +17,11 @@
+ // under the License.
+ 
+ use std::collections::HashMap;
++use std::pin::Pin;
+ use std::sync::{Arc, Mutex, RwLock};
+ 
+ use tokio::sync::Notify;
++use tokio::sync::futures::OwnedNotified;
+ use tokio::sync::oneshot::Receiver;
+ 
+ use crate::delete_vector::DeleteVector;
+@@ -33,6 +36,7 @@
+ enum EqDelState {
+     Loading(Arc<Notify>),
+     Loaded(Predicate),
++    Failed(Arc<Error>),
+ }
+ 
+ /// State tracking for positional delete files.
+@@ -43,13 +47,21 @@
+     /// The file is currently being loaded by a task.
+     /// The notifier allows other tasks to wait for completion.
+     Loading(Arc<Notify>),
+-    /// The file has been fully loaded and merged into the delete vector map.
+-    Loaded,
++    /// Vectors remain scoped to their input delete file. Applicability to a
++    /// data file was decided by the scan planner, including sequence numbers.
++    Loaded(HashMap<String, DeleteVector>),
++    Failed(Arc<Error>),
++}
++
++#[derive(Debug)]
++struct CachedDeleteVector {
++    inputs: Vec<String>,
++    vector: Arc<Mutex<DeleteVector>>,
+ }
+ 
+ #[derive(Debug, Default)]
+ struct DeleteFileFilterState {
+-    delete_vectors: HashMap<String, Arc<Mutex<DeleteVector>>>,
++    delete_vectors: HashMap<String, CachedDeleteVector>,
+     equality_deletes: HashMap<String, EqDelState>,
+     positional_deletes: HashMap<String, PosDelState>,
+ }
+@@ -63,13 +75,55 @@
+ /// Action to take when trying to start loading a positional delete file
+ pub(crate) enum PosDelLoadAction {
+     /// The file is not loaded, the caller should load it.
+-    Load,
++    Load(PosDelLoadGuard),
++    /// The previous owner failed or was cancelled.
++    Failed(Error),
+     /// The file is already loaded, nothing to do.
+     AlreadyLoaded,
+     /// The file is currently being loaded by another task.
+     /// The caller *must* wait for this notifier to ensure data availability
+     /// before returning, as subsequent access (get_delete_vector) is synchronous.
+-    WaitFor(Arc<Notify>),
++    WaitFor(Pin<Box<OwnedNotified>>),
++}
++
++/// Owns a claimed positional load through opening, parsing and publication.
++/// Dropping a buffered future or cancelling its scan must also complete waiters.
++pub(crate) struct PosDelLoadGuard {
++    filter: DeleteFilter,
++    file_path: String,
++    finished: bool,
++}
++
++impl PosDelLoadGuard {
++    pub(crate) fn finish(mut self, vectors: HashMap<String, DeleteVector>) {
++        self.filter.finish_pos_del_load(&self.file_path, vectors);
++        self.finished = true;
++    }
++
++    pub(crate) fn fail(&mut self, error: Error) -> Error {
++        let error = Arc::new(error);
++        self.filter
++            .finish_pos_del_state(&self.file_path, PosDelState::Failed(error.clone()));
++        self.finished = true;
++        positional_load_error(error)
++    }
++}
++
++impl Drop for PosDelLoadGuard {
++    fn drop(&mut self) {
++        if !self.finished {
++            self.fail(Error::new(
++                ErrorKind::Unexpected,
++                "Positional delete load cancelled",
++            ));
++        }
++    }
++}
++
++fn positional_load_error(error: Arc<Error>) -> Error {
++    Error::new(error.kind(), "Positional delete load failed")
++        .with_retryable(error.retryable())
++        .with_source(error)
+ }
+ 
+ impl DeleteFilter {
+@@ -86,18 +140,38 @@
+         &self,
+         file_scan_task: &FileScanTask,
+     ) -> Option<Arc<Mutex<DeleteVector>>> {
+-        self.get_delete_vector_for_path(file_scan_task.data_file_path())
+-    }
+-
+-    /// Retrieve a delete vector for a data file
+-    pub(crate) fn get_delete_vector_for_path(
+-        &self,
+-        data_file_path: &str,
+-    ) -> Option<Arc<Mutex<DeleteVector>>> {
+-        self.state
+-            .read()
+-            .ok()
+-            .and_then(|st| st.delete_vectors.get(data_file_path).cloned())
++        let mut inputs = file_scan_task
++            .deletes
++            .iter()
++            .filter(|file| file.file_type == DataContentType::PositionDeletes)
++            .map(|file| file.file_path.clone())
++            .collect::<Vec<_>>();
++        inputs.sort_unstable();
++        inputs.dedup();
++        let path = file_scan_task.data_file_path();
++        let mut state = self.state.write().unwrap();
++        if let Some(cached) = state.delete_vectors.get(path)
++            && cached.inputs == inputs
++        {
++            return Some(cached.vector.clone());
++        }
++        let mut combined = None;
++        for input in &inputs {
++            if let Some(PosDelState::Loaded(vectors)) = state.positional_deletes.get(input)
++                && let Some(vector) = vectors.get(path)
++            {
++                *combined.get_or_insert_with(DeleteVector::default) |= vector;
++            }
++        }
++        let vector = Arc::new(Mutex::new(combined?));
++        state.delete_vectors.insert(
++            path.to_owned(),
++            CachedDeleteVector {
++                inputs,
++                vector: vector.clone(),
++            },
++        );
++        Some(vector)
+     }
+ 
+     pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Arc<Notify>> {
+@@ -126,8 +200,17 @@
+ 
+         if let Some(state) = state.positional_deletes.get(file_path) {
+             match state {
+-                PosDelState::Loaded => return PosDelLoadAction::AlreadyLoaded,
+-                PosDelState::Loading(notify) => return PosDelLoadAction::WaitFor(notify.clone()),
++                PosDelState::Loaded(_) => return PosDelLoadAction::AlreadyLoaded,
++                PosDelState::Failed(error) => {
++                    return PosDelLoadAction::Failed(positional_load_error(error.clone()));
++                }
++                PosDelState::Loading(notify) => {
++                    let mut notified = Box::pin(notify.clone().notified_owned());
++                    // Register while holding the state lock so completion
++                    // cannot be lost before the waiter is first polled.
++                    notified.as_mut().enable();
++                    return PosDelLoadAction::WaitFor(notified);
++                }
+             }
+         }
+ 
+@@ -136,16 +219,28 @@
+             .positional_deletes
+             .insert(file_path.to_string(), PosDelState::Loading(notifier));
+ 
+-        PosDelLoadAction::Load
++        PosDelLoadAction::Load(PosDelLoadGuard {
++            filter: self.clone(),
++            file_path: file_path.to_owned(),
++            finished: false,
++        })
+     }
+ 
+     /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
+-    pub(crate) fn finish_pos_del_load(&self, file_path: &str) {
++    pub(crate) fn finish_pos_del_load(
++        &self,
++        file_path: &str,
++        vectors: HashMap<String, DeleteVector>,
++    ) {
++        self.finish_pos_del_state(file_path, PosDelState::Loaded(vectors));
++    }
++
++    fn finish_pos_del_state(&self, file_path: &str, result: PosDelState) {
+         let notify = {
+             let mut state = self.state.write().unwrap();
+             if let Some(PosDelState::Loading(notify)) = state
+                 .positional_deletes
+-                .insert(file_path.to_string(), PosDelState::Loaded)
++                .insert(file_path.to_string(), result)
+             {
+                 Some(notify)
+             } else {
+@@ -162,22 +257,27 @@
+     pub(crate) async fn get_equality_delete_predicate_for_delete_file_path(
+         &self,
+         file_path: &str,
+-    ) -> Option<Predicate> {
+-        let notifier = {
+-            match self.state.read().unwrap().equality_deletes.get(file_path) {
+-                None => return None,
+-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
+-                Some(EqDelState::Loaded(predicate)) => {
+-                    return Some(predicate.clone());
++    ) -> Result<Option<Predicate>> {
++        loop {
++            let notified = {
++                match self.state.read().unwrap().equality_deletes.get(file_path) {
++                    None => return Ok(None),
++                    Some(EqDelState::Loading(notify)) => {
++                        let mut notified = Box::pin(notify.clone().notified_owned());
++                        // Register before releasing the lock to avoid losing completion.
++                        notified.as_mut().enable();
++                        notified
++                    }
++                    Some(EqDelState::Loaded(predicate)) => {
++                        return Ok(Some(predicate.clone()));
++                    }
++                    Some(EqDelState::Failed(error)) => {
++                        return Err(Error::new(error.kind(), "Equality delete load failed")
++                            .with_source(error.clone()));
++                    }
+                 }
+-            }
+-        };
+-
+-        notifier.notified().await;
+-
+-        match self.state.read().unwrap().equality_deletes.get(file_path) {
+-            Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
+-            _ => unreachable!("Cannot be any other state than loaded"),
++            };
++            notified.await;
+         }
+     }
+ 
+@@ -199,7 +299,7 @@
+ 
+             let Some(predicate) = self
+                 .get_equality_delete_predicate_for_delete_file_path(&delete.file_path)
+-                .await
++                .await?
+             else {
+                 return Err(Error::new(
+                     ErrorKind::Unexpected,
+@@ -222,46 +322,43 @@
+         Ok(Some(bound_predicate))
+     }
+ 
+-    pub(crate) fn upsert_delete_vector(
+-        &mut self,
+-        data_file_path: String,
+-        delete_vector: DeleteVector,
+-    ) {
+-        let mut state = self.state.write().unwrap();
+-
+-        let Some(entry) = state.delete_vectors.get_mut(&data_file_path) else {
+-            state
+-                .delete_vectors
+-                .insert(data_file_path, Arc::new(Mutex::new(delete_vector)));
+-            return;
+-        };
+-
+-        *entry.lock().unwrap() |= delete_vector;
+-    }
+-
+     pub(crate) fn insert_equality_delete(
+         &self,
+         delete_file_path: &str,
+         eq_del: Receiver<Predicate>,
+     ) {
+-        let notify = Arc::new(Notify::new());
+-        {
++        let notify = {
+             let mut state = self.state.write().unwrap();
+-            state.equality_deletes.insert(
+-                delete_file_path.to_string(),
+-                EqDelState::Loading(notify.clone()),
+-            );
+-        }
++            // Preserve the notifier installed when this load was claimed.
++            if let Some(EqDelState::Loading(notify)) = state.equality_deletes.get(delete_file_path)
++            {
++                notify.clone()
++            } else {
++                let notify = Arc::new(Notify::new());
++                state.equality_deletes.insert(
++                    delete_file_path.to_string(),
++                    EqDelState::Loading(notify.clone()),
++                );
++                notify
++            }
++        };
+ 
+         let state = self.state.clone();
+         let delete_file_path = delete_file_path.to_string();
+         self.runtime.cpu().spawn(async move {
+-            let eq_del = eq_del.await.unwrap();
++            let result = match eq_del.await {
++                Ok(predicate) => EqDelState::Loaded(predicate),
++                Err(error) => EqDelState::Failed(Arc::new(
++                    Error::new(
++                        ErrorKind::Unexpected,
++                        "Equality delete load did not complete",
++                    )
++                    .with_source(error),
++                )),
++            };
+             {
+                 let mut state = state.write().unwrap();
+-                state
+-                    .equality_deletes
+-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
++                state.equality_deletes.insert(delete_file_path, result);
+             }
+             notify.notify_waiters();
+         });
+@@ -356,12 +453,11 @@
+             let pos_vals = pos_values.get(n - 1).unwrap();
+             let pos_col = Arc::new(Int64Array::from_iter_values(pos_vals.clone()));
+ 
+-            let positional_deletes_to_write =
+-                RecordBatch::try_new(positional_delete_schema.clone(), vec![
+-                    file_path_col.clone(),
+-                    pos_col.clone(),
+-                ])
+-                .unwrap();
++            let positional_deletes_to_write = RecordBatch::try_new(
++                positional_delete_schema.clone(),
++                vec![file_path_col.clone(), pos_col.clone()],
++            )
++            .unwrap();
+ 
+             let file = File::create(format!(
+                 "{}/pos-del-{}.parquet",
+--- a/src/arrow/caching_delete_file_loader.rs
++++ b/src/arrow/caching_delete_file_loader.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -23,7 +24,7 @@
+ use futures::{StreamExt, TryStreamExt};
+ use tokio::sync::oneshot::{Receiver, channel};
+ 
+-use super::delete_filter::{DeleteFilter, PosDelLoadAction};
++use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard};
+ use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
+ use crate::arrow::scan_metrics::ScanMetrics;
+ use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
+@@ -56,7 +57,7 @@
+     ExistingEqDel,
+     ExistingPosDel,
+     PosDels {
+-        file_path: String,
++        load: PosDelLoadGuard,
+         stream: ArrowRecordBatchStream,
+     },
+     FreshEqDel {
+@@ -70,7 +71,7 @@
+ // results are fully merged into the DeleteFileManager's state
+ enum ParsedDeleteFileContext {
+     DelVecs {
+-        file_path: String,
++        load: PosDelLoadGuard,
+         results: HashMap<String, DeleteVector>,
+     },
+     EqDel,
+@@ -170,7 +171,7 @@
+         delete_file_entries: &[FileScanTaskDeleteFile],
+         schema: SchemaRef,
+     ) -> Receiver<Result<DeleteFilter>> {
+-        let (tx, rx) = channel();
++        let (mut tx, rx) = channel();
+ 
+         let stream_items = delete_file_entries
+             .iter()
+@@ -190,7 +191,6 @@
+         let basic_delete_file_loader = self.basic_delete_file_loader.clone();
+         self.runtime.io().spawn(async move {
+             let result = async move {
+-                let mut del_filter = del_filter;
+                 let basic_delete_file_loader = basic_delete_file_loader.clone();
+ 
+                 let mut results_stream = task_stream
+@@ -213,20 +213,28 @@
+ 
+                 while let Some(item) = results_stream.next().await {
+                     let item = item?;
+-                    if let ParsedDeleteFileContext::DelVecs { file_path, results } = item {
+-                        for (data_file_path, delete_vector) in results.into_iter() {
+-                            del_filter.upsert_delete_vector(data_file_path, delete_vector);
+-                        }
++                    if let ParsedDeleteFileContext::DelVecs { load, results } = item {
+                         // Mark the positional delete file as fully loaded so waiters can proceed
+-                        del_filter.finish_pos_del_load(&file_path);
++                        load.finish(results);
+                     }
+                 }
+ 
+                 Ok(del_filter)
++            };
++
++            // The receiver owns this task's lifetime, including while its caller
++            // opens the data file. Dropping a scan cancels all buffered loads.
++            let result = {
++                let closed = tx.closed();
++                futures::pin_mut!(closed, result);
++                match futures::future::select(closed, result).await {
++                    futures::future::Either::Left(_) => None,
++                    futures::future::Either::Right((result, _)) => Some(result),
++                }
++            };
++            if let Some(result) = result {
++                let _ = tx.send(result);
+             }
+-            .await;
+-
+-            let _ = tx.send(result);
+         });
+ 
+         rx
+@@ -239,24 +247,22 @@
+         schema: SchemaRef,
+     ) -> Result<DeleteFileContext> {
+         match task.file_type {
+-            DataContentType::PositionDeletes => {
++            DataContentType::PositionDeletes => loop {
+                 match del_filter.try_start_pos_del_load(&task.file_path) {
+-                    PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
+-                    PosDelLoadAction::WaitFor(notify) => {
+-                        // Positional deletes are accessed synchronously by ArrowReader.
+-                        // We must wait here to ensure the data is ready before returning,
+-                        // otherwise ArrowReader might get an empty/partial result.
+-                        notify.notified().await;
+-                        Ok(DeleteFileContext::ExistingPosDel)
++                    PosDelLoadAction::AlreadyLoaded => {
++                        return Ok(DeleteFileContext::ExistingPosDel);
+                     }
+-                    PosDelLoadAction::Load => Ok(DeleteFileContext::PosDels {
+-                        file_path: task.file_path.clone(),
+-                        stream: basic_delete_file_loader
++                    PosDelLoadAction::Failed(error) => return Err(error),
++                    PosDelLoadAction::WaitFor(notify) => notify.await,
++                    PosDelLoadAction::Load(mut load) => {
++                        let stream = basic_delete_file_loader
+                             .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
+-                            .await?,
+-                    }),
++                            .await
++                            .map_err(|error| load.fail(error))?;
++                        return Ok(DeleteFileContext::PosDels { load, stream });
++                    }
+                 }
+-            }
++            },
+ 
+             DataContentType::EqualityDeletes => {
+                 let Some(notify) = del_filter.try_start_eq_del_load(&task.file_path) else {
+@@ -298,10 +304,12 @@
+         match ctx {
+             DeleteFileContext::ExistingEqDel => Ok(ParsedDeleteFileContext::EqDel),
+             DeleteFileContext::ExistingPosDel => Ok(ParsedDeleteFileContext::ExistingPosDel),
+-            DeleteFileContext::PosDels { file_path, stream } => {
+-                let del_vecs = Self::parse_positional_deletes_record_batch_stream(stream).await?;
++            DeleteFileContext::PosDels { mut load, stream } => {
++                let del_vecs = Self::parse_positional_deletes_record_batch_stream(stream)
++                    .await
++                    .map_err(|error| load.fail(error))?;
+                 Ok(ParsedDeleteFileContext::DelVecs {
+-                    file_path,
++                    load,
+                     results: del_vecs,
+                 })
+             }
+@@ -714,9 +722,10 @@
+             Arc::new(arrow_schema::Schema::new(fields))
+         };
+ 
+-        let equality_deletes_to_write = RecordBatch::try_new(equality_delete_schema.clone(), vec![
+-            col_y, col_z, col_a, col_s, col_b,
+-        ])
++        let equality_deletes_to_write = RecordBatch::try_new(
++            equality_delete_schema.clone(),
++            vec![col_y, col_z, col_a, col_s, col_b],
++        )
+         .unwrap();
+ 
+         let path = format!("{}/equality-deletes-1.parquet", &table_location);
+@@ -928,12 +937,11 @@
+         let file_path_col = Arc::new(StringArray::from_iter_values(&file_path_values));
+         let pos_col = Arc::new(Int64Array::from_iter_values(vec![0i64, 1, 2, 3]));
+ 
+-        let positional_deletes_to_write =
+-            RecordBatch::try_new(positional_delete_schema.clone(), vec![
+-                file_path_col,
+-                pos_col,
+-            ])
+-            .unwrap();
++        let positional_deletes_to_write = RecordBatch::try_new(
++            positional_delete_schema.clone(),
++            vec![file_path_col, pos_col],
++        )
++        .unwrap();
+ 
+         let props = WriterProperties::builder()
+             .set_compression(Compression::SNAPPY)
+--- a/src/delete_vector.rs
++++ b/src/delete_vector.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -142,6 +143,12 @@
+     }
+ }
+ 
++impl BitOrAssign<&DeleteVector> for DeleteVector {
++    fn bitor_assign(&mut self, other: &DeleteVector) {
++        self.inner.bitor_assign(&other.inner);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;

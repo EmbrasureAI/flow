@@ -1,0 +1,36 @@
+diff --git a/vendor/iceberg-catalog-rest/src/catalog.rs b/vendor/iceberg-catalog-rest/src/catalog.rs
+index aa8a801..8d8642b 100644
+--- a/vendor/iceberg-catalog-rest/src/catalog.rs
++++ b/vendor/iceberg-catalog-rest/src/catalog.rs
+@@ -150,7 +150,7 @@ impl RestCatalogBuilder {
+ }
+ 
+ /// Rest catalog configuration.
+-#[derive(Clone, Debug, TypedBuilder)]
++#[derive(Clone, TypedBuilder)]
+ pub(crate) struct RestCatalogConfig {
+     #[builder(default, setter(strip_option))]
+     name: Option<String>,
+@@ -167,6 +167,22 @@ pub(crate) struct RestCatalogConfig {
+     client: Option<Client>,
+ }
+ 
++/// Properties carry the OAuth credential, bearer token and storage secrets, so
++/// debug output names the configured keys without their values.
++impl std::fmt::Debug for RestCatalogConfig {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let props: std::collections::BTreeMap<_, _> =
++            self.props.keys().map(|key| (key, "<redacted>")).collect();
++        f.debug_struct("RestCatalogConfig")
++            .field("name", &self.name)
++            .field("uri", &self.uri)
++            .field("warehouse", &self.warehouse)
++            .field("props", &props)
++            .field("client", &self.client)
++            .finish()
++    }
++}
++
+ impl RestCatalogConfig {
+     fn url_prefixed(&self, parts: &[&str]) -> String {
+         [&self.uri, PATH_V1]

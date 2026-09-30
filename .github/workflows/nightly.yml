@@ -1,0 +1,142 @@
+name: Nightly endurance
+# Long randomized crash loop and a steady-state soak against disposable
+# services. Each run prints its seed; rerun a failure with the same seed via
+# workflow_dispatch or locally (tests/production/FAULTS.md).
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Crash-loop seed to reproduce (blank for a new one)
+        required: false
+      postgres:
+        description: PostgreSQL image version
+        required: false
+        default: '18.6'
+permissions:
+  contents: read
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install build dependencies from Ubuntu repositories
+        run: |
+          sudo apt-get update -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
+          sudo apt-get install -y clang libclang-dev cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1 (master); the toolchain input selects Rust
+        with:
+          toolchain: '1.97.1'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: postgres
+      - name: Build the daemon
+        run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon --bin embrasure-flow
+      - name: Build MinIO fixture images
+        run: |
+          docker build -f tests/production/Dockerfile.minio --target server -t flow-test-minio:RELEASE.2025-04-22T22-12-26Z tests/production
+          docker build -f tests/production/Dockerfile.minio --target client -t flow-test-mc:RELEASE.2025-04-16T18-13-26Z tests/production
+          docker save -o "$RUNNER_TEMP/minio-images.tar" flow-test-minio:RELEASE.2025-04-22T22-12-26Z flow-test-mc:RELEASE.2025-04-16T18-13-26Z
+          tar -cf "$RUNNER_TEMP/daemon.tar" target/debug/embrasure-flow
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-inputs
+          path: |
+            ${{ runner.temp }}/minio-images.tar
+            ${{ runner.temp }}/daemon.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  endurance:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [crash-loop, soak]
+    env:
+      COMPOSE_PROJECT_NAME: flow-nightly
+      COMPOSE_FILE: tests/production/compose.yaml
+      FLOW_POSTGRES_IMAGE: postgres:${{ github.event.inputs.postgres || '18.6' }}-bookworm
+      FLOW_PRODUCTION_PG_CPUS: '2'
+      FLOW_PRODUCTION_PGDATA: /var/lib/postgresql/flow
+      # Throwaway credentials for the local MinIO container used only in CI.
+      AWS_ACCESS_KEY_ID: demo-access
+      AWS_SECRET_ACCESS_KEY: demo-secret-key
+      AWS_REGION: us-east-1
+      RUST_LOG: info
+      SEED: ${{ github.event.inputs.seed }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nightly-inputs
+          path: ${{ runner.temp }}/nightly-inputs
+      - name: Unpack the daemon and load MinIO fixture images
+        run: |
+          tar -xf "$RUNNER_TEMP/nightly-inputs/daemon.tar"
+          docker load -i "$RUNNER_TEMP/nightly-inputs/minio-images.tar"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - name: Select free service ports
+        run: |
+          python3 - <<'PY'
+          import contextlib
+          import os
+          import socket
+          with contextlib.ExitStack() as sockets, open(os.environ["GITHUB_ENV"], "a") as env:
+              for service in ("PG", "S3", "REST"):
+                  listener = sockets.enter_context(socket.socket())
+                  listener.bind(("127.0.0.1", 0))
+                  env.write(f"FLOW_PRODUCTION_{service}_PORT={listener.getsockname()[1]}\n")
+          PY
+      - name: Start disposable services
+        run: |
+          docker compose pull --ignore-buildable
+          docker compose build rest
+          docker compose up -d --no-build --pull never --wait --wait-timeout 180
+          {
+            echo "FLOW_POSTGRES_URL=postgres://flow:local-test-password@127.0.0.1:$(docker compose port postgres 5432 | cut -d: -f2)/flow?sslmode=disable"
+            echo "FLOW_REST_URL=http://127.0.0.1:$(docker compose port rest 8181 | cut -d: -f2)"
+            echo "FLOW_S3_URL=http://127.0.0.1:$(docker compose port minio 9000 | cut -d: -f2)"
+          } >> "$GITHUB_ENV"
+      - name: One-hour randomized crash loop
+        if: matrix.run == 'crash-loop'
+        run: >-
+          uv run tests/production/crash_loop.py --duration 3600 --timeout 600
+          ${SEED:+--seed "$SEED"}
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow --audit-snapshots 32
+          --artifacts "$RUNNER_TEMP/nightly-crash-loop"
+      - name: Thirty-minute soak with resource-growth checks
+        if: matrix.run == 'soak'
+        run: >-
+          uv run tests/production/soak.py --duration 1800
+          ${SEED:+--seed "$SEED"}
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/nightly-soak"
+      - name: Service logs
+        if: always()
+        run: docker compose logs --no-color > "$RUNNER_TEMP/service-containers.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: nightly-${{ matrix.run }}
+          path: |
+            ${{ runner.temp }}/nightly-*/report.json
+            ${{ runner.temp }}/nightly-*/*.log
+            ${{ runner.temp }}/nightly-*/*.jsonl
+            ${{ runner.temp }}/nightly-*/*metadata.json
+            ${{ runner.temp }}/nightly-*/state/status.json
+            ${{ runner.temp }}/service-containers.log
+      - name: Remove disposable services
+        if: always()
+        run: docker compose down -v

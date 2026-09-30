@@ -1,0 +1,39 @@
+[package]
+name = "flow-coordinator"
+description = "CDC ingestion and commit coordination for Embrasure Flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flow-model.workspace = true
+flow-state-store.workspace = true
+flow-materializer.workspace = true
+flow-iceberg-ext.workspace = true
+flow-ingress-journal.workspace = true
+flow-pg-source.workspace = true
+flow-compactor.workspace = true
+flow-catalog-watch.workspace = true
+iceberg.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+futures.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+tracing-subscriber.workspace = true
+opendal = { version = "=0.57.0", default-features = false }
+
+[lints]
+workspace = true
