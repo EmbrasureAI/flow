@@ -312,6 +312,9 @@ class CrashLoop(Run):
     def configure(self):
         super().configure()
         self.environment["RUST_LOG"] = "info"
+        # The base fixture forces a rewrite after almost every epoch. Keep
+        # compaction running beside the crashes without it dominating recovery.
+        self.set_compaction_policy({"deleted_rows_percent": 10, "delete_files_soft": 16, "delete_files_hard": 64})
         text = self.config.read_text()
         for name, columns in (
             ("events", [("id", "Int64", False), ("writer", "Int32", False), ("version", "Int64", True),

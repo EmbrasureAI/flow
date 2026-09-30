@@ -66,7 +66,11 @@ uv run tests/local/v3_reader.py target/v3-reader
 ```
 
 This checks user rows after cumulative deletes, compaction and a v2-to-v3
-upgrade; the Rust tests also check row lineage. The independent Spark lineage
+upgrade; the Rust tests also check row lineage. The service CI also runs the fault suite
+and the Spark, Trino and DuckDB reader suite against v3 targets on PostgreSQL 18.
+Spark `rewrite_position_delete_files` does not apply to deletion vectors, and
+Spark `rewrite_manifests` on a v3 target currently stops the daemon during
+external-change reconciliation, so the v3 reader run omits both. The independent Spark lineage
 check above is recorded manual validation, not part of this CI job.
 
 The [v3 service benchmark](benchmarks/v3-deletion-vectors.md)
