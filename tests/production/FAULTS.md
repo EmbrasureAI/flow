@@ -38,7 +38,7 @@ The fixture's JDBC catalog shares the PostgreSQL server. After a PostgreSQL rest
 
 Artifacts include `report.json`, daemon and compactor logs, a JSONL catalog-proxy request trace, Compose actions, catalog metadata copies, and durable daemon state. Service restoration is attempted in `finally` blocks. Containers and volumes remain available for inspection after the script exits. `proxy.py` exposes no network fault-control API; its control state is available only inside the local test process.
 
-`--format-version 3` runs the same phases against Iceberg v3 targets (deletion vectors; the manifest audit checks one live vector per data file). `--ack-mode journaled` declares independent journal storage and replaces the "ACK behind the barrier" checks with "ACK never past the durable journal"; the recovery and exactly-once checks are unchanged. CI runs both variants on PostgreSQL 18 (journaled also on 14). With `--format-version 3` the wide-row phase is currently skipped (known issue: after the v3 index rebuild the daemon can stop with "data file is not live"; the fix is tracked separately).
+`--format-version 3` runs the same phases against Iceberg v3 targets (deletion vectors; the manifest audit checks one live vector per data file). `--ack-mode journaled` declares independent journal storage and replaces the "ACK behind the barrier" checks with "ACK never past the durable journal"; the recovery and exactly-once checks are unchanged. CI runs both variants on PostgreSQL 18 (journaled also on 14).
 
 ## Randomized crash loop
 

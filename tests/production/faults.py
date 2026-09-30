@@ -495,14 +495,7 @@ class FaultRun(Run):
             # Keep one graceful pause across the adjacent forced-success checks;
             # do not signal a newly started compactor before its handler is ready.
             self.start_compactor()
-            if self.args.format_version >= 3:
-                known = ("known issue: v3 index rebuild 'data file is not live' (snapshot.rs:245), "
-                         "fix tracked in a separate PR")
-                print(f"[wide-rows-and-unchanged-toast] skipped: {known}", flush=True)
-                self.report.setdefault("skipped_phases", []).append(
-                    {"name": "wide-rows-and-unchanged-toast", "reason": known})
-            else:
-                self.phase("wide-rows-and-unchanged-toast", self.wide_rows)
+            self.phase("wide-rows-and-unchanged-toast", self.wide_rows)
             self.phase("independent-reader-and-manifest-audit", self.final_audit)
             self.stop_compactor()
             self.stop()
