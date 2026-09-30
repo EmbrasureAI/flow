@@ -49,11 +49,11 @@ columns = [
 ]
 ```
 
-These use the existing model `String` value and Iceberg string type. RocksDB,
-spooled row serialization, key encoding, writer and compactor formats do not
-change. Existing configurations with native `Uuid` still decode/write native
-UUIDs; do not change the representation of an initialized table in place. New
-nullable UUID columns inferred during schema evolution use strings.
+These use the model's `String` value and Iceberg string type. Discovery and
+schema evolution always map UUID columns to `String`. A column explicitly
+configured as `data_type = "Uuid"` is also accepted and writes the native
+Iceberg `uuid` type, which some engines, such as Athena, do not support. Do not
+change the representation of an initialized table in place.
 
 ## Value semantics
 
@@ -162,7 +162,8 @@ or wire traffic. The source message size limit still applies before projection.
 Explicit selection is immutable after initialization. New unselected columns
 remain excluded. Changes to excluded columns can continue when PostgreSQL does
 not rewrite the heap. Selected column drops, renames, replacements, incompatible
-type changes, or heap rewrites stop capture rather than guessing a new mapping.
+type changes, or heap rewrites block the table (`source_schema_incompatible`)
+rather than guessing a new mapping.
 Changing the selection or recovering from such a change requires a fresh source
 slot, state directory, and empty target generation; retain the prior target until
 the new snapshot and subsequent CDC are verified and downstream routing switches.

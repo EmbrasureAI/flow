@@ -120,6 +120,7 @@ jobs:
       FLOW_POSTGRES_IMAGE: postgres:${{ matrix.postgres }}-bookworm
       FLOW_PRODUCTION_PG_CPUS: '2'
       FLOW_PRODUCTION_PGDATA: /var/lib/postgresql/flow
+      # Throwaway credentials for the local MinIO container used only in CI.
       AWS_ACCESS_KEY_ID: demo-access
       AWS_SECRET_ACCESS_KEY: demo-secret-key
       AWS_REGION: us-east-1
@@ -363,7 +364,7 @@ jobs:
         run: >-
           uv run tests/local/default_identity.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow --product-preflight skip
+          --binary target/debug/embrasure-flow
           --artifacts "$RUNNER_TEMP/service-default-identity"
       - name: Crash recovery with journaled acknowledgement
         if: matrix.suite == 'isolation'
@@ -425,6 +426,7 @@ jobs:
       FLOW_POSTGRES_IMAGE: pgvector/pgvector:0.8.0-pg17-bookworm
       FLOW_PRODUCTION_PG_CPUS: '2'
       FLOW_PRODUCTION_PGDATA: /var/lib/postgresql/flow
+      # Throwaway credentials for the local MinIO container used only in CI.
       AWS_ACCESS_KEY_ID: demo-access
       AWS_SECRET_ACCESS_KEY: demo-secret-key
       AWS_REGION: us-east-1

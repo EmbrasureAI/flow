@@ -32,4 +32,4 @@ The automated packaging check builds the images, creates a separate project with
 python3 demo/validate.py --artifacts target/production-linux-demo-01
 ```
 
-This complete Linux container check passed locally. Independent Spark and Trino interoperability, including Spark's three maintenance procedures followed by CDC, is covered by the [reader suite](../tests/production/reader_fixtures/README.md). These are correctness checks; they do not qualify production throughput or latency.
+Independent Spark and Trino interoperability, including Spark's three maintenance procedures followed by CDC, is covered by the [reader suite](../tests/production/reader_fixtures/README.md). These are correctness checks; they do not qualify production throughput or latency.

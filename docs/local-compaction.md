@@ -100,10 +100,9 @@ the connection. The shared driver keeps worker-created connections and retry
 timers alive between jobs and after main-runtime shutdown. Connections opened on
 the main runtime can still require normal retry when that runtime stops. None of
 this retires BUILD or substitutes for an actual worker join; bounded process
-shutdown and restart recovery remain unchanged. The actual pooled-HTTP regression
-holds a request across the first worker's completion and parent shutdown, then
-releases the response and joins the surviving worker. It fails with the former
-temporary-runtime helper and passes with the shared driver.
+shutdown and restart recovery still apply. The pooled-HTTP regression test holds
+a request across the first worker's completion and parent shutdown, then
+releases the response and joins the surviving worker.
 
 ## Bounded delete dependencies
 

@@ -47,7 +47,7 @@ This removes container writable layers. Add `--volumes` to also remove this fixt
 7. `SIGKILL` of the daemon, committed WAL backlog while it is down, and restart using the same journal, RocksDB state, and logical slot.
 8. Real compaction commits, unchanged live rows, retained historical snapshot reads, and retirement of positional delete files.
 9. Native Avro manifest checks across retained snapshots: unique operation IDs, unique live file references, correct data/file sequence numbers, and sorted unique positional deletes pointing within live data files.
-10. Fail-closed handling of unsupported `TRUNCATE`: nonzero daemon exit, unchanged target snapshots, and no source acknowledgment past the unsupported transaction.
+10. Per-table handling of unsupported `TRUNCATE`: only the truncated table is blocked with `source_schema_incompatible`, its target snapshot is unchanged, healthy tables continue, and the source acknowledgment does not pass the unsupported transaction.
 
 Every phase records its duration and evidence. `report.json`, catalog metadata snapshots, generated configuration, initial-copy logs, daemon logs, and the durable local state are retained. The generated configuration references PostgreSQL credentials through an environment variable.
 

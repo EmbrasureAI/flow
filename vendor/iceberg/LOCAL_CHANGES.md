@@ -54,7 +54,8 @@ manifests. The patch adds `crc32fast` and `lz4_flex` as direct dependencies;
 both were already dependencies in the workspace lockfile. See
 `docs/patches/iceberg-v3.patch` for the complete file list and changes.
 
-From an extracted crate, apply these repository patches (use absolute patch paths):
+From an extracted crate, apply these repository patches in order (use absolute
+patch paths):
 
 ```sh
 patch -p1 < docs/patches/iceberg-table-commit.patch
@@ -62,18 +63,22 @@ patch -p1 < docs/patches/iceberg-delete-cache.patch
 patch -p1 < docs/patches/iceberg-parquet-row-group.patch
 patch -p1 < docs/patches/iceberg-uuid.patch
 patch -p1 < docs/patches/iceberg-v3.patch
+patch -p1 < docs/patches/iceberg-source-nullability.patch
 patch -p1 < docs/patches/iceberg-debug-redaction.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is
 added separately. The crate's original Cargo.lock is omitted because the repository
-uses its root Cargo.lock. No upstream submission is claimed.
+uses its root Cargo.lock. `Cargo.toml.orig` is left as upstream published it; the
+v3 patch's dependency additions apply only to the normalized `Cargo.toml` that
+Cargo builds from. No upstream submission is claimed.
 
 The source-nullability patch adds a root-field `make_column_optional(field_id)`
 schema action. It preserves IDs/types/defaults and rejects identifier fields,
 missing fields and nested paths. Existing current-schema requirements still
 fence concurrent catalog schema edits. Changed file:
-`src/transaction/update_schema.rs`.
+`src/transaction/update_schema.rs`. See
+`docs/patches/iceberg-source-nullability.patch`.
 
 `StorageConfig` formats its properties in `Debug` output as key names with
 redacted values, since they carry object-store credentials; `FileIO` and

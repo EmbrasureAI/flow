@@ -262,7 +262,7 @@ Each durable index transition is synced before the control store records it,
 so a host crash or power loss does not by itself force a rebuild. A rebuild
 first removes `index-<uuid>` candidate and `.scratch` directories left by
 interrupted rebuild attempts under `state_dir/index-generations`, keeping the
-selected generation; other entries and a legacy `state_dir/index` are left
+selected generation; other entries and the initial `state_dir/index` are left
 alone until a rebuilt generation is activated.
 
 ### Open files
@@ -282,7 +282,10 @@ Flow compacts data and deletes, rewrites manifests, expires snapshots after
 and at most about `limits.snapshot_max_count`) and removes files it wrote once
 nothing retains them. A metadata maintenance failure affects only its table:
 it is logged as `metadata_maintenance_failed` and retried with backoff while
-CDC continues. It does not delete files it did not register: data written by
+CDC continues. After five consecutive failures of the same task, Flow logs
+`metadata_maintenance_failing` at ERROR and sets
+`flow_table_maintenance_failing{table_id,task}` to 1 until the task succeeds;
+such a table needs attention. It does not delete files it did not register: data written by
 other engines, their failed writes and catalog files outside Flow's records are
 not Flow's to remove. If other writers commit to the same tables, give their
 orphan-file cleanup to that engine's maintenance, using a conservative age

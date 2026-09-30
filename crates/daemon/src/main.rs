@@ -74,7 +74,7 @@ enum Command {
     /// Read the latest local service status without opening its state database.
     /// Exits 0 when ready and 3 when not ready.
     Status,
-    /// Adopt legacy catalog JSON into grace-delayed GC while the source is paused.
+    /// Adopt catalog metadata JSON that Flow did not register into grace-delayed GC; run while the daemon is stopped.
     MetadataImport {
         /// NDJSON entries containing table_uuid and path; inventory is operator supplied.
         #[arg(long)]

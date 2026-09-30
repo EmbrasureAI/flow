@@ -347,7 +347,7 @@ mod rest_tests {
                 let (status, body) = if line.starts_with("POST /v1/oauth/tokens ") {
                     (
                         "200 OK",
-                        r#"{"access_token":"private-token","token_type":"bearer"}"#,
+                        r#"{"access_token":"FAKE_ACCESS_TOKEN","token_type":"bearer"}"#,
                     )
                 } else if line.starts_with("GET /v1/config ") {
                     ("200 OK", r#"{"defaults":{},"overrides":{}}"#)
@@ -406,7 +406,11 @@ mod rest_tests {
             ),
             "{text}"
         );
-        assert!(!text.contains("private-") && !text.contains(&address.to_string()));
+        assert!(
+            !text.contains("private-")
+                && !text.contains("FAKE_ACCESS_TOKEN")
+                && !text.contains(&address.to_string())
+        );
     }
     #[tokio::test]
     async fn rest_response_errors_omit_secrets_even_from_serde_messages() {

@@ -559,7 +559,7 @@ impl TableMaintenance {
                     .artifacts
                     .path(ordinal)
                     .expect("validated range");
-                // Adopted pre-registry JSON has unknown readers: full grace.
+                // Adopted unregistered JSON has unknown readers: full grace.
                 let grace = millis(if is_metadata_json(&path) && !adopted {
                     policy.metadata_grace
                 } else {

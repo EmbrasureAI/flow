@@ -236,7 +236,7 @@ async fn scenario(url: &str, sql: &Client, label: &str, change: &str) {
                 materialized(&config, "orders") > orders_before
             })
             .await;
-            // The product derives freshness from this global watermark.
+            // Freshness monitoring derives from this global watermark.
             until(
                 "status watermarks.materialized_lsn advances past the blocked table",
                 || async {

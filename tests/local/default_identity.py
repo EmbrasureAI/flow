@@ -5,8 +5,8 @@
 # ///
 """DEFAULT replica identity qualification against disposable services.
 
-Runs standalone (CI, local Compose) or inside the product runner image built by
-default_identity.sh, which additionally runs the product's CDC preflight.
+Runs against any disposable PostgreSQL/REST/MinIO services, such as the local
+or production Compose fixtures.
 """
 import argparse
 import json
@@ -20,12 +20,6 @@ import traceback
 from types import SimpleNamespace
 
 from run import Run, dump, lsn
-
-try:
-    # Present only in the product runner image; the engine checks run without it.
-    from src.services.warehouse_ingestion_runtime import _cdc_preflight_report
-except ImportError:
-    _cdc_preflight_report = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'production'))
 from proxy import CatalogProxy
@@ -70,22 +64,6 @@ class DefaultRun(Run):
         self.pg.execute("INSERT INTO projected VALUES (1,10,repeat('excluded',10000))")
         self.pg.execute(f'CREATE PUBLICATION {self.name} FOR TABLE orders, accounts, projected')
         return {'server_version_num': self.pg.execute("SHOW server_version_num").fetchone()[0]}
-
-    def product_preflight(self):
-        tables = [dict(source_schema=self.name, source_table=name, primary_key_columns=key,
-                       selected_columns=selected)
-                  for name,key,selected in [('orders',['id','tenant'],[]), ('accounts',['id'],[]),
-                                            ('projected',['id'],['id','body']), ('rejected',['id'],[])]]
-        report = _cdc_preflight_report(database_url=self.args.postgres_url, tables=tables, ingestion_engine='embrasure_flow')
-        dump(self.directory / 'product-preflight.json', report)
-        for item in report['tables']:
-            errors = item.get('blocking_reasons', [])
-            name = item['identity']['source_table']
-            identity_errors = [e for e in errors if e['code'] == 'warehouse_flow_replica_identity_required']
-            assert bool(identity_errors) == (name == 'rejected'), (name, errors)
-            if name == 'rejected':
-                assert 'body' in identity_errors[0]['message'] and 'rejected' in identity_errors[0]['message']
-        return report
 
     def compare(self, phase):
         results = {}
@@ -264,9 +242,6 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
     def execute(self):
         try:
             self.phase('seed',self.seed)
-            if self.args.product_preflight == 'require' or (
-                    self.args.product_preflight == 'auto' and _cdc_preflight_report is not None):
-                self.phase('real-product-preflight',self.product_preflight)
             self.phase('native-rejection',self.rejected_init)
             self.phase('snapshot-with-concurrent-writes',self.initialize)
             self.start()
@@ -288,22 +263,19 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
 
 
 def main():
-    # Defaults are the product runner container's service names (default_identity.sh).
+    # Same arguments as the sibling tests/local scripts (see README.md).
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--postgres-url', default=os.environ.get(
-        'FLOW_POSTGRES_URL', 'postgres://flow:local-test-password@postgres:5432/flow?sslmode=disable'))
-    parser.add_argument('--catalog-uri', default='http://rest:8181')
-    parser.add_argument('--s3-endpoint', default='http://minio:9000')
+    parser.add_argument('--postgres-url', default=os.environ.get('FLOW_POSTGRES_URL'))
+    parser.add_argument('--catalog-uri', required=True)
+    parser.add_argument('--s3-endpoint', required=True)
     parser.add_argument('--warehouse', default='s3://warehouse/')
-    parser.add_argument('--binary', type=Path, default=Path('/usr/local/bin/embrasure-flow'))
-    parser.add_argument('--artifacts', type=Path, default=Path('/artifacts'),
+    parser.add_argument('--binary', type=Path, default=Path('target/debug/embrasure-flow'))
+    parser.add_argument('--artifacts', type=Path, required=True,
                         help='new directory; the run and identity-change cases use subdirectories')
     parser.add_argument('--timeout', type=float, default=180)
-    parser.add_argument('--product-preflight', choices=('auto', 'require', 'skip'), default='auto',
-                        help='also check the product CDC preflight; auto runs it when importable')
     args = parser.parse_args()
-    if args.product_preflight == 'require' and _cdc_preflight_report is None:
-        parser.error('the product CDC preflight is not importable here')
+    if not args.postgres_url:
+        parser.error('provide --postgres-url or FLOW_POSTGRES_URL')
     for case, identity_only in (('run', False), ('identity-change', True)):
         DefaultRun(SimpleNamespace(**(vars(args) | {'artifacts': args.artifacts / case,
                                                     'identity_only': identity_only}))).execute()

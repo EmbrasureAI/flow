@@ -1,4 +1,4 @@
-//! Operator adoption of pre-registry catalog JSON. Normal GC owns deletion.
+//! Operator adoption of catalog JSON that Flow did not register. Normal GC owns deletion.
 use crate::{bootstrap, config::Config, services};
 use anyhow::{Context, Result, ensure};
 use flow_state_store::ControlStore;

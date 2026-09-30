@@ -18,9 +18,9 @@ PostgreSQL references: [TOAST storage](https://www.postgresql.org/docs/16/storag
 and [logical message formats](https://www.postgresql.org/docs/16/protocol-logicalrep-message-formats.html).
 
 The engine checks this rule during source/schema validation, including snapshot,
-reconnect and relation changes. Product preflight uses the same resolved type
-rule. NOTHING and USING INDEX are not enabled. Append-only behavior is unchanged.
-No source DDL or ingestion-mode changes are performed by the implementation.
+reconnect and relation changes. NOTHING and USING INDEX are not enabled.
+Append-only behavior is unchanged. No source DDL or ingestion-mode changes are
+performed by the implementation.
 
 Key tuples retain relation column positions: only primary-key fields are decoded,
 in configured key order. Non-key NULL placeholders never become replacement
@@ -35,42 +35,20 @@ quarantined/unapplied changes; the ingress journal may safely retain later WAL.
 
 `default_identity.py` runs against any disposable PostgreSQL/REST/MinIO
 services, such as the local or production Compose fixtures. CI runs it on
-PostgreSQL 14 and 18:
+PostgreSQL 14 and 18. With the [local Compose fixture](README.md#run) running
+and its `AWS_*` and `FLOW_POSTGRES_URL` variables exported:
 
 ```sh
-uv run tests/local/default_identity.py --catalog-uri "$FLOW_REST_URL" \
-  --s3-endpoint "$FLOW_S3_URL" --binary target/debug/embrasure-flow \
-  --product-preflight skip --artifacts /tmp/new-default-identity-run
+uv run tests/local/default_identity.py \
+  --catalog-uri "http://$(docker compose -f tests/local/compose.yaml port rest 8181)" \
+  --s3-endpoint "http://$(docker compose -f tests/local/compose.yaml port minio 9000)" \
+  --binary target/debug/embrasure-flow --artifacts /tmp/new-default-identity-run
 ```
 
-It creates `run/` and `identity-change/` below the artifact directory. The product
-CDC preflight phase runs only where the product runner package is importable.
-
-## Repeatable local qualification
-
-From the **internal engine worktree** matching the product's local source pin:
-
-```sh
-tests/local/default_identity.sh /absolute/path/to/embrasure-product /tmp/new-default-cdc-run
-```
-
-Requires Docker Compose. The script builds the product's pinned engine with its
-production Dockerfile and jemalloc feature, builds its actual runner image, then
-adds only test reader dependencies in a separate layer. The product source pin
-must point to a commit available in this checkout. This never fetches an
-unmodified engine image as a substitute for the changed source.
-
-The fixture uses PostgreSQL 16 logical replication, MinIO, Apache Iceberg REST
-and stock DuckDB Iceberg scans. Real product catalog discovery/preflight runs
-inside the runner image. Engine lifecycle is driven directly by the test; hosted
-API authentication, Temporal scheduling and managed repository persistence are
-not part of this qualification. Existing product unit tests cover the unchanged
-supervisor/configuration path separately.
-
-Each run creates a unique Compose project with dynamically allocated host ports.
-It removes only that project's containers/volumes on exit, retaining reports,
-logs, source revisions/diffs, image identities and the daemon's persisted state
-in the supplied new artifact directory. It does not deploy, push or publish.
+It creates `run/` and `identity-change/` below the artifact directory, which
+must be new. Reports, logs and the daemon's persisted state are retained there.
+The fixture uses PostgreSQL logical replication, MinIO, Apache Iceberg REST and
+stock DuckDB Iceberg scans; the test drives the daemon lifecycle directly.
 
 Coverage includes exact snapshot-to-CDC convergence during writes, composite
 keys in non-attribute order, old-key moves, repeated row changes within/across

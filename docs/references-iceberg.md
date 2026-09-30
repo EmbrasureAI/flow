@@ -8,29 +8,44 @@ with its Apache license, NOTICE, provenance, and tests intact.
 The [0.10.1 transaction API](https://rust.iceberg.apache.org/api/iceberg/transaction/index.html)
 has fast append but lacks RowDelta and RewriteFiles. Its action trait and
 `TableCommit` construction are private. The local
-[upstream patch](patches/iceberg-table-commit.patch) exposes the existing typed
-commit builder, adds snapshot-reference accessors, and allows expiration to
-protect explicit snapshots and a minimum reader window. Publication preserves
-the user's main-branch retention policy. This is a small extension seam, not
-a replacement Iceberg metadata implementation. No upstream submission has
-been made.
+[table-commit patch](patches/iceberg-table-commit.patch) exposes the existing
+typed commit builder, adds snapshot-reference accessors, and allows expiration
+to protect explicit snapshots and a minimum reader window. Publication preserves
+the user's main-branch retention policy. Flow's actions build on these entry
+points and Iceberg's own metadata types rather than replacing them.
 
-The separate [delete-cache patch](patches/iceberg-delete-cache.patch) fixes a
-reader sequence-isolation defect found by the integration suite. A shared
-delete file can contain positions for a data file newer than that delete's
-sequence. The planner correctly excludes that delete from the newer file's
-task, but the upstream cache previously merged positions globally by data path.
-The cache now retains input-delete identity and combines only the task's
-applicable inputs. It also registers positional-delete completion waiters before
-releasing the state lock. The complete stock-reader regression remains in the
-delete-rewrite integration suite.
+Other local patches to the vendored crates cover reader delete isolation
+(below), v3 deletion vectors and row lineage ([Iceberg v3](iceberg-v3.md)),
+Parquet row-group flushing and conservative file statistics, UUID schema round-trips,
+root-column nullability relaxation, REST catalog retry classification, metrics,
+`format-version` forwarding, HTTPS and OAuth token refresh, credential
+redaction in debug output and catalog diagnostics, an S3 operator cache that
+reuses credentials across file operations, and a frame-size limit in the
+PostgreSQL transport. The authoritative inventory, with provenance and replay
+order, is each vendored crate's `LOCAL_CHANGES.md`:
+[iceberg](../vendor/iceberg/LOCAL_CHANGES.md),
+[iceberg-catalog-rest](../vendor/iceberg-catalog-rest/LOCAL_CHANGES.md),
+[iceberg-storage-opendal](../vendor/iceberg-storage-opendal/LOCAL_CHANGES.md)
+and [tokio-postgres](../vendor/tokio-postgres/LOCAL_CHANGES.md).
 
-The [sequence-isolation patch series](patches/upstream/README.md) targets
-upstream commit `6fa8e03834dca17481441ec758afbbe12efc27f6` and includes a native
-Parquet regression. It adapts to upstream's newer V3 reader and excludes the
-already merged lost-wakeup fix. The series documents its base and reproduction
-commands. It does not alter the vendored runtime; no upstream submission has
-been made.
+The [delete-cache patch](patches/iceberg-delete-cache.patch) fixes a reader
+sequence-isolation defect. A shared delete file can contain positions for a
+data file newer than that delete's sequence. The planner correctly excludes
+that delete from the newer file's task, but the 0.10.1 cache merges positions
+globally by data path, so a delete loaded for one task can remove rows from
+another. The patched cache retains input-delete identity and combines only the
+task's applicable inputs. It also registers positional-delete completion
+waiters before releasing the state lock. The complete stock-reader regression
+is in the delete-rewrite integration suite.
+
+[`docs/patches/upstream/`](patches/upstream/README.md) holds the proposed
+upstream form of this fix, based on upstream commit
+`6fa8e03834dca17481441ec758afbbe12efc27f6`, with a native Parquet regression.
+It adapts to upstream's newer
+[V3 reader (#3035)](https://github.com/apache/iceberg-rust/pull/3035) and
+excludes the lost-wakeup fix upstream already merged in
+[#2859](https://github.com/apache/iceberg-rust/pull/2859). The series documents
+its base and reproduction commands. It does not alter the vendored runtime.
 
 ## Standards and reference behavior
 
@@ -215,9 +230,9 @@ running grace ends, or a recheck of a still-referenced object (half the
 record's age, between one minute and one hour, never longer than the grace).
 The queue is read only up to the time the sweep started, so a sweep stops at
 the first record that is not yet due. Its cost follows new registrations and
-due work, not the size of the registry. Queue keys stay in the `v2/` namespace;
-records from older releases, including random UUID keys, are read and migrated
-by the same sweep.
+due work, not the size of the registry. Queue keys use the `v2/` namespace;
+the same sweep reads and migrates records written by pre-release builds,
+including random UUID keys.
 
 Reachability comes from an in-memory index of the retained snapshots: each
 manifest list, manifest and live data/delete path, reference-counted by
@@ -232,8 +247,8 @@ budget checked after each chunk. All indexes share an estimated 128 MiB
 budget. Complete indexes of other tables are evicted least recently used
 first; while one table's index is being built, another partial build waits
 five minutes instead of evicting it. A table whose index alone exceeds the
-budget intersects each page's candidates with a full manifest walk, as earlier
-releases did, and retries the index after an hour.
+budget intersects each page's candidates with a full manifest walk and
+retries the index after an hour.
 
 Each object has one grace clock. It starts when a sweep first observes the
 object unreferenced by retained metadata and by protected operations, builds

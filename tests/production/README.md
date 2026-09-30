@@ -21,7 +21,7 @@ docker compose --env-file target/production-local/ports.env \
 
 The fixture keeps PostgreSQL and MinIO data in named volumes, enables PostgreSQL durability, and sets explicit CPU/memory budgets. The REST catalog uses a separate database on the same PostgreSQL server. Its image adds a checksum-pinned PostgreSQL JDBC driver to the Apache fixture. Consequently, a PostgreSQL restart also interrupts catalog storage; this is one machine's recovery test, not independent database failover.
 
-`FLOW_PRODUCTION_PGDATA` defaults to `/var/lib/postgresql/18/docker`, preserving existing PostgreSQL 18 volumes. Older-version fixtures can set it to `/var/lib/postgresql/flow`; keep it outside `/var/lib/postgresql/data`, which PostgreSQL 14–17 images mount as a separate anonymous volume. Use a separate project and volume for each major version; changing PGDATA is not a database upgrade.
+`FLOW_PRODUCTION_PGDATA` defaults to `/var/lib/postgresql/18/docker`, the PostgreSQL 18 image's default data directory. Older-version fixtures can set it to `/var/lib/postgresql/flow`; keep it outside `/var/lib/postgresql/data`, which PostgreSQL 14–17 images mount as a separate anonymous volume. Use a separate project and volume for each major version; changing PGDATA is not a database upgrade.
 
 Each retained run keeps a replication slot. The default capacity is 32; set
 `FLOW_PRODUCTION_REPLICATION_SLOTS=128` in the local environment file when keeping
@@ -422,10 +422,12 @@ resource-hours.
 
 The fixture compactor must retain SIGINT while it finishes an in-flight table
 pass. `compactor_shutdown.py` holds the second real catalog read after a completed
-pass and interval wait, sends SIGINT, then releases the read. The previous binary
-must demonstrate the lost signal by continuing another pass; the fixed binary
-must finish and exit 0. Both process results, binary hashes and proxy requests are
-retained. The negative-control process is killed only during owned cleanup.
+pass and interval wait, sends SIGINT, then releases the read. It is a regression
+check against pre-release (pre-0.1) development builds that lost this signal, so
+it needs such a `local_compactor` build supplied via `--previous-binary`: that
+build must demonstrate the lost signal by continuing another pass; the candidate
+binary must finish and exit 0. Both process results, binary hashes and proxy
+requests are retained. The negative-control process is killed only during owned cleanup.
 
 ```sh
 python3 tests/production/compactor_shutdown.py \
@@ -443,7 +445,10 @@ free proxy port and does not start ingestion or replace local state.
 
 ## Counted journal and ledger upgrade
 
-`journal_upgrade.py` runs COPY and CRUD with a legacy-format baseline binary, holds an actual catalog POST
+`journal_upgrade.py` validates upgrades from pre-release (pre-0.1) development
+builds that use the older journal and ledger format. It needs such a build supplied
+via `--previous-binary`; no released version uses that format. It runs COPY and
+CRUD with that build, holds an actual catalog POST
 after a multi-transaction epoch reaches Prepared, and retains additional
 two-table transactions in the journal and source ledger before SIGKILL. It
 starts the candidate on the same configuration, slot, control database and row index,
@@ -472,8 +477,7 @@ format recovery while compaction is disabled; it makes no latency claim. It uses
 free loopback proxy port and stops only its own processes, leaving service data
 and the original replication slot intact. After joining the old binary, the gate
 checks journal frame headers and CRCs for each retained backlog transaction and
-requires terminal kind 4. Supply a baseline built before counted journal and
-ledger formats were introduced; a current build cannot serve as that baseline.
+requires terminal kind 4. A current build cannot serve as the previous binary.
 The offline inspector opens a copy of the control store,
 decodes the matching ledger identities, and requires FLLEDG02 entries. Observed
 formats are retained in the report; two distinct current-format binaries fail this
@@ -634,7 +638,7 @@ cannot admit another build while its worker remains held.
 
 ```sh
 uv run tests/production/parallel_compaction.py \
-  --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+  --catalog-uri http://127.0.0.1:58181 --s3-endpoint http://127.0.0.1:59000 \
   --binary target/debug/embrasure-flow --artifacts target/service-parallel-compaction
 ```
 
@@ -652,7 +656,7 @@ exact final updates/deletes/key moves, ACK, and clean shutdown.
 
 ```sh
 uv run tests/production/periodic_maintenance.py \
-  --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+  --catalog-uri http://127.0.0.1:58181 --s3-endpoint http://127.0.0.1:59000 \
   --binary target/debug/embrasure-flow --artifacts target/service-periodic
 ```
 

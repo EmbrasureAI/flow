@@ -91,10 +91,10 @@ their original synthetic identities; duplicates are neither collapsed nor
 invented. This reuses the same prepared index transition and recovery fence as
 keyed reconciliation.
 
-New service data filenames carry `flow-l0-`, `flow-l1-`, or `flow-l2-` hints.
+Service data filenames carry `flow-l0-`, `flow-l1-`, or `flow-l2-` hints.
 These survive snapshot expiration and index rebuilding; file size alone does
-not demote a compacted idle file back to L0. Legacy service layouts remain
-recognized. Unknown external outputs start at L1, and undersized files outside
+not demote a compacted idle file back to L0. Data files written by pre-release
+builds are still classified. Unknown external outputs start at L1, and undersized files outside
 L0 still contribute to bounded file-count maintenance regardless of their level
 hint. A compacted singleton does not repeatedly rewrite just because it is small.
 
@@ -150,27 +150,24 @@ Current metadata and all catalog metadata-log entries are protected by GC; empty
 metadata logs (including Glue REST) do not disable cleanup. JSON-only registry pages
 avoid scanning manifests. `gc.enabled=false` disables all physical collection.
 
-New ownership records use `owned-artifacts/v2/`. The collector reads v1 and v2
-within the same bounded page and cursor. Old engines cannot safely classify JSON,
-so rollback must leave v2 records unread rather than delete their objects. After
-its first examination a record moves to the due queue
-`owned-artifacts/v2/{table}/~/{due_ms}-{id}` with an unchanged value, so a
-release that predates the queue still reads and conservatively collects it after
-a rollback. The sweep cursor moved to `artifact-gc/v2/`; each new sweep deletes
-the obsolete `artifact-gc/v1/` cursor. The record format and
-durable control/index ownership protocol are otherwise unchanged.
+Ownership records use `owned-artifacts/v2/`. After its first examination a
+record moves to the due queue `owned-artifacts/v2/{table}/~/{due_ms}-{id}` with
+an unchanged value, so a sweep reads new records and then only the due part of
+the queue rather than the whole registry. The sweep cursor is
+`artifact-gc/v2/`. `owned-artifacts/v1/` records written by pre-release builds
+are still read within the same bounded page and cursor.
 
-Pre-registry JSON can be adopted with `metadata-import --inventory <ndjson>` while
-the daemon is stopped and supervisor desired state is paused. Entries contain
-`table_uuid` and `path`. The command checks frozen source/table identities, flat
+`metadata-import --inventory <ndjson>` adopts catalog metadata JSON that Flow
+did not register, so ordinary collection can remove it once unreferenced. Run
+it while the daemon is stopped. Entries contain `table_uuid` and `path`. The command checks frozen source/table identities, flat
 metadata paths, each object's UUID/location/timestamp and a 16 MiB read limit.
 Without `--apply`, it only validates. Apply records ownership; collection gives
 adopted JSON the full `limits.orphan_grace_secs`, not the shorter metadata JSON
 grace, because secondary catalogs or readers may still use it by location. The
 grace starts when collection first observes the JSON unreferenced. Import never
-deletes objects or commits catalog changes. Import is
-idempotent and refuses a live daemon's state lock. Resume the normal source after
-bounded batches, keeping upstream WAL within its retention headroom.
+deletes objects or commits catalog changes. Import is idempotent and refuses a
+live daemon's state lock. Import in bounded batches and restart the daemon
+between them, keeping upstream WAL within its retention headroom.
 
 `flow_garbage_metadata_json_delete_requests_total` reports successful JSON delete
 requests. Versioned object stores can retain noncurrent versions after deletion;

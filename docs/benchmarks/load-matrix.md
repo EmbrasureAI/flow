@@ -5,14 +5,14 @@ observation, exact PostgreSQL acknowledgement and external-compactor
 reconciliation. None passed every performance gate. These results qualify
 finite local correctness, not the full performance targets or endurance.
 
-The release daemon was built from `36ff0b7210accb924993db73ba2eb9ab76cd663a`;
-its SHA-256 is `22d8e99bab2a03a7206324b415caab85f43a09a3ca8247d5a7a906bb30417b1e`.
-PostgreSQL 18.6, Iceberg REST 1.10.1 and MinIO ran in Docker on a shared Apple
+These results were measured on a release build of a pre-release development
+version. PostgreSQL 18.6, Iceberg REST 1.10.1 and MinIO ran in Docker on an Apple
 M5 Pro / 48 GiB / 18-logical-CPU host. Docker had approximately 8 GiB memory;
 PostgreSQL used 4 CPUs / 2 GiB, REST 2 CPUs / 1.5 GiB and MinIO 2 CPUs / 2 GiB.
 The native macOS daemon and DuckDB 1.5.5 reader shared that host. Runs were serial,
 with 10 seconds of warmup, 60 measured seconds, four source writers, four table
-workers, Iceberg v2 and the default maintenance policy. Other tasks were active.
+workers, Iceberg v2 and the default maintenance policy. The host was not
+reserved for the benchmark.
 
 ## Results
 
@@ -42,7 +42,7 @@ its offered rate is aggregate. Other cases use one table. Consult the
 The 50k case accepted all measured source arrivals, then needed 5.07 seconds of
 final drain. Its 6.02-second publication p99 fails the two-second target. A
 separate source-only precheck achieved 48,452 mutations/s with 855 missed
-transactions, so these shared-host runs cannot establish a stable 50k capacity
+transactions, so these single-host runs cannot establish a stable 50k capacity
 bound. At 1k mixed load and with 10,000-row transactions, ingestion rate and
 publication latency passed; the remaining failure was reading the streaming
 layout versus its compacted equivalent.
@@ -55,7 +55,7 @@ external rewrite, or silently remove missed arrivals from qualification.
 
 ## Wide-schema correctness
 
-The new `wide_rows.py` checks passed on the same binary:
+The `wide_rows.py` checks passed on the same binary:
 
 - 258 columns, 1,000 initial rows, up to 64 KiB text per row.
 - 1,502 columns, 1,000 initial rows, small nullable values.

@@ -4,9 +4,9 @@ All six local runs passed full-row verification, transaction-marker observation,
 
 ## Protocol
 
-Runs used the same frozen release binary, default maintenance policy and 256 pending transactions. Each had one table, 100,000 initial rows, four writers, 100 mutations per transaction, 256-byte compressible payloads, 10 seconds of warmup and 60 measured seconds. Mixed means 70% updates, 10% deletes and 20% inserts; hot-update means 90% updates and 10% inserts with hot-key sampling. Every v3 inventory verified actual format version 3 and live Puffin deletion vectors.
+Runs used the same frozen release build of a pre-release development version, default maintenance policy and 256 pending transactions. Each had one table, 100,000 initial rows, four writers, 100 mutations per transaction, 256-byte compressible payloads, 10 seconds of warmup and 60 measured seconds. Mixed means 70% updates, 10% deletes and 20% inserts; hot-update means 90% updates and 10% inserts with hot-key sampling. Every v3 inventory verified actual format version 3 and live Puffin deletion vectors.
 
-PostgreSQL 18.6, a Java Iceberg 1.10.1 REST catalog backed by PostgreSQL, and MinIO ran in Docker on the shared Apple M5 Pro / 48 GiB host. Native compaction ran throughout each workload. An independent compactor then rewrote the final table, and the daemon reconciled it before another full-row check. Source durability settings remained enabled. No benchmark-owned builds or profiling ran during timed ingestion. This host was not reserved. Treat these finite runs as local observations, not isolated hardware capacity or a competitive product comparison.
+PostgreSQL 18.6, a Java Iceberg 1.10.1 REST catalog backed by PostgreSQL, and MinIO ran in Docker on an Apple M5 Pro / 48 GiB host. Native compaction ran throughout each workload. An independent compactor then rewrote the final table, and the daemon reconciled it before another full-row check. Source durability settings remained enabled. No benchmark-owned builds or profiling ran during timed ingestion. This host was not reserved. Treat these finite runs as local observations, not isolated hardware capacity or a competitive product comparison.
 
 The host had 18 logical CPUs and Docker had 8 GiB of memory. PostgreSQL used a 4-CPU/2-GiB limit, MinIO 2 CPUs/2 GiB, and REST 2 CPUs/1.5 GiB. The daemon and reader shared the host with the workload generator.
 
@@ -42,7 +42,7 @@ For the two 10k pairs, the complete sorted source/target row hashes matched acro
 
 The hot-update v3 snapshot had 25 data files and 12 DVs, versus three data files and one position-delete file for v2. A separate detailed profile recorded full-query planning at 16.16 ms versus 5.43 ms. This diagnoses the observed layouts; it does not isolate bitmap decoding cost or establish a universal format penalty. The single detailed profiles are explanatory samples, separate from the twenty unprofiled timing pairs.
 
-Each run also retained its original same-final-row comparison against external compaction. Those v3 layout ratios were 2.26× (hot updates), 1.47× (mixed 10k), and 1.08× (mixed 50k). They are fragmentation diagnostics against fully compacted copies, not alternate streaming-ingestion baselines. The legacy 1.25× gate remains in reports; only hot-update v2 passed every existing gate. No 24-hour run was performed.
+Each run also retained its original same-final-row comparison against external compaction. Those v3 layout ratios were 2.26× (hot updates), 1.47× (mixed 10k), and 1.08× (mixed 50k). They are fragmentation diagnostics against fully compacted copies, not alternate streaming-ingestion baselines. Reports also apply the 1.25× reader gate; only hot-update v2 passed every gate. No 24-hour run was performed.
 
 ## Measured bottleneck
 
@@ -79,15 +79,6 @@ The direct reader comparison uses the `post-workload-reader` metadata locations 
 
 ## Measurement identity
 
-The frozen build used base commit `fcd7f15e8cb90a6261b48458e3d0151e118f1a8e` plus the v3 working changes, with dirty-source SHA-256 `494f4e50c09fe2b7b719a0208f7f0a9fcf6a3cbf65eb50f5bb20f94ccc73f5cd`. Daemon SHA-256 is `351a8761c2403bcc02bb2469f8c389d838a5fe999deec4953b820591c2647e4f`; external compactor SHA-256 is `8386d7eda8ee0155bb85185364be0ba9a03b90cd4bb8c3036c4fdc8ceeb06ca8`.
-
-The subsequent shared-Puffin consolidation acceptance fix is not included in this measured binary. Rebuilding current source produces new evidence, not these exact timings. Raw reports and binaries were retained locally and are not distributed with the repository; the hashes below identify the reports used here.
-
-| Report | SHA-256 |
-| --- | --- |
-| `update90-hot-10k-v3/report.json` | `743d27f0a0da8979353a6dfe81bd1105299ca42bc86ea0324c9325164c7a0be2` |
-| `update90-hot-10k-v2/report.json` | `36c84ced5a6473a7fe61867e90ce6051d5edda34fcee4cca51c025dcfd45935c` |
-| `mixed-10k-v2/report.json` | `2760ab9a7b8fa7b6545411eee52c2706a97e3a5dfd0dca1c05ef84fe8e964118` |
-| `mixed-10k-v3/report.json` | `c97b0a663b20d3f178ed24bdbe387250abef18f46b6b37ef7e98ee8da47095fd` |
-| `mixed-50k-v3/report.json` | `89615d925c861ddfef7643cf711a0bb40daf5e2fae3e2cfe0c6edf856b01a5e9` |
-| `mixed-50k-v2/report.json` | `3313aa6b3d29fd8660d37e01a4cb370533be848957f7b249e6a3b39d31ebbd24` |
+These results were measured on a pre-release development build, which predates
+a later fix to shared-Puffin consolidation. A build of current source produces
+new evidence, not these exact timings.

@@ -8,7 +8,7 @@ not available through their released extension interfaces.
 - [Iceberg changes](iceberg/LOCAL_CHANGES.md)
 - [REST catalog changes](iceberg-catalog-rest/LOCAL_CHANGES.md)
 - [OpenDAL storage changes](iceberg-storage-opendal/LOCAL_CHANGES.md)
-- [Reference review and patch inventory](../docs/references-iceberg.md)
+- [Iceberg reference review](../docs/references-iceberg.md) (the `LOCAL_CHANGES.md` files above are the patch inventory)
 - [Prepared upstream submissions](../docs/patches/upstream/README.md)
 
 Preserve the upstream licenses, notices and source provenance when updating

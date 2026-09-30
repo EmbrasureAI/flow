@@ -1,0 +1,62 @@
+--- a/src/transaction/update_schema.rs
++++ b/src/transaction/update_schema.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -116,6 +117,7 @@
+ pub struct UpdateSchemaAction {
+     additions: Vec<AddColumn>,
+     deletes: Vec<String>,
++    optional: Vec<i32>,
+ }
+ 
+ impl UpdateSchemaAction {
+@@ -124,6 +126,7 @@
+         Self {
+             additions: Vec::new(),
+             deletes: Vec::new(),
++            optional: Vec::new(),
+         }
+     }
+ 
+@@ -139,6 +142,12 @@
+         self
+     }
+ 
++    /// Relax a root field without changing its ID, type, or historical files.
++    pub fn make_column_optional(mut self, field_id: i32) -> Self {
++        self.optional.push(field_id);
++        self
++    }
++
+     // --- Other builder methods ---
+ 
+     /// Record a column deletion by name.
+@@ -442,13 +451,24 @@
+         }
+ 
+         // --- 4. Rebuild the schema tree with additions and deletions ---
+-        let new_fields = rebuild_fields(
++        let mut new_fields = rebuild_fields(
+             base_schema.as_struct().fields(),
+             &additions_by_parent,
+             &delete_ids,
+             None,
+         );
+ 
++        for id in &self.optional {
++            if base_schema.identifier_field_ids().any(|key| key == *id) {
++                return Err(Error::new(ErrorKind::PreconditionFailed, "Cannot relax an identifier field"));
++            }
++            let field = new_fields.iter_mut().find(|field| field.id == *id)
++                .ok_or_else(|| Error::new(ErrorKind::PreconditionFailed, "Optional field must be an existing root column"))?;
++            let mut relaxed = field.as_ref().clone();
++            relaxed.required = false;
++            *field = Arc::new(relaxed);
++        }
++
+         // --- 5. Build the new schema ---
+         let schema = Schema::builder()
+             .with_fields(new_fields)

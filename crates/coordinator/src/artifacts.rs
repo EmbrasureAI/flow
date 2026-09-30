@@ -105,7 +105,7 @@ pub(super) fn registry_prefix(uuid: uuid::Uuid) -> String {
     // makes rollback retain new records instead of deleting a live JSON pointer.
     format!("owned-artifacts/v2/{uuid}/")
 }
-/// Operation prefix of adopted pre-registry JSON. Its readers are unknown, so
+/// Operation prefix of adopted unregistered catalog JSON. Its readers are unknown, so
 /// the collector gives it the full orphan grace, not the metadata JSON grace.
 pub(super) const METADATA_IMPORT: &str = "metadata-import";
 pub(super) fn now_ms() -> Result<u64> {

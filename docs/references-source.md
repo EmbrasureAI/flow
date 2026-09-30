@@ -9,7 +9,7 @@ points, PostgreSQL framing, binary COPY framing, and `CopyBothDuplex`. Our
 `PostgresSource` boundary owns protocol-2 transaction semantics; changing the
 transport need not change the journal, coordinator, or materializer.
 
-## Idle publications and upgrades
+## Idle publications and schema records
 
 Capture emits a transactional `pg_logical_emit_message` heartbeat immediately on
 connect and every 30 seconds. The source role needs EXECUTE permission on that
@@ -20,11 +20,8 @@ Nontransactional messages and server keepalive WAL ends never advance progress.
 This prevents an idle publication from retaining unrelated database WAL forever;
 long source transactions or blocked materialization can still retain WAL.
 
-The internal engine reads verified format-2 source schema records from the
-previous Postgres-only engine, retaining their full column-incarnation proof.
-The generic format-3 envelope is an in-memory compatibility view; existing records
-are not rewritten. Unknown formats, truncated records and invalid incarnation
-proofs fail closed. Preserve state, source slots and destination during upgrades.
+Source schema records use format 2, which carries the column-incarnation proof.
+Unknown formats, truncated records and invalid proofs fail closed.
 
 ## Standards that determine behavior
 
@@ -53,8 +50,8 @@ proofs fail closed. Preserve state, source slots and destination during upgrades
   with concurrent source writes. Mutable capture requires FULL identity. pgoutput
   can still mark new tuple fields unchanged; capture reconstructs them only from
   the validated complete old tuple carried by the same update. Missing, malformed, key-only,
-  or incomplete old tuples stop capture. No current-row query or placeholder is
-  used.
+  or incomplete old tuples block that table (`source_schema_incompatible`) while
+  other tables keep publishing. No current-row query or placeholder is used.
 
 ## Implemented paths and verification
 
@@ -65,7 +62,7 @@ proofs fail closed. Preserve state, source slots and destination during upgrades
 | Primary-key changes | FULL before row supplies old canonical key; new row supplies replacement; real update/delete/key-move workloads across PostgreSQL 14.24–18.6 | Longer production-shaped qualification |
 | Large streamed transactions | One bounded active buffer, disk spool, bounded XID/savepoint counts, terminal-only journal commit | Sustained throughput and source memory measurements |
 | Nested stream abort | Real disk suffix truncation removes aborted parent and child changes | PostgreSQL nested-savepoint workloads |
-| TOAST | Validated FULL old tuples resolve unchanged fields; unresolved values stop before a terminal record. Real 18.6 updates, key moves and deletes preserve 16 KiB text and 8 KiB binary values | PostgreSQL version matrix and larger configured row limits |
+| TOAST | Validated FULL old tuples resolve unchanged fields; unresolved values block the table instead of publishing. Real 18.6 updates, key moves and deletes preserve 16 KiB text and 8 KiB binary values | PostgreSQL version matrix and larger configured row limits |
 | Reconnect | Real pinned transport against a local scripted wire peer; interrupted uncommitted stream reconnects; journal deduplicates committed LSNs | Real failover and PostgreSQL slot rollback |
 | Initial snapshot | Permanent slot export, imported snapshot with parallel binary COPY and concurrent CDC; real crashes before/after staging, nullable DDL between copy attempts, retained completed tables and index-loss recovery across PostgreSQL 14.24–18.6 | Larger copy and multi-hour recovery workloads |
 | Nullable additive DDL | Durable schema registry, exact source catalog proof, stable Iceberg field IDs, historical projection; mixed-version/savepoint/abort/restart contracts on PostgreSQL 14.24–18.6 | Broader incompatible-DDL matrix |
@@ -95,7 +92,7 @@ Every frame has a 28-byte little-endian header:
 | --- | --- |
 | 0–3 | `FLJ1` magic |
 | 4–5 | Format version, currently 1 |
-| 6 | Chunk (1), legacy terminal (2), abort (3), range terminal (4), or counted terminal (5) |
+| 6 | Chunk (1), abort (3), or counted range terminal (5); kinds 2 and 4 are read-only earlier terminals |
 | 7 | Reserved zero |
 | 8–11 | Payload byte length |
 | 12–19 | Monotonic sequence number |
@@ -131,9 +128,7 @@ and the durable LSN become visible together after the journal sync. Recovery
 reconstructs missing or torn indexes from validated frames; cursor iteration
 holds one transaction at a time. Segment pin counts and cursor-based reclamation
 avoid both a backlog-sized transaction vector and rescanning row payloads for
-acknowledgement. Index bytes are included in the disk quota. Legacy terminal
-vectors remain readable within the configured frame limit; source-ledger entries
-migrate on update to a marked descriptor format.
+acknowledgement. Index bytes are included in the disk quota.
 
 The source ledger registers a bounded journal page or completes a table's
 publication page with one durable ControlStore write. That write atomically
@@ -168,7 +163,7 @@ over missing transactions, or removes an existing source snapshot.
   and timestamps, and bounded decimals. [PostgreSQL type mappings](postgres-types.md)
   adds UUID strings, JSON/JSONB strings, JSON-encoded arrays, enum labels, domain
   base values, exact numeric strings, and published PostgreSQL 18 stored generated
-  columns. Native `Uuid` remains available for existing non-Athena targets. No
+  columns. An explicitly configured native `Uuid` column is also accepted. No
   decimal-to-float conversion or silent numeric rounding is used.
 * Snapshot copy uses the verified current publication projection. The publication
   must contain every configured table and may contain others, such as an
@@ -200,10 +195,12 @@ over missing transactions, or removes an existing source snapshot.
   decides membership as of each change, so writes made while the table was out
   are never sent, and checks on either side of the gap both pass. Coordinate
   every publication change that affects
-  configured tables with a resync. Incompatible table DDL and received TRUNCATE stop capture.
+  configured tables with a resync. Incompatible table DDL and a received TRUNCATE
+  block only the affected table (`source_schema_incompatible`); other tables keep
+  publishing, as described in [table publication isolation](table-publication-isolation.md).
   A failed initial-copy slot is retained for operator diagnosis.
-  Publication must include TRUNCATE messages so such a source operation pauses
-  capture rather than disappearing silently.
+  Publication must include TRUNCATE messages so such a source operation blocks
+  the table rather than disappearing silently.
 * The daemon persists an `IDENTIFY_SYSTEM` proof before initial copy and verifies
   the system identifier, database, timeline, configured source identity and slot
   on every reconnect. Timeline changes currently require coordinated operator
@@ -231,12 +228,8 @@ over missing transactions, or removes an existing source snapshot.
   These limits bound individual frames and batches, not total process memory.
 
 Journal terminal kind 5 and source-ledger envelope `FLLEDG03` persist these
-counts. Readers explicitly decode older terminal kinds 2 and 4 and ledger
-envelopes without a prefix or with `FLLEDG02`; no existing files are rewritten
-as a migration. Older descriptors retain unknown counts and publish alone rather
-than inventing a row estimate. Chunk payloads, segment indexes, source LSNs,
-durability barriers and index-generation formats are unchanged. Older binaries
-reject new terminal/envelope versions, so downgrade requires a compatible binary.
+counts. Records written by pre-release builds without counts are still read;
+their transactions publish alone rather than inventing a row estimate.
 
 ## Nullable additive schema transitions
 
@@ -292,10 +285,9 @@ Iceberg, even when the source later makes it NOT NULL: Iceberg can relax a
 required field but never require an optional one.
 
 Stored column numbers catch a dropped and re-added column even when its name and
-type are unchanged. Physical table rewrites also stop capture: a volatile
+type are unchanged. Physical table rewrites also block the table: a volatile
 default can rewrite existing rows without equivalent pgoutput row events, and
 the current catalog alone cannot distinguish that history from a harmless
 rewrite. This deliberately includes `VACUUM FULL`, `CLUSTER` and similar source
-storage rewrites; operators must resynchronize before capture resumes. Schema
-record format 2 requires these proofs and explicitly rejects earlier development
-records that lack them.
+storage rewrites; operators must resynchronize before the table publishes
+again. Schema record format 2 requires these proofs.

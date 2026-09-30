@@ -2,7 +2,8 @@
 
 `embrasure-flow status` reads an atomic local observation without locking the state database. It reports the source identity, process, readiness, observation timestamp, captured durable LSN, ledger watermarks and registered pending transactions. Readiness expires after fifteen seconds without an update. SIGINT and SIGTERM clear it before shutdown. This file is not recovery authority.
 `status` exits 0 when the observation reports ready, 3 when it does not (the
-JSON is still printed), and 1 when there is no readable observation.
+JSON is still printed), 78 when the configuration is invalid, and 1 when there
+is no readable observation.
 
 `state` is `starting` from process start through recovery, index rebuild and
 startup source validation, `running` once the main loop is serving, and
@@ -95,12 +96,16 @@ No separate export task is created.
 | `flow_table_materialized_lsn{table_id}` | The table's last successfully published source position |
 | `flow_table_lag_bytes{table_id}` | Captured WAL from the start of the table's oldest registered, unpublished transaction to the captured durable LSN; 0 when the table has none |
 | `flow_table_lag_seconds{table_id}` | Age of that transaction's source commit (source clock); 0 when the table has none |
+| `flow_source_received_lsn` | Highest source end LSN Flow has received and recorded; at least `flow_journal_durable_lsn` |
 | `flow_journal_durable_lsn` | Actual capture frontier after journal sync |
 | `flow_ledger_registered_lsn` | Prefix registered with source-wide completion tracking |
 | `flow_materialized_lsn` | Contiguous source prefix published across every affected table |
 | `flow_pending_transactions` | Registered, incomplete source transactions; compare the captured and registered LSNs to detect additional disk backlog |
 | `flow_source_health_check_available` | Whether the latest WAL check returned a result; zero before the first result or after a monitoring failure |
 | `flow_source_at_risk` | Latest check found hard WAL/journal pressure or a lost slot; inspect availability before interpreting zero as healthy |
+| `flow_source_retained_wal_bytes` | WAL the slot retains on the source (current WAL LSN minus the slot's `restart_lsn`) at the latest WAL check |
+| `flow_source_safe_wal_bytes` | PostgreSQL's `safe_wal_size` for the slot: WAL that can still be written before the slot is at risk of invalidation. Present only when `max_slot_wal_keep_size` caps retention |
+| `flow_journal_bytes` | Total size of the local journal's segment files at the latest WAL check; excludes segment indexes |
 | `flow_capture_journal_full` | 1 while capture is paused because the journal quota is full; publication keeps draining and capture resumes automatically |
 | `flow_capture_connected` | 1 while replication is streaming, 0 while capture is retrying its connection or replication start |
 | `flow_capture_reconnect_failures_total{reason}` | Failed capture (re)connect attempts: `slot_in_use` (SQLSTATE 55006), `too_many_connections` (53300) or `unavailable` |
@@ -109,12 +114,16 @@ No separate export task is created.
 | `flow_state_volume_available_bytes` | Free bytes on the state volume at the last startup or capture check (about every five seconds) |
 | `flow_observation_write_skipped_total` | `status.json`/`metrics.prom` updates skipped because the state volume was full |
 | `flow_commit_to_journal_seconds` | Source commit timestamp to successful journal durability |
+| `flow_journal_transactions_total` | Source transactions with a nonzero XID durably written to the journal |
 | `flow_journal_committed_payload_bytes_total` | Serialized mutation-chunk payload bytes in successfully synced source transactions; excludes aborted subtransactions, journal framing and terminal records |
 | `flow_source_registration_seconds` | Successful dispatcher page read and durable source-ledger registration, before feedback; includes blocking database work |
 | `flow_source_registration_transactions` | Newly registered transactions per successful dispatcher page; histogram count measures registration pages |
 | `flow_capture_phase_seconds` | Schema validation and spool begin/replay/disposal per transaction; journal sync per durability group, labelled by bounded phase and success/error |
 | `flow_journal_commit_group_transactions` | Number of complete source transactions sharing a successful journal durability barrier |
 | `flow_catalog_commit_seconds` | Catalog publication path, including preparing and committing metadata |
+| `flow_catalog_commit_attempts_total{table_id}` | CDC catalog commit attempts, including retries and recovery of a prepared operation |
+| `flow_catalog_commits_total{table_id}` | CDC epochs this process committed to the catalog |
+| `flow_catalog_recovered_commits_total{table_id}` | Prepared CDC operations found already committed during recovery, for example after a lost commit response; excluded from latency samples |
 | `flow_epoch_oldest_commit_to_catalog_seconds` | Oldest source commit in a published epoch to catalog success; this is an epoch histogram, not a transaction percentile |
 | `flow_index_apply_seconds` | Local index application after catalog visibility |
 | `flow_ingest_prepare_seconds` | Successful ingest artifact and delta preparation through durable Prepared, before catalog resolution |
@@ -124,7 +133,7 @@ No separate export task is created.
 | `flow_state_apply_batch_size` | Apply cursor rows, serialized index `WriteBatch` bytes, submitted update-record count and reverse-owner reads; fixed measurement, operation-kind and controlled/standalone labels |
 | `flow_state_stage_batch_seconds` | Delta-batch construction, duplicate lookup and staged write; fixed operation-kind and controlled/standalone labels |
 | `flow_state_collapse_batch_seconds` | Disk-collapse batch setup, fold, prior spool reads, index lookup, binding and staged write; fixed phase and controlled/standalone labels |
-| `flow_table_l0_*`, `flow_table_small_files`, `flow_table_*delete_files`, `flow_table_reclaimable_bytes`, `flow_table_manifest*`, `flow_table_publication_pressure` | L0 count/bytes/age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
+| `flow_table_l0_files`, `flow_table_l0_bytes`, `flow_table_oldest_l0_seconds`, `flow_table_small_files`, `flow_table_*delete_files`, `flow_table_reclaimable_bytes`, `flow_table_manifest*`, `flow_table_publication_pressure` | L0 count, bytes and oldest-file age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
 | `flow_compaction_finalization_actor_lane_hold_seconds` | Completed data-build finalization from actual table-lane reservation through cleanup and lane release |
@@ -135,12 +144,15 @@ No separate export task is created.
 | `flow_external_reconciliations_total` | External snapshots successfully verified and durably applied to the row index, labelled by table and bounded reconciliation kind |
 | `flow_artifact_{files,bytes}_written_total` | Successfully finished data/delete artifacts, including attempts later invalidated |
 | `flow_garbage_delete_requests_total` | Conservative deletion requests against registered obsolete artifacts |
+| `flow_garbage_metadata_json_delete_requests_total` | Successful delete requests for superseded catalog metadata JSON |
+| `flow_garbage_collection_seconds` | Duration of each successful garbage-collection pass for a table |
 | `flow_metadata_maintenance_failures_total` | Table-scoped manifest rewrite, snapshot expiration or garbage collection failures, labelled by `task`; each is retried with backoff |
 | `flow_table_maintenance_failing` | 1 after five consecutive failures of one metadata task (`table_id`, `task`) until it succeeds; CDC continues, the task needs attention |
 | `flow_expiration_missing_protections_total` | Checkpoint or operation snapshots another process expired before Flow; their protection is dropped |
 | `flow_snapshots_over_cap` | Snapshots above `limits.snapshot_max_count` that protection or table policy retain. Checkpoints protect about `retained_checkpoints` × `checkpoint_interval_secs` of commits, so tables committing faster than about `snapshot_max_count` / 600 per second (1.7 at defaults) stay above the cap |
 | `flow_snapshot_cap_exceeded_by_table_policy` | 1 when an explicit table `history.expire.max-snapshot-age-ms` keeps the table above the snapshot cap |
 | `flow_snapshot_expiration_disabled` | 1 for targets with `gc.enabled=false`; Flow never expires their history |
+| `flow_bootstrap_runs_total{outcome}`, `flow_bootstrap_seconds{outcome}` | `init` runs and their duration, labelled `success` or `error` |
 
 Recovered catalog markers are counted separately and excluded from latency samples. Source-to-service times require synchronized clocks; the production benchmark records calibration uncertainty and complete per-transaction observations. Artifact counters do not include internal SDK retry traffic or catalog-owned metadata writes and must not be presented as cloud billing measurements.
 
@@ -194,11 +206,7 @@ Residual spooling writes only translated late masks; original and late residuals
 are merged directly during residual writing, which includes scratch reads,
 live-file filtering, deduplication and Parquet output. The mapping caller's
 verification remainder includes scratch reads, key preparation and ordering;
-final coverage checks remain inside the whole mapping interval. Older builds
-without `mapping_elapsed_ms` reported disjoint lookup/stage/mask/verification
-fields; retain that additive interpretation only for those older events. Older
-builds also copied carried positions in the spooling phase, so compare total
-catch-up as well as its inner fields when assessing changes. The outer coordinator
+final coverage checks remain inside the whole mapping interval. The outer coordinator
 catch-up duration includes blocking-task dispatch and runtime setup. A successful
 catch-up can still fail during sealing or publication, so this event alone does
 not prove a commit.
@@ -231,9 +239,8 @@ actual `Catalog::update_table` await, durable commit marking, state application,
 discard-before-replan and unassigned recovery overhead.
 `catalog_resolution_path` states whether the operation committed, was already
 found, was already marked committed, or needs replanning. `maintenance_recovered`
-remains as a compatibility success event after completed state application, with
-the legacy `catalog_resolve_ms` and `mark_apply_ms` aggregates for comparisons
-with older reports. `compaction_completed.coordinator_prepare_publish_ms` covers
+is also emitted after state application completes successfully; its
+`catalog_resolve_ms` and `mark_apply_ms` fields are coarser aggregates. `compaction_completed.coordinator_prepare_publish_ms` covers
 the coordinator interval from preflight preparation through durable application;
 `coordinator_prepare_publish_other_ms` excludes the reported preparation and
 publish/application intervals. Join the operation ID to
@@ -262,8 +269,9 @@ labels. ACK feedback timing ends when the coordinator sends feedback, before
 PostgreSQL necessarily receives it.
 `epoch_completed` retains total `elapsed_ms` and partitions it into
 `durable_completion_ms` (ledger, pending/index cleanup and ACK feedback) and
-`observation_ms` (immediate status and any due Prometheus export).
-`metrics_exported` distinguishes full exports from lightweight status updates.
+`observation_ms` (immediate status and any due Prometheus export). Its
+`metrics_exported` field distinguishes full exports from lightweight status
+updates.
 
 `ingest_prepared` partitions `precommit_prepare_ms` into
 `data_stage_pair_wall_ms`, `delete_write_ms` (delete-writer calls and close),
@@ -281,8 +289,7 @@ dispatch, input-channel waits and join overhead outside those intervals.
 Thus pair wall equals data plus staging minus overlap plus pair overhead.
 These are elapsed times, not CPU or storage-only timings. Add the three outer
 fields to obtain preparation time; do not add the nested concurrent fields
-again. Older events without pair fields used the additive data, staging,
-delete and other partition.
+again.
 
 Index-application samples cover normal committed batches, excluding invalid and
 already-applied calls. Preparation includes operation/delta reads, batched key
@@ -437,8 +444,9 @@ normal responses, HTTP errors, connection failure, and label redaction.
 The standard-library [offline cost CLI](../tests/production/cost_report.py)
 accepts user-supplied USD prices and explicitly measured quantities with a common
 UTC interval, local evidence references and declared accounting scope. It hashes
-all inputs and evidence, refuses to overwrite reports, and produces the six
-specification §22.4 normalizations. The [usage and partial-input example](../tests/production/README.md#offline-cost-report)
+all inputs and evidence, refuses to overwrite reports, and produces six
+normalized ratios, such as dollars per million mutations and catalog commits
+per million mutations. The [usage and partial-input example](../tests/production/README.md#offline-cost-report)
 describes the small input contract. Unknown source bytes, provider requests,
 compaction bytes or prices remain null with reasons. A known subtotal is separate
 from the complete total within the declared scope; omitted billing categories
@@ -469,9 +477,9 @@ cache/memtables and writer workspace. It is an accounted retention limit, not a
 process RSS limit. Oversized and initial-copy transactions take the disk path
 directly. Raising worker concurrency also raises the possible retained memory.
 
-The existing `epoch_collapsed` event records `collapse_mode`, the configured limit,
+The `epoch_collapsed` event records `collapse_mode`, the configured limit,
 and the largest accepted retention when known. Modes distinguish memory fit,
-disabled buffering, initial COPY, oversized/legacy prefixes and capacity fallback.
+disabled buffering, initial COPY, oversized or uncounted prefixes and capacity fallback.
 Binding overflow reports an unknown peak because the partial map is consumed and
 dropped; `collapse_memory_peak_known` distinguishes that from zero. The outer
 collapse duration covers every mode. StateStore's six batch-phase histograms
@@ -509,3 +517,24 @@ consume additional memory. Resource sizing must include that concurrency.
 `limits.table_workers` defaults to four and bounds concurrent table jobs across
 CDC publication and maintenance. Waiting tables retain their source backlog;
 reaching the worker limit does not relax reader-debt or acknowledgement rules.
+
+## Allocator memory
+
+GNU/Linux builds with `--features jemalloc` enable process-wide jemalloc and its
+background reclamation threads during `init` and `run`. The daemon samples the
+allocator at most once every 15 seconds and exports these gauges in `metrics.prom`
+and `/metrics`:
+
+| Gauge | Meaning |
+| --- | --- |
+| `flow_allocator_allocated_bytes` | Bytes currently allocated to application objects |
+| `flow_allocator_active_bytes` | Active allocation pages, including unused space within them |
+| `flow_allocator_resident_bytes` | Allocator resident pages, including allocator metadata and dirty pages |
+
+The values overlap and must not be added together. Allocator resident memory is
+not process RSS: mapped files, thread stacks and other mappings are measured
+separately by the operating system. Compare allocator gauges with process RSS
+when distinguishing live objects from retained pages. Failed samples omit the
+gauges until a later sample succeeds; absence does not mean zero memory.
+Background reclamation does not cap live allocations or replace worker, batch,
+cache and container limits. Default and non-GNU/Linux builds omit these gauges.

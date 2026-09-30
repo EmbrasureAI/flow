@@ -1,8 +1,0 @@
-ARG FLOW_RUNNER_IMAGE=embrasure-flow-runner:default-pk-cdc
-FROM ${FLOW_RUNNER_IMAGE}
-USER root
-RUN /usr/local/bin/python -m pip --python /app/.venv/bin/python install --no-cache-dir duckdb==1.5.5 'psycopg[binary]==3.3.5' boto3==1.43.88 fastavro==1.12.2
-COPY tests/local /qualification
-COPY tests/production/proxy.py /production/proxy.py
-ENV PYTHONPATH=/app
-ENTRYPOINT ["/app/.venv/bin/python", "/qualification/default_identity.py"]

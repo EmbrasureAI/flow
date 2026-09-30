@@ -15,18 +15,18 @@ entries; table completion removes its references atomically with completion proo
 
 This separates table admission from the source's oldest unfinished transaction.
 A healthy table can seek its next reference directly without scanning another
-table's retained history. On upgrade, a resumable migration builds references in
-bounded pages, advancing its progress marker in the same durable write. These
-SOURCE records are mirrored through the authoritative control store and survive
-index-generation recovery. They do not introduce another payload journal.
+table's retained history. These SOURCE records are mirrored through the
+authoritative control store and survive index-generation recovery. They do not
+introduce another payload journal.
 
 Queued descriptors share the configured `pending_transactions` lookahead.
 Admission rotates across eligible tables, including when there are more tables
 than available descriptors. Queued work only makes a table schedulable: a
 dispatched epoch leaves the lookahead and continues in order through that table's
-durable references, up to the 32 MiB payload limit and a fixed per-epoch
-descriptor-memory limit, so a busy table does not hold lookahead another table
-needs. A failed or deferred worker must return before its queued and running
+durable references, up to the 32 MiB payload limit, a fixed per-epoch
+descriptor-memory limit and the optional `limits.epoch_max_transactions` cap on
+source transactions per epoch, so a busy table does not hold lookahead another
+table needs. A failed or deferred worker must return before its queued and running
 reservations are evicted; its epoch is reloaded from the ledger. Eviction removes only volatile admission:
 restarting the cursor at zero finds exactly the references that still need work.
 It neither completes a transaction nor advances an acknowledgement.
@@ -87,10 +87,10 @@ are projected out before quarantine, including when a selected column disappears
 
 A source-table block persists across restart and source repair. Use an explicit
 resync/replacement to establish new authoritative state; never clear the block or
-discard journal records manually. This version does not reinterpret quarantined
-mutations automatically. The product's current Full resync replaces the whole
-connection. Journal/spool quotas and source WAL pressure still bound how long
-healthy tables can continue; a full journal pauses capture without dropping changes.
+discard journal records manually. Flow does not reinterpret quarantined
+mutations automatically. A [resync](operations.md#resynchronize-a-source)
+replaces the whole connection. Journal/spool quotas and source WAL pressure
+still bound how long healthy tables can continue; a full journal pauses capture without dropping changes.
 
 Journal corruption, source connection/slot/identity failures, state-store failures,
 spool limits, a replication message larger than `limits.source_message_bytes`
@@ -98,13 +98,12 @@ spool limits, a replication message larger than `limits.source_message_bytes`
 unclassified errors remain connection-wide. A replication slot still held by a
 previous session (SQLSTATE 55006) and a server out of connection slots (53300)
 are retried with backoff like a disconnect; PostgreSQL releases a stale
-walsender's slot within `wal_sender_timeout`. Retries never stop, so after five
-minutes (or twice `wal_sender_timeout`) of failures capture logs an error with
-the slot holder's `active_pid` and sets `flow_capture_reconnect_stalled`. Completed bootstrap with intact local authority
-can load and recover targets independently. Initial snapshot/bootstrap, legacy
-target-identity adoption, and whole-index reconstruction still require their
-existing coordinated recovery path. Unknown/replaced source identities also
-retain coordinated recovery.
+walsender's slot within `wal_sender_timeout`. Retries never stop, so once
+failures have lasted five minutes or twice `wal_sender_timeout`, whichever is
+longer, capture logs an error with the slot holder's `active_pid` and sets `flow_capture_reconnect_stalled`. Completed bootstrap with intact local authority
+can load and recover targets independently. Initial snapshot/bootstrap and
+whole-index reconstruction still require their coordinated recovery path.
+Unknown/replaced source identities also retain coordinated recovery.
 
 ### Publication changes
 
@@ -137,9 +136,8 @@ target is gone or was replaced, that operation is abandoned locally instead,
 since whatever it may have committed belongs to a table this pipeline no
 longer owns and a resync rebuilds it. So the
 blocked table stops holding the acknowledgement frontier and source WAL is not
-retained for it. Usage receipts still count rows journaled before the latch.
-The block persists across restart even after the publication is restored;
-completing a publication or recovery never clears it, and only a resync does.
+retained for it. The block persists across restart even after the
+publication is restored; completing a publication or recovery never clears it, and only a resync does.
 A publication block supersedes an earlier schema block on the same table, since
 both need a resync, and releases its quarantined changes the same way. The
 publication check runs before schema refresh at startup and reconnect, so a
@@ -193,15 +191,13 @@ These are design precedents, not claims that the projects expose identical
 failure guarantees. The Moonlink references identify a fixed public revision.
 
 
-## Compatibility and qualification
-
-The new `Quarantined` mutation is appended to the bincode enum, preserving existing
-mutation encodings. Older binaries cannot consume new quarantine records or the
-new nullable schema lineage. Keep the upgraded binary with that generation; use a
-forward repair or explicit replacement instead of rolling the engine back.
+## Qualification
 
 `tests/local/schema_isolation.py` covers real PostgreSQL/Iceberg nullable updates,
 lost schema commit responses, streamed DDL, subsequent additions, incompatible
 schema blocks, mixed transactions beyond admission capacity, acknowledgement
 fencing, process restart, and exclusion of unselected values. Run it with and
-without `--explicit`. The PostgreSQL 14–18 CI matrix runs both selections.
+without `--explicit`, and with `--heap-rewrite`, which blocks a table on a
+volatile-default heap rewrite and checks that the block survives a crash
+restart while the other table keeps publishing. The PostgreSQL 14–18 CI matrix
+runs all three.

@@ -755,7 +755,7 @@ impl CaptureAssembler {
             }
             SourceEvent::Truncate { .. } => {
                 return Err(Error::Config(
-                    "TRUNCATE requires coordinated table replacement and is unsupported in V1; capture paused",
+                    "TRUNCATE requires coordinated table replacement and is not supported; the table must be resynchronized",
                 ));
             }
             SourceEvent::Metadata => {}

@@ -97,8 +97,8 @@ container or secret manager. `token_env` supplies a bearer token;
 if the catalog supports it). Flow does not load `.env` files automatically.
 Missing, empty or non-Unicode values fail when connecting. `check` and `status`
 do not resolve these secrets. Restart Flow to use changed environment values.
-Existing literal `token` and `credential` properties remain supported, but do
-not set a literal property and its corresponding `_env` reference together.
+Literal `token` and `credential` properties are also accepted; do not set a
+literal property and its corresponding `_env` reference together.
 If both token and OAuth credentials are supplied, the token takes precedence
 until the catalog rejects it.
 
@@ -129,8 +129,8 @@ Flow reads `tls_ca_file` when connecting and does not forward it to the
 catalog. Client certificates (mutual TLS) are not supported. Use `https://` for
 any catalog that receives a token or credential: Flow logs a warning when
 `uri` or `oauth2-server-uri` sends them over plain `http://` to a host other
-than loopback, but still connects so existing private-network deployments keep
-working. `tls_ca_file` and these environment variables apply to the catalog
+than loopback, but still connects, so catalogs on a trusted private network
+can use plain HTTP. `tls_ca_file` and these environment variables apply to the catalog
 client; object-storage connections use their own client.
 
 Configuration parse errors report a location without source excerpts or input
