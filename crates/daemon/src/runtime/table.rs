@@ -1408,6 +1408,9 @@ impl TableWork {
                     id,
                     &flow_coordinator::GarbagePolicy {
                         grace: Duration::from_secs(self.config.limits.orphan_grace_secs),
+                        metadata_grace: Duration::from_secs(
+                            self.config.limits.metadata_json_grace_secs(),
+                        ),
                         ..Default::default()
                     },
                     &protection,

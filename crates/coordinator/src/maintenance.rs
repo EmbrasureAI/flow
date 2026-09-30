@@ -267,6 +267,7 @@ pub struct TableMaintenance {
     writer: WriterConfig,
     read_limits: flow_compactor::ReadLimits,
     cache: ManifestCache,
+    garbage: garbage::RetainedIndexes,
 }
 
 impl TableMaintenance {
@@ -284,6 +285,7 @@ impl TableMaintenance {
             writer,
             read_limits: flow_compactor::ReadLimits::default(),
             cache: ManifestCache::default(),
+            garbage: garbage::RetainedIndexes::new(garbage::RETAINED_INDEX_BYTES),
         })
     }
 

@@ -139,8 +139,9 @@ writes elsewhere (such as under `write.metadata.path`) stays catalog-owned and
 is skipped, never collected.
 A durable per-object clock requires a full grace after first observing an
 unreferenced file, independently of upload/fence age. Retained references reset
-that clock. Check absence before deleting obsolete siblings of a partially live
-owner, so repeat sweeps do not create endless S3 delete markers.
+that clock. JSON uses `limits.metadata_json_grace_secs`, other objects
+`limits.orphan_grace_secs`. Check absence before deleting obsolete siblings of a
+partially live owner, so repeat sweeps do not create endless S3 delete markers.
 
 Current metadata and all catalog metadata-log entries are protected by GC; empty
 metadata logs (including Glue REST) do not disable cleanup. JSON-only registry pages
@@ -148,15 +149,23 @@ avoid scanning manifests. `gc.enabled=false` disables all physical collection.
 
 New ownership records use `owned-artifacts/v2/`. The collector reads v1 and v2
 within the same bounded page and cursor. Old engines cannot safely classify JSON,
-so rollback must leave v2 records unread rather than delete their objects. The
-record format and durable control/index ownership protocol are otherwise unchanged.
+so rollback must leave v2 records unread rather than delete their objects. After
+its first examination a record moves to the due queue
+`owned-artifacts/v2/{table}/~/{due_ms}-{id}` with an unchanged value, so a
+release that predates the queue still reads and conservatively collects it after
+a rollback. The sweep cursor moved to `artifact-gc/v2/`; each new sweep deletes
+the obsolete `artifact-gc/v1/` cursor. The record format and
+durable control/index ownership protocol are otherwise unchanged.
 
 Pre-registry JSON can be adopted with `metadata-import --inventory <ndjson>` while
 the daemon is stopped and supervisor desired state is paused. Entries contain
 `table_uuid` and `path`. The command checks frozen source/table identities, flat
 metadata paths, each object's UUID/location/timestamp and a 16 MiB read limit.
-Without `--apply`, it only validates. Apply records ownership and starts the normal
-unfenced GC grace; it never deletes objects or commits catalog changes. Import is
+Without `--apply`, it only validates. Apply records ownership; collection gives
+adopted JSON the full `limits.orphan_grace_secs`, not the shorter metadata JSON
+grace, because secondary catalogs or readers may still use it by location. The
+grace starts when collection first observes the JSON unreferenced. Import never
+deletes objects or commits catalog changes. Import is
 idempotent and refuses a live daemon's state lock. Resume the normal source after
 bounded batches, keeping upstream WAL within its retention headroom.
 

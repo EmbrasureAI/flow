@@ -89,15 +89,18 @@ Compaction debt can delay or stop publication. The source can continue into its 
 
 Metadata and garbage work has a separate due signal from soft data compaction.
 One periodic table actor may run at a time, and ready CDC receives a dispatch
-between periodic visits. Each visit checks manifest/history debt and scans one
-bounded garbage-registry page; continuation can resume after CDC gets its turn.
-WAL pressure suppresses these visits, so after publishing an epoch the CDC
+between periodic visits. Each visit checks manifest/history debt and processes
+one bounded garbage-registry page; continuation can resume after CDC gets its
+turn. WAL pressure suppresses these visits, so after publishing an epoch the CDC
 path itself expires history far past the snapshot cap and rewrites manifests
 past twice their limit, unless a background build owns the table; garbage
-collection remains optional.
-The collector's scan budget is cooperative: retained-artifact checks and in-flight
-storage requests are not a hard wall-clock deadline. Builds, prepared publication
-and checkpoint protection retain their existing ownership rules.
+collection remains optional. A garbage page reads only new and due registry
+records, checks them against an in-memory index of retained snapshots that
+reads each new manifest list once, and bounds deletions by count. Its time
+budget is cooperative: in-flight catalog and storage requests finish, so a page
+holds the table actor for about two catalog loads plus a few rounds of
+concurrent object requests. Builds, prepared publication and checkpoint
+protection retain their existing ownership rules.
 
 Checkpoint rotation does not wait for all tables to become idle. A checkpoint
 records pending operations consistently with its index and keeps their base and

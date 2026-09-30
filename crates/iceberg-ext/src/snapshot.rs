@@ -90,6 +90,27 @@ impl ManifestCache {
             .await
             .map_err(|error| iceberg::Error::new(error.kind(), error.message()).with_source(error))
     }
+
+    /// Reuse a cached manifest, but do not admit one read for background
+    /// history scans. Those reads would evict manifests of the current snapshot
+    /// that publication reuses on every commit.
+    pub(crate) async fn peek_or_read(
+        &self,
+        table: &Table,
+        manifest: &ManifestFile,
+    ) -> Result<Arc<Manifest>> {
+        let key = (
+            table.metadata().uuid(),
+            manifest.manifest_path.clone(),
+            manifest.sequence_number,
+            manifest.added_snapshot_id,
+            manifest.first_row_id,
+        );
+        match self.entries.get(&key).await {
+            Some(cached) => Ok(cached),
+            None => manifest.load_manifest(table.file_io()).await.map(Arc::new),
+        }
+    }
 }
 
 impl Default for ManifestCache {

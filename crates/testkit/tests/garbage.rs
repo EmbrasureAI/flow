@@ -80,8 +80,10 @@ async fn collect(
                 schema(1).table_id,
                 &GarbagePolicy {
                     grace: Duration::from_millis(1),
+                    metadata_grace: Duration::from_millis(1),
                     max_objects: 3,
                     max_records: 2,
+                    max_deletes: 2,
                     max_duration: Duration::from_secs(1),
                 },
                 protection,
@@ -89,14 +91,15 @@ async fn collect(
             .await
             .unwrap();
         assert!(report.examined_objects <= 3);
+        assert!(report.delete_requests <= 2);
         deleted += report.delete_requests;
         if !report.continuation_required {
             sweeps += 1;
             if sweeps == 3 {
                 break;
             }
-            // Upload and last-reference grace are independent. Complete real
-            // bounded sweeps, allowing each 1 ms test grace to elapse between them.
+            // Complete real bounded sweeps, allowing each 1 ms test grace to
+            // elapse between them: the first observation starts the clock.
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
@@ -176,7 +179,11 @@ async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_
             )
             .unwrap();
         // These synthetic orphans were already observed unreferenced before
-        // the grace boundary. New observations are tested separately below.
+        // the grace boundary. The young record has never been observed.
+        paths.push(path.clone());
+        if young {
+            continue;
+        }
         let unreferenced = format!(
             "artifact-unreferenced/v1/{}/{}",
             table.metadata().uuid(),
@@ -188,7 +195,6 @@ async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_
                 &bincode::serialize(&0_u64).unwrap(),
             )
             .unwrap();
-        paths.push(path);
     }
     let protection = GarbageProtection {
         operations: protected_operations,
@@ -199,6 +205,7 @@ async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_
         max_objects: 8,
         max_records: 8,
         max_duration: Duration::from_secs(1),
+        ..Default::default()
     };
     let first = maintenance
         .collect_garbage(&table, schema.table_id, &policy, &protection)
@@ -241,6 +248,8 @@ async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_
         "explicit operation protection is retained"
     );
     assert!(paths[79].exists(), "the grace period is retained");
+    // Fenced records stay under their unordered keys; the young one moved to
+    // the due queue, which remains inside the rollback-readable v2 namespace.
     assert_eq!(
         store
             .source_transactions_after(prefix.as_bytes(), None)
@@ -256,6 +265,10 @@ async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_
             .await
             .unwrap();
         idle_passes += 1;
+        assert_eq!(
+            idle.examined_records, 8,
+            "only fenced records; the queue stops at the first record not yet due"
+        );
         assert_eq!(idle.delete_requests, 0);
         assert_eq!(idle.retired_records, 0);
         if !idle.continuation_required {
@@ -263,7 +276,7 @@ async fn registry_backlog_drains_in_bounded_pages_and_ineligible_records_do_not_
         }
         assert!(idle_passes < 3, "ineligible-only sweep must terminate");
     }
-    assert_eq!(idle_passes, 2);
+    assert_eq!(idle_passes, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -738,21 +751,29 @@ async fn legacy_metadata_import_is_scoped_idempotent_and_grace_delayed() {
         WriterConfig::default(),
     )
     .unwrap();
-    let report = maintenance
-        .collect_garbage(
-            &current,
-            schema.table_id,
-            &GarbagePolicy::default(),
-            &GarbageProtection::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        report.delete_requests, 0,
-        "adoption starts a fresh 24-hour production grace"
-    );
-    assert!(Path::new(&old_path).exists());
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    let grace = GarbagePolicy {
+        grace: Duration::from_millis(300),
+        metadata_grace: Duration::from_millis(1),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let report = maintenance
+            .collect_garbage(
+                &current,
+                schema.table_id,
+                &grace,
+                &GarbageProtection::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.delete_requests, 0,
+            "adopted JSON gets the full orphan grace, not the metadata JSON grace"
+        );
+        assert!(Path::new(&old_path).exists());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(330)).await;
     assert_eq!(
         collect(&maintenance, &current, &GarbageProtection::default()).await,
         1
@@ -816,11 +837,16 @@ async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history(
             .await
             .unwrap();
     }
+    let grace = GarbagePolicy {
+        grace: Duration::from_millis(300),
+        metadata_grace: Duration::from_millis(300),
+        ..Default::default()
+    };
     let report = maintenance
         .collect_garbage(
             &current,
             schema.table_id,
-            &GarbagePolicy::default(),
+            &grace,
             &GarbageProtection::default(),
         )
         .await
@@ -844,7 +870,7 @@ async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history(
         .collect_garbage(
             &current,
             schema.table_id,
-            &GarbagePolicy::default(),
+            &grace,
             &GarbageProtection::default(),
         )
         .await
@@ -853,7 +879,7 @@ async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history(
         report.delete_requests, 0,
         "restart must preserve the reader grace"
     );
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
     assert_eq!(
         collect(&maintenance, &current, &GarbageProtection::default()).await,
         1
@@ -907,4 +933,443 @@ async fn partially_live_owner_does_not_redelete_absent_siblings() {
     );
     assert!(Path::new(table.metadata_location().unwrap()).exists());
     assert!(!orphan.exists());
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+fn register(store: &StateStore, table: &Table, key: &str, paths: Vec<String>, created_ms: u64) {
+    let record = RegistryFixture {
+        table_uuid: table.metadata().uuid(),
+        table_id: schema(1).table_id,
+        location: table.metadata().location().to_owned(),
+        operation: OperationId(format!("fixture-{key}")),
+        created_ms,
+        unfenced_since_ms: None,
+        artifacts: ArtifactSet {
+            paths,
+            ranges: Vec::new(),
+        },
+        cursor: 0,
+        protected: false,
+    };
+    store
+        .put_source_transaction(key.as_bytes(), &bincode::serialize(&record).unwrap())
+        .unwrap();
+}
+fn registry_keys(store: &StateStore, prefix: &str) -> Vec<String> {
+    store
+        .source_transactions_after(prefix.as_bytes(), None)
+        .map(|entry| String::from_utf8(entry.unwrap().0.to_vec()).unwrap())
+        .collect()
+}
+/// Run pages until one sweep completes; returns (pages, manifest-list reads, deletes).
+async fn sweep(
+    maintenance: &TableMaintenance,
+    table: &Table,
+    policy: &GarbagePolicy,
+) -> (usize, usize, usize) {
+    let (mut pages, mut reads, mut deletes) = (0, 0, 0);
+    loop {
+        let report = maintenance
+            .collect_garbage(
+                table,
+                schema(1).table_id,
+                policy,
+                &GarbageProtection::default(),
+            )
+            .await
+            .unwrap();
+        pages += 1;
+        reads += report.manifest_list_reads;
+        deletes += report.delete_requests;
+        assert!(report.examined_records <= policy.max_records);
+        if !report.continuation_required {
+            return (pages, reads, deletes);
+        }
+        assert!(pages < 1000, "a sweep must terminate");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_stops_at_records_not_yet_due_and_still_collects_uuid_keyed_records() {
+    let temp = TempDir::new().unwrap();
+    let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
+    let table = table(catalog.as_ref(), &schema(1)).await;
+    let store = StateStore::open(temp.path().join("index"), Default::default()).unwrap();
+    let maintenance = TableMaintenance::new(
+        store.clone(),
+        catalog.clone(),
+        Policy::default(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let uuid = table.metadata().uuid();
+    let data = Path::new(table.metadata().location()).join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let mut young = Vec::new();
+    for n in 0..100 {
+        let path = data.join(format!("young-{n:03}.parquet"));
+        std::fs::write(&path, b"never observed").unwrap();
+        register(
+            &store,
+            &table,
+            &format!("owned-artifacts/v2/{uuid}/{}", uuid::Uuid::new_v4()),
+            vec![path.to_string_lossy().into_owned()],
+            now_ms(),
+        );
+        young.push(path);
+    }
+    // Records written by earlier releases under random UUIDv4 keys, in both
+    // namespaces, whose objects were first observed unreferenced long ago.
+    let mut legacy = Vec::new();
+    for (n, namespace) in ["v1", "v2"].into_iter().enumerate() {
+        let path = data.join(format!("legacy-{n}.parquet"));
+        std::fs::write(&path, b"old orphan").unwrap();
+        let path_string = path.to_string_lossy().into_owned();
+        register(
+            &store,
+            &table,
+            &format!(
+                "owned-artifacts/{namespace}/{uuid}/{}",
+                uuid::Uuid::new_v4()
+            ),
+            vec![path_string.clone()],
+            0,
+        );
+        store
+            .put_source_transaction(
+                format!(
+                    "artifact-unreferenced/v1/{uuid}/{}",
+                    uuid::Uuid::new_v5(&uuid, path_string.as_bytes())
+                )
+                .as_bytes(),
+                &bincode::serialize(&0_u64).unwrap(),
+            )
+            .unwrap();
+        legacy.push(path);
+    }
+    let obsolete_cursor = format!("artifact-gc/v1/{uuid}");
+    store
+        .put_source_transaction(obsolete_cursor.as_bytes(), b"old engine cursor")
+        .unwrap();
+    let policy = GarbagePolicy {
+        grace: Duration::from_secs(4 * 60 * 60),
+        ..Default::default()
+    };
+    let started = now_ms();
+    let first = maintenance
+        .collect_garbage(
+            &table,
+            schema(1).table_id,
+            &policy,
+            &GarbageProtection::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!first.continuation_required);
+    assert_eq!(first.examined_records, 102);
+    assert_eq!(first.delete_requests, 2);
+    assert_eq!(first.retired_records, 2);
+    assert_eq!(first.deferred_objects, 100);
+    assert_eq!(first.rescheduled_records, 100);
+    assert!(legacy.iter().all(|path| !path.exists()));
+    assert!(young.iter().all(|path| path.exists()));
+    // Every observed record waits in the due queue, keyed by its due time.
+    let queue = format!("owned-artifacts/v2/{uuid}/~/");
+    let queued = registry_keys(&store, &queue);
+    assert_eq!(queued.len(), 100);
+    assert!(
+        queued.iter().all(|key| {
+            let due: u64 = key[queue.len()..queue.len() + 20].parse().unwrap();
+            due > started && due <= now_ms() + 60 * 60 * 1000
+        }),
+        "a record waiting on a longer grace is still rechecked hourly"
+    );
+    assert!(
+        store
+            .source_transaction(obsolete_cursor.as_bytes())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        registry_keys(&store, &format!("owned-artifacts/v2/{uuid}/")).len(),
+        100
+    );
+    assert!(registry_keys(&store, &format!("owned-artifacts/v1/{uuid}/")).is_empty());
+    // A sweep reads only work that is due: none of the young records.
+    for _ in 0..2 {
+        let idle = maintenance
+            .collect_garbage(
+                &table,
+                schema(1).table_id,
+                &policy,
+                &GarbageProtection::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!idle.continuation_required);
+        assert_eq!(idle.examined_records, 0);
+        assert_eq!(idle.delete_requests, 0);
+    }
+    assert_eq!(registry_keys(&store, &queue), queued);
+
+    // A clock that ran ahead can park a record far in the future. Such due
+    // times are treated as due now, past the legitimately scheduled range.
+    let parked = data.join("parked.parquet");
+    std::fs::write(&parked, b"parked orphan").unwrap();
+    let parked_string = parked.to_string_lossy().into_owned();
+    register(
+        &store,
+        &table,
+        &format!("{queue}{:020}-parked", now_ms() + 30 * 24 * 60 * 60 * 1000),
+        vec![parked_string.clone()],
+        0,
+    );
+    store
+        .put_source_transaction(
+            format!(
+                "artifact-unreferenced/v1/{uuid}/{}",
+                uuid::Uuid::new_v5(&uuid, parked_string.as_bytes())
+            )
+            .as_bytes(),
+            &bincode::serialize(&0_u64).unwrap(),
+        )
+        .unwrap();
+    let report = maintenance
+        .collect_garbage(
+            &table,
+            schema(1).table_id,
+            &policy,
+            &GarbageProtection::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.examined_records, 1, "only the parked record");
+    assert_eq!(report.delete_requests, 1);
+    assert!(!parked.exists());
+    assert_eq!(registry_keys(&store, &queue), queued);
+}
+
+async fn expired_history_is_reclaimed_once_indexed(budget: Option<usize>) {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let temp = TempDir::new().unwrap();
+    let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
+    let schema = schema(1);
+    let mut current = table(catalog.as_ref(), &schema).await;
+    let store = StateStore::open(temp.path().join("index"), Default::default()).unwrap();
+    let publisher = TablePublisher::new(
+        store.clone(),
+        catalog.clone(),
+        WriterConfig::default(),
+        100,
+        1 << 20,
+    )
+    .unwrap();
+    let publish = |current: Table, n: i64| {
+        let store = store.clone();
+        let publisher = &publisher;
+        let schema = schema.clone();
+        let catalog = catalog.clone();
+        async move {
+            let (e, collapsed) = epoch(
+                &store,
+                &current,
+                &schema,
+                n as u64 * 10,
+                vec![(n, Change::Insert(row(n, "kept")))],
+            );
+            publisher
+                .publish(&current, &schema, collapsed)
+                .await
+                .unwrap();
+            store.forget_applied(&e.id).unwrap();
+            catalog.load_table(current.identifier()).await.unwrap()
+        }
+    };
+    for n in 1..=4 {
+        current = publish(current, n).await;
+    }
+    let mut maintenance = TableMaintenance::new(
+        store.clone(),
+        catalog.clone(),
+        Policy::default(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    if let Some(budget) = budget {
+        maintenance = maintenance.with_retained_index_budget(budget);
+    }
+    let policy = GarbagePolicy {
+        grace: Duration::from_millis(1),
+        metadata_grace: Duration::from_millis(1),
+        max_records: 1,
+        ..Default::default()
+    };
+    let indexed = budget.is_none();
+    let (pages, reads, deletes) = sweep(&maintenance, &current, &policy).await;
+    assert!(pages > 1, "one-record pages force a multi-page sweep");
+    assert_eq!(deletes, 0, "the first observation starts every clock");
+    if indexed {
+        assert_eq!(
+            reads, 4,
+            "each retained manifest list is read once for the whole sweep"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let (_, reads, _) = sweep(&maintenance, &current, &policy).await;
+    if indexed {
+        assert_eq!(reads, 0, "immutable lists are reused by later sweeps");
+    }
+    current = publish(current, 5).await;
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let (_, reads, _) = sweep(&maintenance, &current, &policy).await;
+    if indexed {
+        assert_eq!(reads, 1, "only the new commit's list is read");
+    }
+
+    let mut snapshots: Vec<_> = current.metadata().snapshots().cloned().collect();
+    snapshots.sort_by_key(|snapshot| snapshot.sequence_number());
+    let (expired, retained) = snapshots.split_at(snapshots.len() - 2);
+    let tx = Transaction::new(&current);
+    current = tx
+        .expire_snapshots()
+        .expire_snapshot_ids(expired.iter().map(|snapshot| snapshot.snapshot_id()))
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(current.metadata().snapshots().count(), 2);
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        sweep(&maintenance, &current, &policy).await;
+    }
+    assert!(
+        expired
+            .iter()
+            .all(|snapshot| !Path::new(snapshot.manifest_list()).exists()),
+        "an index kept across expiration must release expired history"
+    );
+    let mut referenced = BTreeSet::new();
+    for snapshot in retained {
+        referenced.insert(snapshot.manifest_list().to_owned());
+        for manifest in current
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .unwrap()
+            .entries()
+        {
+            referenced.insert(manifest.manifest_path.clone());
+            let entries = manifest.load_manifest(current.file_io()).await.unwrap();
+            for entry in entries.entries().iter().filter(|entry| entry.is_alive()) {
+                referenced.insert(entry.file_path().to_owned());
+            }
+        }
+    }
+    assert!(referenced.len() > 2);
+    assert!(
+        referenced.iter().all(|path| Path::new(path).exists()),
+        "retained snapshots keep every referenced object"
+    );
+    assert_eq!(scan(&current, &schema).await.unwrap().len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reachability_is_indexed_once_per_sweep_and_tracks_expiration() {
+    expired_history_is_reclaimed_once_indexed(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_reachability_index_falls_back_to_manifest_walks() {
+    expired_history_is_reclaimed_once_indexed(Some(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superseded_metadata_json_uses_its_shorter_grace() {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let temp = TempDir::new().unwrap();
+    let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
+    let mut current = table(catalog.as_ref(), &schema(1)).await;
+    let superseded = current.metadata_location().unwrap().to_owned();
+    for n in 0..2 {
+        let tx = Transaction::new(&current);
+        current = tx
+            .update_table_properties()
+            .set("write.metadata.previous-versions-max".into(), "1".into())
+            .set("test.version".into(), n.to_string())
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+    }
+    let orphan = Path::new(current.metadata().location()).join("metadata/orphan.avro");
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let store = StateStore::open(temp.path().join("index"), Default::default()).unwrap();
+    let uuid = current.metadata().uuid();
+    let tracked = current.metadata().metadata_log()[0].metadata_file.clone();
+    register(
+        &store,
+        &current,
+        &format!("owned-artifacts/v2/{uuid}/json"),
+        vec![superseded.clone(), tracked.clone()],
+        0,
+    );
+    register(
+        &store,
+        &current,
+        &format!("owned-artifacts/v2/{uuid}/manifest"),
+        vec![orphan.to_string_lossy().into_owned()],
+        0,
+    );
+    let maintenance =
+        TableMaintenance::new(store, catalog, Policy::default(), WriterConfig::default()).unwrap();
+    let policy = GarbagePolicy {
+        grace: Duration::from_secs(60 * 60),
+        metadata_grace: Duration::from_millis(1),
+        ..Default::default()
+    };
+    let first = maintenance
+        .collect_garbage(
+            &current,
+            schema(1).table_id,
+            &policy,
+            &GarbageProtection::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.delete_requests, 0,
+        "creation age does not start a clock"
+    );
+    assert_eq!(first.deferred_objects, 2);
+    assert_eq!(
+        first.protected_objects, 1,
+        "the metadata log keeps its JSON"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = maintenance
+        .collect_garbage(
+            &current,
+            schema(1).table_id,
+            &policy,
+            &GarbageProtection::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.examined_records, 1, "the data grace is not yet due");
+    assert_eq!(second.delete_requests, 1);
+    assert_eq!(second.metadata_json_delete_requests, 1);
+    assert!(!Path::new(&superseded).exists());
+    assert!(Path::new(&tracked).exists());
+    assert!(Path::new(current.metadata_location().unwrap()).exists());
+    assert!(orphan.exists());
 }
