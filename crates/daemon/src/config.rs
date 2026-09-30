@@ -15,6 +15,8 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub source: Source,
     pub catalog: HashMap<String, String>,
+    /// Required except by `discover`, which generates these blocks.
+    #[serde(default)]
     pub tables: Vec<Table>,
     #[serde(default)]
     pub limits: Limits,
@@ -22,6 +24,15 @@ pub struct Config {
     pub compaction: flow_compactor::Policy,
     #[serde(default)]
     pub parquet_read: flow_compactor::ReadLimits,
+    /// Optional HTTP endpoints for probes and Prometheus scraping.
+    #[serde(default)]
+    pub http: Option<Http>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http {
+    /// For example `0.0.0.0:9464`; serves /healthz, /readyz and /metrics.
+    pub listen: std::net::SocketAddr,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +154,13 @@ impl Default for Limits {
 }
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self> {
+        let config = Self::load_without_tables(path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate everything except the table list, for `discover`.
+    pub fn load_without_tables(path: &std::path::Path) -> Result<Self> {
         let input = std::fs::read_to_string(path).context("read configuration")?;
         let config: Self = toml::from_str(&input).map_err(|error: toml::de::Error| {
             // Both source excerpts and serde messages can contain secret values.
@@ -159,7 +177,7 @@ impl Config {
                 + 1;
             anyhow::anyhow!("invalid configuration at line {line}, column {column}")
         })?;
-        config.validate()?;
+        config.validate_source()?;
         Ok(config)
     }
 
@@ -191,9 +209,13 @@ impl Config {
         Ok(properties)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(!self.tables.is_empty(), "source and tables are required");
+        self.validate_source()
+    }
+
+    fn validate_source(&self) -> Result<()> {
         ensure!(
-            !self.tables.is_empty()
-                && !self.source.id.is_empty()
+            !self.source.id.is_empty()
                 && !self.source.slot.is_empty()
                 && !self.source.publication.is_empty(),
             "source and tables are required"

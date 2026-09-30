@@ -3,6 +3,8 @@
 Open an issue to report a bug or discuss a substantial change. Include the
 PostgreSQL, catalog and reader versions, relevant configuration, reproduction
 steps and expected behavior. Remove credentials and source data from logs.
+Report security vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Participation is governed by the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Development setup
 
@@ -29,7 +31,10 @@ The [code guide](docs/code-guide.md) maps crate responsibilities, internal
 modules and test locations. Start there when deciding where a change belongs.
 
 Keep changes focused and explain the problem, resulting behavior and relevant
-validation. Prefer integration checks at durable state transitions to tests that
+validation. Add user-visible changes to the `Unreleased` section of the
+[changelog](CHANGELOG.md), with an **Upgrade** note for anything that changes
+configuration defaults, on-disk state or required operator action; see the
+[compatibility policy](docs/upgrading.md#compatibility-policy). Prefer integration checks at durable state transitions to tests that
 repeat implementation details. Changes to source acknowledgement, catalog
 recovery, index application or delete handling need failure-path coverage.
 Documentation-only changes do not require a service benchmark.
@@ -59,3 +64,19 @@ the service. Review new dependency terms and the
 Workspace crates are currently unpublished implementation components. Their
 manifests disable accidental crates.io publication while the public API and
 release process are being established.
+
+## Releases
+
+Maintainers release from `main`:
+
+1. Set `version` under `[workspace.package]` in `Cargo.toml` and update `Cargo.lock`.
+2. Rename the changelog's `Unreleased` section to `## [X.Y.Z] - YYYY-MM-DD`
+   and start a new empty `Unreleased` section.
+3. Merge, then push the tag `vX.Y.Z` from that commit.
+
+The [release workflow](.github/workflows/release.yml) checks that the tag,
+workspace version and changelog agree, then publishes Linux x86-64 and arm64
+archives with checksums and license notices, a multi-architecture image at
+`ghcr.io/embrasureai/flow`, and a GitHub release with the changelog entry.
+Tags with a hyphen (for example `v0.2.0-rc.1`) are prereleases and do not move
+the image's `latest` tag.

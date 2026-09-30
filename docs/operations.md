@@ -25,6 +25,10 @@ and `catalog_xmin` age. It also lists other inactive slots retaining WAL. The
 command exits nonzero when any check fails. Rerun it when diagnosing a stopped
 daemon.
 
+`discover` generates the `[[tables]]` configuration for the publication's
+tables from the same catalog reads; see
+[configuration](getting-started.md#configuration).
+
 ### Bound source WAL retention
 
 PostgreSQL's default `max_slot_wal_keep_size = -1` lets a stalled or abandoned
