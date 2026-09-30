@@ -146,8 +146,11 @@ warning because quotas are ceilings, not reservations.
 While running, capture checks free space about every five seconds. Below
 `storage.min_free_bytes` it pauses exactly like a full journal:
 `flow_capture_disk_low` is 1, publication keeps draining and reclaiming the
-journal, and the slot retains the unjournaled WAL. Capture resumes once free
-space is a quarter above the watermark. `status.json` and `metrics.prom` are
+journal, and the slot retains the unjournaled WAL. Optional table maintenance
+(such as compaction, which stages local scratch stores) and index checkpoints
+are suppressed so they cannot consume the reserve, and a warning
+with the free bytes and pause duration repeats every five minutes. Capture
+resumes once free space is a quarter above the watermark. `status.json` and `metrics.prom` are
 observations, so a full volume skips their updates
 (`flow_observation_write_skipped_total`) instead of stopping the service.
 Running out of space in the journal or index still stops the process, and a
@@ -159,29 +162,33 @@ writers off the state volume, or leave them their own margin.
 
 ### Index verification and rebuild space
 
-After an unclean exit (crash, power loss, `kill -9`, or any exit with an
-error), the next start reads every row index block to verify its checksum, so a
-damaged index deterministically triggers a rebuild. This can take minutes on a
-large index. After a clean shutdown the full scan is skipped; RocksDB still
-verifies each block's checksum when it is read, and a corrupt read stops the
-process without recording a clean shutdown, so the next start runs the full
-scan. Set `storage.verify_index_on_start = true` to scan on every start. With
-the service stopped, `check --storage` runs the same scan on demand, checks the
-index against the control store, and exits nonzero when the index needs a
-rebuild (the next start then rebuilds it).
+After an unclean exit (crash, power loss, `kill -9`, or an exit with an error
+that may involve local state), the next start reads every row index block to
+verify its checksum, so a damaged index deterministically triggers a rebuild.
+This can take minutes on a large index. The scan is skipped after a clean
+shutdown, and after an exit caused only by a transient catalog/object-store
+failure or a PostgreSQL error, so a supervisor restarting through an outage
+does not rescan each time. RocksDB still verifies each block's checksum when it
+is read, and a corrupt read stops the process without recording a clean
+shutdown, so the next start runs the full scan. Set
+`storage.verify_index_on_start = true` to scan on every start. With the service
+stopped, `check --storage` runs the same scan on demand and checks the index
+against the control store. On success the next start skips the scan; on any
+failure it exits nonzero and the next start rescans (and rebuilds if needed).
 
 Each durable index transition is synced before the control store records it,
 so a host crash or power loss does not by itself force a rebuild. A rebuild
-first removes candidate and scratch directories left by interrupted rebuild
-attempts under `state_dir/index-generations`, keeping only the selected
-generation.
+first removes `index-<uuid>` candidate and `.scratch` directories left by
+interrupted rebuild attempts under `state_dir/index-generations`, keeping the
+selected generation; other entries and a legacy `state_dir/index` are left
+alone until a rebuilt generation is activated.
 
 ### Open files
 
 RocksDB caches open table files. Flow raises the process's soft
 `RLIMIT_NOFILE` toward its hard limit at startup and gives each row index a
-quarter of the result (between 64 and 8192 files); the control store uses up to
-256. The chosen values are logged as `file_descriptor_budget`. A small hard
+quarter of the result (between 64 and 8192 files), which also caps each
+compaction and reconcile scratch store; the control store uses up to 256. The chosen values are logged as `file_descriptor_budget`. A small hard
 limit still works, but a large index then reopens table files more often;
 raise the hard limit (`LimitNOFILE=` in systemd, `ulimit -Hn`) to 65536 or
 more for large deployments.

@@ -753,6 +753,169 @@ mod tests {
         );
     }
 
+    fn row_delta(key: u8) -> crate::IndexDelta {
+        crate::IndexDelta {
+            key: flow_model::PrimaryKey(vec![key]),
+            expected: None,
+            replacement: Some(flow_model::RowLocation {
+                data_file_id: flow_model::FileId("data.parquet".into()),
+                row_position: u64::from(key),
+                data_sequence_number: 1,
+                spec_id: 0,
+                partition: vec![],
+                source_commit_lsn: PgLsn(10),
+                row_version: 1,
+                row_fingerprint: [key; 16],
+            }),
+        }
+    }
+
+    fn row_operation() -> crate::PreparedOperation {
+        crate::PreparedOperation {
+            id: OperationId("power-loss".into()),
+            table_id: TableId(3),
+            kind: crate::OperationKind::Ingest,
+            base_snapshot_id: None,
+            last_lsn: PgLsn(10),
+            schema_version: 1,
+            artifacts: vec!["data.parquet".into()],
+            payload: vec![1],
+        }
+    }
+
+    const ROWS: u8 = 6;
+    fn two_row_batches() -> StateStoreOptions {
+        StateStoreOptions {
+            apply_batch_rows: 2,
+            ..Default::default()
+        }
+    }
+
+    /// Lose power with both databases open, then reopen the surviving bytes.
+    fn power_loss(
+        control: ControlStore,
+        index: StateStore,
+        root: &Path,
+    ) -> (ControlStore, StateStore) {
+        let (path, control_path) = (root.join("index"), root.join("control"));
+        let index_image = crash_image(&path);
+        let control_image = crash_image(&control_path);
+        drop(index);
+        drop(control);
+        SIMULATE_POWER_LOSS.set(false);
+        restore_image(&index_image, &path);
+        restore_image(&control_image, &control_path);
+        let control = ControlStore::open(&control_path).unwrap();
+        let index = StateStore::open_with_control(&path, two_row_batches(), control.clone())
+            .expect("equal revisions after power loss");
+        (control, index)
+    }
+
+    fn assert_published(control: &ControlStore, index: &StateStore) {
+        let id = row_operation().id;
+        assert_eq!(
+            index.operation(&id).unwrap().unwrap().phase,
+            crate::OperationPhase::Applied
+        );
+        let state = index.table_state(&TableId(3)).unwrap();
+        assert_eq!(state.snapshot_id, Some(5));
+        assert_eq!(state.materialized_lsn, PgLsn(10));
+        assert_eq!(state.pending_operation, None);
+        assert_eq!(control.table_state(&TableId(3)).unwrap(), Some(state));
+        for key in 0..ROWS {
+            assert_eq!(
+                index
+                    .lookup(&TableId(3), &flow_model::PrimaryKey(vec![key]))
+                    .unwrap(),
+                row_delta(key).replacement
+            );
+        }
+        assert_eq!(
+            index
+                .file_live_row_counts(
+                    &TableId(3),
+                    Some(5),
+                    &[flow_model::FileId("data.parquet".into())]
+                )
+                .unwrap(),
+            [u64::from(ROWS)]
+        );
+    }
+
+    #[test]
+    fn power_loss_during_multi_batch_apply_loses_only_the_staged_tail() {
+        SIMULATE_POWER_LOSS.set(true);
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let index = control
+            .initialize_index(root.path().join("index"), two_row_batches())
+            .unwrap();
+        let id = row_operation().id;
+        index
+            .prepare(row_operation(), (0..ROWS).map(row_delta))
+            .unwrap();
+        index.mark_committed(&id, 5, 5).unwrap();
+        // Intermediate apply batches are staged without their own sync.
+        for _ in 0..2 {
+            assert!(
+                !index
+                    .apply_batch(&id, false)
+                    .unwrap()
+                    .into_result()
+                    .complete
+            );
+        }
+        assert_eq!(index.operation(&id).unwrap().unwrap().applied_count, 4);
+
+        let (control, index) = power_loss(control, index, root.path());
+        let record = index.operation(&id).unwrap().unwrap();
+        assert_eq!(record.phase, crate::OperationPhase::Committed);
+        assert_eq!(record.applied_count, 0, "the unsynced tail was lost");
+        assert!(index.index_is_empty(&TableId(3)).unwrap());
+        index.apply_committed(&id).unwrap();
+        assert_published(&control, &index);
+    }
+
+    #[test]
+    fn power_loss_during_delta_staging_resumes_from_the_durable_count() {
+        SIMULATE_POWER_LOSS.set(true);
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let index = control
+            .initialize_index(root.path().join("index"), two_row_batches())
+            .unwrap();
+        let operation = row_operation();
+        let id = operation.id.clone();
+        index.begin_prepare(operation.clone()).unwrap();
+        index.stage_deltas(&id, (0..4).map(row_delta)).unwrap();
+        assert_eq!(index.operation(&id).unwrap().unwrap().delta_count, 4);
+
+        let (control, index) = power_loss(control, index, root.path());
+        let record = index.operation(&id).unwrap().unwrap();
+        assert_eq!(record.phase, crate::OperationPhase::Building);
+        assert_eq!(record.delta_count, 0, "the unsynced staging was lost");
+        assert_eq!(
+            control
+                .table_state(&TableId(3))
+                .unwrap()
+                .unwrap()
+                .pending_operation,
+            Some(id.clone())
+        );
+        // Staging restarts from the durable count without duplicate markers.
+        index.stage_deltas(&id, (0..ROWS).map(row_delta)).unwrap();
+        index
+            .seal_prepare(&id, operation.artifacts, operation.payload)
+            .unwrap();
+        assert_eq!(
+            index.prepared_deltas(&id).unwrap().count(),
+            usize::from(ROWS)
+        );
+        index.mark_committed(&id, 5, 5).unwrap();
+        index.apply_committed(&id).unwrap();
+        assert_published(&control, &index);
+    }
+
     #[test]
     fn index_revision_is_durable_before_control_is_written() {
         let root = tempfile::tempdir().unwrap();

@@ -57,9 +57,24 @@ pub fn status(config: Config) -> Result<()> {
 }
 
 pub async fn run(config: Config, compaction: bool) -> Result<()> {
+    let state_dir = config.state_dir.clone();
+    let witness = crate::generation::ShutdownWitness::default();
+    let result = run_service(config, compaction, &witness).await;
+    witness.finish(&state_dir, &result);
+    result
+}
+
+async fn run_service(
+    config: Config,
+    compaction: bool,
+    witness: &crate::generation::ShutdownWitness,
+) -> Result<()> {
     let mut observation = crate::observation::Observation::install()?;
     let control = ControlStore::open(config.state_dir.join("control"))?;
     let opened = crate::generation::open(&config, control.clone());
+    if let Ok(store) = &opened {
+        witness.observe(store);
+    }
     let _lifecycle = crate::lifecycle::Lifecycle::start(&config)?;
     crate::lifecycle::refuse_if_resync_required(&config)?;
     let mut boot = bootstrap(&control)?;
@@ -161,6 +176,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    witness.observe(&store);
     // Recovery may have loaded every table's snapshot history. Workers reload
     // targets on admission, so do not retain this inventory for the daemon's lifetime.
     drop(tables);
@@ -323,10 +339,10 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         Ok(joined) => {
             joined??;
         }
-        Err(_) => tracing::warn!("capture shutdown timed out; journal remains replayable"),
-    }
-    if result.is_ok() {
-        crate::generation::record_clean_shutdown(&config.state_dir);
+        Err(_) => {
+            witness.capture_detached();
+            tracing::warn!("capture shutdown timed out; journal remains replayable");
+        }
     }
     result
 }
@@ -591,7 +607,7 @@ impl PublishRuntime {
                 pending.has_work()
                     || pending.has_runnable_unloaded(ledger, &excluded)
                     || ledger.watermarks().journal_durable_lsn < capture_goal,
-            );
+            ) && !crate::disk::capture_paused_for_space(&config.state_dir);
             let cdc_deadline = scheduler.next_deadline();
             let periodic_allowed = optional_allowed
                 && !periodic_active
@@ -1063,7 +1079,7 @@ impl PublishRuntime {
                             pending.has_work()
                                 || pending.has_runnable_unloaded(ledger, &excluded)
                                 || ledger.watermarks().journal_durable_lsn < capture_goal,
-                        );
+                        ) && !crate::disk::capture_paused_for_space(&config.state_dir);
                         let prepared = ready_preparations
                             .keys()
                             .find(|id| !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none())
@@ -1313,6 +1329,7 @@ impl PublishRuntime {
                     observation.write(config, ledger, capture_goal, true)?;
                     if checkpoints.is_empty()
                         && checkpoint_at.elapsed() >= Duration::from_secs(config.limits.checkpoint_interval_secs)
+                        && !crate::disk::capture_paused_for_space(&config.state_dir)
                     {
                         // Checkpoints capture pending records consistently. Recovery
                         // may use the full catalog rebuild instead of their index.

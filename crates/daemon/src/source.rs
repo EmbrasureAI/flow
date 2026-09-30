@@ -616,8 +616,9 @@ async fn wait_for_journal_drain(
 
 /// Low free space on the state volume pauses capture like a full journal:
 /// journaled work keeps draining through publication (reclaiming segments)
-/// while the slot retains the unjournaled WAL. Returns false when the
-/// coordinator stops capture while waiting.
+/// while the slot retains the unjournaled WAL. Optional maintenance and
+/// checkpoints are suppressed meanwhile. Returns false when the coordinator
+/// stops capture while waiting.
 async fn wait_for_free_space(
     journal: &mut Journal,
     ack: &mut watch::Receiver<Acknowledgement>,
@@ -626,9 +627,11 @@ async fn wait_for_free_space(
     min_free_bytes: u64,
     available: &crate::disk::SpaceProbe,
 ) -> Result<bool> {
+    const WARNING_INTERVAL: Duration = Duration::from_secs(300);
+    let _pause = crate::disk::SpacePause::start(state_dir);
     journal.reclaim(ack.borrow_and_update().materialized)?;
-    metrics::gauge!("flow_capture_disk_low").set(1.0);
     let started = Instant::now();
+    let mut warned = started;
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let resumed = loop {
@@ -641,13 +644,23 @@ async fn wait_for_free_space(
                 journal.reclaim(ack.borrow_and_update().materialized)?;
             }
             _ = poll.tick() => {
-                if crate::disk::capture_may_resume(available, state_dir, min_free_bytes) {
+                let free = crate::disk::measure(available, state_dir);
+                if free.is_some_and(|free| free >= crate::disk::resume_bytes(min_free_bytes)) {
                     break true;
+                }
+                if warned.elapsed() >= WARNING_INTERVAL {
+                    warned = Instant::now();
+                    tracing::warn!(
+                        available_bytes = free,
+                        resume_bytes = crate::disk::resume_bytes(min_free_bytes),
+                        paused_seconds = started.elapsed().as_secs(),
+                        journal_bytes = journal.bytes_used(),
+                        "capture still paused for state volume free space; the source slot retains WAL meanwhile"
+                    );
                 }
             }
         }
     };
-    metrics::gauge!("flow_capture_disk_low").set(0.0);
     if resumed {
         tracing::info!(
             paused_seconds = started.elapsed().as_secs_f64(),
@@ -1428,6 +1441,7 @@ mod tests {
             move |_: &std::path::Path| Ok(probe_free.load(std::sync::atomic::Ordering::SeqCst));
         let state_dir = directory.path().to_owned();
         assert!(crate::disk::capture_should_pause(&probe, &state_dir, 100));
+        let paused_dir = state_dir.clone();
         let waiting = tokio::spawn(async move {
             let resumed =
                 wait_for_free_space(&mut journal, &mut ack, &send, &state_dir, 100, &probe)
@@ -1446,6 +1460,7 @@ mod tests {
             !waiting.is_finished(),
             "capture resumed below the watermark"
         );
+        assert!(crate::disk::capture_paused_for_space(&paused_dir));
         // At the watermark is not enough; resume a quarter above it.
         free.store(110, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -1455,6 +1470,7 @@ mod tests {
         let (resumed, journal) = waiting.await.unwrap();
         assert!(resumed);
         assert!(journal.bytes_used() < journaled_bytes);
+        assert!(!crate::disk::capture_paused_for_space(&paused_dir));
     }
 
     #[tokio::test]

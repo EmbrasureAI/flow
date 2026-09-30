@@ -2,8 +2,9 @@
 //! RocksDB file descriptor limits.
 use crate::config::Config;
 use std::{
+    collections::BTreeSet,
     fs, io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -152,38 +153,71 @@ pub(crate) fn capture_should_pause(probe: &SpaceProbe, state_dir: &Path, min_fre
     if min_free == 0 {
         return false;
     }
+    let Some(available) = measure(probe, state_dir) else {
+        return false;
+    };
+    if available < min_free {
+        tracing::warn!(
+            available_bytes = available,
+            min_free_bytes = min_free,
+            "state volume free space is below storage.min_free_bytes; pausing capture"
+        );
+    }
+    available < min_free
+}
+
+/// Free bytes on the state volume, also exported as a gauge.
+pub(crate) fn measure(probe: &SpaceProbe, state_dir: &Path) -> Option<u64> {
     match probe(state_dir) {
         Ok(available) => {
             metrics::gauge!("flow_state_volume_available_bytes").set(available as f64);
-            if available < min_free {
-                tracing::warn!(
-                    available_bytes = available,
-                    min_free_bytes = min_free,
-                    "state volume free space is below storage.min_free_bytes; pausing capture"
-                );
-                return true;
-            }
-            false
+            Some(available)
         }
         Err(error) => {
             tracing::warn!(%error, "could not measure free space on the state volume");
-            false
+            None
         }
     }
 }
 
 /// Resume a quarter above the watermark so capture does not flap around it.
-pub(crate) fn capture_may_resume(probe: &SpaceProbe, state_dir: &Path, min_free: u64) -> bool {
-    match probe(state_dir) {
-        Ok(available) => {
-            metrics::gauge!("flow_state_volume_available_bytes").set(available as f64);
-            available >= min_free.saturating_add(min_free / 4)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "could not measure free space on the state volume");
-            false
-        }
+pub(crate) fn resume_bytes(min_free: u64) -> u64 {
+    min_free.saturating_add(min_free / 4)
+}
+
+static SPACE_PAUSED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Held while capture for a state directory is paused for free space. Optional
+/// maintenance and checkpoints must not consume the remaining reserve.
+pub(crate) struct SpacePause(PathBuf);
+
+impl SpacePause {
+    pub fn start(state_dir: &Path) -> Self {
+        let state_dir = state_dir.to_owned();
+        SPACE_PAUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(state_dir.clone());
+        metrics::gauge!("flow_capture_disk_low").set(1.0);
+        Self(state_dir)
     }
+}
+
+impl Drop for SpacePause {
+    fn drop(&mut self) {
+        SPACE_PAUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+        metrics::gauge!("flow_capture_disk_low").set(0.0);
+    }
+}
+
+pub(crate) fn capture_paused_for_space(state_dir: &Path) -> bool {
+    SPACE_PAUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(state_dir)
 }
 
 /// A full volume, as opposed to a failure that indicates damaged state.
@@ -209,10 +243,12 @@ pub(crate) fn warn_observation_skipped(error: &anyhow::Error) {
     }
 }
 
-/// RocksDB descriptor budget for each row index, derived once per process
-/// after raising the soft `RLIMIT_NOFILE` toward its hard limit. At most two
-/// index generations (a rebuild candidate and its scratch store) are open at
-/// once, beside control, journal segments, and network sockets.
+/// RocksDB descriptor cap for each row index store, derived once per process
+/// after raising the soft `RLIMIT_NOFILE` toward its hard limit. The cap is a
+/// cache bound, not a reservation: the active index (or a rebuild candidate and
+/// its scratch store) shares the limit with short-lived per-table compaction and
+/// reconcile scratch stores, which stay small, and with control (256), journal
+/// segments and network sockets.
 pub(crate) fn index_max_open_files() -> i32 {
     static BUDGET: OnceLock<i32> = OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -275,7 +311,6 @@ fn raise_descriptor_limit() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn config(state_dir: PathBuf) -> Config {
         let mut config: Config =
@@ -328,9 +363,15 @@ mod tests {
         assert!(!capture_should_pause(&at, dir, 100));
         assert!(!capture_should_pause(&low, dir, 0));
         assert!(!capture_should_pause(&failed, dir, 100));
-        assert!(!capture_may_resume(&at, dir, 100));
-        assert!(capture_may_resume(&resumed, dir, 100));
-        assert!(!capture_may_resume(&failed, dir, 100));
+        assert_eq!(measure(&resumed, dir), Some(125));
+        assert_eq!(measure(&failed, dir), None);
+        assert_eq!(resume_bytes(100), 125);
+        let other = Path::new("/other-state");
+        let pause = SpacePause::start(dir);
+        assert!(capture_paused_for_space(dir));
+        assert!(!capture_paused_for_space(other));
+        drop(pause);
+        assert!(!capture_paused_for_space(dir));
     }
 
     #[test]

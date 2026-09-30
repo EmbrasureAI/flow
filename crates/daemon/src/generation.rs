@@ -125,6 +125,64 @@ pub(crate) fn open(config: &Config, control: ControlStore) -> Result<StateStore>
     Ok(store)
 }
 
+/// Decides, after `run` returns, whether the next start may skip the full index
+/// scan. Only a process that opened a usable index, never failed a durable
+/// transition, joined capture, and stopped cleanly or on an external outage
+/// qualifies. Its index clone is dropped before the marker is written.
+#[derive(Default)]
+pub(crate) struct ShutdownWitness {
+    store: std::sync::Mutex<Option<StateStore>>,
+    detached: std::sync::atomic::AtomicBool,
+}
+
+impl ShutdownWitness {
+    pub(crate) fn observe(&self, store: &StateStore) {
+        *self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store.clone());
+    }
+
+    /// Capture did not stop in time and may still use the index.
+    pub(crate) fn capture_detached(&self) {
+        self.detached
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn finish(self, state_dir: &Path, result: &Result<()>) {
+        let Some(store) = self
+            .store
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        else {
+            return;
+        };
+        let healthy = !store.has_failed();
+        drop(store);
+        let benign = match result {
+            Ok(()) => true,
+            Err(error) => external_outage(error),
+        };
+        if healthy && benign && !self.detached.into_inner() {
+            record_clean_shutdown(state_dir);
+        }
+    }
+}
+
+/// A transient catalog/object-store failure or a PostgreSQL error that never
+/// passed through local state. Anything else (including untyped errors) keeps
+/// the conservative full scan on the next start.
+fn external_outage(error: &anyhow::Error) -> bool {
+    let local = error.chain().any(|cause| {
+        cause.is::<flow_state_store::Error>() || cause.is::<flow_ingress_journal::Error>()
+    });
+    !local
+        && (crate::retry::transient(error)
+            || error
+                .chain()
+                .any(|cause| cause.is::<flow_pg_source::tokio_postgres::Error>()))
+}
+
 /// Record that this process stopped without an error, so the next start may
 /// skip the full index scan. Failure only costs that next start a full scan.
 pub(crate) fn record_clean_shutdown(state_dir: &Path) {
@@ -167,6 +225,8 @@ pub(crate) fn check_storage(config: &Config) -> Result<()> {
         .and_then(|store| store.validate_storage());
     match verified {
         Ok(()) => {
+            // Just verified: the next start need not repeat the scan.
+            record_clean_shutdown(&config.state_dir);
             println!(
                 "index storage verified in {:.1}s: {}",
                 started.elapsed().as_secs_f64(),
@@ -174,13 +234,16 @@ pub(crate) fn check_storage(config: &Config) -> Result<()> {
             );
             Ok(())
         }
-        Err(error) if error.requires_index_rebuild() => {
+        Err(error) => {
+            // Any failure, including I/O errors, makes the next start rescan.
             take_clean_shutdown(&config.state_dir)?;
-            anyhow::bail!(
-                "index storage check failed: {error}; the next start rebuilds the index from control and Iceberg"
-            )
+            if error.requires_index_rebuild() {
+                anyhow::bail!(
+                    "index storage check failed: {error}; the next start rebuilds the index from control and Iceberg"
+                )
+            }
+            Err(anyhow::Error::new(error).context("index storage check failed"))
         }
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -198,12 +261,9 @@ pub(crate) async fn rebuild(
     let previous = control.active_generation()?;
     // A rebuild writes a complete new generation. Reclaim what interrupted
     // attempts left first; the selected generation is retained for diagnosis.
-    if let Err(error) = sweep_abandoned_generations(
-        &config.state_dir,
-        previous
-            .as_ref()
-            .map(|generation| generation.path.as_path()),
-    ) {
+    if let Some(previous) = &previous
+        && let Err(error) = sweep_abandoned_generations(&config.state_dir, &previous.path)
+    {
         tracing::warn!(%error, "failed to remove abandoned index rebuild directories");
     }
     for operation in control.pending_operations()? {
@@ -494,13 +554,16 @@ fn retire_superseded_generations(
     }
 }
 
-/// Remove every managed generation except the selected one: candidates and
-/// scratch stores of interrupted rebuilds, and generations a completed rebuild
-/// would retire anyway. Only one process owns the state directory.
-fn sweep_abandoned_generations(state_dir: &Path, active: Option<&Path>) -> Result<usize> {
+/// Remove `index-generations/index-<uuid>[.scratch]` directories except the
+/// selected one: candidates and scratch stores of interrupted rebuilds, and
+/// generations a completed rebuild would retire anyway. The legacy
+/// `state_dir/index` is left to post-activation retirement. Only one process
+/// owns the state directory.
+fn sweep_abandoned_generations(state_dir: &Path, active: &Path) -> Result<usize> {
+    let legacy = fs::canonicalize(state_dir)?.join("index");
     let mut removed = 0;
     for path in managed_generation_directories(state_dir)? {
-        if Some(path.as_path()) == active {
+        if path == active || path == legacy {
             continue;
         }
         remove_directory_and_sync(&path)?;
@@ -673,6 +736,7 @@ mod tests {
         let control = ControlStore::open(state_dir.join("control")).unwrap();
         drop(open(&config, control).unwrap());
         check_storage(&config).unwrap();
+        assert!(state_dir.join(CLEAN_SHUTDOWN).exists());
     }
 
     #[test]
@@ -696,18 +760,91 @@ mod tests {
         fs::create_dir(&unrelated).unwrap();
 
         let active = control.active_generation().unwrap().unwrap().path;
-        assert_eq!(
-            sweep_abandoned_generations(&state_dir, Some(&active)).unwrap(),
-            2
-        );
+        assert_eq!(sweep_abandoned_generations(&state_dir, &active).unwrap(), 2);
         assert_eq!(
             managed_generation_directories(&state_dir).unwrap(),
             std::slice::from_ref(&active)
         );
         assert!(unrelated.exists());
-        drop(
-            StateStore::open_with_control(&active, StateStoreOptions::default(), control).unwrap(),
+
+        // Once a rebuilt generation is selected, the legacy index is left to
+        // post-activation retirement; only managed candidates are swept.
+        let directory = candidate_directory(&state_dir).unwrap();
+        let replacement = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let mut candidate = RebuildCandidate::new(replacement, directory);
+        let rebuilt = control.activate_rebuilt(candidate.store()).unwrap();
+        candidate.directory.retain();
+        candidate.close();
+        let mut stale = candidate_directory(&state_dir).unwrap();
+        stale.retain();
+        fs::create_dir(stale.path()).unwrap();
+        assert_eq!(
+            sweep_abandoned_generations(&state_dir, &rebuilt.path).unwrap(),
+            1
         );
+        assert!(active.exists());
+        assert!(rebuilt.path.exists());
+        assert!(!stale.path().exists());
+        drop(
+            StateStore::open_with_control(&rebuilt.path, StateStoreOptions::default(), control)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn shutdown_witness_records_only_clean_or_external_exits() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let config = test_config(&state_dir);
+        let store = open(
+            &config,
+            ControlStore::open(state_dir.join("control")).unwrap(),
+        )
+        .unwrap();
+        let marker = state_dir.join(CLEAN_SHUTDOWN);
+        let finish = |observe: bool, detached: bool, result: Result<()>| {
+            let witness = ShutdownWitness::default();
+            if observe {
+                witness.observe(&store);
+            }
+            if detached {
+                witness.capture_detached();
+            }
+            witness.finish(&state_dir, &result);
+            let recorded = marker.exists();
+            let _ = fs::remove_file(&marker);
+            recorded
+        };
+        let outage = || {
+            Err(anyhow::Error::new(
+                iceberg::Error::new(iceberg::ErrorKind::Unexpected, "503").with_retryable(true),
+            )
+            .context("load target table"))
+        };
+
+        assert!(finish(true, false, Ok(())));
+        assert!(!finish(false, false, Ok(())), "no usable index was opened");
+        assert!(
+            !finish(true, true, Ok(())),
+            "capture may still use the index"
+        );
+        assert!(finish(true, false, outage()));
+        assert!(!finish(
+            true,
+            false,
+            Err(
+                anyhow::Error::new(flow_state_store::Error::RecoveryRequired(
+                    "revision differs".into()
+                ))
+                .context("load target table")
+            )
+        ));
+        assert!(!finish(
+            true,
+            false,
+            Err(anyhow::anyhow!("source capture stopped: disk I/O error"))
+        ));
     }
 
     #[test]

@@ -371,6 +371,12 @@ impl StateStore {
         Ok(guard)
     }
 
+    /// Whether a durable transition failed in this process. The generation is
+    /// then fenced and must be revalidated before reuse.
+    pub fn has_failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
+    }
+
     fn ensure_writable(&self) -> Result<()> {
         if self.0.failed.load(Ordering::Acquire) {
             return Err(Error::RecoveryRequired(
