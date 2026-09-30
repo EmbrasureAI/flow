@@ -16,6 +16,25 @@ also missed the compacted-reader target. Separate 258-column, 1,502-column and
 approximately MiB-row recovery checks passed. Read the report's workload and
 shared-host limits before using these observations for sizing.
 
+## Publication batching across many tables
+
+Before this change, each table's publication epoch held at most its share of
+the global `pending_transactions` window (256 descriptors by default, counting
+queued and in-flight work, one per affected table). With N busy tables, an
+epoch carried about 256/N transactions, so small transactions were limited to
+roughly 256/N × `table_workers` per catalog commit latency: on the order of
+10–20 transactions/s across 100 tables at 0.5–1 s commits, and about 256 per
+commit for a single table. Workloads with many rows per transaction hid this.
+
+The window now bounds only queued lookahead. A dispatched epoch continues
+through its table's durable ledger references, up to 32 MiB of payload and
+about 4 MiB of in-memory transaction descriptors (roughly 16,000 single-table
+transactions), so epoch size no longer depends on how many other tables are
+busy. Descriptor memory is bounded by the lookahead plus that per-epoch limit
+for each running worker. Catalog commit latency, the commit-rate budget and
+`table_workers` still bound throughput. The results on this page predate the
+change and have not been rerun.
+
 ## V3 deletion-vector results
 
 The latest [v2/v3 comparison](benchmarks/v3-deletion-vectors.md)

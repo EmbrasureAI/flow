@@ -799,7 +799,8 @@ impl PublishRuntime {
                         TableOutcome::Deferred => {
                             blocked.clear(id)?;
                             ensure!(!reserved_build, "build reservation deferred behind itself");
-                            pending.restore(id, transactions, &mut scheduler, profiles[&id]);
+                            // The ledger retains the epoch; admission reloads it in order.
+                            pending.defer(id, &mut scheduler);
                             if build_active.contains(&id) {
                                 waiting_for_build.insert(id);
                                 scheduler.stall(id, true);
@@ -1231,7 +1232,7 @@ impl PublishRuntime {
                             build_admission,
                             actor_acquired_at: lane_acquired_at,
                         };
-                        let transactions = if idle { Vec::new() } else { pending.take_epoch(id) };
+                        let transactions = if idle { Vec::new() } else { pending.take_epoch(id, ledger)? };
                         if transactions.is_empty() && !idle {
                             continue;
                         }
