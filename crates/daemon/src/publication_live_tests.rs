@@ -416,9 +416,16 @@ async fn live_locked_table_does_not_stall_capture() {
     let sql = &sql;
     let held_url = url.clone();
     with_daemon(&url, sql, "locked", |config, name| async move {
-        until("orders publishes before the lock", || async {
-            materialized(&config, "orders") > 0
-        })
+        // The initial copy already published orders; prove capture is streaming
+        // before the lock, or its setup would wait for the lock to end.
+        sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (2, 'before')"))
+            .await
+            .unwrap();
+        let mark = current(sql).await;
+        until(
+            "orders publishes through capture before the lock",
+            || async { materialized(&config, "orders") as i64 >= mark },
+        )
         .await;
         let (held, connection) = tokio_postgres::connect(&held_url, NoTls).await.unwrap();
         let held_task = tokio::spawn(connection);
@@ -503,8 +510,11 @@ async fn live_rolled_back_streamed_changes_do_not_block_tables() {
         sql.batch_execute(&format!("INSERT INTO {name}.items VALUES (2, 'before')"))
             .await
             .unwrap();
+        // Capture must be streaming, not merely past the initial copy, before
+        // a held TRUNCATE locks items.
+        let mark = current(sql).await;
         until("items publishes before the streamed transactions", || async {
-            materialized(&config, "items") > 0
+            materialized(&config, "items") as i64 >= mark
         })
         .await;
         let (held, connection) = tokio_postgres::connect(&held_url, NoTls).await.unwrap();
