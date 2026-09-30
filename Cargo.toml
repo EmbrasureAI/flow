@@ -30,7 +30,7 @@ flow-coordinator = { path = "crates/coordinator" }
 flow-compactor = { path = "crates/compactor" }
 flow-catalog-watch = { path = "crates/catalog-watch" }
 arrow-array = "58"
-arrow-schema = "58"
+arrow-schema = "60"
 parquet = { version = "58", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "async", "zstd", "snap"] }
 iceberg = "=0.10.1"
 iceberg-catalog-rest = "=0.10.1"
