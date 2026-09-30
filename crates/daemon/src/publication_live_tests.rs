@@ -88,6 +88,11 @@ where
     ))
     .await
     .unwrap();
+    // Surface capture warnings (disconnects, deferred checks) in test output.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+        .with_test_writer()
+        .try_init();
     let root = tempfile::tempdir().unwrap();
     let mut config: Config = toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
     config.state_dir = root.path().join("state");
@@ -343,7 +348,7 @@ async fn published_rows(name: &str, table: &str) -> usize {
 
 /// Wait until the slot's walsender decoded all WAL written so far, including
 /// an open transaction's changes. A committed message flushes that WAL.
-async fn decoded(sql: &Client, slot: &str) {
+async fn decoded(sql: &Client, slot: &str, config: &Config) {
     sql.batch_execute("SELECT pg_catalog.pg_logical_emit_message(true, 'flow-test', '')")
         .await
         .unwrap();
@@ -372,7 +377,20 @@ async fn decoded(sql: &Client, slot: &str) {
                 )
                 .await
                 .map(|rows| rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>());
-            panic!("timed out: the walsender decodes the open transaction; {diagnostics:?}");
+            let sessions = sql
+                .query(
+                    "SELECT format('%s %s wait=%s:%s xact_age=%s query=%s', backend_type, state, wait_event_type, wait_event,
+                        now() - xact_start, left(regexp_replace(query, '\\s+', ' ', 'g'), 160))
+                     FROM pg_catalog.pg_stat_activity WHERE pid <> pg_backend_pid() AND state <> 'idle'",
+                    &[],
+                )
+                .await
+                .map(|rows| rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>());
+            let daemon = status(config);
+            panic!(
+                "timed out: the walsender decodes the open transaction; {diagnostics:?}; sessions: {sessions:?}; daemon state={} source_health={} last_error={} blocked={}",
+                daemon["state"], daemon["source_health"], daemon["last_error"], daemon["blocked_tables"]
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -521,7 +539,7 @@ async fn live_rolled_back_streamed_changes_do_not_block_tables() {
             held.batch_execute(&open).await.unwrap();
             // PostgreSQL skips streaming a transaction already known to have
             // aborted, so end it only after its changes reached the daemon.
-            decoded(sql, &name).await;
+            decoded(sql, &name, &config).await;
             held.batch_execute(&end).await.unwrap();
         }
         drop(held);
@@ -693,7 +711,7 @@ async fn live_streamed_ddl_blocks_only_when_it_commits() {
             ))
             .await
             .unwrap();
-            decoded(sql, &name).await;
+            decoded(sql, &name, &config).await;
             // Another transaction commits while the streamed one is undecided.
             sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (3, 'during')"))
                 .await
