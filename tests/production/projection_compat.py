@@ -49,7 +49,7 @@ columns = [
         original = self.config.read_text()
         self.config.write_text(original.replace('name = "id"', 'name = "payload"').replace('data_type = "Int32"', 'data_type = "String"'))
         result = subprocess.run(self.command("init"), env=self.environment, capture_output=True, timeout=self.args.timeout)
-        assert result.returncode != 0 and b"complete primary key" in result.stderr, result.stderr.decode()
+        assert result.returncode != 0 and b"complete primary key" in result.stdout + result.stderr, (result.stdout + result.stderr).decode()
         assert not self.pg.execute("SELECT 1 FROM pg_replication_slots WHERE slot_name=%s", (self.name,)).fetchone()
         self.config.write_text(original)
         if int(self.pg.execute("SHOW server_version_num").fetchone()[0]) >= 150000:
@@ -57,13 +57,13 @@ columns = [
             # ordinary columns, even when those columns are excluded in Flow.
             self.pg.execute(sql.SQL("ALTER PUBLICATION {} SET TABLE orders (id, value)").format(sql.Identifier(self.name)))
             result = subprocess.run(self.command("init"), env=self.environment, capture_output=True, timeout=self.args.timeout)
-            assert result.returncode != 0 and b"publication must include every current source column" in result.stderr, result.stderr.decode()
+            assert result.returncode != 0 and b"publication must include every current source column" in result.stdout + result.stderr, (result.stdout + result.stderr).decode()
             assert not self.pg.execute("SELECT 1 FROM pg_replication_slots WHERE slot_name=%s", (self.name,)).fetchone()
             self.pg.execute(sql.SQL("ALTER PUBLICATION {} SET TABLE orders").format(sql.Identifier(self.name)))
         if int(self.pg.execute("SHOW server_version_num").fetchone()[0]) >= 180000:
             self.pg.execute(sql.SQL("ALTER PUBLICATION {} SET (publish_generated_columns=none)").format(sql.Identifier(self.name)))
             result = subprocess.run(self.command("init"), env=self.environment, capture_output=True, timeout=self.args.timeout)
-            assert result.returncode != 0 and b"requires publish_generated_columns=stored" in result.stderr, result.stderr.decode()
+            assert result.returncode != 0 and b"requires publish_generated_columns=stored" in result.stdout + result.stderr, (result.stdout + result.stderr).decode()
             assert not self.pg.execute("SELECT 1 FROM pg_replication_slots WHERE slot_name=%s", (self.name,)).fetchone()
             self.pg.execute(sql.SQL("ALTER PUBLICATION {} SET (publish_generated_columns=stored)").format(sql.Identifier(self.name)))
         with (self.directory / "init.log").open("wb") as log:
@@ -132,7 +132,7 @@ columns = [
         self.config.write_text(original.replace('column_selection = "explicit"', 'column_selection = "all_current"'))
         result = subprocess.run(self.command("run"), env=self.environment, capture_output=True, timeout=self.args.timeout)
         self.config.write_text(original)
-        assert result.returncode != 0 and b"selection mode differs" in result.stderr, result.stderr.decode()
+        assert result.returncode != 0 and b"selection mode differs" in result.stdout + result.stderr, (result.stdout + result.stderr).decode()
         self.start()
         return {"mode_mutation_rejected": True}
 
