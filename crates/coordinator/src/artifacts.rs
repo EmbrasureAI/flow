@@ -105,6 +105,9 @@ pub(super) fn registry_prefix(uuid: uuid::Uuid) -> String {
     // makes rollback retain new records instead of deleting a live JSON pointer.
     format!("owned-artifacts/v2/{uuid}/")
 }
+/// Operation prefix of adopted pre-registry JSON. Its readers are unknown, so
+/// the collector gives it the full orphan grace, not the metadata JSON grace.
+pub(super) const METADATA_IMPORT: &str = "metadata-import";
 pub(super) fn now_ms() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)?
@@ -138,11 +141,21 @@ async fn register_metadata_path(
     table_id: TableId,
     path: &str,
 ) -> Result<()> {
+    register_metadata_owner(store, table, table_id, path, "catalog-metadata").await
+}
+
+async fn register_metadata_owner(
+    store: &StateStore,
+    table: &Table,
+    table_id: TableId,
+    path: &str,
+    operation: &str,
+) -> Result<()> {
     let identity = uuid::Uuid::new_v5(&table.metadata().uuid(), path.as_bytes());
     let owner = OwnedArtifacts::new(
         table,
         table_id,
-        OperationId(format!("catalog-metadata-{identity}")),
+        OperationId(format!("{operation}-{identity}")),
         ArtifactSet {
             paths: vec![path.to_owned()],
             ranges: Vec::new(),
@@ -162,7 +175,9 @@ async fn register_metadata_path(
 /// Adopt a legacy catalog JSON into normal GC, without deleting anything.
 /// The operator must hold exclusive daemon state ownership. Every candidate is
 /// read and checked against the frozen table incarnation; names and age alone
-/// never establish ownership. Newly adopted files start a full GC grace.
+/// never establish ownership. Adopted files get the full orphan grace, not the
+/// shorter metadata JSON grace: secondary catalogs or readers may still use
+/// them by location. The grace starts when collection first observes them.
 pub async fn import_catalog_metadata(
     store: &StateStore,
     table: &Table,
@@ -185,7 +200,7 @@ pub async fn import_catalog_metadata(
     OwnedArtifacts::new(
         table,
         table_id,
-        OperationId("metadata-import".into()),
+        OperationId(METADATA_IMPORT.into()),
         ArtifactSet {
             paths: vec![path.to_owned()],
             ranges: Vec::new(),
@@ -218,7 +233,7 @@ pub async fn import_catalog_metadata(
         "metadata JSON does not match the retained table incarnation"
     );
     if apply {
-        register_metadata_path(store, table, table_id, path).await?;
+        register_metadata_owner(store, table, table_id, path, METADATA_IMPORT).await?;
     }
     Ok(())
 }

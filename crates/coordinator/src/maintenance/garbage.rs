@@ -1,5 +1,5 @@
 use super::{TableMaintenance, builds::active_build_protection};
-use crate::artifacts::{OwnedArtifacts, now_ms, registry_prefix};
+use crate::artifacts::{METADATA_IMPORT, OwnedArtifacts, now_ms, registry_prefix};
 use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
 use flow_iceberg_ext::{RetainedIndex, retained_artifacts};
@@ -25,7 +25,8 @@ pub struct GarbagePolicy {
     pub grace: Duration,
     /// The same clock for catalog metadata JSON once it has left the current
     /// pointer and the catalog metadata log. Readers load the current JSON, so
-    /// this can be much shorter than `grace`.
+    /// this can be shorter than `grace`; it breaks consumers that use an old
+    /// JSON by location. JSON adopted by `metadata-import` uses `grace`.
     pub metadata_grace: Duration,
     pub max_objects: usize,
     /// Maximum registry rows decoded by one invocation. A caller should run an
@@ -42,7 +43,7 @@ impl Default for GarbagePolicy {
     fn default() -> Self {
         Self {
             grace: Duration::from_secs(24 * 60 * 60),
-            metadata_grace: Duration::from_secs(10 * 60),
+            metadata_grace: Duration::from_secs(60 * 60),
             max_objects: 4096,
             max_records: 512,
             max_deletes: 64,
@@ -118,6 +119,9 @@ const DELETE_CONCURRENCY: usize = 16;
 /// alone exceeds it falls back to per-page manifest walks.
 pub(super) const RETAINED_INDEX_BYTES: usize = 128 << 20;
 const OVERSIZED_RETRY: Duration = Duration::from_secs(60 * 60);
+/// A partial index that yielded the budget to another build waits this long,
+/// walking manifests per page, before it starts again.
+const YIELDED_RETRY: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Serialize, Deserialize)]
 struct Sweep {
@@ -133,56 +137,107 @@ struct TableIndex {
 struct IndexSlot {
     index: Arc<tokio::sync::Mutex<TableIndex>>,
     bytes: usize,
+    complete: bool,
     used: Instant,
+}
+
+#[derive(Default)]
+struct IndexSlots {
+    tables: HashMap<uuid::Uuid, IndexSlot>,
+    /// The one partial index allowed to keep building when the budget is
+    /// tight. Other partial builds yield instead of evicting each other.
+    builder: Option<uuid::Uuid>,
 }
 
 /// Per-process reachability indexes shared by all tables' collection pages.
 /// They are rebuilt after restart; nothing here is durable.
 pub(super) struct RetainedIndexes {
     budget: usize,
-    tables: Mutex<HashMap<uuid::Uuid, IndexSlot>>,
+    slots: Mutex<IndexSlots>,
 }
 impl RetainedIndexes {
     pub(super) fn new(budget: usize) -> Self {
         Self {
             budget,
-            tables: Mutex::default(),
+            slots: Mutex::default(),
         }
     }
     fn slot(&self, table: uuid::Uuid) -> Result<Arc<tokio::sync::Mutex<TableIndex>>> {
-        let mut tables = self
-            .tables
+        let mut slots = self
+            .slots
             .lock()
             .map_err(|_| anyhow::anyhow!("retained index lock poisoned"))?;
-        let slot = tables.entry(table).or_insert_with(|| IndexSlot {
+        let slot = slots.tables.entry(table).or_insert_with(|| IndexSlot {
             index: Arc::default(),
             bytes: 0,
+            complete: false,
             used: Instant::now(),
         });
         slot.used = Instant::now();
         Ok(slot.index.clone())
     }
-    /// Record a table's size and evict least recently used other tables.
-    fn account(&self, table: uuid::Uuid, bytes: usize) -> Result<()> {
-        let mut tables = self
-            .tables
+    fn forget_builder(&self, table: uuid::Uuid) -> Result<()> {
+        let mut slots = self
+            .slots
             .lock()
             .map_err(|_| anyhow::anyhow!("retained index lock poisoned"))?;
-        if let Some(slot) = tables.get_mut(&table) {
-            slot.bytes = bytes;
+        if slots.builder == Some(table) {
+            slots.builder = None;
         }
-        while tables.values().map(|slot| slot.bytes).sum::<usize>() > self.budget {
-            let Some(victim) = tables
-                .iter()
-                .filter(|(id, _)| **id != table)
-                .min_by_key(|(_, slot)| slot.used)
-                .map(|(id, _)| *id)
-            else {
-                break;
-            };
-            tables.remove(&victim);
+        if let Some(slot) = slots.tables.get_mut(&table) {
+            slot.bytes = 0;
+            slot.complete = false;
         }
         Ok(())
+    }
+    /// Record a table's size and evict least recently used complete indexes
+    /// of other tables. Partial indexes are evicted only for a complete one,
+    /// and never the current builder, so concurrent builds cannot thrash each
+    /// other. Returns false when this table's partial index must yield: the
+    /// caller clears it and walks manifests for a while.
+    fn account(&self, table: uuid::Uuid, bytes: usize, complete: bool) -> Result<bool> {
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("retained index lock poisoned"))?;
+        if let Some(slot) = slots.tables.get_mut(&table) {
+            slot.bytes = bytes;
+            slot.complete = complete;
+        }
+        if complete && slots.builder == Some(table) {
+            slots.builder = None;
+        }
+        if !complete && slots.builder.is_none() {
+            slots.builder = Some(table);
+        }
+        while slots.tables.values().map(|slot| slot.bytes).sum::<usize>() > self.budget {
+            let builder = slots.builder;
+            let victim = |partial: bool| {
+                slots
+                    .tables
+                    .iter()
+                    .filter(|(id, slot)| {
+                        **id != table && slot.complete != partial && Some(**id) != builder
+                    })
+                    .min_by_key(|(_, slot)| slot.used)
+                    .map(|(id, _)| *id)
+            };
+            let victim = victim(false).or_else(|| if complete { victim(true) } else { None });
+            if let Some(victim) = victim {
+                slots.tables.remove(&victim);
+                continue;
+            }
+            if !complete && builder != Some(table) {
+                if let Some(slot) = slots.tables.get_mut(&table) {
+                    slot.bytes = 0;
+                }
+                return Ok(false);
+            }
+            // Only the builder or this complete index remains over budget.
+            // `RetainedIndex::sync` bounds each table by the whole budget.
+            break;
+        }
+        Ok(true)
     }
 }
 
@@ -296,6 +351,9 @@ impl TableMaintenance {
         let saved_cursor_key = cursor_key.clone();
         let saved_queue = queue.clone();
         let protected_head = head.clone();
+        // No schedule legitimately exceeds the larger grace plus a recheck.
+        // Later due times come from a clock that ran ahead; treat them as due.
+        let horizon = millis(policy.grace.max(policy.metadata_grace) + MAX_RECHECK);
         let (sweep, indexed, pending, records, has_unseen_records, builds) = blocking(move || {
             let sweep = match store.source_transaction(&saved_cursor_key)? {
                 Some(bytes) => bincode::deserialize::<Sweep>(&bytes)?,
@@ -310,13 +368,19 @@ impl TableMaintenance {
             let entries = store
                 .source_transactions_after(&legacy_prefix, sweep.after.as_deref())
                 .chain(store.source_transactions_after(&prefix, sweep.after.as_deref()));
+            let parked_after = sweep.started_ms.saturating_add(horizon);
+            let parked = |due: u64| due > parked_after;
             let mut records = Vec::new();
             let mut has_unseen_records = false;
+            let mut reached_schedule = false;
             for entry in entries {
                 let (key, value) = entry?;
                 // Queue keys are ordered by due time. Records moved during this
                 // sweep are due after its start, which bounds the sweep.
-                if queue_due(&key, &saved_queue).is_some_and(|due| due > sweep.started_ms) {
+                if queue_due(&key, &saved_queue)
+                    .is_some_and(|due| due > sweep.started_ms && !parked(due))
+                {
+                    reached_schedule = true;
                     break;
                 }
                 if records.len() == limit {
@@ -327,6 +391,29 @@ impl TableMaintenance {
                     key.to_vec(),
                     bincode::deserialize::<OwnedArtifacts>(&value)?,
                 ));
+            }
+            if reached_schedule {
+                // Skip the legitimately scheduled range to parked records.
+                let boundary = [
+                    saved_queue.as_slice(),
+                    format!("{parked_after:0DUE_DIGITS$}~").as_bytes(),
+                ]
+                .concat();
+                let after = sweep.after.clone().filter(|after| *after > boundary);
+                for entry in store.source_transactions_after(
+                    &saved_queue,
+                    Some(after.as_deref().unwrap_or(&boundary)),
+                ) {
+                    let (key, value) = entry?;
+                    if records.len() == limit {
+                        has_unseen_records = true;
+                        break;
+                    }
+                    records.push((
+                        key.to_vec(),
+                        bincode::deserialize::<OwnedArtifacts>(&value)?,
+                    ));
+                }
             }
             Ok((
                 sweep,
@@ -465,13 +552,15 @@ impl TableMaintenance {
         let mut truncated = None;
         'records: for (position, record) in selected.iter_mut().enumerate() {
             let age = now.saturating_sub(record.owner.created_ms);
+            let adopted = record.owner.operation.0.starts_with(METADATA_IMPORT);
             for ordinal in record.owner.cursor..record.end {
                 let path = record
                     .owner
                     .artifacts
                     .path(ordinal)
                     .expect("validated range");
-                let grace = millis(if is_metadata_json(&path) {
+                // Adopted pre-registry JSON has unknown readers: full grace.
+                let grace = millis(if is_metadata_json(&path) && !adopted {
                     policy.metadata_grace
                 } else {
                     policy.grace
@@ -505,7 +594,11 @@ impl TableMaintenance {
                 if since.saturating_add(grace) > now {
                     report.deferred_objects += 1;
                     record.retained = true;
-                    let eligible = since.saturating_add(grace);
+                    // Recheck at least hourly, so a reference that reappears
+                    // inside the grace resets the clock.
+                    let eligible = since
+                        .saturating_add(grace)
+                        .min(now.saturating_add(millis(MAX_RECHECK)));
                     record.next_due =
                         Some(record.next_due.map_or(eligible, |due| due.min(eligible)));
                     continue;
@@ -615,7 +708,7 @@ impl TableMaintenance {
             puts.push((moved, bincode::serialize(&record.owner)?));
             report.rescheduled_records += 1;
         }
-        let mut next_cursor = sweep.after;
+        let mut next_cursor = sweep.after.clone();
         for (key, index) in order {
             // Stop before a partial or untouched record; it is resumed next page.
             if index.is_some_and(|index| selected.get(index).is_none_or(|record| !record.finished))
@@ -623,6 +716,10 @@ impl TableMaintenance {
                 break;
             }
             next_cursor = Some(key);
+        }
+        if sweep.after.is_none() {
+            // The cursor of engines before the due queue is obsolete.
+            deletes.push(format!("artifact-gc/v1/{uuid}").into_bytes());
         }
         if report.continuation_required {
             let cursor = Sweep {
@@ -669,6 +766,7 @@ impl TableMaintenance {
                 .await?;
             report.manifest_list_reads += progress.manifest_lists_read;
             if progress.oversized {
+                self.garbage.forget_builder(uuid)?;
                 table.retry_after = Some(Instant::now() + OVERSIZED_RETRY);
                 tracing::warn!(
                     table_uuid = %uuid,
@@ -678,9 +776,15 @@ impl TableMaintenance {
             } else {
                 table.retry_after = None;
             }
-            self.garbage.account(uuid, table.index.estimated_bytes())?;
             if !progress.oversized {
-                return Ok(progress.complete.then_some(Referenced::Index(table)));
+                if self
+                    .garbage
+                    .account(uuid, table.index.estimated_bytes(), progress.complete)?
+                {
+                    return Ok(progress.complete.then_some(Referenced::Index(table)));
+                }
+                table.index = RetainedIndex::default();
+                table.retry_after = Some(Instant::now() + YIELDED_RETRY);
             }
         }
         drop(table);
@@ -693,6 +797,38 @@ impl TableMaintenance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_partial_build_keeps_priority_over_the_budget() {
+        let indexes = RetainedIndexes::new(100);
+        let [a, b, c] = [(); 3].map(|_| uuid::Uuid::new_v4());
+        for table in [a, b, c] {
+            indexes.slot(table).unwrap();
+        }
+        assert!(
+            indexes.account(a, 80, false).unwrap(),
+            "first build has priority"
+        );
+        assert!(
+            !indexes.account(b, 50, false).unwrap(),
+            "a second partial build yields instead of evicting the first"
+        );
+        assert!(indexes.slots.lock().unwrap().tables.contains_key(&a));
+        assert!(indexes.account(a, 80, true).unwrap());
+        assert!(
+            indexes.account(b, 50, false).unwrap(),
+            "a complete index is evicted for a build"
+        );
+        let slots = indexes.slots.lock().unwrap();
+        assert!(!slots.tables.contains_key(&a));
+        assert_eq!(slots.builder, Some(b));
+        drop(slots);
+        assert!(
+            indexes.account(c, 60, true).unwrap(),
+            "a complete index never evicts the builder"
+        );
+        assert!(indexes.slots.lock().unwrap().tables.contains_key(&b));
+    }
 
     #[test]
     fn queue_keys_order_by_due_time_and_keep_their_identity() {

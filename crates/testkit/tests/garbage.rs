@@ -753,21 +753,27 @@ async fn legacy_metadata_import_is_scoped_idempotent_and_grace_delayed() {
     .unwrap();
     let grace = GarbagePolicy {
         grace: Duration::from_millis(300),
-        metadata_grace: Duration::from_millis(300),
+        metadata_grace: Duration::from_millis(1),
         ..Default::default()
     };
-    let report = maintenance
-        .collect_garbage(
-            &current,
-            schema.table_id,
-            &grace,
-            &GarbageProtection::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(report.delete_requests, 0, "adoption starts a fresh grace");
-    assert!(Path::new(&old_path).exists());
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    for _ in 0..2 {
+        let report = maintenance
+            .collect_garbage(
+                &current,
+                schema.table_id,
+                &grace,
+                &GarbageProtection::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.delete_requests, 0,
+            "adopted JSON gets the full orphan grace, not the metadata JSON grace"
+        );
+        assert!(Path::new(&old_path).exists());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(330)).await;
     assert_eq!(
         collect(&maintenance, &current, &GarbageProtection::default()).await,
         1
@@ -1049,10 +1055,15 @@ async fn sweep_stops_at_records_not_yet_due_and_still_collects_uuid_keyed_record
             .unwrap();
         legacy.push(path);
     }
+    let obsolete_cursor = format!("artifact-gc/v1/{uuid}");
+    store
+        .put_source_transaction(obsolete_cursor.as_bytes(), b"old engine cursor")
+        .unwrap();
     let policy = GarbagePolicy {
-        grace: Duration::from_secs(60 * 60),
+        grace: Duration::from_secs(4 * 60 * 60),
         ..Default::default()
     };
+    let started = now_ms();
     let first = maintenance
         .collect_garbage(
             &table,
@@ -1071,8 +1082,22 @@ async fn sweep_stops_at_records_not_yet_due_and_still_collects_uuid_keyed_record
     assert!(legacy.iter().all(|path| !path.exists()));
     assert!(young.iter().all(|path| path.exists()));
     // Every observed record waits in the due queue, keyed by its due time.
-    let queued = registry_keys(&store, &format!("owned-artifacts/v2/{uuid}/~/"));
+    let queue = format!("owned-artifacts/v2/{uuid}/~/");
+    let queued = registry_keys(&store, &queue);
     assert_eq!(queued.len(), 100);
+    assert!(
+        queued.iter().all(|key| {
+            let due: u64 = key[queue.len()..queue.len() + 20].parse().unwrap();
+            due > started && due <= now_ms() + 60 * 60 * 1000
+        }),
+        "a record waiting on a longer grace is still rechecked hourly"
+    );
+    assert!(
+        store
+            .source_transaction(obsolete_cursor.as_bytes())
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         registry_keys(&store, &format!("owned-artifacts/v2/{uuid}/")).len(),
         100
@@ -1093,10 +1118,43 @@ async fn sweep_stops_at_records_not_yet_due_and_still_collects_uuid_keyed_record
         assert_eq!(idle.examined_records, 0);
         assert_eq!(idle.delete_requests, 0);
     }
-    assert_eq!(
-        registry_keys(&store, &format!("owned-artifacts/v2/{uuid}/~/")),
-        queued
+    assert_eq!(registry_keys(&store, &queue), queued);
+
+    // A clock that ran ahead can park a record far in the future. Such due
+    // times are treated as due now, past the legitimately scheduled range.
+    let parked = data.join("parked.parquet");
+    std::fs::write(&parked, b"parked orphan").unwrap();
+    let parked_string = parked.to_string_lossy().into_owned();
+    register(
+        &store,
+        &table,
+        &format!("{queue}{:020}-parked", now_ms() + 30 * 24 * 60 * 60 * 1000),
+        vec![parked_string.clone()],
+        0,
     );
+    store
+        .put_source_transaction(
+            format!(
+                "artifact-unreferenced/v1/{uuid}/{}",
+                uuid::Uuid::new_v5(&uuid, parked_string.as_bytes())
+            )
+            .as_bytes(),
+            &bincode::serialize(&0_u64).unwrap(),
+        )
+        .unwrap();
+    let report = maintenance
+        .collect_garbage(
+            &table,
+            schema(1).table_id,
+            &policy,
+            &GarbageProtection::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.examined_records, 1, "only the parked record");
+    assert_eq!(report.delete_requests, 1);
+    assert!(!parked.exists());
+    assert_eq!(registry_keys(&store, &queue), queued);
 }
 
 async fn expired_history_is_reclaimed_once_indexed(budget: Option<usize>) {

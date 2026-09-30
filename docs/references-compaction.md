@@ -150,15 +150,19 @@ so rollback must leave v2 records unread rather than delete their objects. After
 its first examination a record moves to the due queue
 `owned-artifacts/v2/{table}/~/{due_ms}-{id}` with an unchanged value, so a
 release that predates the queue still reads and conservatively collects it after
-a rollback. The sweep cursor moved to `artifact-gc/v2/`. The record format and
+a rollback. The sweep cursor moved to `artifact-gc/v2/`; each new sweep deletes
+the obsolete `artifact-gc/v1/` cursor. The record format and
 durable control/index ownership protocol are otherwise unchanged.
 
 Pre-registry JSON can be adopted with `metadata-import --inventory <ndjson>` while
 the daemon is stopped and supervisor desired state is paused. Entries contain
 `table_uuid` and `path`. The command checks frozen source/table identities, flat
 metadata paths, each object's UUID/location/timestamp and a 16 MiB read limit.
-Without `--apply`, it only validates. Apply records ownership and starts the normal
-unfenced GC grace; it never deletes objects or commits catalog changes. Import is
+Without `--apply`, it only validates. Apply records ownership; collection gives
+adopted JSON the full `limits.orphan_grace_secs`, not the shorter metadata JSON
+grace, because secondary catalogs or readers may still use it by location. The
+grace starts when collection first observes the JSON unreferenced. Import never
+deletes objects or commits catalog changes. Import is
 idempotent and refuses a live daemon's state lock. Resume the normal source after
 bounded batches, keeping upstream WAL within its retention headroom.
 

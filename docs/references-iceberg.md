@@ -207,11 +207,17 @@ Reachability comes from an in-memory index of the retained snapshots: each
 manifest list, manifest and live data/delete path, reference-counted by
 manifest-list path. Manifest lists and manifests are immutable, so each is
 read once while it is retained, not once per page; a page reads only lists
-committed since the previous page and releases expired ones. The index stores
-64-bit path hashes; a collision can only retain an orphan. It is rebuilt after
-a restart. All indexes share an estimated 128 MiB budget; a table whose index
-alone exceeds it intersects each page's candidates with a full manifest walk,
-as earlier releases did.
+committed since the previous page and releases expired ones. Lists and
+manifests are keyed by their full path, and a list counts only after all of
+its manifests have loaded. Only the set of referenced paths stores 64-bit
+hashes, where a collision can only retain an orphan. The index is rebuilt
+after a restart, in chunks of 16 reads with the page deadline and memory
+budget checked after each chunk. All indexes share an estimated 128 MiB
+budget. Complete indexes of other tables are evicted least recently used
+first; while one table's index is being built, another partial build waits
+five minutes instead of evicting it. A table whose index alone exceeds the
+budget intersects each page's candidates with a full manifest walk, as earlier
+releases did, and retries the index after an hour.
 
 Each object has one grace clock. It starts when a sweep first observes the
 object unreferenced by retained metadata and by protected operations, builds
@@ -222,15 +228,21 @@ fence was released, always has the full grace. Creation age does not count:
 a data file live for a month still gets the full grace after its snapshot
 expires. `limits.orphan_grace_secs` (24 hours by default) must cover the
 longest planned reader and interrupted-upload lifetime. Catalog metadata JSON
-has its own `limits.metadata_json_grace_secs`, 600 seconds by default (never
-more than the orphan grace unless set). The JSON is protected while it is the
-current pointer or in the catalog metadata log, and readers load the current
-pointer, so the risk of the shorter grace is limited to a client that resolved
-a pointer and fetched it only after the JSON left the log, or that stores
-metadata file locations for later use. Iceberg's own
-`write.metadata.delete-after-commit.enabled` deletes such files without any
-grace. Raise the setting if your readers retain metadata locations. A lowered
-grace applies to already-queued records when they next become due.
+has its own `limits.metadata_json_grace_secs`, one hour by default (never more
+than the orphan grace unless set). The JSON is protected while it is the
+current pointer or in the catalog metadata log, and ordinary readers load the
+current pointer. The shorter grace can break anything that uses a metadata
+JSON by location after it has left the log: a secondary or disaster-recovery
+catalog that registered the table from a metadata location, readers asked to
+scan a specific `metadata.json` (for example a static-table or
+`iceberg_scan` reader), or a client that resolved a pointer and fetched it
+only much later. Iceberg's own `write.metadata.delete-after-commit.enabled`
+deletes such files without any grace. Raise the setting if you rely on any of
+these. JSON adopted with `metadata-import` always gets the full orphan grace.
+Every waiting record is rechecked at least hourly, so a reference that
+reappears inside the grace resets its clock; a lowered grace applies at that
+recheck. Queue due times beyond the larger grace plus one hour, which only a
+clock that ran ahead can produce, are treated as due.
 
 Each page is bounded by registry records, candidate objects, deletions (64 by
 default, each preceded by an existence check, 16 concurrently) and a 250 ms

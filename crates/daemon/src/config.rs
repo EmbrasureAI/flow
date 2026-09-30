@@ -126,13 +126,13 @@ pub struct Limits {
     pub garbage_interval_secs: u64,
     pub orphan_grace_secs: u64,
     /// Grace for superseded catalog metadata JSON once it leaves the catalog
-    /// metadata log. Defaults to the smaller of 600 and `orphan_grace_secs`.
+    /// metadata log. Defaults to the smaller of 3600 and `orphan_grace_secs`.
     pub metadata_json_grace_secs: Option<u64>,
 }
 impl Limits {
     pub fn metadata_json_grace_secs(&self) -> u64 {
         self.metadata_json_grace_secs
-            .unwrap_or(self.orphan_grace_secs.min(600))
+            .unwrap_or(self.orphan_grace_secs.min(3600))
     }
 }
 impl Default for Limits {

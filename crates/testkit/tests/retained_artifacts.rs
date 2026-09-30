@@ -218,9 +218,76 @@ async fn retained_index_matches_the_walk_and_reads_each_list_once() {
     assert_eq!(next.manifest_lists_read, 1);
     assert!(index.contains(&path));
 
+    // A deadline that has already passed still advances one chunk per call.
+    let mut chunked = RetainedIndex::default();
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        let progress = chunked
+            .sync(&head, &cache, std::time::Instant::now(), usize::MAX)
+            .await
+            .unwrap();
+        if progress.complete {
+            break;
+        }
+        assert!(!chunked.is_complete());
+        assert!(calls < 100);
+    }
+    assert!(calls > 1, "lists and manifests load in separate chunks");
+    for path in &candidates {
+        assert_eq!(chunked.contains(path), index.contains(path));
+    }
+
     // A budget below the history clears the index instead of growing it.
     let mut small = RetainedIndex::default();
     let oversized = small.sync(&observed, &cache, deadline(), 1).await.unwrap();
     assert!(oversized.oversized && !oversized.complete);
     assert!(!small.is_complete() && small.estimated_bytes() == 0);
+}
+
+/// Every manifest (and manifest list) hashes to the same value. Manifests must
+/// still be tracked by full path: a collision may only retain objects.
+fn colliding_manifests(path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if path.ends_with(".avro") {
+        return 0;
+    }
+    let mut hasher = std::hash::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[tokio::test]
+async fn manifest_hash_collisions_only_retain_objects() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = flow_testkit::catalog(&temp.path().join("warehouse")).await;
+    let mut head = flow_testkit::table(&catalog, &flow_testkit::schema(1)).await;
+    let cache = ManifestCache::new(1);
+    let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut index = RetainedIndex::with_path_hasher(colliding_manifests);
+    let mut live = Vec::new();
+    for i in 0..4 {
+        let path = format!("{}/external-layout/{i}.parquet", head.metadata().location());
+        head = RowDeltaAction::new(&head, format!("append-{i}"))
+            .add_data_files(vec![data_file(&path)])
+            .commit(&catalog, &head)
+            .await
+            .unwrap()
+            .table;
+        live.push(path);
+        // Each sync sees a new manifest whose hash equals an indexed one.
+        let progress = index
+            .sync(&head, &cache, deadline(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(progress.complete);
+        assert!(progress.manifests_read >= 1, "the new manifest is read");
+        for path in &live {
+            assert!(index.contains(path), "live file {path} lost to a collision");
+        }
+    }
+    assert!(!index.contains(&format!(
+        "{}/data/unreferenced.parquet",
+        head.metadata().location()
+    )));
 }

@@ -177,9 +177,13 @@ const INDEX_LOAD_CONCURRENCY: usize = 16;
 // Conservative per-entry estimates, including hash-table slack.
 const INDEX_PATH_BYTES: usize = 32;
 const INDEX_ENTRY_BYTES: usize = 96;
+// A decoded manifest-list entry held until all of its list's manifests load.
+const INDEX_PENDING_MANIFEST_BYTES: usize = 512;
 
-/// Fixed-key SipHash of an object path. The index uses membership only to
-/// retain objects: a collision can keep an orphan, never delete a live file.
+/// Fixed-key SipHash of a live object path. Only the reference-count set of
+/// paths is hashed, and membership there only retains objects: a collision can
+/// keep an orphan, never delete a live file. Manifest lists and manifests, whose
+/// contents decide which paths are live, are keyed by their full path.
 fn path_hash(path: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::hash::DefaultHasher::new();
@@ -188,6 +192,8 @@ fn path_hash(path: &str) -> u64 {
 }
 
 struct IndexedManifest {
+    /// Applied lists that reference this manifest. Zero while it is loaded
+    /// only for lists still pending.
     lists: u32,
     live: Box<[u64]>,
 }
@@ -209,18 +215,45 @@ pub struct IndexProgress {
 /// is read once while it stays retained, rather than on every collection page.
 /// Synchronization adds newly retained lists and releases expired ones by
 /// reference count, so the result tracks exactly the metadata last synced.
-/// Paths are stored as 64-bit hashes; catalog JSON is not included.
-#[derive(Default)]
+/// Catalog JSON is not included.
 pub struct RetainedIndex {
     table: Option<uuid::Uuid>,
-    lists: std::collections::HashMap<String, Box<[u64]>>,
-    manifests: std::collections::HashMap<u64, IndexedManifest>,
+    hasher: fn(&str) -> u64,
+    lists: std::collections::HashMap<String, Box<[std::sync::Arc<str>]>>,
+    /// Lists already read whose manifests are not all loaded yet.
+    pending: std::collections::HashMap<String, Vec<iceberg::spec::ManifestFile>>,
+    manifests: std::collections::HashMap<std::sync::Arc<str>, IndexedManifest>,
     paths: std::collections::HashMap<u64, u32>,
     bytes: usize,
     complete: bool,
 }
 
+impl Default for RetainedIndex {
+    fn default() -> Self {
+        Self::with_path_hasher(path_hash)
+    }
+}
+
 impl RetainedIndex {
+    /// Tests use a degenerate hash to prove collisions only retain objects.
+    #[doc(hidden)]
+    pub fn with_path_hasher(hasher: fn(&str) -> u64) -> Self {
+        Self {
+            table: None,
+            hasher,
+            lists: Default::default(),
+            pending: Default::default(),
+            manifests: Default::default(),
+            paths: Default::default(),
+            bytes: 0,
+            complete: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::with_path_hasher(self.hasher);
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         self.bytes
     }
@@ -233,14 +266,16 @@ impl RetainedIndex {
     /// Membership in the metadata last synchronized. Callers must check
     /// [`Self::is_complete`] first: a partial index protects too little.
     pub fn contains(&self, path: &str) -> bool {
-        self.paths.contains_key(&path_hash(path))
+        self.paths.contains_key(&(self.hasher)(path))
     }
 
-    /// Bring the index to `table`'s retained snapshots. New manifest lists are
-    /// read in bounded concurrent batches until `deadline`; at least one batch
-    /// runs so repeated calls always progress. Reads finish before the index
-    /// changes, so an I/O error leaves the previous state intact. Exceeding
-    /// `max_bytes` clears the index and reports `oversized`.
+    /// Bring the index to `table`'s retained snapshots. Manifest lists and
+    /// manifests are read in bounded concurrent chunks until `deadline`, and
+    /// the memory budget is checked after every chunk. At least one chunk runs,
+    /// and partial progress is kept, so repeated calls always advance. A list
+    /// joins the index only after all of its manifests have loaded, so an I/O
+    /// error never leaves a partially counted list. Exceeding `max_bytes`
+    /// clears the index and reports `oversized`.
     pub async fn sync(
         &mut self,
         table: &iceberg::table::Table,
@@ -249,18 +284,19 @@ impl RetainedIndex {
         max_bytes: usize,
     ) -> Result<IndexProgress> {
         use futures::{StreamExt, TryStreamExt, stream};
+        self.complete = false;
         let uuid = table.metadata().uuid();
         if self.table != Some(uuid) {
-            *self = Self {
-                table: Some(uuid),
-                ..Self::default()
-            };
+            self.reset();
+            self.table = Some(uuid);
         }
         let mut missing = Vec::new();
         let mut retained = std::collections::HashSet::new();
         for snapshot in table.metadata().snapshots() {
-            if retained.insert(snapshot.manifest_list())
-                && !self.lists.contains_key(snapshot.manifest_list())
+            let list = snapshot.manifest_list();
+            if retained.insert(list)
+                && !self.lists.contains_key(list)
+                && !self.pending.contains_key(list)
             {
                 missing.push(snapshot.clone());
             }
@@ -275,85 +311,142 @@ impl RetainedIndex {
         for list in expired {
             self.remove_list(&list);
         }
+        let abandoned: Vec<_> = self
+            .pending
+            .keys()
+            .filter(|list| !retained.contains(list.as_str()))
+            .cloned()
+            .collect();
+        if !abandoned.is_empty() {
+            for list in abandoned {
+                let manifests = self.pending.remove(&list).expect("pending list");
+                self.bytes = self.bytes.saturating_sub(pending_bytes(&list, &manifests));
+            }
+            self.drop_unused_manifests();
+        }
         let mut progress = IndexProgress::default();
+        let hasher = self.hasher;
         let mut first = true;
-        while !missing.is_empty() && (first || std::time::Instant::now() < deadline) {
-            first = false;
-            let batch: Vec<_> = missing
-                .drain(..missing.len().min(INDEX_LOAD_CONCURRENCY))
-                .collect();
-            let lists: Vec<(String, Vec<iceberg::spec::ManifestFile>)> = stream::iter(batch)
-                .map(|snapshot| async move {
-                    let list = table.manifest_list_reader(&snapshot).load().await?;
-                    Ok::<_, iceberg::Error>((
-                        snapshot.manifest_list().to_owned(),
-                        list.consume_entries().into_iter().collect(),
-                    ))
-                })
-                .buffer_unordered(INDEX_LOAD_CONCURRENCY)
-                .try_collect()
-                .await?;
-            progress.manifest_lists_read += lists.len();
-            // A manifest shared by lists in this batch is still read once.
-            let mut unknown = std::collections::HashMap::new();
-            for manifest in lists.iter().flat_map(|(_, manifests)| manifests) {
-                let hash = path_hash(&manifest.manifest_path);
-                if !self.manifests.contains_key(&hash) {
-                    unknown.entry(hash).or_insert_with(|| manifest.clone());
+        loop {
+            self.apply_ready();
+            if !first && std::time::Instant::now() >= deadline {
+                break;
+            }
+            // Manifests needed by pending lists, each read once by full path.
+            let mut unloaded = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            'lists: for manifests in self.pending.values() {
+                for manifest in manifests {
+                    if !self.manifests.contains_key(manifest.manifest_path.as_str())
+                        && seen.insert(manifest.manifest_path.as_str())
+                    {
+                        unloaded.push(manifest.clone());
+                        if unloaded.len() == INDEX_LOAD_CONCURRENCY {
+                            break 'lists;
+                        }
+                    }
                 }
             }
-            let loaded: Vec<(u64, Box<[u64]>)> = stream::iter(unknown)
-                .map(|(hash, manifest)| async move {
-                    let manifest = cache.peek_or_read(table, &manifest).await?;
-                    let mut live: Vec<_> = manifest
-                        .entries()
-                        .iter()
-                        .filter(|entry| entry.is_alive())
-                        .map(|entry| path_hash(entry.file_path()))
-                        .collect();
-                    live.sort_unstable();
-                    live.dedup();
-                    Ok::<_, iceberg::Error>((hash, live.into_boxed_slice()))
-                })
-                .buffer_unordered(INDEX_LOAD_CONCURRENCY)
-                .try_collect()
-                .await?;
-            progress.manifests_read += loaded.len();
-            for (hash, live) in loaded {
-                self.bytes += INDEX_ENTRY_BYTES + live.len() * 8;
-                self.manifests
-                    .insert(hash, IndexedManifest { lists: 0, live });
-            }
-            for (list, manifests) in lists {
-                let mut hashes: Vec<_> = manifests
-                    .iter()
-                    .map(|manifest| path_hash(&manifest.manifest_path))
+            if !unloaded.is_empty() {
+                let loaded: Vec<(String, Box<[u64]>)> = stream::iter(unloaded)
+                    .map(|manifest| async move {
+                        let entries = cache.peek_or_read(table, &manifest).await?;
+                        let mut live: Vec<_> = entries
+                            .entries()
+                            .iter()
+                            .filter(|entry| entry.is_alive())
+                            .map(|entry| hasher(entry.file_path()))
+                            .collect();
+                        live.sort_unstable();
+                        live.dedup();
+                        Ok::<_, iceberg::Error>((manifest.manifest_path, live.into_boxed_slice()))
+                    })
+                    .buffer_unordered(INDEX_LOAD_CONCURRENCY)
+                    .try_collect()
+                    .await?;
+                progress.manifests_read += loaded.len();
+                for (path, live) in loaded {
+                    self.bytes += manifest_bytes(&path, &live);
+                    self.manifests
+                        .insert(path.into(), IndexedManifest { lists: 0, live });
+                }
+            } else if !missing.is_empty() {
+                let batch: Vec<_> = missing
+                    .drain(..missing.len().min(INDEX_LOAD_CONCURRENCY))
                     .collect();
-                hashes.sort_unstable();
-                hashes.dedup();
-                self.add_list(list, hashes.into_boxed_slice());
+                let lists: Vec<(String, Vec<iceberg::spec::ManifestFile>)> = stream::iter(batch)
+                    .map(|snapshot| async move {
+                        let list = table.manifest_list_reader(&snapshot).load().await?;
+                        Ok::<_, iceberg::Error>((
+                            snapshot.manifest_list().to_owned(),
+                            list.consume_entries().into_iter().collect(),
+                        ))
+                    })
+                    .buffer_unordered(INDEX_LOAD_CONCURRENCY)
+                    .try_collect()
+                    .await?;
+                progress.manifest_lists_read += lists.len();
+                for (list, manifests) in lists {
+                    self.bytes += pending_bytes(&list, &manifests);
+                    self.pending.insert(list, manifests);
+                }
+            } else {
+                break;
             }
+            first = false;
             if self.bytes > max_bytes {
-                *self = Self::default();
+                self.reset();
                 progress.oversized = true;
                 return Ok(progress);
             }
         }
-        self.complete = missing.is_empty();
+        self.apply_ready();
+        self.complete = missing.is_empty() && self.pending.is_empty();
         progress.complete = self.complete;
         Ok(progress)
     }
 
-    fn add_list(&mut self, list: String, manifests: Box<[u64]>) {
-        self.bytes += INDEX_ENTRY_BYTES + list.len() + manifests.len() * 8;
-        retain_path(&mut self.paths, &mut self.bytes, path_hash(&list));
-        for hash in &manifests {
+    /// Count every pending list whose manifests have all loaded.
+    fn apply_ready(&mut self) {
+        let ready: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, manifests)| {
+                manifests
+                    .iter()
+                    .all(|manifest| self.manifests.contains_key(manifest.manifest_path.as_str()))
+            })
+            .map(|(list, _)| list.clone())
+            .collect();
+        for list in ready {
+            let manifests = self.pending.remove(&list).expect("ready list");
+            self.bytes = self.bytes.saturating_sub(pending_bytes(&list, &manifests));
+            let mut keys: Vec<std::sync::Arc<str>> = manifests
+                .iter()
+                .map(|manifest| {
+                    self.manifests
+                        .get_key_value(manifest.manifest_path.as_str())
+                        .expect("loaded manifest")
+                        .0
+                        .clone()
+                })
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            self.add_list(list, keys.into_boxed_slice());
+        }
+    }
+
+    fn add_list(&mut self, list: String, manifests: Box<[std::sync::Arc<str>]>) {
+        self.bytes += list_bytes(&list, &manifests);
+        retain_path(&mut self.paths, &mut self.bytes, (self.hasher)(&list));
+        for path in &manifests {
             let manifest = self
                 .manifests
-                .get_mut(hash)
+                .get_mut(path)
                 .expect("list manifests are loaded before the list is added");
             if manifest.lists == 0 {
-                retain_path(&mut self.paths, &mut self.bytes, *hash);
+                retain_path(&mut self.paths, &mut self.bytes, (self.hasher)(path));
                 for live in &manifest.live {
                     retain_path(&mut self.paths, &mut self.bytes, *live);
                 }
@@ -367,27 +460,57 @@ impl RetainedIndex {
         let Some(manifests) = self.lists.remove(list) else {
             return;
         };
-        self.bytes = self
-            .bytes
-            .saturating_sub(INDEX_ENTRY_BYTES + list.len() + manifests.len() * 8);
-        release_path(&mut self.paths, &mut self.bytes, path_hash(list));
-        for hash in &manifests {
-            let Some(manifest) = self.manifests.get_mut(hash) else {
+        self.bytes = self.bytes.saturating_sub(list_bytes(list, &manifests));
+        release_path(&mut self.paths, &mut self.bytes, (self.hasher)(list));
+        for path in &manifests {
+            let Some(manifest) = self.manifests.get_mut(path) else {
                 continue;
             };
             manifest.lists -= 1;
             if manifest.lists == 0 {
-                let manifest = self.manifests.remove(hash).expect("present manifest");
+                let manifest = self.manifests.remove(path).expect("present manifest");
                 self.bytes = self
                     .bytes
-                    .saturating_sub(INDEX_ENTRY_BYTES + manifest.live.len() * 8);
-                release_path(&mut self.paths, &mut self.bytes, *hash);
+                    .saturating_sub(manifest_bytes(path, &manifest.live));
+                release_path(&mut self.paths, &mut self.bytes, (self.hasher)(path));
                 for live in &manifest.live {
                     release_path(&mut self.paths, &mut self.bytes, *live);
                 }
             }
         }
     }
+
+    /// Forget loaded manifests that neither an applied nor a pending list uses.
+    fn drop_unused_manifests(&mut self) {
+        let needed: std::collections::HashSet<&str> = self
+            .pending
+            .values()
+            .flatten()
+            .map(|manifest| manifest.manifest_path.as_str())
+            .collect();
+        let unused: Vec<_> = self
+            .manifests
+            .iter()
+            .filter(|(path, manifest)| manifest.lists == 0 && !needed.contains(&***path))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in unused {
+            let manifest = self.manifests.remove(&path).expect("unused manifest");
+            self.bytes = self
+                .bytes
+                .saturating_sub(manifest_bytes(&path, &manifest.live));
+        }
+    }
+}
+
+fn manifest_bytes(path: &str, live: &[u64]) -> usize {
+    INDEX_ENTRY_BYTES + path.len() + live.len() * 8
+}
+fn list_bytes(list: &str, manifests: &[std::sync::Arc<str>]) -> usize {
+    INDEX_ENTRY_BYTES + list.len() + manifests.len() * 16
+}
+fn pending_bytes(list: &str, manifests: &[iceberg::spec::ManifestFile]) -> usize {
+    INDEX_ENTRY_BYTES + list.len() + manifests.len() * INDEX_PENDING_MANIFEST_BYTES
 }
 
 fn retain_path(paths: &mut std::collections::HashMap<u64, u32>, bytes: &mut usize, hash: u64) {
