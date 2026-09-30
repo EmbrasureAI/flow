@@ -190,6 +190,10 @@ class ProxyTests(unittest.TestCase):
                 self.assertEqual(json.loads(response.read())["error"]["code"], status)
                 self.assertTrue(proxy.dropped.is_set())
                 self.assertEqual(len(requests), 1, "the rewritten commit must reach upstream exactly once")
+                # The proxy records its event after responding; wait for it.
+                deadline = time.monotonic() + 5
+                while not [event for event in proxy.events if event.get("fault")] and time.monotonic() < deadline:
+                    time.sleep(.01)
                 event, = [event for event in proxy.events if event.get("fault")]
                 self.assertEqual(event["fault"], "unknown-status-after-successful-commit")
                 self.assertEqual((event["operation_id"], event["snapshot_id"], event["upstream_status"]),
