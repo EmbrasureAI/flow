@@ -77,7 +77,7 @@ operation identities and exact reader results. Source connection/slot/identity f
 CI runs both cases on PostgreSQL 14 and 18 (`isolation` shard), together with
 [`default_identity.py`](DEFAULT_IDENTITY.md#engine-only-run).
 
-Run it again with `--quota` and a new artifact directory for the separate 64 MiB
+Run it again with `--quota` and a new artifact directory for the separate 128 MiB
 journal-limit scenario. With one table's publication denied, the journal fills;
 capture must pause (not exit) with the source ACK held, then resume and replay
 exactly once the table can publish and the journal drains.

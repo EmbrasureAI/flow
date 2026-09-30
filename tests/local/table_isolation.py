@@ -43,8 +43,11 @@ class IsolationRun(Run):
                                     "stable_small_soft_files": 1024, "stable_small_hard_files": 2048,
                                     "delete_files_soft": 1024, "delete_files_hard": 2048})
         if self.args.quota:
+            # Two 64 MiB journal segments. A quota of one segment can never free
+            # space: the active segment is not reclaimed, so a full journal
+            # becomes fatal even after everything journaled was published.
             self.config.write_text(self.config.read_text().replace(
-                "journal_bytes = 268435456", "journal_bytes = 67108864"))
+                "journal_bytes = 268435456", "journal_bytes = 134217728"))
         self.report["profile"] = {"table_workers": 1, "pending_transactions": 4,
                                   "collapse_memory_bytes": 0,
                                   "roles": ["ingest", "coordinator"], "quota_case": self.args.quota}
@@ -257,9 +260,9 @@ class IsolationRun(Run):
         self.wait_blocked()
         pid = self.process.pid
         log = self.directory / f"daemon-{self.generation}.log"
-        # About 80 MiB of explicit row payload against a 64 MiB journal. Each
+        # About 160 MiB of explicit row payload against a 128 MiB journal. Each
         # transaction and row fits normal framing; host disk exhaustion is never used.
-        for index in range(80):
+        for index in range(160):
             barrier = self.transaction([
                 "INSERT INTO orders (id,tenant,payload) SELECT i,1,repeat(md5(i::text),512) "
                 f"FROM generate_series({10000 + index * 64},{10063 + index * 64}) i"
@@ -322,7 +325,7 @@ def main():
     parser.add_argument("--binary", type=Path, default=Path("target/debug/embrasure-flow"))
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
-    parser.add_argument("--quota", action="store_true", help="run the separate 64 MiB journal-full pause and drain case")
+    parser.add_argument("--quota", action="store_true", help="run the separate 128 MiB journal-full pause and drain case")
     args = parser.parse_args()
     if not args.postgres_url:
         parser.error("provide --postgres-url or FLOW_POSTGRES_URL")
