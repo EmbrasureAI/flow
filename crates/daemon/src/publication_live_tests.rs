@@ -95,6 +95,8 @@ where
     config.source.connection_env = "FLOW_POSTGRES_URL".into();
     config.source.slot = name.clone();
     config.source.publication = name.clone();
+    // Functional tests must not depend on the host's free disk space.
+    config.storage.min_free_bytes = 0;
     let uri = format!("memory://{name}");
     config.catalog = HashMap::from([("uri".into(), uri.clone())]);
     let orders = config.tables[0].clone();
@@ -346,16 +348,34 @@ async fn decoded(sql: &Client, slot: &str) {
         .await
         .unwrap();
     let mark = current(sql).await;
-    until("the walsender decodes the open transaction", || async {
-        lsn(
-            sql,
-            "SELECT (r.sent_lsn - '0/0')::bigint FROM pg_catalog.pg_stat_replication r JOIN pg_catalog.pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = $1",
-            slot,
-        )
-        .await
-            >= mark
-    })
-    .await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while lsn(
+        sql,
+        "SELECT (r.sent_lsn - '0/0')::bigint FROM pg_catalog.pg_stat_replication r JOIN pg_catalog.pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = $1",
+        slot,
+    )
+    .await
+        < mark
+    {
+        if Instant::now() >= deadline {
+            // Tell a disconnected capture from one that stopped reading.
+            let diagnostics = sql
+                .query(
+                    "SELECT format('slot active=%s pid=%s confirmed=%s wal_status=%s; sender state=%s sent=%s write=%s flush=%s; stream_txns=%s spill_txns=%s; mark=%s',
+                        s.active, s.active_pid, s.confirmed_flush_lsn, s.wal_status, r.state, r.sent_lsn, r.write_lsn, r.flush_lsn,
+                        st.stream_txns, st.spill_txns, pg_catalog.pg_current_wal_lsn())
+                     FROM pg_catalog.pg_replication_slots s
+                     LEFT JOIN pg_catalog.pg_stat_replication r ON r.pid = s.active_pid
+                     LEFT JOIN pg_catalog.pg_stat_replication_slots st ON st.slot_name = s.slot_name
+                     WHERE s.slot_name = $1",
+                    &[&slot],
+                )
+                .await
+                .map(|rows| rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>());
+            panic!("timed out: the walsender decodes the open transaction; {diagnostics:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn streamed_transactions(sql: &Client, slot: &str) -> i64 {
