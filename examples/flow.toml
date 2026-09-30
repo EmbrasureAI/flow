@@ -30,6 +30,8 @@ collapse_memory_bytes = 33554432
 parquet_row_group_bytes = 33554432
 # The largest single row change; a larger one blocks its table.
 chunk_bytes = 4194304
+# Queued lookahead descriptors shared by all tables. It only makes tables
+# schedulable; a dispatched epoch reads further from the durable ledger.
 pending_transactions = 256
 table_workers = 4
 commits_per_second = 100

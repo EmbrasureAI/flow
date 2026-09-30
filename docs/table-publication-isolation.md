@@ -20,10 +20,14 @@ bounded pages, advancing its progress marker in the same durable write. These
 SOURCE records are mirrored through the authoritative control store and survive
 index-generation recovery. They do not introduce another payload journal.
 
-Queued and running descriptors share the configured `pending_transactions`
-budget. Admission rotates across eligible tables, including when there are more
-tables than available descriptors. A failed worker must return before its queued
-and running reservations are evicted. Eviction removes only volatile admission:
+Queued descriptors share the configured `pending_transactions` lookahead.
+Admission rotates across eligible tables, including when there are more tables
+than available descriptors. Queued work only makes a table schedulable: a
+dispatched epoch leaves the lookahead and continues in order through that table's
+durable references, up to the 32 MiB payload limit and a fixed per-epoch
+descriptor-memory limit, so a busy table does not hold lookahead another table
+needs. A failed or deferred worker must return before its queued and running
+reservations are evicted; its epoch is reloaded from the ledger. Eviction removes only volatile admission:
 restarting the cursor at zero finds exactly the references that still need work.
 It neither completes a transaction nor advances an acknowledgement.
 

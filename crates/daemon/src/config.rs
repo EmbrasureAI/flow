@@ -125,6 +125,9 @@ pub struct Limits {
     /// Additional retained collapse state per table worker; zero uses disk only.
     pub collapse_memory_bytes: usize,
     pub parquet_row_group_bytes: usize,
+    /// Queued lookahead descriptors shared by all tables. It makes tables
+    /// schedulable; a dispatched epoch continues from the durable ledger up to
+    /// its payload and descriptor-memory limits, so this does not cap batches.
     pub pending_transactions: usize,
     pub table_workers: usize,
     pub commits_per_second: u32,
