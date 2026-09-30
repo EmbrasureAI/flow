@@ -67,7 +67,12 @@ Subtransaction rollback still removes its spool records. Inside a streamed,
 still-uncommitted transaction these decisions are provisional: they quarantine
 only that transaction's changes, other transactions keep publishing the table,
 and the block is latched only if the transaction commits with them; a rollback
-or savepoint rollback discards them. Explicitly excluded cells
+or savepoint rollback discards them. Incompatible DDL that commits after all of
+its streamed rows were rolled back to a savepoint is blocked by the table's next
+Relation message or the five-second catalog refresh rather than at its own
+commit, still before any row of the new shape is published. `ADD COLUMN ...
+DEFAULT` blocks even on an empty table, because PostgreSQL still records a
+missing value for it; add the column without a default to avoid that. Explicitly excluded cells
 are projected out before quarantine, including when a selected column disappears.
 
 A source-table block persists across restart and source repair. Use an explicit

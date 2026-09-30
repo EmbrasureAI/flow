@@ -531,3 +531,105 @@ async fn live_column_migrations_publish_optional_fields() {
     .await;
     sql_task.abort();
 }
+
+/// DDL before a savepoint streams its Relation with the savepoint's rows. The
+/// table blocks at the commit when those rows survive; when they are rolled
+/// back, the committed DDL blocks at the next Relation or catalog refresh.
+/// Either way the other table keeps publishing and no row of the new shape
+/// reaches the blocked table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_streamed_ddl_blocks_only_when_it_commits() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let sql = &sql;
+    let budget: i64 = sql
+        .query_one(
+            "SELECT setting::bigint * 1024 FROM pg_catalog.pg_settings WHERE name = 'logical_decoding_work_mem'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let rows = budget * 2 / 256 + 100;
+    for (label, ddl, column, rolled_back) in [
+        ("rename_rb", "RENAME COLUMN status TO label", "label", true),
+        ("rename", "RENAME COLUMN status TO label", "label", false),
+        (
+            "default_rb",
+            "ADD COLUMN extra text DEFAULT 'x'",
+            "status",
+            true,
+        ),
+        (
+            "default",
+            "ADD COLUMN extra text DEFAULT 'x'",
+            "status",
+            false,
+        ),
+    ] {
+        let held_url = url.clone();
+        with_daemon(&url, sql, label, |config, name| async move {
+            sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (2, 'before')"))
+                .await
+                .unwrap();
+            let mark = current(sql).await;
+            until("both tables publish before the DDL", || async {
+                materialized(&config, "orders") as i64 >= mark
+                    && materialized(&config, "items") > 0
+            })
+            .await;
+            let items = published_rows(&name, "items").await;
+            let (held, connection) = tokio_postgres::connect(&held_url, NoTls).await.unwrap();
+            let held_task = tokio::spawn(connection);
+            held.batch_execute(&format!(
+                "BEGIN; ALTER TABLE {name}.items {ddl}; SAVEPOINT s;
+                 INSERT INTO {name}.items (id, {column}) SELECT g, repeat(md5(g::text), 8) FROM generate_series(1000, {}) g",
+                1000 + rows
+            ))
+            .await
+            .unwrap();
+            decoded(sql, &name).await;
+            // Another transaction commits while the streamed one is undecided.
+            sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (3, 'during')"))
+                .await
+                .unwrap();
+            let mark = current(sql).await;
+            until("orders publishes during the streamed DDL", || async {
+                materialized(&config, "orders") as i64 >= mark
+            })
+            .await;
+            let end = if rolled_back { "ROLLBACK TO SAVEPOINT s; COMMIT" } else { "COMMIT" };
+            held.batch_execute(end).await.unwrap();
+            drop(held);
+            held_task.await.unwrap().unwrap();
+            // A row of the committed new shape.
+            sql.batch_execute(&format!(
+                "INSERT INTO {name}.items (id, {column}) VALUES (4, 'new shape')"
+            ))
+            .await
+            .unwrap();
+            until("the committed DDL blocks items", || async {
+                blocked_tables(&config)
+                    .iter()
+                    .any(|record| record["error_code"] == "source_schema_incompatible")
+            })
+            .await;
+            let blocked = blocked_tables(&config);
+            assert_eq!(blocked.len(), 1, "{label}: {blocked:?}");
+            sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (5, 'after')"))
+                .await
+                .unwrap();
+            let mark = current(sql).await;
+            until("orders keeps publishing after the block", || async {
+                materialized(&config, "orders") as i64 >= mark
+            })
+            .await;
+            assert_eq!(published_rows(&name, "items").await, items, "{label}");
+            assert_eq!(published_rows(&name, "orders").await, 4, "{label}");
+        })
+        .await;
+    }
+    sql_task.abort();
+}

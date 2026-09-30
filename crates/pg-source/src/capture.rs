@@ -30,7 +30,11 @@ struct PendingTransaction {
     provisional: Vec<(u64, TableId, String)>,
     /// Tables whose Relation in this streamed transaction capture cannot
     /// decode. pgoutput sends every transaction its own current Relation, so
-    /// this does not affect other transactions.
+    /// this does not affect other transactions. A savepoint rollback does not
+    /// clear it: the Relation precedes the first change it describes, so its
+    /// spool position cannot tell DDL inside a rolled-back savepoint from DDL
+    /// just before it. PostgreSQL re-sends the Relation at the next streamed
+    /// change after catalog invalidation, which replaces this entry either way.
     undecodable: BTreeMap<TableId, String>,
 }
 
@@ -255,6 +259,25 @@ impl CaptureAssembler {
                     .find_map(|(_, provisional, reason)| (*provisional == table).then_some(reason))
             })
             .map(String::as_str)
+    }
+
+    /// Schema versions an open transaction spooled or buffered, or that a
+    /// decoder uses for its next rows. Other unpersisted versions are unused.
+    pub fn schema_versions_in_use(&self) -> BTreeSet<(TableId, u32)> {
+        let mut versions: BTreeSet<_> = self
+            .schemas
+            .values()
+            .map(|schema| (schema.table_id, schema.version))
+            .collect();
+        for transaction in self.transactions.values() {
+            for (table, spooled) in &transaction.schemas {
+                versions.extend(spooled.iter().map(|version| (*table, *version)));
+            }
+        }
+        if let Some(buffer) = &self.buffer {
+            versions.insert((buffer.table_id, buffer.schema_version));
+        }
+        versions
     }
 
     /// Tables whose provisional quarantine survived every rollback of `xid`.

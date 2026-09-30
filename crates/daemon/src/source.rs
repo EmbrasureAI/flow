@@ -463,6 +463,7 @@ pub(crate) async fn capture_loop(
                                 registry.observe_nulls(&event, &mut assembler)?;
                                 let retained = row_table.map(|_| event.clone());
                                 let commit_xid = match &event { SourceEvent::Commit { xid, .. } => Some(*xid), _ => None };
+                                let ended = commit_xid.is_some() || matches!(&event, SourceEvent::Abort { .. });
                                 if let Err(error) = assembler.push_buffered_at(event, source.received_lsn, &mut journal) {
                                     if let Some((_, id)) = row_table
                                         && matches!(&error, flow_pg_source::Error::Row(_) | flow_pg_source::Error::Value(_)
@@ -482,6 +483,7 @@ pub(crate) async fn capture_loop(
                                         }
                                     return Err(error.into());
                                 }
+                                if ended { registry.forget_unused_candidates(&assembler); }
                                 if assembler.pending_commit_count() > 0 {
                                     group_deadline.get_or_insert_with(|| tokio::time::Instant::now() + JOURNAL_GROUP_DELAY);
                                     if assembler.pending_commit_count() >= JOURNAL_GROUP_TRANSACTIONS

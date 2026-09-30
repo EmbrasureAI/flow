@@ -261,7 +261,11 @@ journal terminal, so all of that transaction's changes of the table commit
 quarantined. A rollback removes the decision with the changes it quarantined:
 a subtransaction abort truncates both at the subtransaction's first spooled
 change, and a transaction abort discards both. Outside streaming, PostgreSQL
-has already committed the transaction and the block is immediate. The table actor serializes the Iceberg schema
+has already committed the transaction and the block is immediate. Incompatible
+DDL that commits after every change it described was rolled back to a
+savepoint leaves nothing to block at its own commit; the next Relation message
+for the table, or the five-second catalog refresh, blocks it instead, before
+any row of the new shape is published. The table actor serializes the Iceberg schema
 update before publishing affected data, and reloads metadata to resolve a lost
 catalog response.
 
@@ -275,7 +279,9 @@ A later `SET DEFAULT`, backfilling `UPDATE` or `SET NOT NULL` only affects rows
 through ordinary row changes, so the live catalog's default and nullability of
 an added column are not checked. That makes common ORM migrations (`ADD COLUMN`
 then `SET DEFAULT`, or `ADD COLUMN`, backfill, `SET NOT NULL`) safe however soon
-the catalog check runs after them. An added column is always optional in
+the catalog check runs after them. PostgreSQL also stores `attmissingval` for an
+`ADD COLUMN ... DEFAULT` on an empty table, so that addition blocks too: a
+harmless false positive, avoided by adding the column without a default. An added column is always optional in
 Iceberg, even when the source later makes it NOT NULL: Iceberg can relax a
 required field but never require an optional one.
 

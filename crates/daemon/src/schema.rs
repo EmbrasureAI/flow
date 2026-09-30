@@ -366,12 +366,44 @@ impl SchemaRegistry {
         // Only relation changes perform catalog I/O. Rows use the cached resolver.
         self.types
             .extend(TypeRegistry::fetch(client, relation).await?);
+        let table = TableId(relation.id);
+        let known: BTreeSet<_> = self
+            .candidates
+            .keys()
+            .filter(|(id, _)| *id == table)
+            .copied()
+            .collect();
         let record = self.select(relation)?;
-        self.types.validate_relation(&record.schema, relation)?;
-        assembler.set_types(self.types.clone());
-        self.dirty.insert(record.schema.table_id);
-        assembler.set_schema(record.schema)?;
+        let key = (table, record.schema.version);
+        let selected = self
+            .types
+            .validate_relation(&record.schema, relation)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                assembler.set_types(self.types.clone());
+                assembler.set_schema(record.schema)?;
+                Ok(())
+            });
+        if selected.is_err() && !known.contains(&key) {
+            // A rejected Relation must not leave a candidate that keeps every
+            // later commit flushing for a schema proof.
+            self.candidates.remove(&key);
+        }
+        selected?;
+        self.dirty.insert(table);
         Ok(())
+    }
+
+    /// After a transaction ends, forget unpersisted schema candidates that no
+    /// open transaction or decoder references, such as those a rolled-back
+    /// streamed transaction selected. A later Relation re-selects one if needed.
+    /// Otherwise [`Self::validation_may_query`] would flush every later commit.
+    pub(crate) fn forget_unused_candidates(&mut self, assembler: &CaptureAssembler) {
+        if self.candidates.is_empty() {
+            return;
+        }
+        let in_use = assembler.schema_versions_in_use();
+        self.candidates.retain(|key, _| in_use.contains(key));
     }
 
     /// A streamed DROP NOT NULL can send NULL rows before its catalog change
@@ -1260,6 +1292,48 @@ mod target_identity_tests {
             capture_block(&store, &source, other).unwrap(),
             Some(CaptureBlock::SchemaIncompatible)
         );
+    }
+
+    #[test]
+    fn ended_transactions_leave_no_unused_schema_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            root.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let base = config.tables[0].schema(11);
+        let source = SourceId("candidates".into());
+        let mut registry =
+            SchemaRegistry::new(store, source.clone(), std::slice::from_ref(&base)).unwrap();
+        persist_base(&registry, &base);
+        let spool =
+            flow_pg_source::TransactionSpool::open(root.path().join("spool"), Default::default())
+                .unwrap();
+        let mut assembler = CaptureAssembler::new(source, spool, [base.clone()], 1 << 16).unwrap();
+        // A streamed ADD COLUMN selects an unpersisted candidate.
+        let mut added = registry.saved_relation(base.table_id).unwrap();
+        added.columns.push(flow_pg_source::Column {
+            name: "note".into(),
+            type_oid: 25,
+            type_modifier: -1,
+            identity: false,
+        });
+        let candidate = registry.select(&added).unwrap();
+        assert!(registry.validation_may_query());
+        // While a decoder uses it, it stays.
+        assembler.set_schema(candidate.schema.clone()).unwrap();
+        registry.forget_unused_candidates(&assembler);
+        assert!(registry.validation_may_query());
+        // Once nothing references it, e.g. after its transaction aborted and
+        // another transaction's Relation restored the committed decoder, it goes.
+        assembler.set_schema(base.clone()).unwrap();
+        registry.forget_unused_candidates(&assembler);
+        assert!(!registry.validation_may_query());
+        // A later Relation of that shape selects it again.
+        assert_eq!(registry.select(&added).unwrap().schema, candidate.schema);
     }
 
     #[test]
