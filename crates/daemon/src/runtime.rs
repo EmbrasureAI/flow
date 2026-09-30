@@ -22,7 +22,7 @@ use crate::{
     services::{catalog, journal_config, ledger},
     source::{CaptureProgress, PublicationChanged, capture_loop, connect, validate_publication},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use flow_coordinator::{
     PreparationWait, Priority, ReadyCompaction, ReplanRequired, Scheduler, SourceLedger,
     TableMaintenance, TablePublisher,
@@ -48,25 +48,25 @@ use tokio::sync::watch;
 
 pub use crate::bootstrap::initialize;
 
-pub fn status(config: Config) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&crate::lifecycle::read(&config)?)?
-    );
-    Ok(())
+/// Print the local observation and return whether the service is ready.
+pub fn status(config: Config) -> Result<bool> {
+    let status = crate::lifecycle::read(&config)?;
+    println!("{}", serde_json::to_string_pretty(&status)?);
+    Ok(status.ready())
 }
 
 pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let mut observation = crate::observation::Observation::install()?;
     let control = ControlStore::open(config.state_dir.join("control"))?;
     let opened = crate::generation::open(&config, control.clone());
-    let _lifecycle = crate::lifecycle::Lifecycle::start(&config)?;
+    let lifecycle = crate::lifecycle::Lifecycle::start(&config)?;
+    observation.record_source_health(lifecycle.source_health());
     crate::lifecycle::refuse_if_resync_required(&config)?;
     let mut boot = bootstrap(&control)?;
     crate::bootstrap::validate_identity(&config, &boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len(),
-        "configured tables changed; explicit resynchronization is required"
+        crate::exit::config("configured tables changed; explicit resynchronization is required")
     );
     for (index, configured) in config.tables.iter().enumerate() {
         ensure!(
@@ -75,10 +75,12 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
                     configured.target_namespace.clone(),
                     configured.target_table.clone()
                 ) == boot.targets[index],
-            "configured schema or target changed; apply a coordinated schema migration before restarting"
+            crate::exit::config(
+                "configured schema or target changed; apply a coordinated schema migration before restarting"
+            )
         );
     }
-    let catalog = catalog(&config).await?;
+    let catalog = crate::retry::startup("catalog", || catalog(&config)).await?;
     // An intact completed bootstrap has durable target identity. Load each
     // target in its worker so a remote table outage cannot block startup.
     // Bootstrap, legacy identity adoption and index rebuild still need all tables.
@@ -87,15 +89,15 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let tables = if isolated_start {
         BTreeMap::new()
     } else {
-        tables(catalog.as_ref(), &boot).await?
+        crate::retry::startup("target tables", || tables(catalog.as_ref(), &boot)).await?
     };
     if boot.target_uuids.is_empty() {
         // Upgrade only an intact legacy index with retained source history.
         // A missing index cannot establish the identity of a replaced target.
         let store = opened.as_ref().map_err(|error| {
-            anyhow::anyhow!(
+            crate::exit::resync(format!(
                 "legacy target identity cannot be established after index loss: {error}"
-            )
+            ))
         })?;
         for schema in &boot.schemas {
             let table = &tables[&schema.table_id];
@@ -109,7 +111,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
                         .additional_properties
                         .get("streaming.source-id")
                         == Some(&boot.source_id)),
-                "legacy target identity has no retained source proof; explicit migration is required"
+                crate::exit::resync(
+                    "legacy target identity has no retained source proof; explicit migration is required"
+                )
             );
             boot.target_uuids.push(table.metadata().uuid());
         }
@@ -124,7 +128,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
             tables
                 .get(&schema.table_id)
                 .is_none_or(|table| table.metadata().uuid() == *uuid),
-            "target table was replaced; refusing to reuse its source watermark"
+            crate::exit::resync(
+                "target table was replaced; refusing to reuse its source watermark"
+            )
         );
     }
     let store = match opened {
@@ -174,7 +180,9 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let mut ledger = ledger(&store, &config)?;
     ensure!(
         journal.durable_lsn() >= ledger.watermarks().journal_durable_lsn,
-        "journal lost previously durable transactions; source recovery is required before acknowledgement"
+        crate::exit::resync(
+            "journal lost previously durable transactions; source recovery is required before acknowledgement"
+        )
     );
     if recovery.truncated_bytes > 0 {
         tracing::warn!(
@@ -183,21 +191,27 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
         );
     }
     observation.table_sources(&config, &boot.schemas);
-    {
-        let sql = connect(&config, false).await?;
-        let mut registry = crate::schema::SchemaRegistry::new(
-            store.clone(),
-            SourceId(config.source.id.clone()),
-            &boot.schemas,
-        )?;
-        let validated = validate_publication(&sql, &config, &boot.schemas, false).await;
-        // Table-scoped violations block only those tables; the rest start.
-        // Latch them before schema refresh, which could otherwise quarantine.
-        for violation in crate::lifecycle::record_publication_changed(&config, validated)? {
-            registry.block_publication(violation.table, &violation.reason)?;
+    // Each attempt reconnects; blocking a violating table is idempotent.
+    crate::retry::startup("source validation", || {
+        let (config, store, schemas) = (&config, &store, &boot.schemas);
+        async move {
+            let sql = connect(config, false).await?;
+            let mut registry = crate::schema::SchemaRegistry::new(
+                store.clone(),
+                SourceId(config.source.id.clone()),
+                schemas,
+            )?;
+            let validated = validate_publication(&sql, config, schemas, false).await;
+            // Table-scoped violations block only those tables; the rest start.
+            // Latch them before schema refresh, which could otherwise quarantine.
+            for violation in crate::lifecycle::record_publication_changed(config, validated)? {
+                registry.block_publication(violation.table, &violation.reason)?;
+            }
+            registry.initialize(&sql, &config.tables).await?;
+            Ok(())
         }
-        registry.initialize(&sql, &config.tables).await?;
-    }
+    })
+    .await?;
     let publisher = Arc::new(TablePublisher::new(
         store.clone(),
         catalog.clone(),
@@ -561,9 +575,12 @@ impl PublishRuntime {
         let mut checkpoint_at = Instant::now();
         let shutdown = crate::lifecycle::shutdown_signal();
         tokio::pin!(shutdown);
-        observation.table_states(store, &blocked, schemas.keys().copied())?;
+        observation.table_states(store, ledger, &blocked, schemas.keys().copied())?;
         observation.write(config, ledger, capture_goal, true)?;
         loop {
+            // Liveness: every select arm is bounded and the health tick wakes
+            // an idle loop every five seconds.
+            crate::lifecycle::run_loop_progress();
             recovering = store
                 .applied_operations(schemas.len().max(1))?
                 .into_iter()
@@ -647,7 +664,7 @@ impl PublishRuntime {
                         if error.is::<PublicationChanged>() {
                             record_publication_changed(observation, config, ledger, capture_goal, &error);
                         }
-                        bail!("source capture stopped: {error}");
+                        return Err(crate::exit::capture_failure(error));
                     }
                     changed.context("source actor stopped")?;
                     capture_goal = capture_goal.max(progress.durable_lsn).max(ledger.watermarks().journal_durable_lsn);
@@ -711,7 +728,7 @@ impl PublishRuntime {
                             blocked.record(id, error_code, indexed.pending_operation)?;
                             metrics::counter!("flow_table_retries_total", "table_id" => id.0.to_string()).increment(1);
                             pending.defer(id, &mut scheduler);
-                            observation.table_states(store, &blocked, [id])?;
+                            observation.table_states(store, ledger, &blocked, [id])?;
                             observation.write(config, ledger, capture_goal, true)?;
                             if reserved_build {
                                 build_active.remove(&id);
@@ -839,13 +856,13 @@ impl PublishRuntime {
                             blocked.clear(id)?;
                             ack.send(feedback(ledger))?;
                             let durable_completed = Instant::now();
-                            observation.table_states(store, &blocked, [id])?;
+                            observation.table_states(store, ledger, &blocked, [id])?;
                             let metrics_exported = observation.write(config, ledger, capture_goal, true)?;
                             let completion_finished = Instant::now();
                             if let Some(epoch) = completed_epoch {
                                 let seconds = completion_finished.duration_since(completion_started).as_secs_f64();
                                 metrics::histogram!("flow_table_local_phase_seconds", "table_id" => id.0.to_string(), "phase" => "complete").record(seconds);
-                                tracing::info!(event = "epoch_completed", operation_id = %epoch.0,
+                                tracing::debug!(target: "flow_events", event = "epoch_completed", operation_id = %epoch.0,
                                     table_id = id.0, transactions = transactions.len(), elapsed_ms = seconds * 1000.0,
                                     durable_completion_ms = durable_completed.duration_since(completion_started).as_secs_f64() * 1000.0,
                                     observation_ms = completion_finished.duration_since(durable_completed).as_secs_f64() * 1000.0,
@@ -1306,7 +1323,7 @@ impl PublishRuntime {
                         }
                     }
                     // Keep durability visible while a catalog publication is stalled.
-                    observation.table_states(store, &blocked, schemas.keys().copied())?;
+                    observation.table_states(store, ledger, &blocked, schemas.keys().copied())?;
                     observation.write(config, ledger, capture_goal, true)?;
                     if checkpoints.is_empty()
                         && checkpoint_at.elapsed() >= Duration::from_secs(config.limits.checkpoint_interval_secs)

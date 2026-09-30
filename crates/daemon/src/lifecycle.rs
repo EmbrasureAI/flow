@@ -5,7 +5,8 @@ use flow_model::{PgLsn, TableId};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 /// A local observation, never recovery authority. Readers need no database lock.
@@ -25,6 +26,11 @@ pub(crate) struct Status {
     blocked_tables: Vec<BlockedTable>,
     #[serde(default)]
     table_progress: Vec<TableProgress>,
+    #[serde(default)]
+    state: ProcessState,
+    /// Why the last process stopped; kept until a later process is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<LastError>,
 }
 
 impl Status {
@@ -33,6 +39,33 @@ impl Status {
     pub(crate) fn ready_in(&self, process_id: u32) -> bool {
         self.ready && self.process_id == process_id
     }
+
+    pub(crate) fn ready(&self) -> bool {
+        self.ready
+    }
+}
+
+/// `unknown` identifies an observation written before this field existed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProcessState {
+    #[default]
+    Unknown,
+    /// Recovery, index rebuild or source validation before the run loop.
+    Starting,
+    Running,
+    Stopped,
+}
+
+/// A fatal error. Only Flow-generated operator-action messages are recorded;
+/// other error chains can contain URLs or row values and stay in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LastError {
+    pub(crate) class: String,
+    pub(crate) exit_code: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<String>,
+    pub(crate) at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +76,11 @@ pub(crate) struct TableProgress {
     pub(crate) source_namespace: Option<String>,
     #[serde(default)]
     pub(crate) source_table: Option<String>,
+    /// The table's oldest registered, unpublished transaction, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) oldest_unpublished_lsn: Option<PgLsn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) oldest_unpublished_commit_micros: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,25 +129,125 @@ impl From<SourceHealth> for SourceHealthStatus {
     }
 }
 
-pub(crate) struct Lifecycle(Config);
+pub(crate) struct Lifecycle {
+    config: Config,
+    source_health: SourceHealthStatus,
+}
 impl Lifecycle {
+    /// A lost slot stays reported, and readiness withheld, until a later WAL
+    /// check proves otherwise. The previous exit reason stays visible until
+    /// this process is running.
     pub(crate) fn start(config: &Config) -> Result<Self> {
-        emit(
-            config,
-            None,
-            None,
-            false,
-            Some(SourceHealthStatus::Unknown),
-            None,
-        )?;
-        Ok(Self(config.clone()))
+        let mut source_health = SourceHealthStatus::Unknown;
+        update(config, |status| {
+            if status.source_health == SourceHealthStatus::SlotLost {
+                source_health = SourceHealthStatus::SlotLost;
+            }
+            status.ready = false;
+            status.state = ProcessState::Starting;
+            status.source_health = source_health;
+        })?;
+        Ok(Self {
+            config: config.clone(),
+            source_health,
+        })
+    }
+
+    pub(crate) fn source_health(&self) -> SourceHealthStatus {
+        self.source_health
     }
 }
 impl Drop for Lifecycle {
     fn drop(&mut self) {
-        if let Err(error) = emit(&self.0, None, None, false, None, None) {
+        RUN_LOOP_PROGRESS_MS.store(0, Ordering::Relaxed);
+        if let Err(error) = update(&self.config, |status| {
+            status.ready = false;
+            status.state = ProcessState::Stopped;
+        }) {
             tracing::warn!(%error, "could not mark local status stopped");
         }
+    }
+}
+
+/// Record why `init` or `run` failed, after cleanup marked it stopped. Best
+/// effort: an unwritable or never-created state directory keeps only the log.
+/// A process refused by the state lock must not overwrite the observation of
+/// the live process that holds it.
+pub(crate) fn record_exit(config: &Config, error: &anyhow::Error) {
+    if !config.state_dir.is_dir() {
+        return;
+    }
+    if let Ok(status) = read(config)
+        && owned_by_live_process(&status, std::process::id(), now_ms().unwrap_or_default())
+    {
+        tracing::warn!(
+            process_id = status.process_id,
+            "another process owns the local status; not recording this exit"
+        );
+        return;
+    }
+    let (class, message) = crate::exit::classify(error);
+    let result = now_ms().and_then(|at_ms| {
+        update(config, |status| {
+            status.ready = false;
+            status.state = ProcessState::Stopped;
+            status.last_error = Some(LastError {
+                class: class.name().to_owned(),
+                exit_code: class.code(),
+                message,
+                at_ms,
+            });
+        })
+    });
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not record the exit reason in local status");
+    }
+}
+
+/// Another process wrote this observation as starting or running within
+/// the readiness expiry window; a killed process ages out of it.
+fn owned_by_live_process(status: &Status, process_id: u32, now_ms: u64) -> bool {
+    status.process_id != process_id
+        && matches!(status.state, ProcessState::Starting | ProcessState::Running)
+        && now_ms.saturating_sub(status.updated_at_ms) <= 15_000
+}
+
+/// Monotonic milliseconds of the run loop's latest iteration; zero outside
+/// the run loop, so recovery, index rebuild and initial COPY never fail liveness.
+static RUN_LOOP_PROGRESS_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall-clock steps must not fail liveness.
+fn monotonic_ms() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    u64::try_from(
+        BASE.get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+    .saturating_add(1)
+}
+
+pub(crate) fn run_loop_progress() {
+    RUN_LOOP_PROGRESS_MS.store(monotonic_ms(), Ordering::Relaxed);
+}
+
+/// Serializes tests that start or drop a `Lifecycle`, which resets liveness.
+#[cfg(test)]
+pub(crate) static LIVENESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `Err` carries how long the run loop has not progressed beyond `timeout`.
+pub(crate) fn liveness(timeout: Duration) -> std::result::Result<(), Duration> {
+    let progress = RUN_LOOP_PROGRESS_MS.load(Ordering::Relaxed);
+    stalled(progress, monotonic_ms(), timeout)
+}
+
+fn stalled(progress_ms: u64, now_ms: u64, timeout: Duration) -> std::result::Result<(), Duration> {
+    let stalled = Duration::from_millis(now_ms.saturating_sub(progress_ms));
+    if progress_ms == 0 || timeout.is_zero() || stalled <= timeout {
+        Ok(())
+    } else {
+        Err(stalled)
     }
 }
 
@@ -205,11 +343,10 @@ pub(crate) fn refuse_if_resync_required(config: &Config) -> Result<()> {
     ) {
         tracing::warn!(error = %status, "could not record the pending resynchronization");
     }
-    anyhow::bail!(
+    Err(crate::exit::resync(format!(
         "replication slot {:?} requires resynchronization before capture can resume; a previous run stopped with: {}",
-        marker.slot,
-        marker.reason
-    )
+        marker.slot, marker.reason
+    )))
 }
 
 pub(crate) fn emit(
@@ -220,6 +357,49 @@ pub(crate) fn emit(
     source_health: Option<SourceHealthStatus>,
     tables: Option<(&[BlockedTable], &[TableProgress])>,
 ) -> Result<()> {
+    update(config, |status| {
+        status.ready = ready;
+        if let Some(ledger) = ledger {
+            status.watermarks = ledger.watermarks().clone();
+            status.pending_transactions = ledger.pending_count();
+        }
+        if let Some(captured) = captured {
+            status.captured_durable_lsn = captured;
+        }
+        if let Some(source_health) = source_health {
+            status.source_health = source_health;
+        }
+        if let Some((blocked, progress)) = tables {
+            status.blocked_tables = blocked.to_vec();
+            status.table_progress = progress.to_vec();
+        }
+    })
+}
+
+/// The run loop's observation: the process is serving, so an earlier exit
+/// reason no longer describes it.
+pub(crate) fn emit_running(
+    config: &Config,
+    ledger: &SourceLedger,
+    captured: PgLsn,
+    ready: bool,
+    source_health: SourceHealthStatus,
+    tables: (&[BlockedTable], &[TableProgress]),
+) -> Result<()> {
+    update(config, |status| {
+        status.ready = ready;
+        status.watermarks = ledger.watermarks().clone();
+        status.pending_transactions = ledger.pending_count();
+        status.captured_durable_lsn = captured;
+        status.source_health = source_health;
+        status.blocked_tables = tables.0.to_vec();
+        status.table_progress = tables.1.to_vec();
+        status.state = ProcessState::Running;
+        status.last_error = None;
+    })
+}
+
+fn update(config: &Config, change: impl FnOnce(&mut Status)) -> Result<()> {
     let mut status = read(config).unwrap_or_else(|_| Status {
         source_id: config.source.id.clone(),
         process_id: std::process::id(),
@@ -231,24 +411,12 @@ pub(crate) fn emit(
         source_health: SourceHealthStatus::Unknown,
         blocked_tables: Vec::new(),
         table_progress: Vec::new(),
+        state: ProcessState::Unknown,
+        last_error: None,
     });
+    change(&mut status);
     status.process_id = std::process::id();
-    status.ready = ready;
     status.updated_at_ms = now_ms()?;
-    if let Some(ledger) = ledger {
-        status.watermarks = ledger.watermarks().clone();
-        status.pending_transactions = ledger.pending_count();
-    }
-    if let Some(captured) = captured {
-        status.captured_durable_lsn = captured;
-    }
-    if let Some(source_health) = source_health {
-        status.source_health = source_health;
-    }
-    if let Some((blocked, progress)) = tables {
-        status.blocked_tables = blocked.to_vec();
-        status.table_progress = progress.to_vec();
-    }
     write_observation(
         &config.state_dir.join("status.json"),
         serde_json::to_vec_pretty(&status)?,
@@ -291,6 +459,150 @@ pub(crate) async fn shutdown_signal() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn config() -> (tempfile::TempDir, Config) {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().to_owned();
+        (root, config)
+    }
+
+    fn status(config: &Config) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(config.state_dir.join("status.json")).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn liveness_judges_only_a_running_loop_past_its_timeout() {
+        let timeout = Duration::from_secs(300);
+        assert_eq!(stalled(0, 10_000_000, timeout), Ok(()));
+        assert_eq!(stalled(1_000, 301_000, timeout), Ok(()));
+        assert_eq!(
+            stalled(1_000, 302_000, timeout),
+            Err(Duration::from_secs(301))
+        );
+        assert_eq!(stalled(1_000, 10_000_000, Duration::ZERO), Ok(()));
+        // A concurrent later progress is not a stall.
+        assert_eq!(stalled(5_000, 1_000, timeout), Ok(()));
+    }
+
+    #[test]
+    fn exit_reason_and_lost_slot_survive_restart_until_running() {
+        let _serial = LIVENESS_TEST_LOCK.blocking_lock();
+        let (_root, config) = config();
+        let lifecycle = Lifecycle::start(&config).unwrap();
+        assert_eq!(lifecycle.source_health(), SourceHealthStatus::Unknown);
+        assert_eq!(status(&config)["state"], "starting");
+        emit(
+            &config,
+            None,
+            None,
+            true,
+            Some(SourceHealthStatus::SlotLost),
+            None,
+        )
+        .unwrap();
+        drop(lifecycle);
+        record_exit(
+            &config,
+            &crate::exit::resync("replication slot lost WAL; resynchronization required")
+                .context("health check"),
+        );
+        let stopped = status(&config);
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["ready"], false);
+        assert_eq!(stopped["source_health"], "slot_lost");
+        assert_eq!(stopped["last_error"]["class"], "resync_required");
+        assert_eq!(stopped["last_error"]["exit_code"], 79);
+        assert_eq!(
+            stopped["last_error"]["message"],
+            "replication slot lost WAL; resynchronization required"
+        );
+        assert!(stopped["last_error"]["at_ms"].as_u64().unwrap() > 0);
+
+        // A restart keeps the lost slot and the reason visible while starting.
+        let lifecycle = Lifecycle::start(&config).unwrap();
+        assert_eq!(lifecycle.source_health(), SourceHealthStatus::SlotLost);
+        let starting = status(&config);
+        assert_eq!(starting["state"], "starting");
+        assert_eq!(starting["source_health"], "slot_lost");
+        assert_eq!(starting["last_error"]["exit_code"], 79);
+
+        // Unclassified errors never persist their text.
+        record_exit(
+            &config,
+            &anyhow::anyhow!("postgres://flow:secret@db failed"),
+        );
+        let failed = status(&config);
+        assert_eq!(failed["last_error"]["class"], "failure");
+        assert_eq!(failed["last_error"]["exit_code"], 1);
+        assert!(failed["last_error"].get("message").is_none());
+        assert!(!serde_json::to_string(&failed).unwrap().contains("secret"));
+        drop(lifecycle);
+
+        // A healthy check clears the lost slot and a running loop the reason.
+        let _lifecycle = Lifecycle::start(&config).unwrap();
+        let store = flow_state_store::StateStore::open(
+            config.state_dir.join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let ledger = SourceLedger::open(
+            store,
+            flow_model::SourceId(config.source.id.clone()),
+            flow_coordinator::AckMode::Materialized,
+            flow_coordinator::JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        emit_running(
+            &config,
+            &ledger,
+            PgLsn(1),
+            true,
+            SourceHealthStatus::Healthy,
+            (&[], &[]),
+        )
+        .unwrap();
+        let running = status(&config);
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["ready"], true);
+        assert!(running.get("last_error").is_none());
+        assert!(read(&config).unwrap().ready());
+    }
+
+    #[test]
+    fn a_refused_process_leaves_the_live_owner_status_alone() {
+        let _serial = LIVENESS_TEST_LOCK.blocking_lock();
+        let (_root, config) = config();
+        let _lifecycle = Lifecycle::start(&config).unwrap();
+        let mut status: Status =
+            serde_json::from_slice(&std::fs::read(config.state_dir.join("status.json")).unwrap())
+                .unwrap();
+        let now = status.updated_at_ms;
+        assert!(!owned_by_live_process(&status, status.process_id, now));
+        assert!(owned_by_live_process(&status, status.process_id + 1, now));
+        assert!(!owned_by_live_process(
+            &status,
+            status.process_id + 1,
+            now + 15_001
+        ));
+        status.state = ProcessState::Stopped;
+        assert!(!owned_by_live_process(&status, status.process_id + 1, now));
+    }
+
+    #[test]
+    fn exit_reason_is_not_written_without_a_state_directory() {
+        let (root, mut config) = config();
+        config.state_dir = root.path().join("missing");
+        record_exit(&config, &crate::exit::config("source is not initialized"));
+        assert!(!config.state_dir.exists());
+    }
 }
 
 #[cfg(test)]

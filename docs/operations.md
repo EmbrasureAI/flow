@@ -43,6 +43,87 @@ On PostgreSQL 18, `idle_replication_slot_timeout` invalidates a slot whose
 consumer stays disconnected too long. Leave it disabled or set it longer than
 any planned Flow downtime.
 
+## Run under a supervisor
+
+Run `init` once, then keep `run` running under a supervisor that restarts it
+after a crash. Only one process may use a `state_dir` at a time; the state
+database lock refuses a second one. A relative `state_dir` is resolved against
+the configuration file's directory, not the working directory; `init` and `run`
+log the resolved path at startup.
+
+### Exit codes
+
+| Code | Meaning | Supervisor action |
+| --- | --- | --- |
+| 0 | Clean exit (`run` after SIGTERM/SIGINT; `init` finished) | None |
+| 1 | Failure that a restart may clear | Restart with backoff |
+| 2 | Invalid command line | Fix the command |
+| 3 | `status` only: the service is not ready | None |
+| 75 | A source or catalog dependency stayed unavailable through the ten-minute startup retry window | Restart with backoff |
+| 78 | Configuration invalid or incompatible with the state directory (changed tables, schema, targets, slot or publication; missing environment; `init` on an existing slot) | Stop; fix the configuration |
+| 79 | Resynchronization required (lost or changed slot, publication contract violation, source identity or timeline change, replaced target, lost journal) | Stop; [resynchronize](#resynchronize-a-source) |
+
+Codes 78 and 79 recur on every restart until an operator acts, so configure the
+supervisor not to restart on them. `status` shows the reason in `last_error`
+and the `fatal` log event has the complete error chain. At startup, catalog and
+PostgreSQL connection failures that the running service would retry are
+retried with capped backoff, each attempt logged as `startup_retry`; other
+startup errors exit immediately.
+
+### systemd
+
+```ini
+[Unit]
+Description=Embrasure Flow
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=flow
+Environment=FLOW_POSTGRES_URL=...
+# Or EnvironmentFile=/etc/flow/env with mode 0600.
+ExecStart=/usr/local/bin/embrasure-flow --config /etc/flow/flow.toml run
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=78 79
+# Shutdown is bounded; allow the in-flight commit and capture drain to finish.
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Run `init` as a separate one-shot unit or by hand before enabling the service.
+Logs are JSON lines on standard output, captured by the journal.
+
+### Kubernetes
+
+- Run one replica as a StatefulSet (or a Deployment with the `Recreate`
+  strategy). A rolling update would start a second process against the same
+  state before the first stops; the lock makes it fail instead of corrupting
+  state, but the rollout stalls.
+- Put `state_dir` on a PersistentVolumeClaim. It holds the journal and index
+  that recovery depends on; an `emptyDir` loses them on rescheduling. Set
+  `state_dir` to an absolute path on the mount.
+- Run `init` as a one-shot Job, or as an initContainer: `init` exits 0
+  immediately once initialization has completed, and resumes an interrupted
+  initialization otherwise. Both need the same volume, configuration and
+  secrets as `run`.
+- Enable `[http]` and use `/healthz` as the liveness probe and `/readyz` as the
+  readiness probe. Liveness fails only when the running main loop stalls for
+  `liveness_timeout_secs`; recovery, index rebuild and initial COPY are never
+  judged, so no generous `initialDelaySeconds` is needed for them. Readiness
+  also drops under WAL pressure, which a restart does not fix, so do not base
+  restarts on it.
+- Kubernetes restarts containers regardless of exit code. Alert on
+  `last_error.exit_code` 78 or 79 in `status`, on the `fatal` log event, or on
+  a container restart count, rather than letting the pod crash-loop unnoticed.
+- Give the pod a `terminationGracePeriodSeconds` of at least 60.
+
+See [observability](observability.md#stall-and-lag-signals) for metrics and
+example alerting rules.
+
 ## Resynchronize a source
 
 Several changes require resynchronization: a changed table set, a publication

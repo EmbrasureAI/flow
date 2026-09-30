@@ -33,7 +33,7 @@ class FaultRun(Run):
         super().configure()
         # Recovery assertions require structured activation events regardless
         # of the caller's logging preference.
-        self.environment["RUST_LOG"] = "info"
+        self.environment["RUST_LOG"] = "info,flow_events=debug"
         # FULL old/new text tuples can exceed twice the decoded row size because
         # bytea is hex encoded. Keep the fixture bounded without rejecting its
         # intentional wide-row workload at the ordinary smoke test's 64 KiB cap.

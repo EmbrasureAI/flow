@@ -216,9 +216,11 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
 '''
         path.write_text(text)
         result = subprocess.run([str(self.args.binary),'--config',str(path),'init'],env=self.environment,capture_output=True,text=True,timeout=60)
-        (self.directory/'rejected-init.log').write_text(result.stdout+result.stderr)
-        assert result.returncode != 0 and 'rejected' in result.stderr and 'REPLICA IDENTITY FULL' in result.stderr
-        return {'exit':result.returncode, 'message':result.stderr}
+        output = result.stdout+result.stderr
+        (self.directory/'rejected-init.log').write_text(output)
+        # A daemon command reports its fatal error as a JSON log event on stdout.
+        assert result.returncode != 0 and 'rejected' in output and 'REPLICA IDENTITY FULL' in output
+        return {'exit':result.returncode, 'message':output}
 
     def unsupported_change(self, identity=False):
         # On a new run, fail one table after initial progress. Neither its target

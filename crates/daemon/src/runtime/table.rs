@@ -870,7 +870,7 @@ impl TableWork {
         .await??;
         let seconds = collapse_started.elapsed().as_secs_f64();
         metrics::histogram!("flow_table_local_phase_seconds", "table_id" => id.0.to_string(), "phase" => "collapse").record(seconds);
-        tracing::info!(event = "epoch_collapsed", operation_id = %epoch.id.0,
+        tracing::debug!(target: "flow_events", event = "epoch_collapsed", operation_id = %epoch.id.0,
             table_id = id.0, transactions = transactions.len(), elapsed_ms = seconds * 1000.0,
             collapse_mode = collapsed.mode(),
             collapse_memory_limit_bytes = collapse_limits.memory_bytes,

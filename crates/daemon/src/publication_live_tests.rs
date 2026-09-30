@@ -211,6 +211,21 @@ async fn scenario(url: &str, sql: &Client, label: &str, change: &str) {
                 .find(|record| record["source_table"] == "items")
                 .unwrap();
             assert_eq!(blocked[0]["table_id"], items["table_id"]);
+            assert_eq!(status["state"], "running");
+
+            // The block is visible to Prometheus alerts without parsing status.
+            let series = format!(
+                "flow_table_blocked{{table_id=\"{}\",code=\"publication_changed\"}} 1\n",
+                items["table_id"]
+            );
+            until("the blocked table is exported as a gauge", || async {
+                std::fs::read_to_string(config.state_dir.join("metrics.prom")).is_ok_and(
+                    |metrics| {
+                        metrics.contains(&series) && metrics.contains("flow_blocked_tables 1\n")
+                    },
+                )
+            })
+            .await;
         };
         tokio::select! {
             result = &mut daemon => panic!("daemon stopped: {result:?}"),

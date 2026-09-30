@@ -39,7 +39,7 @@ class JournalUpgradeRun(UpgradeRun):
 
     def configure(self):
         super().configure()
-        self.environment["RUST_LOG"] = "info"
+        self.environment["RUST_LOG"] = "info,flow_events=debug"
         # Isolate format recovery from age-triggered maintenance while compaction
         # is disabled. This functional gate makes no latency or reader-debt claim.
         self.set_compaction_policy({"oldest_l0_soft_ms": 3600000, "oldest_l0_hard_ms": 7200000})

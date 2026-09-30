@@ -94,3 +94,76 @@ async fn copy_outlives_source_statement_timeout_without_changing_session_default
     client_task.await.unwrap().unwrap();
     keeper_task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn snapshot_keeper_outlives_session_idle_and_transaction_timeouts() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (mut exporter, exporter_connection) = flow_pg_source::tokio_postgres::connect(&url, NoTls)
+        .await
+        .unwrap();
+    let exporter_task = tokio::spawn(exporter_connection);
+    let (mut keeper, connection) = flow_pg_source::tokio_postgres::connect(&url, NoTls)
+        .await
+        .unwrap();
+    let keeper_task = tokio::spawn(connection);
+    let export = exporter
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await
+        .unwrap();
+    let snapshot_name: String = export
+        .query_one("SELECT pg_export_snapshot()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    // Limits a managed server or role can impose on every session.
+    let has_transaction_timeout = keeper
+        .query_opt(
+            "SELECT 1 FROM pg_catalog.pg_settings WHERE name = 'transaction_timeout'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .is_some();
+    keeper
+        .batch_execute("SET idle_in_transaction_session_timeout = '300ms'")
+        .await
+        .unwrap();
+    if has_transaction_timeout {
+        keeper
+            .batch_execute("SET transaction_timeout = '600ms'")
+            .await
+            .unwrap();
+    }
+    let snapshot = SnapshotSession::import(&mut keeper, "unused", PgLsn(0), &snapshot_name)
+        .await
+        .unwrap();
+    // Idle in the snapshot transaction past both limits.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let alive: i32 = snapshot
+        .transaction()
+        .query_one("SELECT 1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(alive, 1);
+    assert!(!snapshot.reexport().await.unwrap().is_empty());
+    snapshot.finish().await.unwrap();
+    // The overrides were local to the snapshot transaction.
+    assert_eq!(
+        keeper
+            .query_one("SHOW idle_in_transaction_session_timeout", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "300ms"
+    );
+    export.commit().await.unwrap();
+    drop(keeper);
+    drop(exporter);
+    keeper_task.await.unwrap().unwrap();
+    exporter_task.await.unwrap().unwrap();
+}

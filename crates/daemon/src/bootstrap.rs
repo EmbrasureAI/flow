@@ -57,7 +57,7 @@ pub(crate) fn bootstrap(store: &ControlStore) -> Result<Bootstrap> {
     Ok(serde_json::from_slice(
         &store
             .source_transaction(BOOTSTRAP)?
-            .context("source is not initialized; run init first")?,
+            .ok_or_else(|| crate::exit::config("source is not initialized; run init first"))?,
     )?)
 }
 pub(crate) async fn tables(
@@ -168,7 +168,7 @@ pub async fn initialize(config: Config) -> Result<()> {
     let started = std::time::Instant::now();
     let result = async {
         crate::lifecycle::refuse_if_resync_required(&config)?;
-        let catalog = catalog(&config).await?;
+        let catalog = crate::retry::startup("catalog", || catalog(&config)).await?;
         let store = open_bootstrap_state(&config, catalog.clone()).await?;
         let mut boot = match store.source_transaction(BOOTSTRAP)? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
@@ -231,7 +231,9 @@ pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Re
                 .enumerate()
                 .filter_map(|(index, table)| table.projection().map(|_| index))
                 .collect::<Vec<_>>(),
-        "column selection mode differs from durable bootstrap; resynchronization is required"
+        crate::exit::config(
+            "column selection mode differs from durable bootstrap; resynchronization is required"
+        )
     );
     Ok(())
 }
@@ -242,7 +244,7 @@ pub(crate) fn validate_identity(config: &Config, boot: &Bootstrap) -> Result<()>
         boot.source_id == config.source.id
             && boot.slot == config.source.slot
             && boot.publication == config.source.publication,
-        "source incarnation differs from durable bootstrap"
+        crate::exit::config("source incarnation differs from durable bootstrap")
     );
     Ok(())
 }
@@ -251,7 +253,7 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
     validate_identity(config, boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len() && boot.targets.len() == config.tables.len(),
-        "configured source tables differ from durable bootstrap"
+        crate::exit::config("configured source tables differ from durable bootstrap")
     );
     for (index, configured) in config.tables.iter().enumerate() {
         ensure!(
@@ -260,7 +262,7 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
                     configured.target_namespace.clone(),
                     configured.target_table.clone()
                 ) == boot.targets[index],
-            "configured schema or target differs from durable bootstrap"
+            crate::exit::config("configured schema or target differs from durable bootstrap")
         );
     }
     Ok(())
@@ -271,10 +273,14 @@ async fn prepare_source(
     store: &StateStore,
     catalog: &dyn Catalog,
 ) -> Result<Bootstrap> {
-    let sql = connect(config, false).await?;
+    let sql = crate::retry::startup("source connection", || connect(config, false)).await?;
+    let slot = &config.source.slot;
     ensure!(
-        slot_cut(&sql, &config.source.slot).await?.is_none(),
-        "initialization requires a new permanent replication slot"
+        slot_cut(&sql, slot).await?.is_none(),
+        crate::exit::config(format!(
+            "replication slot {slot:?} already exists, but state_dir {} has no initialization record for it; init only creates a new slot. To resume an initialized source, set state_dir to its original state directory and use run. Otherwise set a new source.slot, or drop the stale slot after confirming no Flow instance uses it: SELECT pg_drop_replication_slot('{slot}');",
+            config.state_dir.display()
+        ))
     );
     let mut schemas = Vec::new();
     let mut target_uuids = Vec::new();
@@ -427,7 +433,7 @@ pub(crate) async fn resume(
         return Ok(());
     }
     validate_config(config, boot)?;
-    let sql = connect(config, false).await?;
+    let sql = crate::retry::startup("source connection", || connect(config, false)).await?;
     let mut registry = crate::schema::SchemaRegistry::new(
         store.clone(),
         SourceId(config.source.id.clone()),

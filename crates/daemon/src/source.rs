@@ -133,8 +133,10 @@ pub(crate) async fn connect_owned(
     replication: bool,
 ) -> Result<(Client, ConnectionTask)> {
     let connection_env = &config.source.connection_env;
-    let url = std::env::var(connection_env).with_context(|| {
-        format!("source connection environment variable is missing: {connection_env}")
+    let url = std::env::var(connection_env).map_err(|_| {
+        crate::exit::config(format!(
+            "source connection environment variable is missing: {connection_env}"
+        ))
     })?;
     let mut pg: PgConfig = url
         .parse()
@@ -215,6 +217,7 @@ pub(crate) async fn capture_loop(
             let started = source_deadline(async {
                 verify_source_identity(&client, &config, false).await?;
                 let (sql, sql_connection) = connect_owned(&config, false).await?;
+                prepare_heartbeat_session(&sql).await?;
                 validate_slot(&sql, &config, journal.durable_lsn()).await?;
                 // IDENTIFY_SYSTEM above proved this URL on the replication
                 // connection, and this SQL session was opened to it just now; a
@@ -325,7 +328,7 @@ pub(crate) async fn capture_loop(
                                 tracing::warn!(%error, "source WAL heartbeat disconnected");
                                 break;
                             }
-                            return Err(error.context("Postgres CDC requires EXECUTE on pg_logical_emit_message for idle WAL progress"));
+                            return Err(heartbeat_error(error));
                         }
                     }
                     _ = feedback_tick.tick() => {
@@ -518,6 +521,7 @@ pub(crate) async fn capture_loop(
         result = capture => result,
     };
     if let Err(error) = result {
+        crate::exit::remember_capture_stop(&error);
         send.send_replace(CaptureProgress {
             durable_lsn: journal.durable_lsn(),
             error: Some(format!("{error:#}")),
@@ -633,7 +637,9 @@ pub(crate) fn record_journaled(transaction: &flow_model::SourceTransaction) {
                 .record(latency as f64 / 1_000_000.0);
         }
     }
-    tracing::info!(
+    // Per-transaction evidence; enable with RUST_LOG=info,flow_events=debug.
+    tracing::debug!(
+        target: "flow_events",
         event = "transaction_journaled",
         source_id = %transaction.source_id.0,
         xid = transaction.xid,
@@ -643,6 +649,59 @@ pub(crate) fn record_journaled(transaction: &flow_model::SourceTransaction) {
         journal_payload_bytes = transaction.mutation_chunks.payload_bytes(),
         "source transaction durable"
     );
+}
+
+/// The heartbeat commits on capture's SQL session. With a matching
+/// `synchronous_standby_names`, Flow's own walsender can be the synchronous
+/// standby; a remote-ack commit would then wait for the capture loop it blocks.
+async fn prepare_heartbeat_session(sql: &Client) -> Result<()> {
+    sql.batch_execute("SET synchronous_commit = local").await?;
+    Ok(())
+}
+
+/// Name the missing grant only when PostgreSQL reported one.
+fn heartbeat_error(error: anyhow::Error) -> anyhow::Error {
+    let denied = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<flow_pg_source::tokio_postgres::Error>()
+            .and_then(flow_pg_source::tokio_postgres::Error::code)
+            == Some(&SqlState::INSUFFICIENT_PRIVILEGE)
+    });
+    error.context(if denied {
+        "Postgres CDC requires EXECUTE on pg_logical_emit_message for idle WAL progress"
+    } else {
+        "source WAL heartbeat failed"
+    })
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_failures_name_a_missing_grant_only_when_reported() {
+        let error = heartbeat_error(anyhow::anyhow!("server closed the connection"));
+        assert_eq!(
+            format!("{error:#}"),
+            "source WAL heartbeat failed: server closed the connection"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+    async fn live_heartbeat_session_commits_without_synchronous_standbys() {
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.source.connection_env = "FLOW_POSTGRES_URL".into();
+        let (sql, _connection) = connect_owned(&config, false).await.unwrap();
+        prepare_heartbeat_session(&sql).await.unwrap();
+        let setting: String = sql
+            .query_one("SHOW synchronous_commit", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(setting, "local");
+    }
 }
 
 fn retryable_postgres(error: &flow_pg_source::tokio_postgres::Error) -> bool {
@@ -731,7 +790,7 @@ pub(crate) async fn verify_source_identity(
     match std::fs::read(&path) {
         Ok(bytes) => {
             let expected: SourceIdentity = serde_json::from_slice(&bytes).context("invalid saved source identity")?;
-            ensure!(identity == expected, "PostgreSQL source system, database, timeline, or slot lineage changed; coordinated failover/resynchronization is required");
+            ensure!(identity == expected, crate::exit::resync("PostgreSQL source system, database, timeline, or slot lineage changed; coordinated failover/resynchronization is required"));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && initialize => {
             let temporary = path.with_extension("json.tmp");
@@ -748,17 +807,21 @@ pub(crate) async fn verify_source_identity(
 
 async fn validate_slot(client: &Client, config: &Config, durable_lsn: PgLsn) -> Result<()> {
     let row = client.query_opt("SELECT plugin, slot_type, database = current_database(), confirmed_flush_lsn::text, restart_lsn::text, wal_status FROM pg_catalog.pg_replication_slots WHERE slot_name = $1", &[&config.source.slot]).await?
-        .context("replication slot disappeared; source resynchronization is required")?;
+        .ok_or_else(|| crate::exit::resync("replication slot disappeared; source resynchronization is required"))?;
     ensure!(
         row.get::<_, Option<String>>(0).as_deref() == Some("pgoutput")
             && row.get::<_, String>(1) == "logical"
             && row.get::<_, Option<bool>>(2) == Some(true),
-        "replication slot plugin/type/database differs from the initialized source"
+        crate::exit::resync(
+            "replication slot plugin/type/database differs from the initialized source"
+        )
     );
     ensure!(
         row.get::<_, Option<String>>(5).as_deref() != Some("lost")
             && row.get::<_, Option<String>>(4).is_some(),
-        "replication slot lost required WAL; source resynchronization is required"
+        crate::exit::resync(
+            "replication slot lost required WAL; source resynchronization is required"
+        )
     );
     let confirmed: PgLsn = row
         .get::<_, Option<String>>(3)
@@ -766,7 +829,9 @@ async fn validate_slot(client: &Client, config: &Config, durable_lsn: PgLsn) -> 
         .parse()?;
     ensure!(
         confirmed <= durable_lsn,
-        "PostgreSQL slot has acknowledged beyond the local durable journal; another consumer or storage loss requires source reconciliation"
+        crate::exit::resync(
+            "PostgreSQL slot has acknowledged beyond the local durable journal; another consumer or storage loss requires source reconciliation"
+        )
     );
     Ok(())
 }
@@ -821,7 +886,9 @@ pub(crate) async fn source_identity_matches(client: &Client, config: &Config) ->
     ensure!(
         row.try_get::<_, String>(0)? == expected.system_identifier
             && row.try_get::<_, String>(1)? == expected.database,
-        "PostgreSQL source system or database changed; coordinated failover/resynchronization is required"
+        crate::exit::resync(
+            "PostgreSQL source system or database changed; coordinated failover/resynchronization is required"
+        )
     );
     Ok(true)
 }

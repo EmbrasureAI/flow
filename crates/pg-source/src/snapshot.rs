@@ -167,9 +167,15 @@ impl<'a> SnapshotSession<'a> {
             .read_only(true)
             .start()
             .await?;
+        // The keeper sits idle in this transaction while other sessions copy,
+        // possibly for hours. Server or role session limits must not end it;
+        // PostgreSQL 17's transaction_timeout also covers active COPY.
         transaction
             .batch_execute(&format!(
-                "SET TRANSACTION SNAPSHOT {}; SET LOCAL row_security = off",
+                "SET TRANSACTION SNAPSHOT {}; SET LOCAL row_security = off; \
+                 SET LOCAL idle_in_transaction_session_timeout = 0; \
+                 SELECT pg_catalog.set_config(name, '0', true) FROM pg_catalog.pg_settings \
+                 WHERE name = 'transaction_timeout'",
                 quote_literal(snapshot_name)
             ))
             .await?;

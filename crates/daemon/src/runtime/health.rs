@@ -7,13 +7,19 @@ use crate::{
     observation::Observation,
     source::{connect_owned, retryable_connection},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use flow_coordinator::{SourceHealth, SourceLedger, WalPressure};
 use flow_model::PgLsn;
 use flow_pg_source::tokio_postgres::Client;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Unchanged storage pressure is repeated at most this often; metrics and
+/// status carry every five-second check.
+const PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(300);
 
 pub(super) struct HealthConnection {
     client: Client,
@@ -77,7 +83,9 @@ pub(super) fn observe_health(
     observation.record_source_health(result.source_health);
     observation.write(config, ledger, captured, true)?;
     if result.source_health == SourceHealthStatus::SlotLost {
-        bail!("replication slot lost WAL; resynchronization required");
+        return Err(crate::exit::resync(
+            "replication slot lost WAL; resynchronization required",
+        ));
     }
     Ok(result)
 }
@@ -142,9 +150,33 @@ async fn check_wal(client: &Client, config: &Config) -> Result<SourceHealth> {
         config.limits.wal_hard_bytes,
         config.limits.journal_bytes,
     );
+    let now = Instant::now();
+    let previous = {
+        let mut logged = PRESSURE_LOGGED
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !pressure_log_due(*logged, health, now) {
+            return Ok(health);
+        }
+        let previous = logged.map(|(health, _)| health);
+        *logged = (health != SourceHealth::Healthy).then_some((health, now));
+        previous
+    };
     match health {
-        SourceHealth::Healthy | SourceHealth::SlotLost => {}
-        health => tracing::error!(
+        SourceHealth::SlotLost => {}
+        SourceHealth::Healthy => tracing::info!(
+            ?previous,
+            retained_wal_bytes = pressure.retained_bytes,
+            journal_bytes,
+            "source storage pressure cleared"
+        ),
+        SourceHealth::Warning => tracing::warn!(
+            ?health,
+            retained_wal_bytes = pressure.retained_bytes,
+            journal_bytes,
+            "source storage pressure; increase capacity or drain publication lag"
+        ),
+        SourceHealth::AtRisk => tracing::error!(
             ?health,
             retained_wal_bytes = pressure.retained_bytes,
             journal_bytes,
@@ -152,4 +184,41 @@ async fn check_wal(client: &Client, config: &Config) -> Result<SourceHealth> {
         ),
     }
     Ok(health)
+}
+
+/// The last logged pressure state and when it was logged.
+static PRESSURE_LOGGED: Mutex<Option<(SourceHealth, Instant)>> = Mutex::new(None);
+
+/// Log pressure on every state change and repeat an unchanged state only
+/// after `PRESSURE_LOG_INTERVAL`. A healthy result is logged only as recovery.
+fn pressure_log_due(
+    logged: Option<(SourceHealth, Instant)>,
+    health: SourceHealth,
+    now: Instant,
+) -> bool {
+    match logged {
+        None => health != SourceHealth::Healthy,
+        Some((previous, at)) => {
+            previous != health || now.duration_since(at) >= PRESSURE_LOG_INTERVAL
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_pressure_is_rate_limited_but_changes_are_logged() {
+        let start = Instant::now();
+        let later = |seconds| start + Duration::from_secs(seconds);
+        assert!(!pressure_log_due(None, SourceHealth::Healthy, start));
+        assert!(pressure_log_due(None, SourceHealth::Warning, start));
+        let warned = Some((SourceHealth::Warning, start));
+        assert!(!pressure_log_due(warned, SourceHealth::Warning, later(5)));
+        assert!(!pressure_log_due(warned, SourceHealth::Warning, later(299)));
+        assert!(pressure_log_due(warned, SourceHealth::Warning, later(300)));
+        assert!(pressure_log_due(warned, SourceHealth::AtRisk, later(5)));
+        assert!(pressure_log_due(warned, SourceHealth::Healthy, later(5)));
+    }
 }

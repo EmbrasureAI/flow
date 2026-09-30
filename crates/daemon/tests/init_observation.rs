@@ -1,6 +1,14 @@
 use std::process::Command;
 use tempfile::TempDir;
 
+fn fatal_event(stdout: &[u8]) -> serde_json::Value {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["fields"]["event"] == "fatal")
+        .expect("fatal event")
+}
+
 #[test]
 fn failed_init_exports_process_metrics_without_hiding_the_primary_error() {
     let temp = TempDir::new().unwrap();
@@ -22,10 +30,37 @@ fn failed_init_exports_process_metrics_without_hiding_the_primary_error() {
             .unwrap()
     };
     let first = run();
-    assert!(!first.status.success());
-    assert!(String::from_utf8_lossy(&first.stderr).contains(
+    // An operator must provide the environment; restarting cannot fix it.
+    assert_eq!(first.status.code(), Some(78));
+    // The fatal error is one JSON event in the log stream, not stderr text.
+    let fatal = fatal_event(&first.stdout);
+    assert_eq!(
+        fatal["fields"]["error"],
         "source connection environment variable is missing: FLOW_INIT_TEST_MISSING_CONNECTION"
-    ));
+    );
+    assert_eq!(fatal["fields"]["exit_code"], 78);
+    assert_eq!(fatal["fields"]["class"], "config");
+    assert_eq!(fatal["level"], "ERROR");
+    assert!(
+        first.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status["state"], "stopped");
+    assert_eq!(status["last_error"]["exit_code"], 78);
+    assert_eq!(
+        status["last_error"]["message"],
+        "source connection environment variable is missing: FLOW_INIT_TEST_MISSING_CONNECTION"
+    );
+    let status_command = Command::new(env!("CARGO_BIN_EXE_embrasure-flow"))
+        .args(["--config", path.to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    // `status` prints the observation and exits 3 while not ready.
+    assert_eq!(status_command.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&status_command.stdout).contains("\"last_error\""));
     let metrics = std::fs::read_to_string(state.join("metrics.prom")).unwrap();
     assert!(
         metrics.contains("flow_bootstrap_runs_total{outcome=\"error\"} 1"),
@@ -39,7 +74,9 @@ fn failed_init_exports_process_metrics_without_hiding_the_primary_error() {
     let second = run();
     assert!(!second.status.success());
     assert!(
-        String::from_utf8_lossy(&second.stderr)
+        fatal_event(&second.stdout)["fields"]["error"]
+            .as_str()
+            .unwrap()
             .contains("source connection environment variable is missing")
     );
     assert!(

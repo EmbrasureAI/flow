@@ -34,7 +34,7 @@ class BootstrapRun(Run):
         self.catalog_proxy = CatalogProxy(args.catalog_uri, self.directory / "catalog-proxy.jsonl")
         args.catalog_uri = self.catalog_proxy.url
         self.configure()
-        self.environment.update(FLOW_LOCAL_POSTGRES_URL=self.copy_proxy.connection, RUST_LOG="info")
+        self.environment.update(FLOW_LOCAL_POSTGRES_URL=self.copy_proxy.connection, RUST_LOG="info,flow_events=debug")
 
     def seed(self):
         super().seed()
@@ -48,7 +48,7 @@ class BootstrapRun(Run):
         self.generation += 1
         self.log_path = self.directory / f"init-{self.generation}.log"
         self.log = self.log_path.open("wb")
-        self.process = subprocess.Popen(self.command("init"), env=self.environment | {"RUST_LOG": "info"}, stdout=self.log, stderr=subprocess.STDOUT)
+        self.process = subprocess.Popen(self.command("init"), env=self.environment | {"RUST_LOG": "info,flow_events=debug"}, stdout=self.log, stderr=subprocess.STDOUT)
 
     def events(self):
         events = []
@@ -264,7 +264,7 @@ def main():
         result = run_supervised([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--supervised-worker"],
                                 args.artifacts, timeout=12 * args.timeout + 120)
         raise SystemExit(result.returncode)
-    os.environ["RUST_LOG"] = "info"
+    os.environ["RUST_LOG"] = "info,flow_events=debug"
     BootstrapRun(args).execute()
     print(f"PASS: {args.artifacts.resolve() / 'report.json'}", flush=True)
 

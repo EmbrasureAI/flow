@@ -554,7 +554,8 @@ impl TablePublisher {
         let other_prepare = preparation.saturating_sub(data_stage_pair_wall + delete_write);
         metrics::histogram!("flow_ingest_prepare_seconds", "table_id" => epoch.table.0.to_string())
             .record(precommit_prepare_ms / 1000.0);
-        tracing::info!(
+        tracing::debug!(
+            target: "flow_events",
             event = "ingest_prepared",
             operation_id = %epoch.id.0,
             table_id = epoch.table.0,
@@ -662,7 +663,8 @@ impl TablePublisher {
                             .record((catalog_committed_at_micros - committed) as f64 / 1_000_000.0);
                     }
                 }
-                tracing::info!(
+                tracing::debug!(
+                    target: "flow_events",
                     event = "table_published",
                     operation_id = %id.0,
                     table_id = record.operation.table_id.0,

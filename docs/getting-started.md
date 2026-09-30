@@ -128,7 +128,8 @@ The configured column list defines the initial source schema; see the [type mapp
 Configure the REST catalog URI, warehouse and object-store endpoint for your own
 services. Flow needs catalog access to load/create tables and commit snapshots,
 and object access to read, write, list and delete its files. Use a persistent,
-writable `state_dir`; do not share it between running Flow processes.
+writable `state_dir`; do not share it between running Flow processes. A
+relative `state_dir` is resolved against the configuration file's directory.
 
 `check` validates the configuration locally. `check --source` also connects to
 PostgreSQL read-only and reports server settings, slot and sender capacity,
@@ -159,9 +160,10 @@ The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,c
 listen = "0.0.0.0:9464"
 ```
 
-`init` and `run` then serve `GET /healthz` (the process is up), `GET /readyz`
-(200 while this process reports ready, otherwise 503, with the status JSON) and
-`GET /metrics` (the same Prometheus text as `metrics.prom`). The listener has no
+`init` and `run` then serve `GET /healthz` (liveness: fails only if the running
+service's main loop stalls), `GET /readyz` (200 while this process reports
+ready, otherwise 503, with the status JSON) and `GET /metrics` (the same
+Prometheus text as `metrics.prom`). The listener has no
 authentication; bind it to a private interface. See [observability](observability.md) for latency definitions, reader debt and the distinction between SDK operations and billed requests.
 
 ## Common setup errors
