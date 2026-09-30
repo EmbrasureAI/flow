@@ -21,6 +21,7 @@ Use the actual selected ports if those defaults were occupied. `--compose-file` 
 The workload starts with 4,096 typed orders and 16 accounts, verifies the initial COPY/WAL handoff, then exercises:
 
 1. A lost catalog response **after the upstream catalog successfully committed an actual ingestion snapshot**. A loopback HTTP proxy closes the downstream socket without sending response headers. Its trace records the operation ID, snapshot ID, and successful upstream status. Recovery must find exactly one matching logical commit and produce the exact source rows.
+   The same commit is then reported as 500, 502 and 504 (commit state unknown), and once its real response is held for `--late-response-seconds` (default 65), beyond the daemon's catalog request timeout. Each variant must also produce exactly one matching logical commit.
 2. Catalog HTTP 503 responses before requests reach the upstream catalog. PostgreSQL continues accepting updates, deletes, reinserts, and a transaction spanning both tables. The source ACK must remain behind that unmaterialized transaction.
 3. A full catalog container stop/start, preserving table UUIDs and catalog metadata.
 4. A full MinIO container stop/start, preserving objects and the same endpoint.
@@ -36,6 +37,26 @@ The script acts as an explicit process supervisor after service restoration. Eve
 The fixture's JDBC catalog shares the PostgreSQL server. After a PostgreSQL restart, readiness probes load both actual tables because the catalog's configuration endpoint does not exercise its database pool. If table reads still fail after five seconds, the suite explicitly restarts the catalog and records that infrastructure intervention as another availability incident. Neither source nor catalog data is reset.
 
 Artifacts include `report.json`, daemon and compactor logs, a JSONL catalog-proxy request trace, Compose actions, catalog metadata copies, and durable daemon state. Service restoration is attempted in `finally` blocks. Containers and volumes remain available for inspection after the script exits. `proxy.py` exposes no network fault-control API; its control state is available only inside the local test process.
+
+`--format-version 3` runs the same phases against Iceberg v3 targets (deletion vectors; the manifest audit checks one live vector per data file). `--ack-mode journaled` declares independent journal storage and replaces the "ACK behind the barrier" checks with "ACK never past the durable journal"; the recovery and exactly-once checks are unchanged. CI runs both variants on PostgreSQL 18 (journaled also on 14).
+
+## Randomized crash loop
+
+`crash_loop.py` takes the same connection arguments (no Compose project; it never restarts services). Three writers share key ranges and mix updates, upserts, deletes and primary-key moves, with savepoint rollbacks and whole-transaction rollbacks. A bulk writer periodically commits a 12,000-row transaction that exceeds a 4 MB `logical_decoding_work_mem` (PostgreSQL must report it streamed) and contains its own rolled-back savepoint. Nullable column additions land on a FULL-identity and a DEFAULT-identity table at random times. Every cycle the daemon is `SIGKILL`ed after 0.5–10 seconds under a random catalog fault: none, commits held before upstream (released at a random time or after the kill), 503 before upstream, a dropped response after a successful commit, or a successful commit reported as 500/502/504.
+
+After each kill, the harness compares the slot's `confirmed_flush_lsn` with the catalog: every writer transaction advances a per-writer `ticks` row and records WAL positions immediately before and after `COMMIT`, so a transaction that is certainly acknowledged but certainly outside the ticks table's highest published `streaming.last-lsn` fails the run. After each restart, writers pause at a transaction boundary; every column of every row of all four tables must match PostgreSQL once materialization passes a new barrier, and each `flow.operation-id` must map to exactly one snapshot for the whole run. The final phase audits recent manifests.
+
+```sh
+uv run tests/production/crash_loop.py --duration 240 \
+  --catalog-uri http://127.0.0.1:58181 --s3-endpoint http://127.0.0.1:59000 \
+  --binary target/debug/embrasure-flow --artifacts target/crash-loop-01
+```
+
+The seed is printed first and recorded with a reproduction command in `report.json`; pass `--seed` to replay the same fault, timing and workload decisions (thread scheduling still varies). CI runs a four-minute loop on every change. `.github/workflows/nightly.yml` runs a one-hour loop (`--duration 3600`) and `soak.py`, which runs the same workload for 30 minutes without faults, samples daemon RSS, state directory and journal bytes and table metadata size, and fails when a resource's medians grow across three post-warm-up windows beyond a tolerance. The soak shortens snapshot retention and orphan grace to two minutes so that metadata and artifact bookkeeping can reach steady state.
+
+## Fail-closed storage-loss guards
+
+`live_storage_loss_guards_fail_closed` (in the daemon's test binary, `--ignored`, `FLOW_POSTGRES_URL` of a disposable superuser session, `--test-threads=1`) runs the real daemon against live PostgreSQL and an in-memory catalog. Each case publishes a change, damages state while the daemon is stopped, and requires startup to refuse with the documented message, publish no snapshot and leave the slot unchanged: restoring an older copy of `state_dir`; dropping and recreating the slot; advancing it past the journal; truncating the journal below a journaled but unpublished transaction; and invalidating the slot by lowering `max_slot_wal_keep_size` and removing its WAL (PostgreSQL 17+ also reports `invalidation_reason = wal_removed`). The last case changes a server setting, so `compose.yaml` configures `max_slot_wal_keep_size` with `ALTER SYSTEM` rather than on the command line. CI runs it on PostgreSQL 14–18.
 
 These are bounded local correctness and recovery tests. They do not prove multi-node failover, independent-host journal durability, network partitions with real object-store semantics, complete disk-loss recovery, or long-duration availability.
 

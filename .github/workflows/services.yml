@@ -36,21 +36,22 @@ jobs:
         run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
       - name: Build PostgreSQL regression tests
         run: |
-          cargo test --locked -p flow-pg-source --test snapshot_timeout --test schema_batch --no-run --message-format=json > target/pg-test-build.jsonl
+          cargo test --locked -p flow-pg-source --test snapshot_timeout --test schema_batch --test superset_publication --no-run --message-format=json > target/pg-test-build.jsonl
           cargo test --locked -p flow-daemon --bin embrasure-flow --no-run --message-format=json > target/daemon-test-build.jsonl
           python3 - <<'PYTEST'
           import json
           import shutil
           from pathlib import Path
           artifacts = [json.loads(line) for name in ("pg", "daemon") for line in Path(f"target/{name}-test-build.jsonl").read_text().splitlines()]
-          for name, output in (("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("embrasure-flow", "daemon_tests")):
+          for name, output in (("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("superset_publication", "superset_publication_tests"), ("embrasure-flow", "daemon_tests")):
               executable, = [item["executable"] for item in artifacts if item.get("executable") and item.get("profile", {}).get("test") and item.get("target", {}).get("name") == name]
               shutil.copy2(executable, f"target/debug/{output}")
           PYTEST
       - name: Package service binaries with executable permissions and checksums
         run: |
-          sha256sum target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/daemon_tests > target/service-binaries.sha256
-          tar -cf "$RUNNER_TEMP/service-binaries.tar" target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/daemon_tests target/service-binaries.sha256
+          binaries=(target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/superset_publication_tests target/debug/daemon_tests)
+          sha256sum "${binaries[@]}" > target/service-binaries.sha256
+          tar -cf "$RUNNER_TEMP/service-binaries.tar" "${binaries[@]}" target/service-binaries.sha256
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: service-binaries
@@ -79,18 +80,32 @@ jobs:
   postgres:
     needs: [build, minio]
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ matrix.suite == 'periodic-single-worker' && 30 || 20 }}
+    timeout-minutes: ${{ contains(fromJSON('["periodic-single-worker", "isolation", "v3"]'), matrix.suite) && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:
         postgres: ['14.24', '15.19', '16.15', '17.11', '18.6']
         suite: [compatibility]
         # Split by measured duration. Each shard owns an isolated service stack.
+        # Version-sensitive shards (lifecycle, compaction, isolation) also run
+        # on the oldest supported major; the rest run on the newest.
         include:
-          - postgres: '18.6'
+          - postgres: '14.24'
             suite: lifecycle
           - postgres: '18.6'
+            suite: lifecycle
+          - postgres: '14.24'
             suite: compaction
+          - postgres: '18.6'
+            suite: compaction
+          - postgres: '14.24'
+            suite: isolation
+          - postgres: '18.6'
+            suite: isolation
+          - postgres: '18.6'
+            suite: v3
+          - postgres: '18.6'
+            suite: crash-loop
           - postgres: '18.6'
             suite: periodic-single-worker
           - postgres: '18.6'
@@ -126,7 +141,7 @@ jobs:
       - name: Load MinIO fixture images
         run: docker load -i "$RUNNER_TEMP/minio-images/minio-images.tar"
       - name: Reserve disk for independent reader images
-        if: matrix.suite == 'readers'
+        if: matrix.suite == 'readers' || matrix.suite == 'v3'
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Verify stock reader extensions from an empty cache
@@ -168,9 +183,16 @@ jobs:
       - name: Batched catalog metadata preserves identity and DDL checks
         if: matrix.suite == 'compatibility'
         run: target/debug/schema_batch_tests batched_metadata --ignored
-      - name: Publication changes isolate tables and preserve restart blocks
-        if: matrix.postgres == '17.11' && matrix.suite == 'compatibility'
-        run: target/debug/daemon_tests live_ --ignored --test-threads=1
+      - name: Publication isolation and fail-closed storage-loss guards
+        # Serial: the lost-WAL guard lowers max_slot_wal_keep_size server-wide.
+        # The publication tests use PostgreSQL 15 row filters and schema publications.
+        if: matrix.suite == 'compatibility'
+        env:
+          LIVE_TESTS: ${{ matrix.postgres == '14.24' && 'live_storage' || 'live_' }}
+        run: target/debug/daemon_tests "$LIVE_TESTS" --ignored --test-threads=1 --nocapture
+      - name: Superset publication captures only configured tables
+        if: matrix.suite == 'compatibility'
+        run: target/debug/superset_publication_tests live_ --ignored
       - name: Snapshot COPY survives inherited statement timeouts
         if: matrix.suite == 'compatibility'
         run: target/debug/snapshot_timeout_tests --ignored
@@ -331,6 +353,47 @@ jobs:
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
           --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers"
           --native-compaction --keyless-duplicates
+      - name: TRUNCATE and catalog-failure table isolation, then journal quota recovery
+        if: matrix.suite == 'isolation'
+        run: |
+          uv run tests/local/table_isolation.py --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" --artifacts "$RUNNER_TEMP/service-table-isolation"
+          uv run tests/local/table_isolation.py --quota --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" --artifacts "$RUNNER_TEMP/service-table-isolation-quota"
+      - name: REPLICA IDENTITY DEFAULT capture, crash replay and identity changes
+        if: matrix.suite == 'isolation'
+        run: >-
+          uv run tests/local/default_identity.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow --product-preflight skip
+          --artifacts "$RUNNER_TEMP/service-default-identity"
+      - name: Crash recovery with journaled acknowledgement
+        if: matrix.suite == 'isolation'
+        run: >-
+          uv run tests/production/faults.py --ack-mode journaled
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults-journaled"
+      - name: Iceberg v3 crash recovery and concurrent compaction
+        if: matrix.suite == 'v3'
+        run: >-
+          uv run tests/production/faults.py --format-version 3
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --compactor-binary target/debug/examples/local_compactor
+          --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults-v3"
+      - name: Iceberg v3 standard readers with native and external maintenance
+        if: matrix.suite == 'v3'
+        run: >-
+          uv run tests/production/readers.py --format-version 3
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers-v3"
+          --native-compaction --keyless-duplicates
+      - name: Randomized crash loop (seed printed; rerun with --seed)
+        if: matrix.suite == 'crash-loop'
+        run: >-
+          uv run tests/production/crash_loop.py --duration 240
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --artifacts "$RUNNER_TEMP/service-crash-loop"
       - name: Service logs
         if: always()
         run: docker compose logs --no-color > "$RUNNER_TEMP/service-containers.log"
@@ -345,6 +408,8 @@ jobs:
             ${{ runner.temp }}/service-*/*metadata.json
             ${{ runner.temp }}/service-*/state/status.json
             ${{ runner.temp }}/service-*/state/metrics.prom
+            ${{ runner.temp }}/service-*/*/report.json
+            ${{ runner.temp }}/service-*/*/*.log
             ${{ runner.temp }}/service-containers.log
       - name: Remove this job's disposable services
         if: always()

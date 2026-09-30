@@ -25,8 +25,8 @@ services:
       - synchronous_commit=on
       - -c
       - full_page_writes=on
-      - -c
-      - max_slot_wal_keep_size=4GB
+    # max_slot_wal_keep_size is set in init.sql with ALTER SYSTEM: a command-line
+    # value would prevent the slot-invalidation guard test from lowering it.
     environment:
       POSTGRES_USER: flow
       POSTGRES_PASSWORD: local-test-password

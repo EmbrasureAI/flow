@@ -28,6 +28,8 @@ class CatalogProxy:
         self.drop_kind = "ingest"
         self.drop_table = None
         self.reject_after_drop = None
+        self.drop_status = None
+        self.drop_delay = 0
         self.hold_kind = "ingest"
         self.hold_table = None
         self.dropped = threading.Event()
@@ -96,14 +98,26 @@ class CatalogProxy:
         with self.lock:
             self.table_rejections.pop(table, None)
 
-    def arm_drop(self, kind="ingest", table=None, reject_after=None):
+    def arm_drop(self, kind="ingest", table=None, reject_after=None, status=None, delay_seconds=0):
+        """Hide the outcome of the next successful matching commit from its caller.
+
+        By default the connection closes without a response. `status` instead
+        replaces the upstream success with a commit-state-unknown 500, 502 or
+        504; `delay_seconds` holds the real response past the client's timeout.
+        """
         if reject_after is not None and (table is None or reject_after not in (403, 503)):
             raise ValueError("post-commit rejection requires a table and status 403 or 503")
+        if status is not None and status not in (500, 502, 504):
+            raise ValueError("an unknown commit outcome is reported as 500, 502 or 504")
+        if status is not None and delay_seconds:
+            raise ValueError("choose a rewritten status or a late response, not both")
         with self.lock:
             self.drop_remaining = 1
             self.drop_kind = kind
             self.drop_table = table
             self.reject_after_drop = reject_after
+            self.drop_status = status
+            self.drop_delay = delay_seconds
             self.dropped.clear()
 
     def hold_commits(self, kind="ingest", table=None):
@@ -181,7 +195,28 @@ class CatalogProxy:
                             # Install before disconnecting: recovery reads cannot race
                             # ahead of the fixture's post-commit failure boundary.
                             self.table_rejections[self.drop_table] = (self.reject_after_drop, None)
-            if should_drop:
+            if should_drop and self.drop_status is not None:
+                # Upstream committed, but the client is told the outcome is unknown,
+                # as a gateway or catalog may after an interrupted commit.
+                status = self.drop_status
+                event.update(fault="unknown-status-after-successful-commit", rewritten_status=status)
+                self.dropped.set()
+                handler.close_connection = True
+                self.respond(handler, status, json.dumps({"error": {
+                    "message": "injected unknown commit outcome", "type": "CommitStateUnknownException",
+                    "code": status,
+                }}).encode())
+            elif should_drop and self.drop_delay:
+                # The response arrives only after the client's own deadline.
+                event.update(fault="late-after-successful-commit", delay_seconds=self.drop_delay)
+                self.dropped.set()
+                handler.close_connection = True
+                time.sleep(self.drop_delay)
+                try:
+                    self.respond(handler, response.status, data, response.getheader("Content-Type", "application/json"))
+                except OSError as error:
+                    event["late_response_error"] = str(error)
+            elif should_drop:
                 # Upstream has durably accepted the actual add-snapshot request. Closing
                 # without headers prevents the client from learning the outcome.
                 event["fault"] = "drop-after-successful-commit"

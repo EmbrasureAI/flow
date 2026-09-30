@@ -419,3 +419,61 @@ async fn oversized_late_rows_fail_before_any_output_and_leave_writers_reusable()
     assert_eq!(deletes.close().await?.len(), 1);
     Ok(())
 }
+
+/// A v3 rewrite preserves row lineage for every column type, including binary
+/// values, whose rows are built as `Binary` while Iceberg's Arrow schema
+/// conversion yields `LargeBinary`.
+#[tokio::test]
+async fn lineage_rewrite_accepts_binary_columns() -> anyhow::Result<()> {
+    let schema = schema();
+    let directory = tempfile::tempdir()?;
+    let mut writer = DataWriter::new(
+        io(),
+        directory.path().to_str().unwrap(),
+        &OperationId("lineage-binary".into()),
+        schema.clone(),
+        0,
+        WriterConfig::default(),
+    )?
+    .with_row_lineage()?;
+    let rows: Vec<Row> = (0..3)
+        .map(|id| {
+            vec![
+                Value::Int64(id),
+                Value::String(format!("row-{id}")),
+                if id == 1 {
+                    Value::Null
+                } else {
+                    Value::Binary(vec![id as u8, 0, 255])
+                },
+            ]
+        })
+        .collect();
+    let lineage: Vec<_> = (0..3)
+        .map(|id| flow_materializer::RowLineage {
+            row_id: Some(100 + id),
+            last_updated_sequence_number: Some(7),
+        })
+        .collect();
+    writer
+        .write_with_lineage(&rows, Some(&lineage), PgLsn(10))
+        .await?;
+    let files = writer.close().await?;
+    let mut recovered = Vec::new();
+    for file in files {
+        for batch in
+            ParquetRecordBatchReaderBuilder::try_new(File::open(file.file_path())?)?.build()?
+        {
+            let batch = batch?;
+            recovered.extend(rows_from_batch(&schema, &batch.project(&[0, 1, 2])?)?);
+            let row_ids = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(row_ids.values(), &[100, 101, 102]);
+        }
+    }
+    assert_eq!(recovered, rows);
+    Ok(())
+}
