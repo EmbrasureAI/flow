@@ -199,8 +199,11 @@ the journal much larger than the largest source transaction and at least four
 ## Iceberg table maintenance
 
 Flow compacts data and deletes, rewrites manifests, expires snapshots after
-`limits.snapshot_retention_secs` and removes files it wrote once nothing
-retains them. It does not delete files it did not register: data written by
+`limits.snapshot_retention_secs` (keeping at least `limits.snapshot_retain_last`
+and at most about `limits.snapshot_max_count`) and removes files it wrote once
+nothing retains them. A metadata maintenance failure affects only its table:
+it is logged as `metadata_maintenance_failed` and retried with backoff while
+CDC continues. It does not delete files it did not register: data written by
 other engines, their failed writes and catalog files outside Flow's records are
 not Flow's to remove. If other writers commit to the same tables, give their
 orphan-file cleanup to that engine's maintenance, using a conservative age

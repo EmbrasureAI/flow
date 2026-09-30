@@ -303,7 +303,7 @@ async fn pending_checkpoints_preserve_catalog_recovery_after_physical_index_loss
                 .expire_history(
                     &head,
                     schema.table_id,
-                    Duration::from_millis(1),
+                    &flow_coordinator::HistoryPolicy::window(Duration::from_millis(1)),
                     &protection.snapshots,
                 )
                 .await

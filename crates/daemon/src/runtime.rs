@@ -312,6 +312,7 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
             publisher,
             maintenance,
             garbage_checked: Arc::default(),
+            metadata_backoff: Arc::default(),
             compaction,
         },
         profiles: boot

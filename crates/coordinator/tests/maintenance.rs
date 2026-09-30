@@ -275,7 +275,7 @@ async fn coordinator_compaction_and_full_rebuild_preserve_the_published_rows_and
         .expire_history(
             &head,
             schema.table_id,
-            std::time::Duration::from_secs(60),
+            &flow_coordinator::HistoryPolicy::window(std::time::Duration::from_secs(60)),
             &Default::default(),
         )
         .await
@@ -346,7 +346,7 @@ async fn coordinator_compaction_and_full_rebuild_preserve_the_published_rows_and
             .expire_history(
                 &metadata_head,
                 schema.table_id,
-                std::time::Duration::from_millis(1),
+                &flow_coordinator::HistoryPolicy::window(std::time::Duration::from_millis(1)),
                 &Default::default()
             )
             .await

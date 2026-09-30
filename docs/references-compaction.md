@@ -134,6 +134,9 @@ See [RocksDB synchronous and non-sync writes](https://github.com/facebook/rocksd
 Catalog-generated JSON is independent of snapshot expiration. Before publication
 replaces a catalog pointer, register that immutable JSON with the manifest attempt.
 Schema and expiration-only commits register the same pointer durably before commit.
+Only flat children of `{location}/metadata/` are registered. JSON a catalog
+writes elsewhere (such as under `write.metadata.path`) stays catalog-owned and
+is skipped, never collected.
 A durable per-object clock requires a full grace after first observing an
 unreferenced file, independently of upload/fence age. Retained references reset
 that clock. Check absence before deleting obsolete siblings of a partially live

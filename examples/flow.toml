@@ -45,6 +45,10 @@ snapshot_retention_secs = 3600
 # Disable only when another process performs coordinated expiration; without it
 # table metadata and files replaced by compaction are never reclaimed.
 snapshot_expiration = true
+# Never expire below this many snapshots on main.
+snapshot_retain_last = 128
+# Expire the oldest unprotected snapshots beyond this count, even inside the window.
+snapshot_max_count = 1000
 
 [parquet_read]
 footer_bytes = 8388608

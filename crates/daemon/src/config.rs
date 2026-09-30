@@ -134,6 +134,11 @@ pub struct Limits {
     /// Without expiration, table metadata and replaced files grow without bound.
     /// Disable only when another coordinated process expires snapshots.
     pub snapshot_expiration: bool,
+    /// Expiration never leaves fewer snapshots than this on `main`.
+    pub snapshot_retain_last: usize,
+    /// Expiration removes the oldest unprotected snapshots beyond this count,
+    /// even inside the retention window. Each commit rewrites all retained history.
+    pub snapshot_max_count: usize,
     pub checkpoint_interval_secs: u64,
     pub retained_checkpoints: usize,
     pub manifest_max_count: usize,
@@ -160,6 +165,8 @@ impl Default for Limits {
             wal_hard_bytes: 32 << 30,
             snapshot_retention_secs: 3600,
             snapshot_expiration: true,
+            snapshot_retain_last: 128,
+            snapshot_max_count: 1000,
             checkpoint_interval_secs: 300,
             retained_checkpoints: 2,
             manifest_max_count: 64,
@@ -187,6 +194,15 @@ fn resolve_state_dir(config: &std::path::Path, state_dir: &std::path::Path) -> R
     } else {
         directory.join(relative)
     })
+}
+impl Limits {
+    pub fn history_policy(&self) -> flow_coordinator::HistoryPolicy {
+        flow_coordinator::HistoryPolicy {
+            retention: std::time::Duration::from_secs(self.snapshot_retention_secs),
+            retain_last: self.snapshot_retain_last,
+            max_snapshots: self.snapshot_max_count,
+        }
+    }
 }
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self> {
@@ -317,6 +333,9 @@ impl Config {
                 && l.manifest_max_count >= 2,
             "invalid history, checkpoint, or manifest maintenance limits"
         );
+        l.history_policy()
+            .validate()
+            .context("invalid snapshot history limits")?;
         ensure!(
             l.garbage_interval_secs > 0 && l.orphan_grace_secs > 0,
             "garbage interval and orphan grace must be positive"

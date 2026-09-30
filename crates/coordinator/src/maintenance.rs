@@ -12,6 +12,8 @@ pub use concurrent::{
 };
 mod garbage;
 pub use garbage::{GarbagePolicy, GarbageProtection, GarbageReport};
+mod history;
+pub use history::{HistoryPlan, HistoryPolicy};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail, ensure};
 use flow_compactor::{Debt, DeleteDependency, FileCandidate, Level, Policy};
 use flow_iceberg_ext::{
-    CommitBase, ManifestCache, OPERATION_ID_KEY, SnapshotView, find_operation, write_artifact_plan,
+    CommitBase, ManifestCache, OPERATION_ID_KEY, SnapshotView, write_artifact_plan,
 };
 use flow_materializer::{WriterConfig, iceberg_schema};
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId, TableSchema};
@@ -406,111 +408,6 @@ impl TableMaintenance {
             manifest_entries: view.manifest_entries(),
             delete_file_count,
         })
-    }
-
-    /// Expire metadata snapshots after the reader window. No object deletion is
-    /// performed. Call from the table actor and include any active worker bases
-    /// or index checkpoints whose descendant history is still needed.
-    /// The caller must coordinate external reference creation and retention-policy
-    /// changes: REST assertions protect existing heads, not the entire reference set.
-    pub async fn expire_history(
-        &self,
-        table: &Table,
-        table_id: TableId,
-        reader_window: Duration,
-        protected_bases: &BTreeSet<i64>,
-    ) -> Result<usize> {
-        use iceberg::transaction::{ApplyTransactionAction, Transaction};
-        ensure!(
-            !reader_window.is_zero(),
-            "snapshot retention needs a positive reader window"
-        );
-        let head = self.catalog.load_table(table.identifier()).await?;
-        let store = self.store.clone();
-        let (indexed, pending) =
-            blocking(move || Ok((store.table_state(&table_id)?, store.pending_operations()?)))
-                .await?;
-        ensure!(
-            indexed.snapshot_id == head.metadata().current_snapshot_id(),
-            "reconcile the index before expiring history"
-        );
-        let pending: Vec<_> = pending
-            .into_iter()
-            .filter(|record| record.operation.table_id == table_id)
-            .collect();
-        // Initial-copy/first-publication recovery may need to prove an operation
-        // was never committed anywhere in the entire original lineage.
-        if pending
-            .iter()
-            .any(|record| record.operation.base_snapshot_id.is_none())
-        {
-            return Ok(0);
-        }
-        let mut bases = protected_bases.clone();
-        bases.extend(active_build_protection(&self.store, &head, table_id)?.snapshots);
-        for record in &pending {
-            if let Some(base) = record.operation.base_snapshot_id {
-                bases.insert(base);
-            }
-            if let Some(snapshot) = record.snapshot_id {
-                bases.insert(snapshot);
-            }
-            if let Some(snapshot) = find_operation(head.metadata(), &record.operation.id.0) {
-                bases.insert(snapshot.snapshot_id());
-            }
-        }
-        let oldest_sequence = bases
-            .iter()
-            .map(|id| {
-                head.metadata()
-                    .snapshot_by_id(*id)
-                    .map(|snapshot| snapshot.sequence_number())
-                    .ok_or_else(|| anyhow::anyhow!("protected snapshot {id} has already expired"))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .min();
-        let mut protected: BTreeSet<_> = head
-            .metadata()
-            .snapshot_references()
-            .map(|(_, reference)| reference.snapshot_id)
-            .collect();
-        protected.extend(indexed.snapshot_id);
-        protected.extend(bases);
-        if let Some(oldest) = oldest_sequence {
-            protected.extend(
-                head.metadata()
-                    .snapshots()
-                    .filter(|snapshot| snapshot.sequence_number() >= oldest)
-                    .map(|snapshot| snapshot.snapshot_id()),
-            );
-        }
-        let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-        let cutoff = now.saturating_sub(i64::try_from(reader_window.as_millis())?);
-        if head.metadata().snapshots().all(|snapshot| {
-            snapshot.timestamp_ms() >= cutoff || protected.contains(&snapshot.snapshot_id())
-        }) {
-            return Ok(0);
-        }
-        let retained: BTreeSet<_> = head
-            .metadata()
-            .snapshots()
-            .map(|snapshot| snapshot.snapshot_id())
-            .collect();
-        artifacts::register_catalog_metadata(&self.store, &head, table_id).await?;
-        let transaction = Transaction::new(&head);
-        let updated = transaction
-            .expire_snapshots()
-            .expire_older_than_ms(cutoff)
-            .protect_snapshots(protected)
-            .protect_newer_than_ms(cutoff)
-            .apply(transaction)?
-            .commit(self.catalog.as_ref())
-            .await?;
-        Ok(retained
-            .into_iter()
-            .filter(|id| updated.metadata().snapshot_by_id(*id).is_none())
-            .count())
     }
 
     /// Plan and execute one bounded rewrite. The scratch store is exclusive to

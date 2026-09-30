@@ -129,6 +129,10 @@ pub async fn register_catalog_metadata(
     let Some(path) = table.metadata_location() else {
         return Ok(());
     };
+    // JSON outside Flow's flat service paths stays owned by the catalog.
+    if !flow_iceberg_ext::owned_metadata_path(table.metadata().location(), path) {
+        return Ok(());
+    }
     register_metadata_path(store, table, table_id, path).await
 }
 
