@@ -60,9 +60,6 @@ tracing-subscriber.workspace = true
 typetag = "0.2"
 uuid.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["process", "std"] }
-
 [dev-dependencies]
 base64 = "0.22"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
