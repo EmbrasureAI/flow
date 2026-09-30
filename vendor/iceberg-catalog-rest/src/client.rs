@@ -17,7 +17,8 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug, Display, Formatter};
+use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
@@ -29,13 +30,84 @@ use tokio::sync::Mutex;
 use crate::types::TokenResponse;
 use crate::RestCatalogConfig;
 
+/// Replace an OAuth token this long before the server-reported expiry, or after
+/// nine tenths of a shorter lifetime, so requests do not race the expiry.
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
+
+/// Marks an error caused by the catalog rejecting the request's credentials.
+///
+/// It is attached as the source of catalog responses with HTTP 401, 403 or
+/// 419, and of OAuth token responses with HTTP 400, 401 or 403. Callers can
+/// distinguish credential failures from catalog outages without parsing
+/// messages. It never carries response text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthRejected;
+
+impl Display for AuthRejected {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("catalog rejected the request credentials")
+    }
+}
+
+impl std::error::Error for AuthRejected {}
+
+/// A bearer token. Tokens obtained from the OAuth endpoint with `expires_in`
+/// are replaced before they expire; configured tokens are used until rejected.
+#[derive(Clone)]
+struct CachedToken {
+    value: String,
+    refresh_at: Option<Instant>,
+    expires_at: Option<Instant>,
+}
+
+impl CachedToken {
+    fn configured(value: String) -> Self {
+        Self {
+            value,
+            refresh_at: None,
+            expires_at: None,
+        }
+    }
+
+    fn issued(value: String, expires_in: Option<u64>, now: Instant) -> Self {
+        let lifetime = expires_in.map(Duration::from_secs);
+        Self {
+            value,
+            refresh_at: lifetime.and_then(|lifetime| {
+                now.checked_add(lifetime - TOKEN_REFRESH_MARGIN.min(lifetime / 10))
+            }),
+            expires_at: lifetime.and_then(|lifetime| now.checked_add(lifetime)),
+        }
+    }
+
+    fn refresh_due(&self, now: Instant) -> bool {
+        self.refresh_at.is_some_and(|at| now >= at)
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|at| now >= at)
+    }
+}
+
+/// A catalog response status for which a new OAuth token may succeed.
+fn token_rejected(status: StatusCode) -> bool {
+    status == StatusCode::UNAUTHORIZED || status.as_u16() == 419
+}
+
+/// A catalog response status caused by the request's credentials.
+fn auth_rejected(status: StatusCode) -> bool {
+    token_rejected(status) || status == StatusCode::FORBIDDEN
+}
+
 pub(crate) struct HttpClient {
     client: Client,
 
     /// The token to be used for authentication.
     ///
     /// It's possible to fetch the token from the server while needed.
-    token: Mutex<Option<String>>,
+    token: Mutex<Option<CachedToken>>,
+    /// Serializes token exchanges so concurrent requests share one refresh.
+    refresh: Mutex<()>,
     /// The token endpoint to be used for authentication.
     token_endpoint: String,
     /// The credential to be used for authentication.
@@ -50,9 +122,14 @@ pub(crate) struct HttpClient {
 
 impl Debug for HttpClient {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // Configured headers can carry credentials (`header.Authorization`,
+        // API keys); show only their names. Tokens and credentials are omitted.
         f.debug_struct("HttpClient")
             .field("client", &self.client)
-            .field("extra_headers", &self.extra_headers)
+            .field(
+                "extra_headers",
+                &self.extra_headers.keys().collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -63,7 +140,8 @@ impl HttpClient {
         let extra_headers = cfg.extra_headers()?;
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
-            token: Mutex::new(cfg.token()),
+            token: Mutex::new(cfg.token().map(CachedToken::configured)),
+            refresh: Mutex::new(()),
             token_endpoint: cfg.get_token_endpoint(),
             credential: cfg.credential(),
             extra_headers,
@@ -83,7 +161,12 @@ impl HttpClient {
             .unwrap_or(self.extra_headers);
         Ok(HttpClient {
             client: cfg.client().unwrap_or(self.client),
-            token: Mutex::new(cfg.token().or_else(|| self.token.into_inner())),
+            token: Mutex::new(
+                cfg.token()
+                    .map(CachedToken::configured)
+                    .or_else(|| self.token.into_inner()),
+            ),
+            refresh: Mutex::new(()),
             token_endpoint: if !cfg.get_token_endpoint().is_empty() {
                 cfg.get_token_endpoint()
             } else {
@@ -108,10 +191,10 @@ impl HttpClient {
             .build()
             .unwrap();
         self.authenticate(&mut req).await.ok();
-        self.token.lock().await.clone()
+        self.token.lock().await.as_ref().map(|token| token.value.clone())
     }
 
-    async fn exchange_credential_for_token(&self) -> Result<String> {
+    async fn exchange_credential_for_token(&self) -> Result<CachedToken> {
         // Credential must exist here.
         let (client_id, client_secret) = self.credential.as_ref().ok_or_else(|| {
             Error::new(
@@ -144,6 +227,7 @@ impl HttpClient {
         );
         let auth_url = auth_req.url().clone();
         let auth_resp = self.send(auth_req, true).await?;
+        let issued_at = Instant::now();
 
         let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
             let text = response_bytes(auth_resp)
@@ -162,14 +246,27 @@ impl HttpClient {
             let _ = response_bytes(auth_resp)
                 .await
                 .map_err(|err| err.with_url(auth_url.clone()))?;
+            let error = Error::new(ErrorKind::Unexpected, "OAuth token request failed")
+                .with_retryable(retryable)
+                .with_context("code", code.to_string())
+                .with_context("operation", "auth");
+            // RFC 6749 reports rejected client credentials and grants as 400 or 401.
             Err(
-                Error::new(ErrorKind::Unexpected, "OAuth token request failed")
-                    .with_retryable(retryable)
-                    .with_context("code", code.to_string())
-                    .with_context("operation", "auth"),
+                if matches!(
+                    code,
+                    StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) {
+                    error.with_source(AuthRejected)
+                } else {
+                    error
+                },
             )
         }?;
-        Ok(auth_res.access_token)
+        Ok(CachedToken::issued(
+            auth_res.access_token,
+            auth_res.expires_in,
+            issued_at,
+        ))
     }
 
     /// Invalidate the current token without generating a new one. On the next request, the client
@@ -186,12 +283,13 @@ impl HttpClient {
     /// If credential is invalid, or the request fails, this method will return an error and leave
     /// the current token unchanged.
     pub(crate) async fn regenerate_token(&self) -> Result<()> {
+        let _refresh = self.refresh.lock().await;
         let new_token = self.exchange_credential_for_token().await?;
-        *self.token.lock().await = Some(new_token.clone());
+        *self.token.lock().await = Some(new_token);
         Ok(())
     }
 
-    /// Authenticates the request by adding a bearer token to the authorization header.
+    /// Returns the bearer token for the next request, if any.
     ///
     /// This method supports three authentication modes:
     ///
@@ -199,42 +297,66 @@ impl HttpClient {
     /// 2. **Token authentication** - Use the provided `token` directly for authentication.
     /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
     ///
-    /// When both `credential` and `token` are present, `token` takes precedence.
-    ///
-    /// # TODO: Support automatic token refreshing.
-    async fn authenticate(&self, req: &mut Request) -> Result<()> {
+    /// When both `credential` and `token` are present, `token` takes precedence until the
+    /// catalog rejects it. An OAuth token is exchanged again before its reported expiry; if
+    /// that early exchange fails, the current token is used until it actually expires.
+    async fn current_token(&self) -> Result<Option<String>> {
         // Clone the token from lock without holding the lock for entire function.
-        let token = self.token.lock().await.clone();
-
-        if self.credential.is_none() && token.is_none() {
-            return Ok(());
+        let cached = self.token.lock().await.clone();
+        match &cached {
+            Some(token) if !token.refresh_due(Instant::now()) => {
+                return Ok(Some(token.value.clone()));
+            }
+            None if self.credential.is_none() => return Ok(None),
+            _ => {}
         }
 
-        // Either use the provided token or exchange credential for token, cache and use that
-        let token = match token {
-            Some(token) => token,
-            None => {
-                let token = self.exchange_credential_for_token().await?;
+        let _refresh = self.refresh.lock().await;
+        // Another request may have replaced the token while this one waited.
+        if let Some(token) = self.token.lock().await.as_ref()
+            && !token.refresh_due(Instant::now())
+        {
+            return Ok(Some(token.value.clone()));
+        }
+        match self.exchange_credential_for_token().await {
+            Ok(token) => {
+                let value = token.value.clone();
                 // Update token so that we use it for next request instead of
                 // exchanging credential for token from the server again
-                *self.token.lock().await = Some(token.clone());
-                token
+                *self.token.lock().await = Some(token);
+                Ok(Some(value))
             }
-        };
+            Err(error) => match cached {
+                Some(token) if !token.expired(Instant::now()) => Ok(Some(token.value)),
+                _ => Err(error),
+            },
+        }
+    }
 
-        // Insert token in request.
-        req.headers_mut().insert(
-            http::header::AUTHORIZATION,
-            format!("Bearer {token}").parse().map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Invalid token received from catalog server!",
-                )
-                .with_source(e)
-            })?,
-        );
+    /// Replaces a token that the catalog rejected, unless a concurrent request already did.
+    async fn replace_rejected_token(&self, rejected: &str) -> Result<String> {
+        let _refresh = self.refresh.lock().await;
+        if let Some(token) = self.token.lock().await.as_ref()
+            && token.value != rejected
+            && !token.refresh_due(Instant::now())
+        {
+            return Ok(token.value.clone());
+        }
+        let token = self.exchange_credential_for_token().await?;
+        let value = token.value.clone();
+        *self.token.lock().await = Some(token);
+        Ok(value)
+    }
 
-        Ok(())
+    /// Authenticates the request by adding a bearer token to the authorization header.
+    ///
+    /// Returns the token used, if any.
+    async fn authenticate(&self, req: &mut Request) -> Result<Option<String>> {
+        let token = self.current_token().await?;
+        if let Some(token) = &token {
+            set_bearer(req, token)?;
+        }
+        Ok(token)
     }
 
     #[inline]
@@ -263,15 +385,50 @@ impl HttpClient {
 
     // Queries the Iceberg REST catalog after authentication with the given `Request` and
     // returns a `Response`.
+    //
+    // When OAuth credentials are configured and the catalog rejects the token, the
+    // credential is exchanged for a new token and the request is sent once more. A
+    // rejected request was not processed, so repeating it is safe. Configured tokens
+    // without credentials cannot be replaced; their rejection is returned.
     pub async fn query_catalog(&self, mut request: Request) -> Result<Response> {
-        self.authenticate(&mut request).await?;
-        self.execute(request).await
+        let retry = self
+            .credential
+            .as_ref()
+            .and_then(|_| request.try_clone());
+        let token = self.authenticate(&mut request).await?;
+        let response = self.execute(request).await?;
+        let (Some(mut retry), Some(token)) = (retry, token) else {
+            return Ok(response);
+        };
+        if !token_rejected(response.status()) {
+            return Ok(response);
+        }
+        // Consume the body for transport accounting; it is not diagnostic.
+        let _ = response_bytes(response).await;
+        let token = self.replace_rejected_token(&token).await?;
+        set_bearer(&mut retry, &token)?;
+        self.execute(retry).await
     }
 
     /// Returns whether header redaction is disabled for this client.
     pub(crate) fn disable_header_redaction(&self) -> bool {
         self.disable_header_redaction
     }
+}
+
+/// Inserts the bearer token, replacing any existing authorization header.
+fn set_bearer(req: &mut Request, token: &str) -> Result<()> {
+    req.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Invalid token received from catalog server!",
+            )
+            .with_source(e)
+        })?,
+    );
+    Ok(())
 }
 
 #[cfg(feature = "metrics")]
@@ -361,16 +518,22 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
     response: Response,
     disable_header_redaction: bool,
 ) -> Error {
+    let status = response.status();
     let err = Error::new(
         ErrorKind::Unexpected,
         "Received response with unexpected status code",
     )
-    .with_retryable(retryable_status(response.status()))
-    .with_context("status", response.status().to_string())
+    .with_retryable(retryable_status(status))
+    .with_context("status", status.to_string())
     .with_context(
         "headers",
         format_headers_redacted(response.headers(), disable_header_redaction),
     );
+    let err = if auth_rejected(status) {
+        err.with_source(AuthRejected)
+    } else {
+        err
+    };
 
     let bytes = match response_bytes(response).await {
         Ok(bytes) => bytes,
@@ -383,6 +546,113 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_tokens_refresh_before_reported_expiry() {
+        let now = Instant::now();
+        let at = |seconds| now + Duration::from_secs(seconds);
+
+        let hour = CachedToken::issued("token".into(), Some(3600), now);
+        assert!(!hour.refresh_due(at(3299)));
+        assert!(hour.refresh_due(at(3300)));
+        assert!(!hour.expired(at(3599)));
+        assert!(hour.expired(at(3600)));
+
+        // Short lifetimes keep nine tenths of the lifetime before refreshing.
+        let minute = CachedToken::issued("token".into(), Some(60), now);
+        assert!(!minute.refresh_due(at(53)));
+        assert!(minute.refresh_due(at(54)));
+
+        for token in [
+            CachedToken::issued("token".into(), None, now),
+            CachedToken::issued("token".into(), Some(u64::MAX), now),
+            CachedToken::configured("token".into()),
+        ] {
+            assert!(!token.refresh_due(at(10 * 365 * 86400)));
+            assert!(!token.expired(at(10 * 365 * 86400)));
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_output_omits_header_values_and_credentials() {
+        let client = HttpClient::new(
+            &RestCatalogConfig::builder()
+                .uri("http://localhost:8181".to_string())
+                .props(HashMap::from([
+                    (
+                        "header.Authorization".to_string(),
+                        "Bearer FAKE_HEADER_SECRET".to_string(),
+                    ),
+                    (
+                        "header.x-api-key".to_string(),
+                        "FAKE_API_KEY_SECRET".to_string(),
+                    ),
+                    ("token".to_string(), "FAKE_TOKEN_SECRET".to_string()),
+                    (
+                        "credential".to_string(),
+                        "client:FAKE_CREDENTIAL_SECRET".to_string(),
+                    ),
+                ]))
+                .build(),
+        )
+        .unwrap();
+        let debug = format!("{client:?} {client:#?}");
+        assert!(debug.contains("authorization") && debug.contains("x-api-key"));
+        assert!(!debug.contains("FAKE_"), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn failed_early_refresh_uses_the_unexpired_token() {
+        let mut server = mockito::Server::new_async().await;
+        let oauth = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(503)
+            .expect(2)
+            .create_async()
+            .await;
+        let namespaces = server
+            .mock("GET", "/v1/namespaces")
+            .match_header("authorization", "Bearer current")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = HttpClient::new(
+            &RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([(
+                    "credential".to_string(),
+                    "client:secret".to_string(),
+                )]))
+                .build(),
+        )
+        .unwrap();
+        let now = Instant::now();
+        *client.token.lock().await = Some(CachedToken {
+            value: "current".into(),
+            refresh_at: Some(now),
+            expires_at: Some(now + Duration::from_secs(60)),
+        });
+        let request = client
+            .request(Method::GET, format!("{}/v1/namespaces", server.url()))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.query_catalog(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // Once the token has expired, the exchange failure is returned.
+        client.token.lock().await.as_mut().unwrap().expires_at = Some(now);
+        let request = client
+            .request(Method::GET, format!("{}/v1/namespaces", server.url()))
+            .build()
+            .unwrap();
+        let error = client.query_catalog(request).await.unwrap_err();
+        assert!(error.retryable(), "{error:?}");
+        oauth.assert_async().await;
+        namespaces.assert_async().await;
+    }
 
     #[test]
     fn test_format_headers_redacted_empty() {

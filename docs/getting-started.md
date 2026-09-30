@@ -99,7 +99,38 @@ Missing, empty or non-Unicode values fail when connecting. `check` and `status`
 do not resolve these secrets. Restart Flow to use changed environment values.
 Existing literal `token` and `credential` properties remain supported, but do
 not set a literal property and its corresponding `_env` reference together.
-If both token and OAuth credentials are supplied, the token takes precedence.
+If both token and OAuth credentials are supplied, the token takes precedence
+until the catalog rejects it.
+
+Tokens obtained with OAuth client credentials are renewed before the expiry
+the token endpoint reports in `expires_in` (five minutes early, or after nine
+tenths of a shorter lifetime). If the catalog rejects a token with HTTP 401 or
+419, Flow exchanges the credentials for a new token and retries the request
+once. A static `token_env` token cannot be renewed; when it expires, restart Flow
+with a new value. Rejected credentials or insufficient permissions (HTTP 401,
+403 or 419, or a rejected OAuth token request) block the affected tables with
+`blocked_tables` code `catalog_auth` instead of `catalog_unavailable`, so alert
+on it separately. Blocked tables keep retrying.
+
+HTTPS catalog and OAuth endpoints are verified against the host's trust store:
+the system certificate bundle on Linux and the keychain's trusted roots on
+macOS. Setting `SSL_CERT_FILE` (a PEM bundle) or `SSL_CERT_DIR` in the Flow
+process environment replaces that store for the catalog client. To trust a
+private CA in addition to the system roots, name its PEM bundle:
+
+```toml
+[catalog]
+uri = "https://catalog.internal.example.com"
+tls_ca_file = "/etc/flow/catalog-ca.pem"
+```
+
+Flow reads `tls_ca_file` when connecting and does not forward it to the
+catalog. Client certificates (mutual TLS) are not supported. Use `https://` for
+any catalog that receives a token or credential: Flow logs a warning when
+`uri` or `oauth2-server-uri` sends them over plain `http://` to a host other
+than loopback, but still connects so existing private-network deployments keep
+working. `tls_ca_file` and these environment variables apply to the catalog
+client; object-storage connections use their own client.
 
 Configuration parse errors report a location without source excerpts or input
 values. Catalog errors similarly omit response bodies, including OAuth error
@@ -173,7 +204,8 @@ authentication; bind it to a private interface. See [observability](observabilit
 | Publication no longer matches the capture contract | A configured table was removed or given a row filter or column list: only that table is blocked with `publication_changed` and needs a resync. A missing publication or unpublished operation stops capture; every start for that slot then fails with "requires resynchronization before capture can resume". Restoring the setting does not clear either; changes may have been skipped. |
 | Replica identity or primary-key validation fails | Set FULL replica identity, or DEFAULT when every replicated column is [fixed-width](#replica-identity), and match the complete primary key in `primary_key`; keyless tables require append-only mode. `discover` generates matching blocks. |
 | Source column name or type differs | Match column order, names and the type mappings; check `column_selection` if intentionally excluding columns. |
-| Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. `check --source` validates the PostgreSQL side; plain `check` validates none of them. |
+| Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. `check --source` validates the PostgreSQL side; plain `check` validates none of them. Tables blocked with `catalog_auth` need new or broader catalog credentials. |
+| Catalog TLS certificate verification fails | Trust the catalog's CA through the system store, `SSL_CERT_FILE`, or `catalog.tls_ca_file`, and connect with a host name the certificate covers. |
 | Source slot is missing, lost WAL, or source identity changed | Preserve local state and diagnose the source change. Restoring the slot name alone cannot recover missing changes; coordinated resynchronization is required. |
 
 Inspect `status`, `blocked_tables` and the structured process logs together.

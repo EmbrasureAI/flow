@@ -1,0 +1,753 @@
+diff --git a/vendor/iceberg-catalog-rest/Cargo.toml b/vendor/iceberg-catalog-rest/Cargo.toml
+index b5ddbd4..0af9f8e 100644
+--- a/vendor/iceberg-catalog-rest/Cargo.toml
++++ b/vendor/iceberg-catalog-rest/Cargo.toml
+@@ -56,7 +56,10 @@ version = "0.13"
+ 
+ [dependencies.reqwest]
+ version = "0.12.12"
+-features = ["json"]
++features = [
++    "json",
++    "rustls-tls-native-roots",
++]
+ default-features = false
+ 
+ [dependencies.serde]
+diff --git a/vendor/iceberg-catalog-rest/Cargo.toml.orig b/vendor/iceberg-catalog-rest/Cargo.toml.orig
+index 69d3243..5f29140 100644
+--- a/vendor/iceberg-catalog-rest/Cargo.toml.orig
++++ b/vendor/iceberg-catalog-rest/Cargo.toml.orig
+@@ -36,7 +36,8 @@ chrono = { workspace = true }
+ http = { workspace = true }
+ iceberg = { workspace = true }
+ itertools = { workspace = true }
+-reqwest = { workspace = true }
++# Local change: HTTPS through rustls and the platform trust store.
++reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+ serde = { workspace = true }
+ serde_derive = { workspace = true }
+ serde_json = { workspace = true }
+diff --git a/vendor/iceberg-catalog-rest/README.md b/vendor/iceberg-catalog-rest/README.md
+index 6721267..3772bc0 100644
+--- a/vendor/iceberg-catalog-rest/README.md
++++ b/vendor/iceberg-catalog-rest/README.md
+@@ -44,3 +44,18 @@ takes precedence over a conflicting raw property; other properties are preserved
+ This prevents explicit v3 creation from silently using the catalog's default.
+ The correction and HTTP request regression are recorded in
+ `docs/patches/iceberg-rest-format-version.patch`.
++
++## Local HTTPS and OAuth token renewal
++
++reqwest is built with its rustls backend and the platform trust store
++(`SSL_CERT_FILE` and `SSL_CERT_DIR` replace that store when set), so `https://`
++catalogs work with the default client. OAuth tokens obtained from client
++credentials are exchanged again before the `expires_in` the token endpoint
++reports: five minutes early, or after nine tenths of a shorter lifetime. A
++failed early exchange keeps using the current token until it expires. When the
++catalog answers 401 or 419 and credentials are configured, the client obtains a
++new token and sends the request once more. Errors caused by rejected credentials
++(catalog 401, 403 or 419; token endpoint 400, 401 or 403) carry the public
++`AuthRejected` marker as their source. The HTTP client's `Debug` output shows
++configured header names only. The change is recorded in
++`docs/patches/iceberg-rest-oauth-refresh.patch`.
+diff --git a/vendor/iceberg-catalog-rest/public-api.txt b/vendor/iceberg-catalog-rest/public-api.txt
+index 027df29..6cb2b9f 100644
+--- a/vendor/iceberg-catalog-rest/public-api.txt
++++ b/vendor/iceberg-catalog-rest/public-api.txt
+@@ -1,4 +1,17 @@
+ pub mod iceberg_catalog_rest
++pub struct iceberg_catalog_rest::AuthRejected
++impl core::clone::Clone for iceberg_catalog_rest::AuthRejected
++pub fn iceberg_catalog_rest::AuthRejected::clone(&self) -> iceberg_catalog_rest::AuthRejected
++impl core::cmp::Eq for iceberg_catalog_rest::AuthRejected
++impl core::cmp::PartialEq for iceberg_catalog_rest::AuthRejected
++pub fn iceberg_catalog_rest::AuthRejected::eq(&self, other: &iceberg_catalog_rest::AuthRejected) -> bool
++impl core::error::Error for iceberg_catalog_rest::AuthRejected
++impl core::fmt::Debug for iceberg_catalog_rest::AuthRejected
++pub fn iceberg_catalog_rest::AuthRejected::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
++impl core::fmt::Display for iceberg_catalog_rest::AuthRejected
++pub fn iceberg_catalog_rest::AuthRejected::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
++impl core::marker::Copy for iceberg_catalog_rest::AuthRejected
++impl core::marker::StructuralPartialEq for iceberg_catalog_rest::AuthRejected
+ pub struct iceberg_catalog_rest::CommitTableRequest
+ pub iceberg_catalog_rest::CommitTableRequest::identifier: core::option::Option<iceberg::catalog::TableIdent>
+ pub iceberg_catalog_rest::CommitTableRequest::requirements: alloc::vec::Vec<iceberg::catalog::TableRequirement>
+diff --git a/vendor/iceberg-catalog-rest/src/catalog.rs b/vendor/iceberg-catalog-rest/src/catalog.rs
+index aa8a801..31eaed1 100644
+--- a/vendor/iceberg-catalog-rest/src/catalog.rs
++++ b/vendor/iceberg-catalog-rest/src/catalog.rs
+@@ -1105,6 +1105,7 @@ mod tests {
+     use uuid::uuid;
+ 
+     use super::*;
++    use crate::AuthRejected;
+ 
+     #[tokio::test]
+     async fn test_update_config() {
+@@ -1391,6 +1392,155 @@ mod tests {
+         assert_eq!(token, Some("ey000000000000".to_string()));
+     }
+ 
++    async fn create_expiring_oauth_mock(
++        server: &mut ServerGuard,
++        token: &str,
++        expires_in: u64,
++    ) -> Mock {
++        server
++            .mock("POST", "/v1/oauth/tokens")
++            .with_status(200)
++            .with_body(format!(
++                r#"{{"access_token": "{token}", "token_type": "Bearer", "expires_in": {expires_in}}}"#
++            ))
++            .expect(1)
++            .create_async()
++            .await
++    }
++
++    async fn create_namespaces_mock(
++        server: &mut ServerGuard,
++        token: &str,
++        status: usize,
++        hits: usize,
++    ) -> Mock {
++        server
++            .mock("GET", "/v1/namespaces")
++            .match_header("authorization", format!("Bearer {token}").as_str())
++            .with_status(status)
++            .with_body(r#"{"namespaces": []}"#)
++            .expect(hits)
++            .create_async()
++            .await
++    }
++
++    fn credential_catalog(server: &ServerGuard, credential: bool) -> RestCatalog {
++        let mut props = HashMap::new();
++        if credential {
++            props.insert("credential".to_string(), "client1:secret1".to_string());
++        } else {
++            props.insert("token".to_string(), "configured-token".to_string());
++        }
++        RestCatalog::new(
++            RestCatalogConfig::builder()
++                .uri(server.url())
++                .props(props)
++                .build(),
++            Some(Arc::new(LocalFsStorageFactory)),
++            Runtime::current(),
++        )
++    }
++
++    fn auth_rejected(error: &Error) -> bool {
++        std::error::Error::source(error).is_some_and(|source| source.is::<AuthRejected>())
++    }
++
++    #[tokio::test]
++    async fn test_oauth_token_refreshed_before_expiry() {
++        let mut server = Server::new_async().await;
++        // A zero lifetime is already due for refresh when the next request starts.
++        let expiring = create_expiring_oauth_mock(&mut server, "ey-expiring", 0).await;
++        let fresh = create_expiring_oauth_mock(&mut server, "ey-fresh", 3600).await;
++        let config_mock = server
++            .mock("GET", "/v1/config")
++            .match_header("authorization", "Bearer ey-expiring")
++            .with_status(200)
++            .with_body(r#"{"overrides": {}, "defaults": {}}"#)
++            .expect(1)
++            .create_async()
++            .await;
++        let namespaces = create_namespaces_mock(&mut server, "ey-fresh", 200, 2).await;
++
++        let catalog = credential_catalog(&server, true);
++        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
++        // The replacement is not due for refresh, so no further exchange happens.
++        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
++
++        expiring.assert_async().await;
++        fresh.assert_async().await;
++        config_mock.assert_async().await;
++        namespaces.assert_async().await;
++    }
++
++    #[tokio::test]
++    async fn test_oauth_rejected_token_regenerated_and_request_retried() {
++        let mut server = Server::new_async().await;
++        let first = create_expiring_oauth_mock(&mut server, "ey-first", 3600).await;
++        let second = create_expiring_oauth_mock(&mut server, "ey-second", 3600).await;
++        let config_mock = create_config_mock(&mut server).await;
++        let rejected = create_namespaces_mock(&mut server, "ey-first", 401, 1).await;
++        let accepted = create_namespaces_mock(&mut server, "ey-second", 200, 2).await;
++
++        let catalog = credential_catalog(&server, true);
++        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
++        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
++
++        first.assert_async().await;
++        second.assert_async().await;
++        config_mock.assert_async().await;
++        rejected.assert_async().await;
++        accepted.assert_async().await;
++    }
++
++    #[tokio::test]
++    async fn test_oauth_rejection_after_regeneration_is_not_retried_again() {
++        let mut server = Server::new_async().await;
++        let first = create_expiring_oauth_mock(&mut server, "ey-first", 3600).await;
++        let second = create_expiring_oauth_mock(&mut server, "ey-second", 3600).await;
++        let config_mock = create_config_mock(&mut server).await;
++        let rejected_first = create_namespaces_mock(&mut server, "ey-first", 401, 1).await;
++        let rejected_second = create_namespaces_mock(&mut server, "ey-second", 401, 1).await;
++
++        let catalog = credential_catalog(&server, true);
++        let error = catalog.list_namespaces(None).await.unwrap_err();
++        assert!(auth_rejected(&error), "{error:?}");
++        assert!(!error.retryable());
++
++        first.assert_async().await;
++        second.assert_async().await;
++        config_mock.assert_async().await;
++        rejected_first.assert_async().await;
++        rejected_second.assert_async().await;
++    }
++
++    #[tokio::test]
++    async fn test_configured_token_rejection_is_marked_and_not_retried() {
++        let mut server = Server::new_async().await;
++        let config_mock = create_config_mock(&mut server).await;
++        let rejected = create_namespaces_mock(&mut server, "configured-token", 401, 1).await;
++
++        let catalog = credential_catalog(&server, false);
++        let error = catalog.list_namespaces(None).await.unwrap_err();
++        assert!(auth_rejected(&error), "{error:?}");
++
++        config_mock.assert_async().await;
++        rejected.assert_async().await;
++    }
++
++    #[tokio::test]
++    async fn test_rejected_oauth_credentials_are_marked() {
++        let mut server = Server::new_async().await;
++        let oauth_mock =
++            create_oauth_mock_with_path(&mut server, "/v1/oauth/tokens", "unused", 401).await;
++
++        let catalog = credential_catalog(&server, true);
++        let error = catalog.list_namespaces(None).await.unwrap_err();
++        assert!(auth_rejected(&error), "{error:?}");
++        assert!(!error.retryable());
++
++        oauth_mock.assert_async().await;
++    }
++
+     #[tokio::test]
+     async fn test_http_headers() {
+         let server = Server::new_async().await;
+diff --git a/vendor/iceberg-catalog-rest/src/client.rs b/vendor/iceberg-catalog-rest/src/client.rs
+index 6132b63..fbde56e 100644
+--- a/vendor/iceberg-catalog-rest/src/client.rs
++++ b/vendor/iceberg-catalog-rest/src/client.rs
+@@ -17,7 +17,8 @@
+ // under the License.
+ 
+ use std::collections::HashMap;
+-use std::fmt::{Debug, Formatter};
++use std::fmt::{Debug, Display, Formatter};
++use std::time::{Duration, Instant};
+ 
+ use http::StatusCode;
+ use iceberg::{Error, ErrorKind, Result};
+@@ -29,13 +30,84 @@ use tokio::sync::Mutex;
+ use crate::types::TokenResponse;
+ use crate::RestCatalogConfig;
+ 
++/// Replace an OAuth token this long before the server-reported expiry, or after
++/// nine tenths of a shorter lifetime, so requests do not race the expiry.
++const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
++
++/// Marks an error caused by the catalog rejecting the request's credentials.
++///
++/// It is attached as the source of catalog responses with HTTP 401, 403 or
++/// 419, and of OAuth token responses with HTTP 400, 401 or 403. Callers can
++/// distinguish credential failures from catalog outages without parsing
++/// messages. It never carries response text.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct AuthRejected;
++
++impl Display for AuthRejected {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        f.write_str("catalog rejected the request credentials")
++    }
++}
++
++impl std::error::Error for AuthRejected {}
++
++/// A bearer token. Tokens obtained from the OAuth endpoint with `expires_in`
++/// are replaced before they expire; configured tokens are used until rejected.
++#[derive(Clone)]
++struct CachedToken {
++    value: String,
++    refresh_at: Option<Instant>,
++    expires_at: Option<Instant>,
++}
++
++impl CachedToken {
++    fn configured(value: String) -> Self {
++        Self {
++            value,
++            refresh_at: None,
++            expires_at: None,
++        }
++    }
++
++    fn issued(value: String, expires_in: Option<u64>, now: Instant) -> Self {
++        let lifetime = expires_in.map(Duration::from_secs);
++        Self {
++            value,
++            refresh_at: lifetime.and_then(|lifetime| {
++                now.checked_add(lifetime - TOKEN_REFRESH_MARGIN.min(lifetime / 10))
++            }),
++            expires_at: lifetime.and_then(|lifetime| now.checked_add(lifetime)),
++        }
++    }
++
++    fn refresh_due(&self, now: Instant) -> bool {
++        self.refresh_at.is_some_and(|at| now >= at)
++    }
++
++    fn expired(&self, now: Instant) -> bool {
++        self.expires_at.is_some_and(|at| now >= at)
++    }
++}
++
++/// A catalog response status for which a new OAuth token may succeed.
++fn token_rejected(status: StatusCode) -> bool {
++    status == StatusCode::UNAUTHORIZED || status.as_u16() == 419
++}
++
++/// A catalog response status caused by the request's credentials.
++fn auth_rejected(status: StatusCode) -> bool {
++    token_rejected(status) || status == StatusCode::FORBIDDEN
++}
++
+ pub(crate) struct HttpClient {
+     client: Client,
+ 
+     /// The token to be used for authentication.
+     ///
+     /// It's possible to fetch the token from the server while needed.
+-    token: Mutex<Option<String>>,
++    token: Mutex<Option<CachedToken>>,
++    /// Serializes token exchanges so concurrent requests share one refresh.
++    refresh: Mutex<()>,
+     /// The token endpoint to be used for authentication.
+     token_endpoint: String,
+     /// The credential to be used for authentication.
+@@ -50,9 +122,14 @@ pub(crate) struct HttpClient {
+ 
+ impl Debug for HttpClient {
+     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        // Configured headers can carry credentials (`header.Authorization`,
++        // API keys); show only their names. Tokens and credentials are omitted.
+         f.debug_struct("HttpClient")
+             .field("client", &self.client)
+-            .field("extra_headers", &self.extra_headers)
++            .field(
++                "extra_headers",
++                &self.extra_headers.keys().collect::<Vec<_>>(),
++            )
+             .finish_non_exhaustive()
+     }
+ }
+@@ -63,7 +140,8 @@ impl HttpClient {
+         let extra_headers = cfg.extra_headers()?;
+         Ok(HttpClient {
+             client: cfg.client().unwrap_or_default(),
+-            token: Mutex::new(cfg.token()),
++            token: Mutex::new(cfg.token().map(CachedToken::configured)),
++            refresh: Mutex::new(()),
+             token_endpoint: cfg.get_token_endpoint(),
+             credential: cfg.credential(),
+             extra_headers,
+@@ -83,7 +161,12 @@ impl HttpClient {
+             .unwrap_or(self.extra_headers);
+         Ok(HttpClient {
+             client: cfg.client().unwrap_or(self.client),
+-            token: Mutex::new(cfg.token().or_else(|| self.token.into_inner())),
++            token: Mutex::new(
++                cfg.token()
++                    .map(CachedToken::configured)
++                    .or_else(|| self.token.into_inner()),
++            ),
++            refresh: Mutex::new(()),
+             token_endpoint: if !cfg.get_token_endpoint().is_empty() {
+                 cfg.get_token_endpoint()
+             } else {
+@@ -108,10 +191,10 @@ impl HttpClient {
+             .build()
+             .unwrap();
+         self.authenticate(&mut req).await.ok();
+-        self.token.lock().await.clone()
++        self.token.lock().await.as_ref().map(|token| token.value.clone())
+     }
+ 
+-    async fn exchange_credential_for_token(&self) -> Result<String> {
++    async fn exchange_credential_for_token(&self) -> Result<CachedToken> {
+         // Credential must exist here.
+         let (client_id, client_secret) = self.credential.as_ref().ok_or_else(|| {
+             Error::new(
+@@ -144,6 +227,7 @@ impl HttpClient {
+         );
+         let auth_url = auth_req.url().clone();
+         let auth_resp = self.send(auth_req, true).await?;
++        let issued_at = Instant::now();
+ 
+         let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
+             let text = response_bytes(auth_resp)
+@@ -162,14 +246,27 @@ impl HttpClient {
+             let _ = response_bytes(auth_resp)
+                 .await
+                 .map_err(|err| err.with_url(auth_url.clone()))?;
++            let error = Error::new(ErrorKind::Unexpected, "OAuth token request failed")
++                .with_retryable(retryable)
++                .with_context("code", code.to_string())
++                .with_context("operation", "auth");
++            // RFC 6749 reports rejected client credentials and grants as 400 or 401.
+             Err(
+-                Error::new(ErrorKind::Unexpected, "OAuth token request failed")
+-                    .with_retryable(retryable)
+-                    .with_context("code", code.to_string())
+-                    .with_context("operation", "auth"),
++                if matches!(
++                    code,
++                    StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
++                ) {
++                    error.with_source(AuthRejected)
++                } else {
++                    error
++                },
+             )
+         }?;
+-        Ok(auth_res.access_token)
++        Ok(CachedToken::issued(
++            auth_res.access_token,
++            auth_res.expires_in,
++            issued_at,
++        ))
+     }
+ 
+     /// Invalidate the current token without generating a new one. On the next request, the client
+@@ -186,12 +283,13 @@ impl HttpClient {
+     /// If credential is invalid, or the request fails, this method will return an error and leave
+     /// the current token unchanged.
+     pub(crate) async fn regenerate_token(&self) -> Result<()> {
++        let _refresh = self.refresh.lock().await;
+         let new_token = self.exchange_credential_for_token().await?;
+-        *self.token.lock().await = Some(new_token.clone());
++        *self.token.lock().await = Some(new_token);
+         Ok(())
+     }
+ 
+-    /// Authenticates the request by adding a bearer token to the authorization header.
++    /// Returns the bearer token for the next request, if any.
+     ///
+     /// This method supports three authentication modes:
+     ///
+@@ -199,42 +297,66 @@ impl HttpClient {
+     /// 2. **Token authentication** - Use the provided `token` directly for authentication.
+     /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
+     ///
+-    /// When both `credential` and `token` are present, `token` takes precedence.
+-    ///
+-    /// # TODO: Support automatic token refreshing.
+-    async fn authenticate(&self, req: &mut Request) -> Result<()> {
++    /// When both `credential` and `token` are present, `token` takes precedence until the
++    /// catalog rejects it. An OAuth token is exchanged again before its reported expiry; if
++    /// that early exchange fails, the current token is used until it actually expires.
++    async fn current_token(&self) -> Result<Option<String>> {
+         // Clone the token from lock without holding the lock for entire function.
+-        let token = self.token.lock().await.clone();
+-
+-        if self.credential.is_none() && token.is_none() {
+-            return Ok(());
++        let cached = self.token.lock().await.clone();
++        match &cached {
++            Some(token) if !token.refresh_due(Instant::now()) => {
++                return Ok(Some(token.value.clone()));
++            }
++            None if self.credential.is_none() => return Ok(None),
++            _ => {}
+         }
+ 
+-        // Either use the provided token or exchange credential for token, cache and use that
+-        let token = match token {
+-            Some(token) => token,
+-            None => {
+-                let token = self.exchange_credential_for_token().await?;
++        let _refresh = self.refresh.lock().await;
++        // Another request may have replaced the token while this one waited.
++        if let Some(token) = self.token.lock().await.as_ref()
++            && !token.refresh_due(Instant::now())
++        {
++            return Ok(Some(token.value.clone()));
++        }
++        match self.exchange_credential_for_token().await {
++            Ok(token) => {
++                let value = token.value.clone();
+                 // Update token so that we use it for next request instead of
+                 // exchanging credential for token from the server again
+-                *self.token.lock().await = Some(token.clone());
+-                token
++                *self.token.lock().await = Some(token);
++                Ok(Some(value))
+             }
+-        };
++            Err(error) => match cached {
++                Some(token) if !token.expired(Instant::now()) => Ok(Some(token.value)),
++                _ => Err(error),
++            },
++        }
++    }
+ 
+-        // Insert token in request.
+-        req.headers_mut().insert(
+-            http::header::AUTHORIZATION,
+-            format!("Bearer {token}").parse().map_err(|e| {
+-                Error::new(
+-                    ErrorKind::DataInvalid,
+-                    "Invalid token received from catalog server!",
+-                )
+-                .with_source(e)
+-            })?,
+-        );
++    /// Replaces a token that the catalog rejected, unless a concurrent request already did.
++    async fn replace_rejected_token(&self, rejected: &str) -> Result<String> {
++        let _refresh = self.refresh.lock().await;
++        if let Some(token) = self.token.lock().await.as_ref()
++            && token.value != rejected
++            && !token.refresh_due(Instant::now())
++        {
++            return Ok(token.value.clone());
++        }
++        let token = self.exchange_credential_for_token().await?;
++        let value = token.value.clone();
++        *self.token.lock().await = Some(token);
++        Ok(value)
++    }
+ 
+-        Ok(())
++    /// Authenticates the request by adding a bearer token to the authorization header.
++    ///
++    /// Returns the token used, if any.
++    async fn authenticate(&self, req: &mut Request) -> Result<Option<String>> {
++        let token = self.current_token().await?;
++        if let Some(token) = &token {
++            set_bearer(req, token)?;
++        }
++        Ok(token)
+     }
+ 
+     #[inline]
+@@ -263,9 +385,29 @@ impl HttpClient {
+ 
+     // Queries the Iceberg REST catalog after authentication with the given `Request` and
+     // returns a `Response`.
++    //
++    // When OAuth credentials are configured and the catalog rejects the token, the
++    // credential is exchanged for a new token and the request is sent once more. A
++    // rejected request was not processed, so repeating it is safe. Configured tokens
++    // without credentials cannot be replaced; their rejection is returned.
+     pub async fn query_catalog(&self, mut request: Request) -> Result<Response> {
+-        self.authenticate(&mut request).await?;
+-        self.execute(request).await
++        let retry = self
++            .credential
++            .as_ref()
++            .and_then(|_| request.try_clone());
++        let token = self.authenticate(&mut request).await?;
++        let response = self.execute(request).await?;
++        let (Some(mut retry), Some(token)) = (retry, token) else {
++            return Ok(response);
++        };
++        if !token_rejected(response.status()) {
++            return Ok(response);
++        }
++        // Consume the body for transport accounting; it is not diagnostic.
++        let _ = response_bytes(response).await;
++        let token = self.replace_rejected_token(&token).await?;
++        set_bearer(&mut retry, &token)?;
++        self.execute(retry).await
+     }
+ 
+     /// Returns whether header redaction is disabled for this client.
+@@ -274,6 +416,21 @@ impl HttpClient {
+     }
+ }
+ 
++/// Inserts the bearer token, replacing any existing authorization header.
++fn set_bearer(req: &mut Request, token: &str) -> Result<()> {
++    req.headers_mut().insert(
++        http::header::AUTHORIZATION,
++        format!("Bearer {token}").parse().map_err(|e| {
++            Error::new(
++                ErrorKind::DataInvalid,
++                "Invalid token received from catalog server!",
++            )
++            .with_source(e)
++        })?,
++    );
++    Ok(())
++}
++
+ #[cfg(feature = "metrics")]
+ use crate::observation::response_bytes;
+ 
+@@ -361,16 +518,22 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
+     response: Response,
+     disable_header_redaction: bool,
+ ) -> Error {
++    let status = response.status();
+     let err = Error::new(
+         ErrorKind::Unexpected,
+         "Received response with unexpected status code",
+     )
+-    .with_retryable(retryable_status(response.status()))
+-    .with_context("status", response.status().to_string())
++    .with_retryable(retryable_status(status))
++    .with_context("status", status.to_string())
+     .with_context(
+         "headers",
+         format_headers_redacted(response.headers(), disable_header_redaction),
+     );
++    let err = if auth_rejected(status) {
++        err.with_source(AuthRejected)
++    } else {
++        err
++    };
+ 
+     let bytes = match response_bytes(response).await {
+         Ok(bytes) => bytes,
+@@ -384,6 +547,113 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn oauth_tokens_refresh_before_reported_expiry() {
++        let now = Instant::now();
++        let at = |seconds| now + Duration::from_secs(seconds);
++
++        let hour = CachedToken::issued("token".into(), Some(3600), now);
++        assert!(!hour.refresh_due(at(3299)));
++        assert!(hour.refresh_due(at(3300)));
++        assert!(!hour.expired(at(3599)));
++        assert!(hour.expired(at(3600)));
++
++        // Short lifetimes keep nine tenths of the lifetime before refreshing.
++        let minute = CachedToken::issued("token".into(), Some(60), now);
++        assert!(!minute.refresh_due(at(53)));
++        assert!(minute.refresh_due(at(54)));
++
++        for token in [
++            CachedToken::issued("token".into(), None, now),
++            CachedToken::issued("token".into(), Some(u64::MAX), now),
++            CachedToken::configured("token".into()),
++        ] {
++            assert!(!token.refresh_due(at(10 * 365 * 86400)));
++            assert!(!token.expired(at(10 * 365 * 86400)));
++        }
++    }
++
++    #[tokio::test]
++    async fn debug_output_omits_header_values_and_credentials() {
++        let client = HttpClient::new(
++            &RestCatalogConfig::builder()
++                .uri("http://localhost:8181".to_string())
++                .props(HashMap::from([
++                    (
++                        "header.Authorization".to_string(),
++                        "Bearer FAKE_HEADER_SECRET".to_string(),
++                    ),
++                    (
++                        "header.x-api-key".to_string(),
++                        "FAKE_API_KEY_SECRET".to_string(),
++                    ),
++                    ("token".to_string(), "FAKE_TOKEN_SECRET".to_string()),
++                    (
++                        "credential".to_string(),
++                        "client:FAKE_CREDENTIAL_SECRET".to_string(),
++                    ),
++                ]))
++                .build(),
++        )
++        .unwrap();
++        let debug = format!("{client:?} {client:#?}");
++        assert!(debug.contains("authorization") && debug.contains("x-api-key"));
++        assert!(!debug.contains("FAKE_"), "{debug}");
++    }
++
++    #[tokio::test]
++    async fn failed_early_refresh_uses_the_unexpired_token() {
++        let mut server = mockito::Server::new_async().await;
++        let oauth = server
++            .mock("POST", "/v1/oauth/tokens")
++            .with_status(503)
++            .expect(2)
++            .create_async()
++            .await;
++        let namespaces = server
++            .mock("GET", "/v1/namespaces")
++            .match_header("authorization", "Bearer current")
++            .with_status(200)
++            .expect(1)
++            .create_async()
++            .await;
++        let client = HttpClient::new(
++            &RestCatalogConfig::builder()
++                .uri(server.url())
++                .props(HashMap::from([(
++                    "credential".to_string(),
++                    "client:secret".to_string(),
++                )]))
++                .build(),
++        )
++        .unwrap();
++        let now = Instant::now();
++        *client.token.lock().await = Some(CachedToken {
++            value: "current".into(),
++            refresh_at: Some(now),
++            expires_at: Some(now + Duration::from_secs(60)),
++        });
++        let request = client
++            .request(Method::GET, format!("{}/v1/namespaces", server.url()))
++            .build()
++            .unwrap();
++        assert_eq!(
++            client.query_catalog(request).await.unwrap().status(),
++            StatusCode::OK
++        );
++
++        // Once the token has expired, the exchange failure is returned.
++        client.token.lock().await.as_mut().unwrap().expires_at = Some(now);
++        let request = client
++            .request(Method::GET, format!("{}/v1/namespaces", server.url()))
++            .build()
++            .unwrap();
++        let error = client.query_catalog(request).await.unwrap_err();
++        assert!(error.retryable(), "{error:?}");
++        oauth.assert_async().await;
++        namespaces.assert_async().await;
++    }
++
+     #[test]
+     fn test_format_headers_redacted_empty() {
+         let headers = HeaderMap::new();
+diff --git a/vendor/iceberg-catalog-rest/src/lib.rs b/vendor/iceberg-catalog-rest/src/lib.rs
+index 254868a..6b458a2 100644
+--- a/vendor/iceberg-catalog-rest/src/lib.rs
++++ b/vendor/iceberg-catalog-rest/src/lib.rs
+@@ -57,6 +57,7 @@ mod client;
+ mod types;
+ 
+ pub use catalog::*;
++pub use client::AuthRejected;
+ pub use types::*;
+ 
+ #[cfg(feature = "metrics")]

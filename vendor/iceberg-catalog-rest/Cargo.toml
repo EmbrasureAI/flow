@@ -56,7 +56,10 @@ version = "0.13"
 
 [dependencies.reqwest]
 version = "0.12.12"
-features = ["json"]
+features = [
+    "json",
+    "rustls-tls-native-roots",
+]
 default-features = false
 
 [dependencies.serde]

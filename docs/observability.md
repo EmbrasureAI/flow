@@ -271,7 +271,10 @@ last successful materialized LSN. These positions may advance independently of t
 connection's contiguous materialized watermark. A blocked table retains its last
 successful position while other tables continue. See
 [table publication isolation](table-publication-isolation.md) for recovery and
-storage limits.
+storage limits. Code `catalog_auth` means the catalog or its OAuth endpoint
+rejected Flow's credentials or permissions (after one token renewal when OAuth
+credentials are configured) and needs operator action; `catalog_unavailable`
+covers catalog outages and other unexpected responses.
 
 ## Storage and REST cost diagnostics
 
