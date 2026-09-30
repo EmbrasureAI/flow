@@ -422,13 +422,14 @@ async fn live_locked_table_does_not_stall_capture() {
     with_daemon(&url, sql, "locked", |config, name| async move {
         // The initial copy already published orders; prove capture is streaming
         // before the lock, or its setup would wait for the lock to end.
+        // Taken before the probe so unrelated WAL cannot outrun it.
+        let mark = current(sql).await;
         sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (2, 'before')"))
             .await
             .unwrap();
-        let mark = current(sql).await;
         until(
             "orders publishes through capture before the lock",
-            || async { materialized(&config, "orders") as i64 >= mark },
+            || async { materialized(&config, "orders") as i64 > mark },
         )
         .await;
         let (held, connection) = tokio_postgres::connect(&held_url, NoTls).await.unwrap();
@@ -511,14 +512,15 @@ async fn live_rolled_back_streamed_changes_do_not_block_tables() {
                 from + rows
             )
         };
+        // Taken before the probe so unrelated WAL cannot outrun it.
+        let mark = current(sql).await;
         sql.batch_execute(&format!("INSERT INTO {name}.items VALUES (2, 'before')"))
             .await
             .unwrap();
         // Capture must be streaming, not merely past the initial copy, before
         // a held TRUNCATE locks items.
-        let mark = current(sql).await;
         until("items publishes before the streamed transactions", || async {
-            materialized(&config, "items") as i64 >= mark
+            materialized(&config, "items") as i64 > mark
         })
         .await;
         let (held, connection) = tokio_postgres::connect(&held_url, NoTls).await.unwrap();
@@ -558,16 +560,17 @@ async fn live_rolled_back_streamed_changes_do_not_block_tables() {
         }
         drop(held);
         held_task.await.unwrap().unwrap();
+        // Taken before the probe so unrelated WAL cannot outrun it.
+        let mark = current(sql).await;
         sql.batch_execute(&format!("INSERT INTO {name}.items VALUES (4, 'after')"))
             .await
             .unwrap();
-        let mark = current(sql).await;
         until("items publishes after the rolled-back streams", || async {
-            materialized(&config, "items") as i64 >= mark
+            materialized(&config, "items") as i64 > mark
         })
         .await;
         until("confirmed_flush_lsn advances past the streams", || async {
-            confirmed(sql, &name).await >= mark
+            confirmed(sql, &name).await > mark
         })
         .await;
         assert!(blocked_tables(&config).is_empty(), "{:?}", status(&config));
@@ -610,6 +613,8 @@ async fn live_column_migrations_publish_optional_fields() {
     let sql_task = tokio::spawn(connection);
     let sql = &sql;
     with_daemon(&url, sql, "migration", |config, name| async move {
+        // Taken before the probe so unrelated WAL cannot outrun it.
+        let mark = current(sql).await;
         sql.batch_execute(&format!(
             "ALTER TABLE {name}.items ADD COLUMN note text;
              ALTER TABLE {name}.items ALTER COLUMN note SET DEFAULT 'defaulted';
@@ -624,21 +629,21 @@ async fn live_column_migrations_publish_optional_fields() {
         ))
         .await
         .unwrap();
-        let mark = current(sql).await;
         until("items publishes the migrated rows", || async {
-            materialized(&config, "items") as i64 >= mark
+            materialized(&config, "items") as i64 > mark
         })
         .await;
         // Span the five-second catalog refresh as well as commit validation.
         tokio::time::sleep(Duration::from_secs(6)).await;
+        // Taken before the probe so unrelated WAL cannot outrun it.
+        let mark = current(sql).await;
         sql.batch_execute(&format!(
             "INSERT INTO {name}.items (id, status) VALUES (4, 'after refresh')"
         ))
         .await
         .unwrap();
-        let mark = current(sql).await;
         until("items publishes after the catalog refresh", || async {
-            materialized(&config, "items") as i64 >= mark
+            materialized(&config, "items") as i64 > mark
         })
         .await;
         assert!(blocked_tables(&config).is_empty(), "{:?}", status(&config));
@@ -706,12 +711,13 @@ async fn live_streamed_ddl_blocks_only_when_it_commits() {
     ] {
         let held_url = url.clone();
         with_daemon(&url, sql, label, |config, name| async move {
+            // Taken before the probe so unrelated WAL cannot outrun it.
+            let mark = current(sql).await;
             sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (2, 'before')"))
                 .await
                 .unwrap();
-            let mark = current(sql).await;
             until("both tables publish before the DDL", || async {
-                materialized(&config, "orders") as i64 >= mark
+                materialized(&config, "orders") as i64 > mark
                     && materialized(&config, "items") > 0
             })
             .await;
@@ -727,12 +733,13 @@ async fn live_streamed_ddl_blocks_only_when_it_commits() {
             .unwrap();
             decoded(sql, &name, &config).await;
             // Another transaction commits while the streamed one is undecided.
+            // Taken before the probe so unrelated WAL cannot outrun it.
+            let mark = current(sql).await;
             sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (3, 'during')"))
                 .await
                 .unwrap();
-            let mark = current(sql).await;
             until("orders publishes during the streamed DDL", || async {
-                materialized(&config, "orders") as i64 >= mark
+                materialized(&config, "orders") as i64 > mark
             })
             .await;
             let end = if rolled_back { "ROLLBACK TO SAVEPOINT s; COMMIT" } else { "COMMIT" };
@@ -753,12 +760,13 @@ async fn live_streamed_ddl_blocks_only_when_it_commits() {
             .await;
             let blocked = blocked_tables(&config);
             assert_eq!(blocked.len(), 1, "{label}: {blocked:?}");
+            // Taken before the probe so unrelated WAL cannot outrun it.
+            let mark = current(sql).await;
             sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (5, 'after')"))
                 .await
                 .unwrap();
-            let mark = current(sql).await;
             until("orders keeps publishing after the block", || async {
-                materialized(&config, "orders") as i64 >= mark
+                materialized(&config, "orders") as i64 > mark
             })
             .await;
             assert_eq!(published_rows(&name, "items").await, items, "{label}");
