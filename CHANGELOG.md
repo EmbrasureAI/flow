@@ -92,6 +92,8 @@ directories and configurations keep working; no resynchronization is needed.
   falls below `min_free_bytes` (4 GiB) and resumes automatically; `check`,
   `init` and `run` report the free-space budget. `check --storage` verifies
   every index checksum offline.
+- Optional `limits.epoch_max_transactions` caps source transactions per
+  publication epoch.
 - Configurable spool limits `limits.spool_transactions` and
   `limits.spool_subtransactions` (default raised to 1,048,576).
 - Operations guidance for systemd and Kubernetes, and disk sizing.

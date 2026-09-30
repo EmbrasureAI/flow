@@ -150,6 +150,9 @@ pub struct Limits {
     /// schedulable; a dispatched epoch continues from the durable ledger up to
     /// its payload and descriptor-memory limits, so this does not cap batches.
     pub pending_transactions: usize,
+    /// Optional cap on source transactions in one publication epoch, bounding
+    /// per-epoch commit work; unset, payload and memory limits size epochs.
+    pub epoch_max_transactions: Option<usize>,
     pub table_workers: usize,
     pub commits_per_second: u32,
     pub wal_soft_bytes: u64,
@@ -192,6 +195,7 @@ impl Default for Limits {
             collapse_memory_bytes: 32 << 20,
             parquet_row_group_bytes: 32 << 20,
             pending_transactions: 256,
+            epoch_max_transactions: None,
             table_workers: 4,
             commits_per_second: 100,
             wal_soft_bytes: 16 << 30,
@@ -358,6 +362,7 @@ impl Config {
                 && l.parquet_row_group_bytes >= l.batch_bytes
                 && l.batch_bytes <= i32::MAX as usize
                 && l.pending_transactions > 0
+                && l.epoch_max_transactions != Some(0)
                 && l.table_workers > 0
                 && l.commits_per_second > 0,
             "invalid batching limits"

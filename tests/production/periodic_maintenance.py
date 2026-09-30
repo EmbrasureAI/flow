@@ -22,7 +22,7 @@ from maintenance_fairness import FairnessRun, dump, lsn
 class PeriodicRun(FairnessRun):
     def __init__(self, args):
         super().__init__(args)
-        text = self.config.read_text().replace("pending_transactions = 16", "pending_transactions = 4")
+        text = self.config.read_text().replace("pending_transactions = 16", "pending_transactions = 4\nepoch_max_transactions = 2")
         text = text.replace("table_workers = 2", f"table_workers = {args.table_workers}")
         text = text.replace("snapshot_retention_secs = 3600", "snapshot_retention_secs = 2\nsnapshot_expiration = true\nsnapshot_retain_last = 8\n"
                             "manifest_max_count = 4\ngarbage_interval_secs = 1\norphan_grace_secs = 1\n"

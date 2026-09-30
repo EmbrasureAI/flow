@@ -40,6 +40,8 @@ fn descriptor_bytes(transaction: &SourceTransaction) -> u64 {
 struct EpochBudget {
     payload: u64,
     memory: u64,
+    count: usize,
+    limit: Option<usize>,
     closed: bool,
 }
 impl EpochBudget {
@@ -56,16 +58,19 @@ impl EpochBudget {
         if self.memory > 0
             && (standalone
                 || self.payload.saturating_add(size) > EPOCH_MAX_BYTES
-                || self.memory.saturating_add(memory) > EPOCH_MAX_DESCRIPTOR_BYTES)
+                || self.memory.saturating_add(memory) > EPOCH_MAX_DESCRIPTOR_BYTES
+                || self.limit.is_some_and(|limit| self.count >= limit))
         {
             self.closed = true;
             return false;
         }
         self.payload = self.payload.saturating_add(size);
         self.memory = self.memory.saturating_add(memory);
+        self.count += 1;
         self.closed = standalone
             || self.payload >= EPOCH_MAX_BYTES
-            || self.memory >= EPOCH_MAX_DESCRIPTOR_BYTES;
+            || self.memory >= EPOCH_MAX_DESCRIPTOR_BYTES
+            || self.limit.is_some_and(|limit| self.count >= limit);
         true
     }
 }
@@ -120,8 +125,17 @@ pub(super) struct PendingWork {
     excluded: HashSet<TableId>,
     capacity: usize,
     unloaded: bool,
+    /// Optional `limits.epoch_max_transactions`.
+    epoch_limit: Option<usize>,
 }
 impl PendingWork {
+    pub(super) fn with_epoch_limit(epoch_limit: Option<usize>) -> Self {
+        Self {
+            epoch_limit,
+            ..Self::default()
+        }
+    }
+
     /// Dequeue a table's ordered prefix without splitting a source transaction.
     /// Only admitted lookahead can start an epoch. Once that queue is drained,
     /// the epoch continues in order through the table's durable references.
@@ -133,6 +147,8 @@ impl PendingWork {
         let mut budget = EpochBudget {
             payload: 0,
             memory: 0,
+            count: 0,
+            limit: self.epoch_limit,
             closed: false,
         };
         let queue = self.tables.entry(table).or_default();
@@ -977,6 +993,45 @@ mod admission_tests {
             "the memory bound, not the lookahead, splits epochs: {sizes:?}"
         );
         assert_eq!(ledger.acknowledgement(), PgLsn(200_001));
+        assert!(!pending.has_work());
+    }
+
+    #[test]
+    fn configured_epoch_transaction_limit_splits_epochs_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            flow_state_store::StateStore::open(directory.path(), StateStoreOptions::default())
+                .unwrap();
+        let source = SourceId("limited".into());
+        let table = TableId(1);
+        let profiles = BTreeMap::from([(table, Priority::Realtime)]);
+        let mut ledger = open_ledger(&store, &source);
+        let transactions = (1..=10)
+            .map(|xid| descriptor(&source, xid, &[table], 100))
+            .collect::<Vec<_>>();
+        journal(&mut ledger, &transactions);
+        let mut scheduler =
+            Scheduler::new(EPOCH_MUTATION_TRIGGER, EPOCH_MAX_BYTES, 100, Instant::now()).unwrap();
+        let mut pending = PendingWork::with_epoch_limit(Some(4));
+        let mut sizes = Vec::new();
+        let mut next = 1;
+        loop {
+            pending
+                .refill(&ledger, &mut scheduler, &profiles, 2, &HashSet::new())
+                .unwrap();
+            let epoch = pending.take_epoch(table, &ledger).unwrap();
+            if epoch.is_empty() {
+                break;
+            }
+            assert_eq!(
+                xids(&epoch),
+                (next..next + epoch.len() as u32).collect::<Vec<_>>()
+            );
+            next += epoch.len() as u32;
+            sizes.push(epoch.len());
+            publish(&mut ledger, &mut pending, table, &epoch);
+        }
+        assert_eq!(sizes, [4, 4, 2]);
         assert!(!pending.has_work());
     }
 

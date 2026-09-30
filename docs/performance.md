@@ -32,8 +32,10 @@ about 4 MiB of in-memory transaction descriptors (roughly 16,000 single-table
 transactions), so epoch size no longer depends on how many other tables are
 busy. Descriptor memory is bounded by the lookahead plus that per-epoch limit
 for each running worker. Catalog commit latency, the commit-rate budget and
-`table_workers` still bound throughput. The results on this page predate the
-change and have not been rerun.
+`table_workers` still bound throughput. Set `limits.epoch_max_transactions` to
+cap the source transactions in one epoch when per-epoch commit work or latency
+matters more than batching. The results on this page predate the change and
+have not been rerun.
 
 ## V3 deletion-vector results
 

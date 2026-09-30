@@ -34,7 +34,7 @@ class IsolationRun(Run):
         super().configure()
         self.environment["RUST_LOG"] = "info"
         self.config.write_text(self.config.read_text().replace(
-            "pending_transactions = 32", "pending_transactions = 4\ntable_workers = 1\ncollapse_memory_bytes = 0"))
+            "pending_transactions = 32", "pending_transactions = 4\nepoch_max_transactions = 4\ntable_workers = 1\ncollapse_memory_bytes = 0"))
         # Publication isolation is tested without competing maintenance. Keep
         # file/deletion budgets above this bounded workload, which makes no
         # reader-debt or long-term throughput claim.

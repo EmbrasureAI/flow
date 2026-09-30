@@ -33,6 +33,8 @@ chunk_bytes = 4194304
 # Queued lookahead descriptors shared by all tables. It only makes tables
 # schedulable; a dispatched epoch reads further from the durable ledger.
 pending_transactions = 256
+# Optional cap on source transactions per publication epoch; unset by default.
+# epoch_max_transactions = 10000
 table_workers = 4
 commits_per_second = 100
 journal_bytes = 68719476736

@@ -531,7 +531,7 @@ impl PublishRuntime {
         let mut excluded: HashSet<_> = blocked.ids().collect();
         let mut recovering: HashSet<TableId>;
         let mut retrying = HashSet::new();
-        let mut pending = PendingWork::default();
+        let mut pending = PendingWork::with_epoch_limit(config.limits.epoch_max_transactions);
         let mut scheduler = Scheduler::new(
             EPOCH_MUTATION_TRIGGER,
             EPOCH_MAX_BYTES,
