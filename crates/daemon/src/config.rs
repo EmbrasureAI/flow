@@ -234,6 +234,12 @@ impl Config {
         })?;
         config.validate_source()?;
         config.state_dir = resolve_state_dir(path, &config.state_dir)?;
+        // Like state_dir, a relative CA bundle belongs to the configuration.
+        if let Some(file) = config.catalog.get_mut("tls_ca_file") {
+            *file = resolve_state_dir(path, std::path::Path::new(file.as_str()))?
+                .to_string_lossy()
+                .into_owned();
+        }
         Ok(config)
     }
 
@@ -399,6 +405,23 @@ mod tests {
         assert_eq!(
             Config::load(&path).unwrap().state_dir,
             PathBuf::from("/srv/flow")
+        );
+        let with_ca = |value: &str| {
+            example.replacen(
+                "[catalog]\n",
+                &format!("[catalog]\ntls_ca_file = \"{value}\"\n"),
+                1,
+            )
+        };
+        std::fs::write(&path, with_ca("certs/ca.pem")).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().catalog["tls_ca_file"],
+            root.join("certs/ca.pem").to_string_lossy()
+        );
+        std::fs::write(&path, with_ca("/etc/ssl/ca.pem")).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().catalog["tls_ca_file"],
+            "/etc/ssl/ca.pem"
         );
     }
 

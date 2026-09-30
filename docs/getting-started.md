@@ -124,6 +124,7 @@ uri = "https://catalog.internal.example.com"
 tls_ca_file = "/etc/flow/catalog-ca.pem"
 ```
 
+A relative `tls_ca_file` is resolved against the configuration file's directory.
 Flow reads `tls_ca_file` when connecting and does not forward it to the
 catalog. Client certificates (mutual TLS) are not supported. Use `https://` for
 any catalog that receives a token or credential: Flow logs a warning when
