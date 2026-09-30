@@ -100,7 +100,8 @@ impl TypeRegistry {
         })
     }
 
-    pub(crate) fn column_type(&self, column: &Column) -> Result<ColumnType> {
+    /// The Flow column type `init` expects for a source column.
+    pub fn column_type(&self, column: &Column) -> Result<ColumnType> {
         self.mapped_type(column.type_oid, column.type_modifier, 0)
     }
 

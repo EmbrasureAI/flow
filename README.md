@@ -10,6 +10,8 @@
   Stream PostgreSQL changes into Apache Iceberg. Written in Rust.
 </p>
 
+<p align="center"><strong>Status: beta.</strong> See <a href="#support-and-status">support and status</a>.</p>
+
 <p align="center">
   <a href="https://github.com/EmbrasureAI/flow/actions/workflows/ci.yml"><img src="https://github.com/EmbrasureAI/flow/actions/workflows/ci.yml/badge.svg?branch=main" alt="Rust CI"></a>
   <a href="https://github.com/EmbrasureAI/flow/actions/workflows/services.yml"><img src="https://github.com/EmbrasureAI/flow/actions/workflows/services.yml/badge.svg?branch=main" alt="Service integration"></a>
@@ -63,6 +65,20 @@ The [demo guide](demo/README.md) walks through changing source rows, checking
 service status and cleaning up. The stack uses named volumes and does not
 publish ports on the host.
 
+### Install a release
+
+Tagged [releases](https://github.com/EmbrasureAI/flow/releases) publish Linux
+binaries for x86-64 and arm64, with checksums and license notices, and a
+multi-architecture container image:
+
+```sh
+docker pull ghcr.io/embrasureai/flow:<version>
+```
+
+The image runs `embrasure-flow --config /etc/flow.toml run` as an unprivileged
+user; mount the configuration at `/etc/flow.toml` and a persistent volume at
+`/data` for `state_dir`.
+
 ### Build from source
 
 Install the [pinned Rust toolchain](rust-toolchain.toml), a C++ compiler, libclang,
@@ -81,8 +97,17 @@ The default build uses the system allocator; the feature has no effect on other
 targets. See [allocator metrics](docs/observability.md#allocator-memory) for
 measurement details and limits.
 
-To connect your own services, follow [Getting started](docs/getting-started.md)
-to configure the source, catalog and storage, then run `init`, `run` and `status`.
+### Connect your own database
+
+Follow [Getting started](docs/getting-started.md). In short:
+
+```sh
+embrasure-flow --config flow.toml check --source   # read-only PostgreSQL preflight
+embrasure-flow --config flow.toml discover >> flow.toml   # generate [[tables]]
+embrasure-flow --config flow.toml init             # slot + initial copy
+embrasure-flow --config flow.toml run              # stream changes
+```
+
 Flow needs persistent disk for its transaction journal and RocksDB row index.
 Readers access Iceberg independently of the running service.
 
@@ -108,23 +133,38 @@ See the [architecture](docs/architecture.md) and
 
 ## Support and status
 
-Mutable tables require a stable primary key and `REPLICA IDENTITY FULL`.
-JSON and JSONB replicate as normalized JSON text in both formats; native Iceberg
-Variant is not yet supported. See the [type mappings](docs/postgres-types.md).
-Automatic schema evolution supports nullable column additions without a non-null
-backfill and compatible required-to-nullable changes. During streaming, TRUNCATE
-and classified incompatible schema changes block the affected table while healthy
-tables continue within journal and WAL limits; see [table isolation](docs/table-publication-isolation.md).
-Partitioning,
-cross-table query atomicity, HA, distributed compaction and Z-order compaction
-are not supported. Check [v3 reader compatibility](docs/iceberg-v3.md) and the
+**Flow is beta software.** The replication, recovery and compaction protocols
+are tested in CI against PostgreSQL 14–18, MinIO, an Iceberg REST catalog and
+independent readers (DuckDB, Trino and Spark), including crash, outage and
+external-maintenance scenarios. Performance qualification is ongoing; the
+[benchmark report](docs/performance.md) records measured throughput, latency
+and the targets still open. Configuration and on-disk state may change between
+minor releases, with the upgrade path stated in the [changelog](CHANGELOG.md);
+see [upgrading](docs/upgrading.md).
+
+Supported today:
+
+- PostgreSQL 14–18 sources, with inserts, updates, deletes and primary-key
+  changes. Mutable tables need a primary key and either `REPLICA IDENTITY FULL`
+  or, when every replicated column is fixed-width, `DEFAULT`; see
+  [replica identity](docs/getting-started.md#replica-identity). Tables without
+  a primary key replicate append-only.
+- Unpartitioned Iceberg v2 (position deletes) and v3 (deletion vectors) tables
+  through an Iceberg REST catalog on S3-compatible storage.
+- The [type mappings](docs/postgres-types.md); JSON and JSONB replicate as
+  normalized JSON text.
+- Automatic schema evolution for nullable column additions and compatible
+  required-to-nullable changes. `TRUNCATE` and other incompatible changes block
+  the affected table while healthy tables continue; see
+  [table isolation](docs/table-publication-isolation.md) and
+  [operations](docs/operations.md).
+
+Not yet supported: partitioned source tables or Iceberg partition specs,
+per-table re-snapshots without resynchronizing the source, cross-table query
+atomicity, high availability, distributed compaction and Z-order compaction.
+Check [v3 reader compatibility](docs/iceberg-v3.md) and the
 [operating limits](docs/getting-started.md#recovery-and-operational-limits)
 before deploying.
-
-**Status:** local correctness and recovery integration checks pass. Performance
-qualification is incomplete; this is not yet a qualified production release.
-The [benchmark report](docs/performance.md) records measured throughput,
-publication latency, reader overhead and remaining targets.
 
 ## Documentation
 
@@ -133,7 +173,9 @@ publication latency, reader overhead and remaining targets.
 | [Getting started](docs/getting-started.md) | Build, configure, initialize and run Flow |
 | [Configuration](examples/flow.toml) | Source, storage, catalog and compaction settings |
 | [PostgreSQL type mappings](docs/postgres-types.md) | Supported application types across snapshot and CDC |
-| [Observability](docs/observability.md) | Status, watermarks, metrics and operational diagnosis |
+| [Operations](docs/operations.md) | Preflight, resynchronization, adding tables and planned maintenance |
+| [Observability](docs/observability.md) | Status, HTTP probes, watermarks, metrics and diagnosis |
+| [Upgrading](docs/upgrading.md) | Release compatibility and the upgrade procedure |
 | [Iceberg v3](docs/iceberg-v3.md) | Deletion vectors, upgrades and reader compatibility |
 | [Code guide](docs/code-guide.md) | Crate responsibilities and module layout |
 | [Integration tests](tests/production/README.md) | Service fixtures, reader checks and recovery scenarios |
@@ -145,7 +187,9 @@ Browse the [documentation index](docs/README.md) for the full set of guides.
 Bug reports, documentation improvements and code contributions are welcome.
 Read [Contributing](CONTRIBUTING.md) for development setup, checks and review
 expectations. Open an [issue](https://github.com/EmbrasureAI/flow/issues) to discuss
-substantial changes or report a bug with reproduction steps.
+substantial changes or report a bug with reproduction steps. Participation is
+governed by the [code of conduct](CODE_OF_CONDUCT.md). Report security issues
+privately as described in [SECURITY.md](SECURITY.md), not in public issues.
 
 ## License
 

@@ -196,6 +196,7 @@ pub(crate) async fn capture_loop(
             SchemaRegistry::new(store, SourceId(config.source.id.clone()), &schemas)?;
         let mut delay = Duration::from_millis(250);
         let mut journal_drained_at = None;
+        metrics::gauge!("flow_capture_journal_full").set(0.0);
         loop {
             let connected = tokio::select! {
                 _ = send.closed() => return Ok(()),

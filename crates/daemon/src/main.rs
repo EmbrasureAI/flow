@@ -2,7 +2,9 @@
 mod allocator;
 mod bootstrap;
 mod config;
+mod discover;
 mod generation;
+mod http;
 mod lifecycle;
 mod metadata_import;
 mod observation;
@@ -38,6 +40,18 @@ enum Command {
         /// Connect to the source and report its readiness without changing it.
         #[arg(long)]
         source: bool,
+    },
+    /// Print [[tables]] configuration for existing source tables (read-only).
+    /// Defaults to the configured publication's tables not yet configured.
+    Discover {
+        /// Tables as schema.table; a bare name means public.
+        tables: Vec<String>,
+        /// Discover every table in this schema instead of the publication.
+        #[arg(long, conflicts_with = "tables")]
+        schema: Option<String>,
+        /// Iceberg namespace for generated targets; defaults to the source schema.
+        #[arg(long)]
+        target_namespace: Option<String>,
     },
     /// Create a logical slot and copy a consistent initial snapshot, then exit.
     Init,
@@ -82,7 +96,11 @@ async fn run_cli() -> Result<()> {
         .json()
         .init();
     let cli = Cli::parse();
-    let config = config::Config::load(&cli.config)?;
+    let config = if matches!(cli.command, Command::Discover { .. }) {
+        config::Config::load_without_tables(&cli.config)?
+    } else {
+        config::Config::load(&cli.config)?
+    };
     #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
     if matches!(&cli.command, Command::Init | Command::Run { .. }) {
         allocator::initialize();
@@ -95,7 +113,23 @@ async fn run_cli() -> Result<()> {
             }
             Ok(())
         }
-        Command::Init => runtime::initialize(config).await,
+        Command::Discover {
+            tables,
+            schema,
+            target_namespace,
+        } => {
+            discover::discover(
+                &config,
+                &tables,
+                schema.as_deref(),
+                target_namespace.as_deref(),
+            )
+            .await
+        }
+        Command::Init => {
+            let _http = http::start(&config).await?;
+            runtime::initialize(config).await
+        }
         Command::Run { roles } => {
             anyhow::ensure!(
                 roles
@@ -107,6 +141,7 @@ async fn run_cli() -> Result<()> {
                 roles.iter().any(|r| r == "ingest") && roles.iter().any(|r| r == "coordinator"),
                 "this binary currently requires ingest and coordinator together; compactor workers are exposed through the library API"
             );
+            let _http = http::start(&config).await?;
             runtime::run(config, roles.iter().any(|r| r == "compactor")).await
         }
         Command::Status => runtime::status(config),
