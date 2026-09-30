@@ -210,6 +210,23 @@ impl TransactionSpool {
         Ok(())
     }
 
+    /// Bytes this transaction has spooled: the position of its next chunk.
+    pub fn position(&self, xid: u32) -> Result<u64> {
+        Ok(self
+            .transactions
+            .get(&xid)
+            .ok_or(Error::Protocol("position of unknown spool transaction"))?
+            .bytes)
+    }
+
+    /// The position `abort(xid, subxid)` truncates to, if the subtransaction
+    /// spooled anything: chunks at or after it do not survive that rollback.
+    pub fn savepoint(&self, xid: u32, subxid: u32) -> Option<u64> {
+        let txn = self.transactions.get(&xid)?;
+        let &index = txn.subtransactions.get(&subxid)?;
+        Some(txn.savepoints[index].bytes)
+    }
+
     /// Match PostgreSQL's serial streamed-apply rollback: truncate to the first
     /// change of the aborted subtransaction, also removing its descendants.
     /// Filtering only rows whose XID equals `subxid` would retain child changes.

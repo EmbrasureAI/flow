@@ -184,7 +184,7 @@ class ContractRun(Run):
         elif case == "non-null-default":
             self.pg.execute("ALTER TABLE orders ADD COLUMN unsafe integer DEFAULT 7")
             self.pg.execute("ALTER TABLE orders ALTER COLUMN unsafe DROP DEFAULT")
-            expected = "new columns must be nullable"
+            expected = "non-NULL ADD COLUMN default"
         elif case == "volatile-default":
             self.pg.execute("ALTER TABLE orders ADD COLUMN unsafe double precision DEFAULT random()")
             self.pg.execute("ALTER TABLE orders ALTER COLUMN unsafe DROP DEFAULT")

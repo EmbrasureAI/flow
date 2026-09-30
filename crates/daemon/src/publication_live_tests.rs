@@ -1,5 +1,6 @@
 //! The real daemon against live PostgreSQL and an in-memory Iceberg catalog:
-//! a publication change affecting one configured table blocks only that table.
+//! a publication change affecting one configured table blocks only that table,
+//! and a streamed transaction blocks a table only if it commits.
 use crate::config::Config;
 use flow_pg_source::tokio_postgres::{self, Client, NoTls};
 use futures::FutureExt;
@@ -61,8 +62,13 @@ async fn until<F: Future<Output = bool>>(description: &str, mut check: impl FnMu
     }
 }
 
-/// `change` applies a publication edit to `{name}.items`.
-async fn scenario(url: &str, sql: &Client, label: &str, change: &str) {
+/// Run `checks` against a live daemon capturing `{name}.orders` and
+/// `{name}.items`, then release its slot and drop its objects.
+async fn with_daemon<F, Fut>(url: &str, sql: &Client, label: &str, checks: F)
+where
+    F: FnOnce(Config, String) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let name = format!(
         "flow_public_block_{label}_{}",
         SystemTime::now()
@@ -122,7 +128,54 @@ async fn scenario(url: &str, sql: &Client, label: &str, change: &str) {
         crate::bootstrap::initialize(config.clone()).await.unwrap();
         let daemon = crate::runtime::run(config.clone(), false);
         tokio::pin!(daemon);
-        let checks = async {
+        tokio::select! {
+            result = &mut daemon => panic!("daemon stopped: {result:?}"),
+            () = checks(config.clone(), name.clone()) => {}
+        }
+    });
+    let result = body.catch_unwind().await;
+
+    // Dropping the daemon closes capture; always release the slot.
+    for _ in 0..100 {
+        sql.execute(
+            "SELECT pg_catalog.pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1 AND active",
+            &[&name],
+        )
+        .await
+        .unwrap();
+        let _ = sql
+            .query(
+                "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1 AND NOT active",
+                &[&name],
+            )
+            .await;
+        let remaining: i64 = sql
+            .query_one(
+                "SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if remaining == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    sql.batch_execute(&format!(
+        "DROP PUBLICATION IF EXISTS {name}; DROP SCHEMA {name} CASCADE"
+    ))
+    .await
+    .unwrap();
+    crate::services::TEST_CATALOGS.lock().unwrap().remove(&uri);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// `change` applies a publication edit to `{name}.items`.
+async fn scenario(url: &str, sql: &Client, label: &str, change: &str) {
+    with_daemon(url, sql, label, |config, name| async move {
             sql.batch_execute(&format!(
                 "BEGIN; INSERT INTO {name}.orders VALUES (2, 'before'); INSERT INTO {name}.items VALUES (2, 'before'); COMMIT"
             ))
@@ -226,50 +279,8 @@ async fn scenario(url: &str, sql: &Client, label: &str, change: &str) {
                 )
             })
             .await;
-        };
-        tokio::select! {
-            result = &mut daemon => panic!("daemon stopped: {result:?}"),
-            () = checks => {}
-        }
-    });
-    let result = body.catch_unwind().await;
-
-    // Dropping the daemon closes capture; always release the slot.
-    for _ in 0..100 {
-        sql.execute(
-            "SELECT pg_catalog.pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1 AND active",
-            &[&name],
-        )
-        .await
-        .unwrap();
-        let _ = sql
-            .query(
-                "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1 AND NOT active",
-                &[&name],
-            )
-            .await;
-        let remaining: i64 = sql
-            .query_one(
-                "SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
-                &[&name],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        if remaining == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    sql.batch_execute(&format!(
-        "DROP PUBLICATION IF EXISTS {name}; DROP SCHEMA {name} CASCADE"
-    ))
-    .await
-    .unwrap();
-    crate::services::TEST_CATALOGS.lock().unwrap().remove(&uri);
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -296,4 +307,344 @@ async fn live_publication_change_blocks_only_the_affected_table() {
     .await;
     drop(sql);
     sql_task.await.unwrap().unwrap();
+}
+
+fn blocked_tables(config: &Config) -> Vec<serde_json::Value> {
+    status(config)["blocked_tables"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn published_rows(name: &str, table: &str) -> usize {
+    use futures::TryStreamExt;
+    let catalog = crate::services::TEST_CATALOGS
+        .lock()
+        .unwrap()
+        .get(&format!("memory://{name}"))
+        .cloned()
+        .unwrap();
+    let table = catalog
+        .load_table(&iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new(name.into()),
+            table.into(),
+        ))
+        .await
+        .unwrap();
+    let mut batches = table.scan().build().unwrap().to_arrow().await.unwrap();
+    let mut rows = 0;
+    while let Some(batch) = batches.try_next().await.unwrap() {
+        rows += batch.num_rows();
+    }
+    rows
+}
+
+/// Wait until the slot's walsender decoded all WAL written so far, including
+/// an open transaction's changes. A committed message flushes that WAL.
+async fn decoded(sql: &Client, slot: &str) {
+    sql.batch_execute("SELECT pg_catalog.pg_logical_emit_message(true, 'flow-test', '')")
+        .await
+        .unwrap();
+    let mark = current(sql).await;
+    until("the walsender decodes the open transaction", || async {
+        lsn(
+            sql,
+            "SELECT (r.sent_lsn - '0/0')::bigint FROM pg_catalog.pg_stat_replication r JOIN pg_catalog.pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = $1",
+            slot,
+        )
+        .await
+            >= mark
+    })
+    .await;
+}
+
+async fn streamed_transactions(sql: &Client, slot: &str) -> i64 {
+    lsn(
+        sql,
+        "SELECT stream_txns FROM pg_catalog.pg_stat_replication_slots WHERE slot_name = $1",
+        slot,
+    )
+    .await
+}
+
+/// pgoutput streams a transaction's TRUNCATE, DDL Relation and rows once it
+/// exceeds logical_decoding_work_mem, before PostgreSQL commits or aborts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_rolled_back_streamed_changes_do_not_block_tables() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let sql = &sql;
+    // Twice the decoding budget of ~300-byte rows forces streaming.
+    let budget: i64 = sql
+        .query_one(
+            "SELECT setting::bigint * 1024 FROM pg_catalog.pg_settings WHERE name = 'logical_decoding_work_mem'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let rows = budget * 2 / 256 + 100;
+    let held_url = url.clone();
+    with_daemon(&url, sql, "streamed", |config, name| async move {
+        let fill = |from: i64| {
+            format!(
+                "INSERT INTO {name}.items SELECT g, repeat(md5(g::text), 8) FROM generate_series({from}, {}) g",
+                from + rows
+            )
+        };
+        sql.batch_execute(&format!("INSERT INTO {name}.items VALUES (2, 'before')"))
+            .await
+            .unwrap();
+        until("items publishes before the streamed transactions", || async {
+            materialized(&config, "items") > 0
+        })
+        .await;
+        let (held, connection) = tokio_postgres::connect(&held_url, NoTls).await.unwrap();
+        let held_task = tokio::spawn(connection);
+        let streamed = streamed_transactions(sql, &name).await;
+        for (open, end) in [
+            // TRUNCATE is streamed with the rows that follow it.
+            (
+                format!("BEGIN; TRUNCATE {name}.items; {}", fill(1_000_000)),
+                "ROLLBACK".to_owned(),
+            ),
+            // So is the Relation describing an incompatible column type.
+            (
+                format!(
+                    "BEGIN; ALTER TABLE {name}.items ALTER COLUMN status TYPE varchar(400); {}",
+                    fill(1_000_000)
+                ),
+                "ROLLBACK".to_owned(),
+            ),
+            // A savepoint rollback discards its TRUNCATE; the rest commits.
+            (
+                format!(
+                    "BEGIN; {}; SAVEPOINT truncated; TRUNCATE {name}.items; {}",
+                    fill(2_000_000),
+                    fill(3_000_000)
+                ),
+                format!(
+                    "ROLLBACK TO SAVEPOINT truncated; INSERT INTO {name}.items VALUES (3, 'kept'); COMMIT"
+                ),
+            ),
+        ] {
+            held.batch_execute(&open).await.unwrap();
+            // PostgreSQL skips streaming a transaction already known to have
+            // aborted, so end it only after its changes reached the daemon.
+            decoded(sql, &name).await;
+            held.batch_execute(&end).await.unwrap();
+        }
+        drop(held);
+        held_task.await.unwrap().unwrap();
+        sql.batch_execute(&format!("INSERT INTO {name}.items VALUES (4, 'after')"))
+            .await
+            .unwrap();
+        let mark = current(sql).await;
+        until("items publishes after the rolled-back streams", || async {
+            materialized(&config, "items") as i64 >= mark
+        })
+        .await;
+        until("confirmed_flush_lsn advances past the streams", || async {
+            confirmed(sql, &name).await >= mark
+        })
+        .await;
+        assert!(blocked_tables(&config).is_empty(), "{:?}", status(&config));
+        until("PostgreSQL reports the streamed transactions", || async {
+            streamed_transactions(sql, &name).await >= streamed + 3
+        })
+        .await;
+        // Seed, 2, the committed fill, 3 and 4: nothing from rolled-back work.
+        let expected = usize::try_from(rows).unwrap() + 5;
+        assert_eq!(published_rows(&name, "items").await, expected);
+
+        // Committed, the same streamed TRUNCATE blocks the table.
+        sql.batch_execute(&format!(
+            "BEGIN; TRUNCATE {name}.items; {}; COMMIT",
+            fill(4_000_000)
+        ))
+        .await
+        .unwrap();
+        until("a committed streamed TRUNCATE blocks items", || async {
+            blocked_tables(&config)
+                .iter()
+                .any(|record| record["error_code"] == "source_schema_incompatible")
+        })
+        .await;
+        let blocked = blocked_tables(&config);
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+    })
+    .await;
+    sql_task.abort();
+}
+
+/// ORM migrations add a column, then set its default or backfill it and set
+/// NOT NULL, usually before the next catalog check. Only defaults that
+/// backfill existing rows without row events block the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_column_migrations_publish_optional_fields() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let sql = &sql;
+    with_daemon(&url, sql, "migration", |config, name| async move {
+        sql.batch_execute(&format!(
+            "ALTER TABLE {name}.items ADD COLUMN note text;
+             ALTER TABLE {name}.items ALTER COLUMN note SET DEFAULT 'defaulted';
+             INSERT INTO {name}.items (id, status) VALUES (2, 'default');
+             BEGIN;
+             ALTER TABLE {name}.items ADD COLUMN flag integer;
+             UPDATE {name}.items SET flag = 1;
+             ALTER TABLE {name}.items ALTER COLUMN flag SET NOT NULL;
+             ALTER TABLE {name}.items ALTER COLUMN flag SET DEFAULT 0;
+             COMMIT;
+             INSERT INTO {name}.items (id, status) VALUES (3, 'not null');"
+        ))
+        .await
+        .unwrap();
+        let mark = current(sql).await;
+        until("items publishes the migrated rows", || async {
+            materialized(&config, "items") as i64 >= mark
+        })
+        .await;
+        // Span the five-second catalog refresh as well as commit validation.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        sql.batch_execute(&format!(
+            "INSERT INTO {name}.items (id, status) VALUES (4, 'after refresh')"
+        ))
+        .await
+        .unwrap();
+        let mark = current(sql).await;
+        until("items publishes after the catalog refresh", || async {
+            materialized(&config, "items") as i64 >= mark
+        })
+        .await;
+        assert!(blocked_tables(&config).is_empty(), "{:?}", status(&config));
+        assert_eq!(published_rows(&name, "items").await, 4);
+        let catalog = crate::services::TEST_CATALOGS
+            .lock()
+            .unwrap()
+            .get(&format!("memory://{name}"))
+            .cloned()
+            .unwrap();
+        let table = catalog
+            .load_table(&iceberg::TableIdent::new(
+                iceberg::NamespaceIdent::new(name.clone()),
+                "items".into(),
+            ))
+            .await
+            .unwrap();
+        let schema = table.metadata().current_schema();
+        for field in ["note", "flag"] {
+            // Source NOT NULL still maps to an optional field: Iceberg cannot
+            // make an existing optional field required.
+            assert!(!schema.field_by_name(field).unwrap().required, "{field}");
+        }
+    })
+    .await;
+    sql_task.abort();
+}
+
+/// DDL before a savepoint streams its Relation with the savepoint's rows. The
+/// table blocks at the commit when those rows survive; when they are rolled
+/// back, the committed DDL blocks at the next Relation or catalog refresh.
+/// Either way the other table keeps publishing and no row of the new shape
+/// reaches the blocked table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_streamed_ddl_blocks_only_when_it_commits() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let sql = &sql;
+    let budget: i64 = sql
+        .query_one(
+            "SELECT setting::bigint * 1024 FROM pg_catalog.pg_settings WHERE name = 'logical_decoding_work_mem'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let rows = budget * 2 / 256 + 100;
+    for (label, ddl, column, rolled_back) in [
+        ("rename_rb", "RENAME COLUMN status TO label", "label", true),
+        ("rename", "RENAME COLUMN status TO label", "label", false),
+        (
+            "default_rb",
+            "ADD COLUMN extra text DEFAULT 'x'",
+            "status",
+            true,
+        ),
+        (
+            "default",
+            "ADD COLUMN extra text DEFAULT 'x'",
+            "status",
+            false,
+        ),
+    ] {
+        let held_url = url.clone();
+        with_daemon(&url, sql, label, |config, name| async move {
+            sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (2, 'before')"))
+                .await
+                .unwrap();
+            let mark = current(sql).await;
+            until("both tables publish before the DDL", || async {
+                materialized(&config, "orders") as i64 >= mark
+                    && materialized(&config, "items") > 0
+            })
+            .await;
+            let items = published_rows(&name, "items").await;
+            let (held, connection) = tokio_postgres::connect(&held_url, NoTls).await.unwrap();
+            let held_task = tokio::spawn(connection);
+            held.batch_execute(&format!(
+                "BEGIN; ALTER TABLE {name}.items {ddl}; SAVEPOINT s;
+                 INSERT INTO {name}.items (id, {column}) SELECT g, repeat(md5(g::text), 8) FROM generate_series(1000, {}) g",
+                1000 + rows
+            ))
+            .await
+            .unwrap();
+            decoded(sql, &name).await;
+            // Another transaction commits while the streamed one is undecided.
+            sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (3, 'during')"))
+                .await
+                .unwrap();
+            let mark = current(sql).await;
+            until("orders publishes during the streamed DDL", || async {
+                materialized(&config, "orders") as i64 >= mark
+            })
+            .await;
+            let end = if rolled_back { "ROLLBACK TO SAVEPOINT s; COMMIT" } else { "COMMIT" };
+            held.batch_execute(end).await.unwrap();
+            drop(held);
+            held_task.await.unwrap().unwrap();
+            // A row of the committed new shape.
+            sql.batch_execute(&format!(
+                "INSERT INTO {name}.items (id, {column}) VALUES (4, 'new shape')"
+            ))
+            .await
+            .unwrap();
+            until("the committed DDL blocks items", || async {
+                blocked_tables(&config)
+                    .iter()
+                    .any(|record| record["error_code"] == "source_schema_incompatible")
+            })
+            .await;
+            let blocked = blocked_tables(&config);
+            assert_eq!(blocked.len(), 1, "{label}: {blocked:?}");
+            sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (5, 'after')"))
+                .await
+                .unwrap();
+            let mark = current(sql).await;
+            until("orders keeps publishing after the block", || async {
+                materialized(&config, "orders") as i64 >= mark
+            })
+            .await;
+            assert_eq!(published_rows(&name, "items").await, items, "{label}");
+            assert_eq!(published_rows(&name, "orders").await, 4, "{label}");
+        })
+        .await;
+    }
+    sql_task.abort();
 }
