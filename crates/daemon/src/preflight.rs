@@ -45,8 +45,11 @@ pub(crate) async fn check_source(config: &Config) -> Result<()> {
 }
 
 async fn run(config: &Config, report: &mut Report) {
-    if let Some(pg) = crate::source_tls::configured(config) {
-        source_tls(&pg, report);
+    if let Some(pg) = crate::source_tls::configured(config)
+        && !source_tls(&pg, report)
+    {
+        // The connection would fail with the same TLS configuration error.
+        return;
     }
     let mut sql = match connect(config, false).await {
         Ok(sql) => sql,
@@ -73,9 +76,11 @@ async fn run(config: &Config, report: &mut Report) {
 }
 
 /// Defaults stay libpq-compatible, so opportunistic TLS is only a warning.
-fn source_tls(pg: &flow_pg_source::tokio_postgres::Config, report: &mut Report) {
+/// Returns false when the TLS configuration itself is invalid.
+fn source_tls(pg: &flow_pg_source::tokio_postgres::Config, report: &mut Report) -> bool {
     if let Err(error) = crate::source_tls::connector(pg) {
-        return report.add(Level::Fail, "source TLS", format!("{error:#}"));
+        report.add(Level::Fail, "source TLS", format!("{error:#}"));
+        return false;
     }
     match crate::source_tls::weakness(pg) {
         Some(weakness) => report.add(
@@ -89,6 +94,7 @@ fn source_tls(pg: &flow_pg_source::tokio_postgres::Config, report: &mut Report) 
             "server authenticated, or the connection does not leave this host",
         ),
     }
+    true
 }
 
 async fn server(sql: &Client, config: &Config, report: &mut Report) -> Result<i32> {
@@ -555,7 +561,8 @@ mod tests {
             ("host=db.example.com sslmode=verify-ca", Level::Fail),
         ] {
             let mut report = Report::default();
-            source_tls(&settings.parse().unwrap(), &mut report);
+            let usable = source_tls(&settings.parse().unwrap(), &mut report);
+            assert_eq!(usable, level != Level::Fail, "{settings}");
             assert_eq!(report.count(level), 1, "{settings}");
             assert_eq!(report.0.len(), 1);
         }

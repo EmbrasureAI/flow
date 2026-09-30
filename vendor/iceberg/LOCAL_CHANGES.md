@@ -62,6 +62,7 @@ patch -p1 < docs/patches/iceberg-delete-cache.patch
 patch -p1 < docs/patches/iceberg-parquet-row-group.patch
 patch -p1 < docs/patches/iceberg-uuid.patch
 patch -p1 < docs/patches/iceberg-v3.patch
+patch -p1 < docs/patches/iceberg-debug-redaction.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is
@@ -76,7 +77,8 @@ fence concurrent catalog schema edits. Changed file:
 
 `StorageConfig` formats its properties in `Debug` output as key names with
 redacted values, since they carry object-store credentials; `FileIO` and
-`FileIOBuilder` print it. Changed file: `src/io/storage/config/mod.rs`.
+`FileIOBuilder` print it. Changed file: `src/io/storage/config/mod.rs`. See
+`docs/patches/iceberg-debug-redaction.patch`.
 
 `src/puffin/deletion_vector.rs` is new Embrasure Flow code added by the v3 patch,
 not Apache Software Foundation code; it carries its own Apache-2.0 header.

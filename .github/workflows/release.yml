@@ -3,8 +3,8 @@ name: Release
 # at ghcr.io/<owner>/flow for a version tag. The tag must match the workspace
 # version and have a CHANGELOG.md entry. Tags with a hyphen are prereleases
 # and do not move the `latest` image tag; neither does any version below the
-# highest released version. Re-running for an existing release refuses to
-# overwrite its assets unless replace_assets is set.
+# highest released version. Re-publishing an existing release fails in verify,
+# before any build or image push, unless replace_assets is set.
 on:
   push:
     tags: ['v*']
@@ -27,6 +27,7 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -41,12 +42,17 @@ jobs:
         name: Match tag, workspace version and changelog
         env:
           GH_TOKEN: ${{ github.token }}
+          REPLACE_ASSETS: ${{ github.event.inputs.replace_assets == 'true' }}
         run: |
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::$TAG is not a version tag such as v0.1.0"; exit 1
           fi
           if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null; then
             echo "::error::tag $TAG does not exist"; exit 1
+          fi
+          # Fail before building or moving any image tag, not in the final job.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$REPLACE_ASSETS" != true ]; then
+            echo "::error::release $TAG already exists; rerun with replace_assets to republish it"; exit 1
           fi
           version="${TAG#v}"
           workspace=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)

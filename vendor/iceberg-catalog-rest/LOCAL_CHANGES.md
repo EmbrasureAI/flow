@@ -38,6 +38,7 @@ patch -p1 < docs/patches/iceberg-rest-retryable-status.patch
 patch -p3 < docs/patches/iceberg-rest-observability.patch
 patch -p3 < docs/patches/iceberg-rest-format-version.patch
 patch -p3 < docs/patches/iceberg-rest-response-redaction.patch
+patch -p3 < docs/patches/iceberg-rest-debug-redaction.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is
@@ -47,4 +48,4 @@ uses its root Cargo.lock. No upstream submission is claimed.
 `RestCatalogConfig` formats its properties in `Debug` output as key names with
 redacted values, since they carry the OAuth credential, bearer token and storage
 secrets. `RestCatalogBuilder` and `RestCatalog` print it. This changes
-`src/catalog.rs`.
+`src/catalog.rs`; see `docs/patches/iceberg-rest-debug-redaction.patch`.

@@ -15,7 +15,8 @@ const MAX_REQUEST_BYTES: usize = 8 << 10;
 /// release their connection slot quickly.
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CONNECTIONS: usize = 256;
+/// Each connection holds a file descriptor alongside RocksDB's open files.
+const MAX_CONNECTIONS: usize = 64;
 
 /// Aborts the listener when the command that started it returns.
 pub(crate) struct Server(tokio::task::JoinHandle<()>);
@@ -236,7 +237,7 @@ mod tests {
 
         // More idle connections than the former 16-slot cap.
         let mut idle = Vec::new();
-        for _ in 0..64 {
+        for _ in 0..32 {
             idle.push(TcpStream::connect(address).await.unwrap());
         }
         let mut slow = TcpStream::connect(address).await.unwrap();

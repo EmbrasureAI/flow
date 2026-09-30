@@ -91,11 +91,14 @@ fn main() -> Result<()> {
 }
 
 async fn run_cli() -> Result<()> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     tracing_subscriber::fmt()
-        .with_env_filter(hardening::cap_secret_logs(
+        .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        ))
+        )
         .json()
+        .finish()
+        .with(hardening::secret_log_filter())
         .init();
     let cli = Cli::parse();
     let config = if matches!(cli.command, Command::Discover { .. }) {

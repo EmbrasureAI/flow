@@ -131,7 +131,9 @@ and object access to read, write, list and delete its files. Use a persistent,
 writable `state_dir`; do not share it between running Flow processes. It holds
 replicated row data, so Flow creates it and every file in it readable only by
 the user running Flow, and removes group and other access from an existing
-`state_dir` owned by that user.
+`state_dir` owned by that user. On shared volumes such as Kubernetes volumes
+with `fsGroup`, use a subdirectory like `/data/state`; see
+[security](../SECURITY.md#deployment).
 
 `check` validates the configuration locally. `check --source` also connects to
 PostgreSQL read-only and reports server settings, slot and sender capacity,

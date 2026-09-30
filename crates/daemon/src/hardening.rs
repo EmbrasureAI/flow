@@ -3,27 +3,19 @@
 //! everything Flow creates inside it are private to the service user.
 use anyhow::{Context, Result};
 use std::path::Path;
-use tracing_subscriber::EnvFilter;
+use tracing::{Level, Metadata};
+use tracing_subscriber::filter::{FilterFn, filter_fn};
 
-/// Log targets capped at INFO whatever `RUST_LOG` requests. reqsign's DEBUG
+/// Global filter layer that drops reqsign records above INFO whatever
+/// `RUST_LOG` requests, including span and field directives. reqsign's DEBUG
 /// records print credential providers with `{:?}`, and its static AWS provider
-/// derives `Debug` over the secret access key. A `RUST_LOG` directive for the
-/// same target is replaced, so each crate and the leaking module are listed.
-const LOG_CAPS: &[&str] = &[
-    "reqsign=info",
-    "reqsign_core=info",
-    "reqsign_core::api=info",
-    "reqsign_aws_core=info",
-    "reqsign_aws_v4=info",
-    "reqsign_file_read_tokio=info",
-];
-
-/// Apply [`LOG_CAPS`] after the operator's filter so they take precedence.
-pub(crate) fn cap_secret_logs(mut filter: EnvFilter) -> EnvFilter {
-    for directive in LOG_CAPS {
-        filter = filter.add_directive(directive.parse().expect("static log directive"));
+/// derives `Debug` over the secret access key. Add it to the subscriber with
+/// `SubscriberExt::with`; other targets keep the operator's filter.
+pub(crate) fn secret_log_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
+    fn allowed(metadata: &Metadata<'_>) -> bool {
+        !(metadata.target().starts_with("reqsign") && *metadata.level() > Level::INFO)
     }
-    filter
+    filter_fn(allowed as fn(&Metadata<'_>) -> bool)
 }
 
 /// Create every file and directory owner-only (0600/0700), including RocksDB
@@ -32,6 +24,31 @@ pub(crate) fn cap_secret_logs(mut filter: EnvFilter) -> EnvFilter {
 pub(crate) fn restrict_umask() {
     #[cfg(unix)]
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+}
+
+/// What to do about an existing state directory's permissions.
+#[derive(Debug, PartialEq, Eq)]
+enum Access {
+    Private,
+    /// Owned by this user: remove group and other access.
+    Tighten,
+    /// Owned by root, as with orchestrator volumes shared through a group
+    /// (for example Kubernetes `fsGroup` mounts): report but continue.
+    Warn,
+    /// Another user can replace Flow's state: refuse to start.
+    Refuse,
+}
+
+fn access(mode: u32, owner: u32, euid: u32) -> Access {
+    if mode & 0o077 == 0 {
+        Access::Private
+    } else if owner == euid {
+        Access::Tighten
+    } else if owner != 0 && mode & 0o022 != 0 {
+        Access::Refuse
+    } else {
+        Access::Warn
+    }
 }
 
 /// Create the state directory owner-only and tighten one this user owns that
@@ -46,36 +63,51 @@ pub(crate) fn secure_state_dir(path: &Path) -> Result<()> {
             .mode(0o700)
             .create(path)
             .with_context(|| format!("create state_dir {}", path.display()))?;
-        let metadata = std::fs::metadata(path)
+        // Inspect and change the directory through one descriptor (fstat and
+        // fchmod), so a concurrent rename cannot redirect the change. A
+        // symlinked state_dir is followed, as every other state access does.
+        let directory = std::fs::File::open(path)
+            .with_context(|| format!("open state_dir {}", path.display()))?;
+        let metadata = directory
+            .metadata()
             .with_context(|| format!("inspect state_dir {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "state_dir {} is not a directory",
+            path.display()
+        );
         let mode = metadata.mode() & 0o7777;
-        if mode & 0o077 == 0 {
-            return Ok(());
-        }
         let path = path.display().to_string();
-        if metadata.uid() != rustix::process::geteuid().as_raw() {
-            tracing::warn!(
+        match access(mode, metadata.uid(), rustix::process::geteuid().as_raw()) {
+            Access::Private => {}
+            Access::Refuse => anyhow::bail!(
+                "state_dir {path} is owned by uid {} and writable by other users (mode {mode:04o}), so another user could replace Flow's state; make it owned by the Flow service user, or set state_dir to a subdirectory Flow creates, such as /data/state",
+                metadata.uid()
+            ),
+            Access::Warn => tracing::warn!(
                 state_dir = path,
                 mode = format!("{mode:04o}"),
-                "state_dir holds replicated row data but is accessible to other users and owned by a different user; restrict it to the Flow service user"
-            );
-            return Ok(());
-        }
-        // Tightening is a protection, not a precondition: an unsupported
-        // filesystem must not stop an existing deployment.
-        match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & !0o077)) {
-            Ok(()) => tracing::warn!(
-                state_dir = path,
-                previous_mode = format!("{mode:04o}"),
-                mode = format!("{:04o}", mode & !0o077),
-                "removed group and other access from state_dir, which holds replicated row data"
+                "state_dir holds replicated row data but is accessible to other users and owned by a different user; restrict it, or set state_dir to a subdirectory Flow creates, such as /data/state"
             ),
-            Err(error) => tracing::warn!(
-                state_dir = path,
-                mode = format!("{mode:04o}"),
-                %error,
-                "state_dir holds replicated row data but is accessible to other users and could not be restricted"
-            ),
+            // Tightening is a protection, not a precondition: an unsupported
+            // filesystem must not stop an existing deployment.
+            Access::Tighten => {
+                let tightened = mode & !0o077;
+                match directory.set_permissions(std::fs::Permissions::from_mode(tightened)) {
+                    Ok(()) => tracing::warn!(
+                        state_dir = path,
+                        previous_mode = format!("{mode:04o}"),
+                        mode = format!("{tightened:04o}"),
+                        "removed group and other access from state_dir, which holds replicated row data"
+                    ),
+                    Err(error) => tracing::warn!(
+                        state_dir = path,
+                        mode = format!("{mode:04o}"),
+                        %error,
+                        "state_dir holds replicated row data but is accessible to other users and could not be restricted"
+                    ),
+                }
+            }
         }
     }
     #[cfg(not(unix))]
@@ -102,6 +134,19 @@ mod tests {
         }
     }
 
+    fn capture(requested: &str, emit: impl FnOnce()) -> String {
+        use tracing_subscriber::layer::SubscriberExt;
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(requested))
+            .with_writer(move || writer.clone())
+            .finish()
+            .with(secret_log_filter());
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+    }
+
     #[test]
     fn debug_logging_never_enables_credential_provider_records() {
         for requested in [
@@ -111,35 +156,35 @@ mod tests {
             "info,reqsign_core=debug",
             "info,reqsign_core::api=trace",
             "info,reqsign_core::api=debug,reqsign_aws_core=trace",
+            "info,reqsign_aws_core::provide_credential::process=trace",
+            // Span and field directives are matched separately from targets.
+            "info,[outer]=trace",
+            "info,[outer{secret}]=trace",
         ] {
-            let captured = Captured::default();
-            let writer = captured.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_env_filter(cap_secret_logs(EnvFilter::new(requested)))
-                .with_writer(move || writer.clone())
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
+            let output = capture(requested, || {
+                let span = tracing::info_span!("outer", secret = true);
+                let _entered = span.enter();
                 tracing::debug!(target: "reqsign_core::api", "provider secret-access-key");
-                tracing::trace!(target: "reqsign_aws_core::provide_credential", "secret process");
+                tracing::trace!(
+                    target: "reqsign_aws_core::provide_credential::process",
+                    "secret process"
+                );
                 tracing::info!(target: "reqsign_core::api", "provider info kept");
                 tracing::info!(target: "flow_daemon", "flow info kept");
             });
-            let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-            assert!(!output.contains("secret"), "{requested}: {output}");
+            assert!(
+                !output.contains("secret-access-key"),
+                "{requested}: {output}"
+            );
+            assert!(!output.contains("secret process"), "{requested}: {output}");
             assert!(output.contains("provider info kept"), "{requested}");
             assert!(output.contains("flow info kept"), "{requested}");
         }
         // Other targets still honor the operator's level.
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(cap_secret_logs(EnvFilter::new("debug")))
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        let output = capture("debug", || {
             tracing::debug!(target: "flow_daemon", "flow debug kept");
         });
-        assert!(String::from_utf8_lossy(&captured.0.lock().unwrap()).contains("flow debug kept"));
+        assert!(output.contains("flow debug kept"));
     }
 
     #[tokio::test]
@@ -179,6 +224,24 @@ mod tests {
                 assert!(!debug.contains(value), "{debug}");
             }
         }
+    }
+
+    #[test]
+    fn foreign_writable_state_dirs_are_refused_but_shared_root_mounts_are_not() {
+        const FLOW: u32 = 1000;
+        const OTHER: u32 = 1001;
+        assert_eq!(access(0o700, FLOW, FLOW), Access::Private);
+        assert_eq!(access(0o700, OTHER, FLOW), Access::Private);
+        assert_eq!(access(0o755, FLOW, FLOW), Access::Tighten);
+        assert_eq!(access(0o777, FLOW, FLOW), Access::Tighten);
+        assert_eq!(access(0o755, OTHER, FLOW), Access::Warn);
+        assert_eq!(access(0o775, OTHER, FLOW), Access::Refuse);
+        assert_eq!(access(0o757, OTHER, FLOW), Access::Refuse);
+        // Root-owned group volumes, such as Kubernetes fsGroup mounts.
+        assert_eq!(access(0o2775, 0, FLOW), Access::Warn);
+        assert_eq!(access(0o777, 0, FLOW), Access::Warn);
+        // Running as root owns root-owned directories.
+        assert_eq!(access(0o755, 0, 0), Access::Tighten);
     }
 
     #[cfg(unix)]

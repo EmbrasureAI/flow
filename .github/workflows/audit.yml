@@ -24,6 +24,6 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
       # Invoke the binary directly: no Rust toolchain is needed to read Cargo.lock.
       - run: cargo-audit audit

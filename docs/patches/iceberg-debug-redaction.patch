@@ -1,0 +1,35 @@
+diff --git a/src/io/storage/config/mod.rs b/src/io/storage/config/mod.rs
+index 2350aab..12c71b2 100644
+--- a/src/io/storage/config/mod.rs
++++ b/src/io/storage/config/mod.rs
+@@ -1,3 +1,4 @@
++// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+@@ -51,12 +52,24 @@ use serde::{Deserialize, Serialize};
+ /// which storage backend to use. The storage type is determined by the
+ /// explicit factory selection.
+ /// ```
+-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+ pub struct StorageConfig {
+     /// Configuration properties for the storage backend
+     props: HashMap<String, String>,
+ }
+ 
++/// Properties carry storage credentials, so debug output names the configured
++/// keys without their values. `FileIO` and its builder print this type.
++impl std::fmt::Debug for StorageConfig {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let props: std::collections::BTreeMap<_, _> =
++            self.props.keys().map(|key| (key, "<redacted>")).collect();
++        f.debug_struct("StorageConfig")
++            .field("props", &props)
++            .finish()
++    }
++}
++
+ impl StorageConfig {
+     /// Create a new empty StorageConfig.
+     pub fn new() -> Self {
