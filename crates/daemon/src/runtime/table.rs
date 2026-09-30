@@ -36,8 +36,11 @@ async fn discard_unowned_spool(store: StateStore, operation: OperationId) -> Res
 /// consecutive failure. CDC for the table and every other table continues.
 const METADATA_RETRY_MIN: Duration = Duration::from_secs(30);
 const METADATA_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
-/// Mandatory work that could not get under its limit (for example, history
-/// pinned by checkpoints) is not retried with every epoch.
+/// Consecutive failures of one task after which it is reported as failing
+/// (`flow_table_maintenance_failing` and an ERROR log) until it succeeds.
+const METADATA_FAILURE_ESCALATION: u32 = 5;
+/// A mandatory manifest rewrite that could not get under its hard limit is
+/// not retried with every epoch.
 const MANDATORY_METADATA_STALL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,8 +64,9 @@ impl MetadataTask {
 enum MetadataScope {
     /// Everything due, including garbage collection.
     Full,
-    /// Only work past a hard limit. It reduces commit cost, so it runs with
-    /// CDC even while source pressure suppresses optional maintenance.
+    /// Only work past a hard limit. It reduces commit cost, so it runs in the
+    /// publication path even while source pressure suppresses optional
+    /// maintenance.
     Mandatory,
 }
 
@@ -89,7 +93,8 @@ impl MetadataBackoff {
                 .is_some_and(|until| now < *until)
     }
 
-    fn fail(&mut self, id: TableId, task: MetadataTask, now: Instant) -> Duration {
+    /// Returns the retry delay and the number of consecutive failures.
+    fn fail(&mut self, id: TableId, task: MetadataTask, now: Instant) -> (Duration, u32) {
         let failures = self
             .failures
             .get(&(id, task))
@@ -98,11 +103,14 @@ impl MetadataBackoff {
             .saturating_mul(1 << failures.saturating_sub(1).min(8))
             .min(METADATA_RETRY_MAX);
         self.failures.insert((id, task), (now + delay, failures));
-        delay
+        (delay, failures)
     }
 
-    fn succeed(&mut self, id: TableId, task: MetadataTask) {
-        self.failures.remove(&(id, task));
+    /// Returns the number of consecutive failures this success ends.
+    fn succeed(&mut self, id: TableId, task: MetadataTask) -> u32 {
+        self.failures
+            .remove(&(id, task))
+            .map_or(0, |(_, failures)| failures)
     }
 
     fn stall(&mut self, id: TableId, task: MetadataTask, until: Instant) {
@@ -119,6 +127,19 @@ fn local_failure(error: &anyhow::Error) -> bool {
             || cause.is::<flow_model::ModelError>()
     }) || error.chain().any(|cause| cause.is::<std::io::Error>())
         && !error.chain().any(|cause| cause.is::<reqwest::Error>())
+}
+
+async fn manifest_count(table: &Table) -> Result<usize> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(0);
+    };
+    Ok(table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await?
+        .consume_entries()
+        .into_iter()
+        .count())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -228,7 +249,8 @@ pub(super) enum TableOutcome {
 }
 
 enum MaintenanceOutcome {
-    Complete(Table, MaintenancePending),
+    /// The head, pending work and its current manifest count.
+    Complete(Table, MaintenancePending, usize),
     Build(StartedBuild),
     Deferred,
 }
@@ -825,7 +847,7 @@ impl TableWork {
             );
             let inventory = self.maintenance.inventory(&current, id).await?;
             crate::observation::table_inventory(id, &inventory);
-            let (_, continuation) = self
+            let (_, continuation, _) = self
                 .maintain_metadata(current, id, inventory.manifest_count, MetadataScope::Full)
                 .await?;
             tracing::info!(
@@ -900,7 +922,7 @@ impl TableWork {
                 }
             }
         }
-        let (current, maintenance_pending) = match self
+        let (current, mut maintenance_pending, manifests) = match self
             .maintain(
                 current,
                 &schema,
@@ -910,7 +932,7 @@ impl TableWork {
             )
             .await?
         {
-            MaintenanceOutcome::Complete(table, pending) => (table, pending),
+            MaintenanceOutcome::Complete(table, pending, manifests) => (table, pending, manifests),
             MaintenanceOutcome::Build(build) => return Ok(TableOutcome::Build(Box::new(build))),
             MaintenanceOutcome::Deferred => return Ok(TableOutcome::Deferred),
         };
@@ -929,6 +951,7 @@ impl TableWork {
         let prepare_epoch = epoch.clone();
         let prepare_transactions = transactions.clone();
         let prepare_table = current.clone();
+        let reader = self.reader.clone();
         let collapse_limits = CollapseLimits {
             batch_rows: self.config.limits.batch_rows,
             batch_bytes: self.config.limits.batch_bytes,
@@ -937,7 +960,7 @@ impl TableWork {
         let collapsed = tokio::task::spawn_blocking(move || {
             collapse_epoch(
                 &store,
-                &self.reader,
+                &reader,
                 &prepare_table,
                 &prepare_schema,
                 &prepare_epoch,
@@ -956,6 +979,13 @@ impl TableWork {
             collapse_memory_peak_known = collapsed.memory_peak_bytes().is_some(),
             "epoch mutations collapsed against the row index");
         let snapshot = self.publisher.publish(&current, &schema, collapsed).await?;
+        if !options.build_active
+            && let Some(periodic) = self
+                .maintain_after_publication(&current, id, manifests)
+                .await?
+        {
+            maintenance_pending.periodic = periodic;
+        }
         Ok(TableOutcome::Complete {
             operation: Some(epoch.id.clone()),
             snapshot,
@@ -1047,13 +1077,16 @@ impl TableWork {
             if rewritten.is_none() {
                 let soft = pressure == flow_compactor::PublicationPressure::Delay;
                 if soft && options.build_admission == BuildAdmission::Wait {
-                    let periodic = self.metadata_due(&current, id, inventory.manifest_count)?;
+                    let periodic = self
+                        .metadata_due(&current, id, inventory.manifest_count)
+                        .await?;
                     return Ok(MaintenanceOutcome::Complete(
                         current,
                         MaintenancePending {
                             data: true,
                             periodic,
                         },
+                        inventory.manifest_count,
                     ));
                 }
                 if data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
@@ -1086,24 +1119,20 @@ impl TableWork {
             return Err(flow_compactor::Error::MaintenanceRequired.into());
         }
         if !optional {
-            let (current, _) = self
-                .maintain_metadata(
-                    current,
-                    id,
-                    inventory.manifest_count,
-                    MetadataScope::Mandatory,
-                )
+            // Mandatory metadata work runs after this epoch is published.
+            let periodic = self
+                .metadata_due(&current, id, inventory.manifest_count)
                 .await?;
-            let periodic = self.metadata_due(&current, id, inventory.manifest_count)?;
             return Ok(MaintenanceOutcome::Complete(
                 current,
                 MaintenancePending {
                     data: self.compaction && pressure == flow_compactor::PublicationPressure::Delay,
                     periodic,
                 },
+                inventory.manifest_count,
             ));
         }
-        let (current, continuation) = self
+        let (current, continuation, manifests) = self
             .maintain_metadata(current, id, inventory.manifest_count, MetadataScope::Full)
             .await?;
         Ok(MaintenanceOutcome::Complete(
@@ -1112,7 +1141,50 @@ impl TableWork {
                 data: false,
                 periodic: continuation,
             },
+            manifests,
         ))
+    }
+
+    /// History and manifests far past their limits make every commit slower.
+    /// Reduce them in the publication path, after the epoch is published, so
+    /// source pressure (which suppresses optional maintenance) cannot let them
+    /// grow without bound. `published` is the head this epoch was published
+    /// on. Returns the refreshed periodic flag when any work ran. A failure
+    /// never changes the published epoch's outcome; only local state failures
+    /// stop the daemon.
+    async fn maintain_after_publication(
+        &self,
+        published: &Table,
+        id: TableId,
+        manifests: usize,
+    ) -> Result<Option<bool>> {
+        let result = async {
+            if !self.manifests_due(id, manifests, MetadataScope::Mandatory)?
+                && !self
+                    .history_due(published, id, MetadataScope::Mandatory)
+                    .await?
+            {
+                return Ok(None);
+            }
+            let current = self.catalog.load_table(published.identifier()).await?;
+            let (current, _, manifests) = self
+                .maintain_metadata(current, id, manifests, MetadataScope::Mandatory)
+                .await?;
+            Ok(Some(self.metadata_due(&current, id, manifests).await?))
+        }
+        .await;
+        match result {
+            Err(error) if !local_failure(&error) => {
+                tracing::warn!(
+                    event = "post_publication_maintenance_deferred",
+                    table_id = id.0,
+                    %error,
+                    "mandatory metadata maintenance after publication deferred"
+                );
+                Ok(None)
+            }
+            result => result,
+        }
     }
 
     fn backoff(&self) -> Result<std::sync::MutexGuard<'_, MetadataBackoff>> {
@@ -1139,8 +1211,8 @@ impl TableWork {
     }
 
     fn manifests_due(&self, id: TableId, manifests: usize, scope: MetadataScope) -> Result<bool> {
-        let now = Instant::now();
         let limit = self.config.limits.manifest_max_count;
+        let now = Instant::now();
         Ok(match scope {
             MetadataScope::Full => {
                 manifests >= limit
@@ -1149,6 +1221,7 @@ impl TableWork {
                         .failed_until(id, MetadataTask::Manifests, now)
             }
             // Manifest count drives the cost of every commit and scan plan.
+            // A stalled rewrite is continued by periodic maintenance only.
             MetadataScope::Mandatory => {
                 manifests >= limit.saturating_mul(2)
                     && !self
@@ -1158,41 +1231,66 @@ impl TableWork {
         })
     }
 
-    fn history_due(&self, table: &Table, id: TableId, scope: MetadataScope) -> Result<bool> {
-        if !self.config.limits.snapshot_expiration {
+    /// Plans against `table` with every protection the actor knows about, so
+    /// history held by checkpoints, the retain floor or table policy is not
+    /// due. A history plan is a few local reads; it needs no catalog request.
+    async fn history_due(&self, table: &Table, id: TableId, scope: MetadataScope) -> Result<bool> {
+        if !self.config.limits.snapshot_expiration
+            || self
+                .backoff()?
+                .stalled_until(id, MetadataTask::History, Instant::now())
+        {
             return Ok(false);
         }
-        let policy = self.config.limits.history_policy();
-        let now = Instant::now();
+        let checkpoints = self.control.checkpoints()?;
+        if unresolved_initial(id, &checkpoints) {
+            return Ok(false);
+        }
+        let protected = flow_coordinator::GarbageProtection::from_checkpoints(id, &checkpoints);
+        let Some(plan) = self
+            .maintenance
+            .history_plan(
+                table,
+                id,
+                &self.config.limits.history_policy(),
+                &protected.snapshots,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
         Ok(match scope {
-            MetadataScope::Full => {
-                policy.due(table.metadata())?
-                    && !self.backoff()?.failed_until(id, MetadataTask::History, now)
-            }
-            MetadataScope::Mandatory => {
-                policy.over_limit(table.metadata())?
-                    && !self
-                        .backoff()?
-                        .stalled_until(id, MetadataTask::History, now)
-            }
+            MetadataScope::Full => plan.due(),
+            MetadataScope::Mandatory => plan.over_limit(),
         })
     }
 
-    fn metadata_due(&self, table: &Table, id: TableId, manifests: usize) -> Result<bool> {
+    async fn metadata_due(&self, table: &Table, id: TableId, manifests: usize) -> Result<bool> {
         Ok(self.manifests_due(id, manifests, MetadataScope::Full)?
-            || self.history_due(table, id, MetadataScope::Full)?
-            || self.garbage_due(id)?)
+            || self.garbage_due(id)?
+            || self.history_due(table, id, MetadataScope::Full).await?)
     }
 
     /// Record the outcome of one metadata maintenance task. A table-scoped
     /// failure is logged, counted and retried later; `None` is returned and
-    /// publication continues. Local failures and replans keep their existing
+    /// CDC continues. After repeated failures the task is reported as failing
+    /// until it succeeds. Local failures and replans keep their existing
     /// handling. A failure that left an operation for recovery blocks only
     /// this table until the operation is resolved.
     fn settle<T>(&self, id: TableId, task: MetadataTask, result: Result<T>) -> Result<Option<T>> {
         let error = match result {
             Ok(value) => {
-                self.backoff()?.succeed(id, task);
+                if self.backoff()?.succeed(id, task) >= METADATA_FAILURE_ESCALATION {
+                    tracing::info!(
+                        event = "metadata_maintenance_recovered",
+                        table_id = id.0,
+                        task = task.name(),
+                        "table metadata maintenance succeeded again"
+                    );
+                }
+                metrics::gauge!("flow_table_maintenance_failing",
+                    "table_id" => id.0.to_string(), "task" => task.name())
+                .set(0.0);
                 return Ok(Some(value));
             }
             Err(error) => error,
@@ -1200,18 +1298,34 @@ impl TableWork {
         if local_failure(&error) || error.downcast_ref::<ReplanRequired>().is_some() {
             return Err(error);
         }
-        let delay = self.backoff()?.fail(id, task, Instant::now());
+        let (delay, failures) = self.backoff()?.fail(id, task, Instant::now());
         metrics::counter!("flow_metadata_maintenance_failures_total",
             "table_id" => id.0.to_string(), "task" => task.name())
         .increment(1);
-        tracing::warn!(
-            event = "metadata_maintenance_failed",
-            table_id = id.0,
-            task = task.name(),
-            retry_in_secs = delay.as_secs(),
-            %error,
-            "table metadata maintenance failed; retrying later without stopping CDC"
-        );
+        if failures >= METADATA_FAILURE_ESCALATION {
+            metrics::gauge!("flow_table_maintenance_failing",
+                "table_id" => id.0.to_string(), "task" => task.name())
+            .set(1.0);
+            tracing::error!(
+                event = "metadata_maintenance_failing",
+                table_id = id.0,
+                task = task.name(),
+                failures,
+                retry_in_secs = delay.as_secs(),
+                %error,
+                "table metadata maintenance keeps failing; CDC continues but this task needs attention"
+            );
+        } else {
+            tracing::warn!(
+                event = "metadata_maintenance_failed",
+                table_id = id.0,
+                task = task.name(),
+                failures,
+                retry_in_secs = delay.as_secs(),
+                %error,
+                "table metadata maintenance failed; retrying later without stopping CDC"
+            );
+        }
         if self.store.table_state(&id)?.pending_operation.is_some() {
             return Err(error.context(flow_compactor::Error::MaintenanceRequired));
         }
@@ -1220,15 +1334,17 @@ impl TableWork {
 
     /// Run on the table actor independently of soft data debt. Garbage collection
     /// visits one bounded page, then yields before its continuation is admitted.
+    /// Returns the head, whether garbage collection continues, and the head's
+    /// manifest count.
     async fn maintain_metadata(
         &self,
         mut current: Table,
         id: TableId,
-        manifests: usize,
+        mut manifests: usize,
         scope: MetadataScope,
-    ) -> Result<(Table, bool)> {
+    ) -> Result<(Table, bool, usize)> {
         let manifests_due = self.manifests_due(id, manifests, scope)?;
-        let history_due = self.history_due(&current, id, scope)?;
+        let history_due = self.history_due(&current, id, scope).await?;
         let garbage_due = scope == MetadataScope::Full && self.garbage_due(id)?;
         if manifests_due {
             let result = self
@@ -1243,24 +1359,27 @@ impl TableWork {
                 )
                 .await;
             let rewritten = self.settle(id, MetadataTask::Manifests, result)?;
-            if scope == MetadataScope::Mandatory && matches!(rewritten, Some(None)) {
+            current = self.catalog.load_table(current.identifier()).await?;
+            if rewritten.is_some() {
+                // Later due checks must not act on the stale inventory count.
+                manifests = manifest_count(&current).await?;
+            }
+            // One bounded rewrite may leave the table above the hard limit.
+            // Periodic maintenance continues; the epoch path waits.
+            if scope == MetadataScope::Mandatory
+                && rewritten.is_some()
+                && manifests >= self.config.limits.manifest_max_count.saturating_mul(2)
+            {
                 self.backoff()?.stall(
                     id,
                     MetadataTask::Manifests,
                     Instant::now() + MANDATORY_METADATA_STALL,
                 );
             }
-            current = self.catalog.load_table(current.identifier()).await?;
         }
         if history_due {
             let checkpoints = self.control.checkpoints()?;
-            let unresolved_initial = checkpoints
-                .iter()
-                .flat_map(|checkpoint| &checkpoint.pending_operations)
-                .any(|record| {
-                    record.operation.table_id == id && record.operation.base_snapshot_id.is_none()
-                });
-            if !unresolved_initial {
+            if !unresolved_initial(id, &checkpoints) {
                 let protected =
                     flow_coordinator::GarbageProtection::from_checkpoints(id, &checkpoints);
                 let policy = self.config.limits.history_policy();
@@ -1268,25 +1387,11 @@ impl TableWork {
                     .maintenance
                     .expire_history(&current, id, &policy, &protected.snapshots)
                     .await;
-                let expired = self.settle(id, MetadataTask::History, result)?;
+                // The plan counts only removable snapshots, so a successful
+                // expiration leaves nothing mandatory; protected history above
+                // the cap is reported by `flow_snapshots_over_cap`.
+                self.settle(id, MetadataTask::History, result)?;
                 current = self.catalog.load_table(current.identifier()).await?;
-                if scope == MetadataScope::Mandatory
-                    && expired.is_some()
-                    && policy.over_limit(current.metadata())?
-                {
-                    tracing::warn!(
-                        event = "snapshot_limit_unreachable",
-                        table_id = id.0,
-                        snapshots = current.metadata().snapshots().len(),
-                        limit = policy.max_snapshots,
-                        "protected snapshots keep the table above its snapshot limit"
-                    );
-                    self.backoff()?.stall(
-                        id,
-                        MetadataTask::History,
-                        Instant::now() + MANDATORY_METADATA_STALL,
-                    );
-                }
             }
         }
         let mut garbage_pending = false;
@@ -1324,8 +1429,19 @@ impl TableWork {
                     .record(started.elapsed().as_secs_f64());
             }
         }
-        Ok((current, garbage_pending))
+        Ok((current, garbage_pending, manifests))
     }
+}
+
+/// Initial-copy recovery may need to prove an operation was never committed
+/// anywhere in the table's lineage, so expiration waits for it.
+fn unresolved_initial(id: TableId, checkpoints: &[flow_state_store::CheckpointRecord]) -> bool {
+    checkpoints
+        .iter()
+        .flat_map(|checkpoint| &checkpoint.pending_operations)
+        .any(|record| {
+            record.operation.table_id == id && record.operation.base_snapshot_id.is_none()
+        })
 }
 
 #[cfg(test)]
@@ -1667,6 +1783,7 @@ mod metadata_maintenance_tests {
 
     struct Fixture {
         _root: tempfile::TempDir,
+        journal: flow_ingress_journal::Journal,
         work: TableWork,
         schema: TableSchema,
         head: Table,
@@ -1800,6 +1917,7 @@ mod metadata_maintenance_tests {
         };
         Fixture {
             _root: root,
+            journal,
             work,
             schema,
             head,
@@ -1815,84 +1933,200 @@ mod metadata_maintenance_tests {
         }
     }
 
-    async fn snapshots(f: &Fixture) -> usize {
+    async fn load(f: &Fixture) -> Table {
         f.work
             .catalog
             .load_table(f.head.identifier())
             .await
             .unwrap()
-            .metadata()
-            .snapshots()
-            .len()
     }
 
-    /// CDC publication does only mandatory maintenance, and it is not subject
-    /// to source-pressure admission. History far past the cap is expired
-    /// there, inside the reader window, while a small overrun waits for
-    /// periodic maintenance.
-    #[tokio::test]
-    async fn publication_path_expires_history_past_the_snapshot_cap() {
-        let f = fixture(
-            |limits| {
-                limits.snapshot_retain_last = 1;
-                limits.snapshot_max_count = 3;
+    /// Journal one committed source transaction inserting `id`.
+    fn journal_insert(f: &mut Fixture, id: i64, lsn: u64) -> SourceTransaction {
+        use flow_model::{JournalChunks, Mutation, MutationKind, TableMutationCount};
+        let table_id = f.schema.table_id;
+        let mutations = vec![Mutation {
+            table_id,
+            schema_version: f.schema.version,
+            kind: MutationKind::Insert {
+                row: vec![Value::Int64(id), Value::String("published".into())],
             },
-            4,
-        )
-        .await;
-        // Four snapshots are within the one-snapshot slack above a cap of three.
-        let outcome = f
-            .work
-            .maintain(
-                f.head.clone(),
-                &f.schema,
-                false,
-                options(),
-                &mut Default::default(),
-            )
-            .await
+        }];
+        f.journal
+            .append_chunk(lsn as u32, &bincode::serialize(&mutations).unwrap())
             .unwrap();
-        let MaintenanceOutcome::Complete(head, pending) = outcome else {
-            panic!("expected completed maintenance");
+        let mutation_chunks: JournalChunks = f.journal.transaction_chunks(lsn as u32);
+        let transaction = SourceTransaction {
+            source_id: SourceId(f.work.config.source.id.clone()),
+            xid: lsn as u32,
+            begin_lsn: PgLsn(lsn - 2),
+            commit_lsn: PgLsn(lsn - 1),
+            end_lsn: PgLsn(lsn),
+            commit_timestamp_micros: 0,
+            affected_tables: vec![table_id],
+            schema_versions: vec![flow_model::TableSchemaVersion {
+                table_id,
+                version: f.schema.version,
+            }],
+            table_mutation_counts: Some(vec![TableMutationCount {
+                table_id,
+                mutations: 1,
+            }]),
+            mutation_chunks,
         };
-        assert_eq!(head.metadata().snapshots().len(), 4);
-        assert!(pending.periodic, "periodic maintenance trims to the cap");
+        f.journal.commit(transaction.clone()).unwrap();
+        transaction
+    }
 
-        let f = fixture(
+    /// Mandatory metadata work runs in the publication path after the epoch
+    /// is published, independently of source-pressure admission: manifests
+    /// past twice their limit are rewritten, then history far past the cap
+    /// is expired inside the reader window.
+    #[tokio::test]
+    async fn publication_runs_mandatory_maintenance_after_publishing() {
+        let mut f = fixture(
             |limits| {
+                limits.manifest_max_count = 2;
                 limits.snapshot_retain_last = 1;
                 limits.snapshot_max_count = 3;
             },
             6,
         )
         .await;
-        let outcome = f
+        let before = f.head.metadata().current_snapshot_id();
+        // Garbage collection is not due, so the refreshed manifest count and
+        // history alone decide whether a periodic visit follows.
+        f.work
+            .garbage_checked
+            .lock()
+            .unwrap()
+            .insert(f.schema.table_id, Instant::now());
+        let transaction = journal_insert(&mut f, 100, 1000);
+        let completion = f
             .work
-            .maintain(
-                f.head.clone(),
-                &f.schema,
-                false,
-                options(),
-                &mut Default::default(),
-            )
+            .clone()
+            .run(f.schema.clone(), vec![transaction], options(), None, None)
             .await
             .unwrap();
-        let MaintenanceOutcome::Complete(head, _) = outcome else {
-            panic!("expected completed maintenance");
+        let TableOutcome::Complete {
+            operation: Some(operation),
+            snapshot: Some(published),
+            maintenance_pending,
+        } = completion.outcome
+        else {
+            panic!("expected a published epoch");
         };
-        assert_eq!(head.metadata().snapshots().len(), 3);
-        assert_eq!(snapshots(&f).await, 3);
+        assert!(!maintenance_pending.periodic);
+        let head = load(&f).await;
+        // Published on the old head, then consolidated and expired.
+        let epoch = flow_iceberg_ext::find_operation(head.metadata(), &operation.0).unwrap();
+        assert_eq!(epoch.snapshot_id(), published);
+        assert_eq!(epoch.parent_snapshot_id(), before);
         assert_eq!(
-            head.metadata().current_snapshot_id(),
-            f.head.metadata().current_snapshot_id()
+            head.metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id(),
+            Some(published)
         );
+        assert_eq!(manifest_count(&head).await.unwrap(), 1);
+        assert_eq!(head.metadata().snapshots().len(), 3);
+        let indexed = f.work.store.table_state(&f.schema.table_id).unwrap();
+        assert_eq!(indexed.snapshot_id, head.metadata().current_snapshot_id());
+        assert_eq!(indexed.materialized_lsn, PgLsn(1000));
+
+        // Small overruns wait for periodic maintenance instead of adding a
+        // commit to every epoch.
+        let transaction = journal_insert(&mut f, 101, 1010);
+        f.work
+            .clone()
+            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(load(&f).await.metadata().snapshots().len(), 4);
+    }
+
+    /// A bounded rewrite that stays above the hard limit is not retried by
+    /// every epoch; periodic maintenance continues it.
+    #[tokio::test]
+    async fn mandatory_manifest_rewrite_that_cannot_reach_the_limit_stalls() {
+        let f = fixture(|limits| limits.manifest_max_count = 2, 70).await;
+        let id = f.schema.table_id;
+        assert_eq!(manifest_count(&f.head).await.unwrap(), 70);
+        let (head, _, manifests) = f
+            .work
+            .maintain_metadata(f.head.clone(), id, 70, MetadataScope::Mandatory)
+            .await
+            .unwrap();
+        assert_eq!(manifests, manifest_count(&head).await.unwrap());
+        assert!((4..70).contains(&manifests), "{manifests}");
+        assert!(
+            !f.work
+                .manifests_due(id, manifests, MetadataScope::Mandatory)
+                .unwrap()
+        );
+        assert!(
+            f.work
+                .manifests_due(id, manifests, MetadataScope::Full)
+                .unwrap()
+        );
+        let (again, _, _) = f
+            .work
+            .maintain_metadata(head.clone(), id, manifests, MetadataScope::Mandatory)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.metadata().current_snapshot_id(),
+            head.metadata().current_snapshot_id()
+        );
+    }
+
+    /// History above the cap that checkpoints protect is reported, but it is
+    /// never due: expiration could not remove anything.
+    #[tokio::test]
+    async fn protected_history_above_the_cap_is_not_due() {
+        let f = fixture(
+            |limits| {
+                limits.snapshot_retain_last = 1;
+                limits.snapshot_max_count = 2;
+            },
+            6,
+        )
+        .await;
+        let id = f.schema.table_id;
+        assert!(
+            f.work
+                .history_due(&f.head, id, MetadataScope::Mandatory)
+                .await
+                .unwrap()
+        );
+        let oldest = f
+            .head
+            .metadata()
+            .snapshots()
+            .min_by_key(|snapshot| snapshot.sequence_number())
+            .unwrap()
+            .snapshot_id();
+        let plan = f
+            .work
+            .maintenance
+            .history_plan(
+                &f.head,
+                id,
+                &f.work.config.limits.history_policy(),
+                &std::collections::BTreeSet::from([oldest]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.over_cap(), 4);
+        assert!(!plan.due() && !plan.over_limit());
     }
 
     #[tokio::test]
     async fn gc_disabled_target_is_skipped_without_error() {
         let f = fixture(
             |limits| {
-                limits.snapshot_retention_secs = 1;
                 limits.snapshot_retain_last = 1;
                 limits.snapshot_max_count = 1;
             },
@@ -1911,16 +2145,21 @@ mod metadata_maintenance_tests {
                 .await
                 .unwrap()
         };
-        tokio::time::sleep(Duration::from_millis(1100)).await;
         let id = f.schema.table_id;
-        // Past the window and the cap, but another process owns its history.
-        assert!(!f.work.history_due(&head, id, MetadataScope::Full).unwrap());
+        // Far past the cap, but another process owns its history.
+        assert!(
+            !f.work
+                .history_due(&head, id, MetadataScope::Full)
+                .await
+                .unwrap()
+        );
         assert!(
             !f.work
                 .history_due(&head, id, MetadataScope::Mandatory)
+                .await
                 .unwrap()
         );
-        let (head, _) = f
+        let (head, _, _) = f
             .work
             .maintain_metadata(head, id, 0, MetadataScope::Full)
             .await
@@ -1958,10 +2197,6 @@ mod metadata_maintenance_tests {
                 .await
                 .unwrap()
         };
-        assert_ne!(
-            external.metadata().current_snapshot_id(),
-            f.head.metadata().current_snapshot_id()
-        );
         f.work
             .garbage_checked
             .lock()
@@ -1970,24 +2205,27 @@ mod metadata_maintenance_tests {
         assert!(
             f.work
                 .history_due(&external, id, MetadataScope::Full)
+                .await
                 .unwrap()
         );
         f.work
             .maintain_metadata(external.clone(), id, 0, MetadataScope::Full)
             .await
             .unwrap();
-        assert_eq!(snapshots(&f).await, 4);
+        assert_eq!(load(&f).await.metadata().snapshots().len(), 4);
         assert!(
             !f.work
                 .history_due(&external, id, MetadataScope::Full)
+                .await
                 .unwrap()
         );
         assert!(
             !f.work
                 .history_due(&external, id, MetadataScope::Mandatory)
+                .await
                 .unwrap()
         );
-        assert!(!f.work.metadata_due(&external, id, 0).unwrap());
+        assert!(!f.work.metadata_due(&external, id, 0).await.unwrap());
         let (retry_at, failures) =
             f.work.metadata_backoff.lock().unwrap().failures[&(id, MetadataTask::History)];
         assert_eq!(failures, 1);
@@ -1999,20 +2237,62 @@ mod metadata_maintenance_tests {
         let mut backoff = MetadataBackoff::default();
         let id = TableId(1);
         let now = Instant::now();
-        let delays: Vec<_> = (0..8)
+        let failures: Vec<_> = (0..8)
             .map(|_| backoff.fail(id, MetadataTask::Garbage, now))
             .collect();
-        assert_eq!(delays[0], METADATA_RETRY_MIN);
-        assert_eq!(delays[1], METADATA_RETRY_MIN * 2);
-        assert_eq!(*delays.last().unwrap(), METADATA_RETRY_MAX);
+        assert_eq!(failures[0], (METADATA_RETRY_MIN, 1));
+        assert_eq!(failures[1], (METADATA_RETRY_MIN * 2, 2));
+        assert_eq!(*failures.last().unwrap(), (METADATA_RETRY_MAX, 8));
         assert!(backoff.failed_until(id, MetadataTask::Garbage, now));
         assert!(!backoff.failed_until(id, MetadataTask::History, now));
         assert!(!backoff.failed_until(TableId(2), MetadataTask::Garbage, now));
-        backoff.succeed(id, MetadataTask::Garbage);
+        assert_eq!(backoff.succeed(id, MetadataTask::Garbage), 8);
         assert!(!backoff.failed_until(id, MetadataTask::Garbage, now));
-        backoff.stall(id, MetadataTask::History, now + MANDATORY_METADATA_STALL);
-        assert!(backoff.stalled_until(id, MetadataTask::History, now));
-        assert!(!backoff.failed_until(id, MetadataTask::History, now));
+        assert_eq!(backoff.succeed(id, MetadataTask::Garbage), 0);
+        backoff.stall(id, MetadataTask::Manifests, now + MANDATORY_METADATA_STALL);
+        assert!(backoff.stalled_until(id, MetadataTask::Manifests, now));
+        assert!(!backoff.failed_until(id, MetadataTask::Manifests, now));
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_escalate_until_the_task_succeeds() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let f = fixture(|_| {}, 1).await;
+        let id = f.schema.table_id;
+        let failing = || {
+            format!(
+                "flow_table_maintenance_failing{{table_id=\"{}\",task=\"garbage_collection\"}} ",
+                id.0
+            )
+        };
+        let invariant =
+            || Err::<(), _>(anyhow::anyhow!("artifact registry table identity mismatch"));
+        for _ in 1..METADATA_FAILURE_ESCALATION {
+            assert!(
+                f.work
+                    .settle(id, MetadataTask::Garbage, invariant())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(!metrics.render().contains(&format!("{}1", failing())));
+        assert!(
+            f.work
+                .settle(id, MetadataTask::Garbage, invariant())
+                .unwrap()
+                .is_none()
+        );
+        assert!(metrics.render().contains(&format!("{}1", failing())));
+        assert!(
+            f.work
+                .settle(id, MetadataTask::Garbage, Ok(()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(metrics.render().contains(&format!("{}0", failing())));
     }
 
     #[tokio::test]

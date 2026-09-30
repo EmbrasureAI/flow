@@ -89,7 +89,11 @@ No separate export task is created.
 | `flow_artifact_{files,bytes}_written_total` | Successfully finished data/delete artifacts, including attempts later invalidated |
 | `flow_garbage_delete_requests_total` | Conservative deletion requests against registered obsolete artifacts |
 | `flow_metadata_maintenance_failures_total` | Table-scoped manifest rewrite, snapshot expiration or garbage collection failures, labelled by `task`; each is retried with backoff |
+| `flow_table_maintenance_failing` | 1 after five consecutive failures of one metadata task (`table_id`, `task`) until it succeeds; CDC continues, the task needs attention |
 | `flow_expiration_missing_protections_total` | Checkpoint or operation snapshots another process expired before Flow; their protection is dropped |
+| `flow_snapshots_over_cap` | Snapshots above `limits.snapshot_max_count` that protection or table policy retain. Checkpoints protect about `retained_checkpoints` × `checkpoint_interval_secs` of commits, so tables committing faster than about `snapshot_max_count` / 600 per second (1.7 at defaults) stay above the cap |
+| `flow_snapshot_cap_exceeded_by_table_policy` | 1 when an explicit table `history.expire.max-snapshot-age-ms` keeps the table above the snapshot cap |
+| `flow_snapshot_expiration_disabled` | 1 for targets with `gc.enabled=false`; Flow never expires their history |
 
 Recovered catalog markers are counted separately and excluded from latency samples. Source-to-service times require synchronized clocks; the production benchmark records calibration uncertainty and complete per-transaction observations. Artifact counters do not include internal SDK retry traffic or catalog-owned metadata writes and must not be presented as cloud billing measurements.
 

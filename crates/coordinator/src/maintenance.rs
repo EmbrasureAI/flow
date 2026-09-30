@@ -13,7 +13,7 @@ pub use concurrent::{
 mod garbage;
 pub use garbage::{GarbagePolicy, GarbageProtection, GarbageReport};
 mod history;
-pub use history::HistoryPolicy;
+pub use history::{HistoryPlan, HistoryPolicy};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

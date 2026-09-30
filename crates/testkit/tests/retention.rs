@@ -1,7 +1,7 @@
 //! Snapshot expiration honors table policy, a retain floor and a count cap,
 //! and never fails on tables or protections it cannot act on.
 use flow_compactor::Policy;
-use flow_coordinator::{HistoryPolicy, TableMaintenance, TablePublisher};
+use flow_coordinator::{HistoryPlan, HistoryPolicy, TableMaintenance, TablePublisher};
 use flow_materializer::WriterConfig;
 use flow_model::{PgLsn, SourceId, TableSchema, Value};
 use flow_state_store::{Change, StateStore};
@@ -99,6 +99,19 @@ impl Fixture {
             .unwrap()
     }
 
+    async fn plan(&self, policy: &HistoryPolicy, protected: &BTreeSet<i64>) -> Option<HistoryPlan> {
+        self.maintenance()
+            .history_plan(&self.head, self.schema.table_id, policy, protected)
+            .await
+            .unwrap()
+    }
+
+    async fn due(&self, policy: &HistoryPolicy) -> bool {
+        self.plan(policy, &BTreeSet::new())
+            .await
+            .is_some_and(|plan| plan.due())
+    }
+
     async fn reload(&mut self) -> Vec<i64> {
         self.head = self
             .catalog
@@ -149,7 +162,7 @@ async fn table_max_snapshot_age_longer_than_flow_retention_keeps_history() {
     tokio::time::sleep(Duration::from_millis(3)).await;
     let window = policy(Duration::from_millis(1), 1, usize::MAX);
     // Flow's one-millisecond window alone would leave only the head.
-    assert!(!window.due(f.head.metadata()).unwrap());
+    assert!(!f.due(&window).await);
     assert_eq!(f.expire(&window, &BTreeSet::new()).await, 0);
     assert_eq!(f.reload().await, before);
 
@@ -157,17 +170,17 @@ async fn table_max_snapshot_age_longer_than_flow_retention_keeps_history() {
     f.set_property("history.expire.max-snapshot-age-ms", "1")
         .await;
     let hour = policy(Duration::from_secs(3600), 1, usize::MAX);
-    assert!(!hour.due(f.head.metadata()).unwrap());
+    assert!(!f.due(&hour).await);
     assert_eq!(f.expire(&hour, &BTreeSet::new()).await, 0);
     assert_eq!(f.reload().await, before);
 
     // Once both windows have passed, the retain floor still keeps the newest
     // snapshots even though every snapshot is past the window.
     let floor = policy(Duration::from_millis(1), 3, usize::MAX);
-    assert!(floor.due(f.head.metadata()).unwrap());
+    assert!(f.due(&floor).await);
     assert_eq!(f.expire(&floor, &BTreeSet::new()).await, 2);
     assert_eq!(f.reload().await, before[2..]);
-    assert!(!floor.due(f.head.metadata()).unwrap());
+    assert!(!f.due(&floor).await);
 }
 
 #[tokio::test]
@@ -205,14 +218,16 @@ async fn snapshot_cap_expires_oldest_history_inside_the_window_but_keeps_refs_an
     f.reload().await;
 
     let capped = policy(Duration::from_secs(3600), 2, 3);
-    assert!(capped.due(f.head.metadata()).unwrap());
-    // Six snapshots exceed the cap of three plus its one-snapshot slack.
-    assert!(capped.over_limit(f.head.metadata()).unwrap());
+    let plan = f.plan(&capped, &BTreeSet::new()).await.unwrap();
+    assert!(plan.due());
+    // The cap can remove three snapshots, more than its one-snapshot slack.
+    assert!(plan.over_limit());
     assert_eq!(f.expire(&capped, &BTreeSet::new()).await, 3);
     let retained = f.reload().await;
     assert_eq!(retained, vec![tagged, before[4], before[5]]);
-    assert!(!capped.due(f.head.metadata()).unwrap());
-    assert!(!capped.over_limit(f.head.metadata()).unwrap());
+    let plan = f.plan(&capped, &BTreeSet::new()).await.unwrap();
+    assert!(!plan.due() && !plan.over_limit());
+    assert_eq!(plan.over_cap(), 0);
 
     // A cap below the floor cannot be configured.
     assert!(policy(Duration::from_secs(1), 4, 3).validate().is_err());
@@ -226,7 +241,34 @@ async fn snapshot_cap_never_expires_checkpoint_protected_history() {
     // A checkpoint base protects itself and every descendant.
     assert_eq!(f.expire(&capped, &BTreeSet::from([before[2]])).await, 2);
     assert_eq!(f.reload().await, before[2..]);
-    assert!(capped.over_limit(f.head.metadata()).unwrap());
+    // Protected history above the cap is reported but never makes expiration
+    // due: there is nothing it could remove.
+    let plan = f.plan(&capped, &BTreeSet::from([before[2]])).await.unwrap();
+    assert_eq!(plan.over_cap(), 2);
+    assert!(!plan.due() && !plan.over_limit() && !plan.held_by_table_policy());
+}
+
+#[tokio::test]
+async fn explicit_table_window_is_exempt_from_the_snapshot_cap() {
+    let mut f = Fixture::new(&[("history.expire.max-snapshot-age-ms", SEVEN_DAYS_MS)], 6).await;
+    let before = f.snapshots();
+    let capped = policy(Duration::from_secs(3600), 1, 3);
+    let plan = f.plan(&capped, &BTreeSet::new()).await.unwrap();
+    assert!(plan.held_by_table_policy());
+    assert_eq!(plan.over_cap(), 3);
+    assert!(!plan.due() && !plan.over_limit());
+    assert_eq!(f.expire(&capped, &BTreeSet::new()).await, 0);
+    assert_eq!(f.reload().await, before);
+
+    // A table window shorter than Flow's leaves the rest of Flow's window
+    // subject to the cap.
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    f.set_property("history.expire.max-snapshot-age-ms", "1")
+        .await;
+    let plan = f.plan(&capped, &BTreeSet::new()).await.unwrap();
+    assert!(!plan.held_by_table_policy() && plan.over_limit());
+    assert_eq!(f.expire(&capped, &BTreeSet::new()).await, 3);
+    assert_eq!(f.reload().await, before[3..]);
 }
 
 #[tokio::test]
@@ -235,8 +277,7 @@ async fn gc_disabled_table_is_not_expired_and_does_not_fail() {
     let before = f.snapshots();
     tokio::time::sleep(Duration::from_millis(3)).await;
     let aggressive = policy(Duration::from_millis(1), 1, 1);
-    assert!(!aggressive.due(f.head.metadata()).unwrap());
-    assert!(!aggressive.over_limit(f.head.metadata()).unwrap());
+    assert!(f.plan(&aggressive, &BTreeSet::new()).await.is_none());
     assert_eq!(f.expire(&aggressive, &BTreeSet::new()).await, 0);
     assert_eq!(f.reload().await, before);
 }
@@ -252,6 +293,28 @@ async fn externally_expired_protected_snapshot_does_not_stop_expiration() {
     let window = HistoryPolicy::window(Duration::from_millis(1));
     assert_eq!(f.expire(&window, &BTreeSet::from([missing])).await, 3);
     assert_eq!(f.reload().await, before[3..]);
+}
+
+#[tokio::test]
+async fn descendants_of_an_externally_expired_base_stay_protected() {
+    let mut f = Fixture::new(&[], 5).await;
+    let before = f.snapshots();
+    // Another process expires a checkpoint base but keeps its descendants.
+    let transaction = Transaction::new(&f.head);
+    f.head = transaction
+        .expire_snapshots()
+        .expire_older_than_ms(0)
+        .expire_snapshot_ids([before[1]])
+        .apply(transaction)
+        .unwrap()
+        .commit(f.catalog.as_ref())
+        .await
+        .unwrap();
+    assert!(f.head.metadata().snapshot_by_id(before[1]).is_none());
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let window = HistoryPolicy::window(Duration::from_millis(1));
+    assert_eq!(f.expire(&window, &BTreeSet::from([before[1]])).await, 1);
+    assert_eq!(f.reload().await, before[2..]);
 }
 
 /// Reports catalog JSON under a separate directory, as a catalog honoring

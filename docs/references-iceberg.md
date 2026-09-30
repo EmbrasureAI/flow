@@ -170,10 +170,12 @@ history of pending operations and supplied worker/checkpoint bases. An unresolve
 initial operation suppresses expiration. The reader window is the longer of
 Flow's retention and an explicit `history.expire.max-snapshot-age-ms`. A retain
 floor keeps the newest snapshots of `main`, and a count cap then expires the
-oldest unprotected snapshots by explicit id, regardless of age; protections and
-the floor take precedence over the cap. Tables with `gc.enabled=false` are
-skipped, as Java `RemoveSnapshots` refuses them. Protected snapshots that no
-longer exist are reported and dropped. It removes only metadata references;
+oldest unprotected snapshots by sequence number and explicit id, regardless of
+age within Flow's window. Protections, the floor and an explicit table window
+take precedence over the cap. Tables with `gc.enabled=false` are skipped, as
+Java `RemoveSnapshots` refuses them. Protected snapshots that no longer exist
+are reported and dropped; the surviving children of a missing base and their
+descendants stay protected. It removes only metadata references;
 physical orphan cleanup remains a separate delayed operation.
 
 ## Physical artifact collection

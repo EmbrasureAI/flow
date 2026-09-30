@@ -91,8 +91,9 @@ Metadata and garbage work has a separate due signal from soft data compaction.
 One periodic table actor may run at a time, and ready CDC receives a dispatch
 between periodic visits. Each visit checks manifest/history debt and scans one
 bounded garbage-registry page; continuation can resume after CDC gets its turn.
-WAL pressure suppresses these visits, so CDC publication itself expires history
-past the snapshot cap and rewrites manifests past twice their limit; garbage
+WAL pressure suppresses these visits, so after publishing an epoch the CDC
+path itself expires history far past the snapshot cap and rewrites manifests
+past twice their limit, unless a background build owns the table; garbage
 collection remains optional.
 The collector's scan budget is cooperative: retained-artifact checks and in-flight
 storage requests are not a hard wall-clock deadline. Builds, prepared publication
