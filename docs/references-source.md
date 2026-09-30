@@ -248,17 +248,36 @@ health tick, so idle additions also reach Iceberg without inventing a source
 watermark. PostgreSQL versions that emit an empty DDL transaction can advance
 through its actual durable journal terminal. Savepoint rollback and streamed
 transaction abort discard provisional
-schemas with their abandoned rows. The table actor serializes the Iceberg schema
+schemas with their abandoned rows.
+
+Blocks follow the same rule. pgoutput streams a large transaction's TRUNCATE,
+Relation messages and rows before PostgreSQL commits or aborts it. Inside a
+streamed transaction, a TRUNCATE, an undecodable Relation or a row decoding
+failure only quarantines that transaction's changes of the table in the
+spool, beside the spool position of the first one. Other transactions keep
+publishing the table meanwhile. At the transaction's commit, a decision that
+survived every savepoint rollback latches the durable table block before the
+journal terminal, so all of that transaction's changes of the table commit
+quarantined. A rollback removes the decision with the changes it quarantined:
+a subtransaction abort truncates both at the subtransaction's first spooled
+change, and a transaction abort discards both. Outside streaming, PostgreSQL
+has already committed the transaction and the block is immediate. The table actor serializes the Iceberg schema
 update before publishing affected data, and reloads metadata to resolve a lost
 catalog response.
 
-The SQL proof checks actual primary-key columns, nullability, generated columns,
-defaults and missing-column values. PostgreSQL may store a constant default in
+The SQL proof checks actual primary-key columns, generated columns and
+missing-column values. PostgreSQL may store a constant ADD COLUMN default in
 `attmissingval` without rewriting old tuples; dropping that default later does
 not remove the backfill semantics. Such additions require resynchronization.
 See the official [column catalog](https://www.postgresql.org/docs/18/catalog-pg-attribute.html)
 and [ALTER TABLE behavior](https://www.postgresql.org/docs/18/sql-altertable.html).
-Only nullable additions with no default or a literal NULL default are accepted.
+A later `SET DEFAULT`, backfilling `UPDATE` or `SET NOT NULL` only affects rows
+through ordinary row changes, so the live catalog's default and nullability of
+an added column are not checked. That makes common ORM migrations (`ADD COLUMN`
+then `SET DEFAULT`, or `ADD COLUMN`, backfill, `SET NOT NULL`) safe however soon
+the catalog check runs after them. An added column is always optional in
+Iceberg, even when the source later makes it NOT NULL: Iceberg can relax a
+required field but never require an optional one.
 
 Stored column numbers catch a dropped and re-added column even when its name and
 type are unchanged. Physical table rewrites also stop capture: a volatile

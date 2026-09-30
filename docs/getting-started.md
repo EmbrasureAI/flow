@@ -123,7 +123,7 @@ column selection, marks tables without a primary key append-only, and adds a
 comment above any table that `init` would still reject. Review the output before
 initializing; the column list and field IDs are fixed once `init` runs.
 
-The configured column list defines the initial source schema; see the [type mappings](postgres-types.md). `primary_key` contains zero-based positions in that list. New nullable columns without a non-null backfill are discovered automatically; keep the original prefix in the configuration across restarts. Field IDs are stable destination identities, while PostgreSQL attribute identity is checked separately to detect drop-and-recreate changes.
+The configured column list defines the initial source schema; see the [type mappings](postgres-types.md). `primary_key` contains zero-based positions in that list. New columns are discovered automatically unless their `ADD COLUMN` default backfills existing rows; a later `SET DEFAULT`, backfill or `SET NOT NULL` is fine and the column stays optional in Iceberg; keep the original prefix in the configuration across restarts. Field IDs are stable destination identities, while PostgreSQL attribute identity is checked separately to detect drop-and-recreate changes.
 
 Configure the REST catalog URI, warehouse and object-store endpoint for your own
 services. Flow needs catalog access to load/create tables and commit snapshots,
@@ -138,7 +138,7 @@ retention; it exits nonzero when a check fails. Neither verifies catalog or
 object-store access; `init` performs the remaining checks while initializing
 the pipeline. See [operations](operations.md#before-initialization).
 
-Mutable tables require a primary key and a [supported replica identity](#replica-identity). Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; they may include other tables. During streaming, TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
+Mutable tables require a primary key and a [supported replica identity](#replica-identity). Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; they may include other tables. During streaming, a committed TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
 
 An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values block the affected table rather than publishing an incomplete row.
 
@@ -192,7 +192,7 @@ Current support boundaries:
 
 - Unpartitioned Iceberg v2 position deletes and v3 deletion vectors. Set `format_version = 3` on a table to create a v3 target; see [v3 configuration and compatibility](iceberg-v3.md). Partitioning remains planned work.
 - Mutable tables require a stable primary key and a [supported replica identity](#replica-identity). Keyless tables support append-only ingestion and equivalent external physical rewrites, including duplicate rows.
-- Automatic DDL supports nullable column additions without a non-null backfill and compatible required-to-nullable changes. During streaming, classified table schema/row errors and TRUNCATE durably block that table. Healthy tables can continue within the journal/WAL budgets, but shared acknowledgement cannot pass an incomplete transaction. Source connection/slot/identity failures remain connection-wide. See [table isolation and recovery](table-publication-isolation.md).
+- Automatic DDL supports column additions whose `ADD COLUMN` default does not backfill existing rows (later defaults, backfills and NOT NULL are fine; the column stays optional in Iceberg) and compatible required-to-nullable changes. During streaming, classified table schema/row errors and TRUNCATE durably block that table once their transaction commits; rolled-back ones have no effect. Healthy tables can continue within the journal/WAL budgets, but shared acknowledgement cannot pass an incomplete transaction. Source connection/slot/identity failures remain connection-wide. See [table isolation and recovery](table-publication-isolation.md).
 - Initial COPY copies up to four tables concurrently; each table is read by one worker. Recovery needs capacity for one additional temporary replication slot. Transaction metadata and row payloads spill to disk; configured journal, spool, message and row-size budgets still apply.
 - Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor (systemd, Kubernetes or similar) that restarts it after a crash or failed start. The `state_dir` must be on persistent storage; Flow does not replicate it to another host.
 - Compaction supports unsorted layouts. Z-order-aware compaction, distributed compaction and high availability are not supported yet. Flow reconciles rewrites made by external compactors, and this is tested against Spark's maintenance procedures.

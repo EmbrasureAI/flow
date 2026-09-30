@@ -375,19 +375,22 @@ pub(crate) async fn capture_loop(
                                 // Unconfigured publication members never reach
                                 // the registry, projector, quarantine or spool.
                                 let Some(event) = assembler.configured(event) else { continue };
+                                // Inside a streamed transaction, TRUNCATE and undecodable
+                                // Relation or row decisions stay provisional until it commits.
                                 if let SourceEvent::Truncate { xid, subxid, relations, cascade, restart_identity } = &event {
                                     for id in relations {
                                         let table = TableId(*id);
-                                        registry.block(table, "source table was truncated; resynchronization is required")?;
-                                        registry.block_decoder(table, &mut assembler)?;
-                                        assembler.quarantine(SourceEvent::Truncate { xid:*xid,subxid:*subxid,
+                                        let relation = registry.saved_relation(table)?;
+                                        registry.quarantine(table, SourceEvent::Truncate { xid:*xid,subxid:*subxid,
                                             relations:vec![*id],cascade:*cascade,restart_identity:*restart_identity },
-                                            &registry.saved_relation(table)?)?;
+                                            &relation, "source table was truncated; resynchronization is required", &mut assembler)?;
                                     }
                                     continue;
                                 }
                                 let event = if let SourceEvent::Relation(relation) = &event {
                                     let id = TableId(relation.id);
+                                    // Each streamed Relation replaces its transaction's wire shape.
+                                    if assembler.streaming().is_some() { assembler.set_undecodable(id, None)?; }
                                     let projected = if registry.is_blocked(id) {
                                         SourceEvent::Relation(projector.quarantine_relation(relation))
                                     } else {
@@ -396,36 +399,46 @@ pub(crate) async fn capture_loop(
                                             Err(error) => {
                                                 let error = anyhow::Error::new(error);
                                                 if !crate::schema::table_schema_error(&error) { return Err(error); }
-                                                registry.block(id, crate::schema::schema_block_reason(&error))?;
+                                                registry.reject_relation(id, crate::schema::schema_block_reason(&error), &mut assembler)?;
                                                 SourceEvent::Relation(projector.quarantine_relation(relation))
                                             }
                                         }
                                     };
                                     let SourceEvent::Relation(projected_relation) = &projected else { unreachable!() };
-                                    if !registry.is_blocked(id)
+                                    if !registry.is_blocked(id) && !assembler.is_undecodable(id)
                                         && let Err(error) = source_deadline(registry.observe_relation(&sql, projected_relation, &mut assembler)).await {
                                             if retryable_connection(&error) { break; }
                                             if !crate::schema::table_schema_error(&error) { return Err(error); }
-                                            registry.block(id, crate::schema::schema_block_reason(&error))?;
+                                            registry.reject_relation(id, crate::schema::schema_block_reason(&error), &mut assembler)?;
                                         }
                                     wire_relations.insert(relation.id, projected_relation.clone());
                                     if registry.is_blocked(id) {
                                         registry.block_decoder(id, &mut assembler)?;
                                         continue;
                                     }
+                                    // Keep the committed decoder for other transactions.
+                                    if assembler.is_undecodable(id) { continue; }
                                     projected
                                 } else { projector.project(event)? };
                                 let row_table = match &event {
-                                    SourceEvent::Insert { relation, .. } | SourceEvent::Update { relation, .. }
-                                    | SourceEvent::Delete { relation, .. } => Some(TableId(*relation)),
+                                    SourceEvent::Insert { xid, relation, .. } | SourceEvent::Update { xid, relation, .. }
+                                    | SourceEvent::Delete { xid, relation, .. } => Some((*xid, TableId(*relation))),
                                     _ => None,
                                 };
-                                if let Some(id) = row_table
-                                    && registry.is_blocked(id) {
-                                        registry.block_decoder(id, &mut assembler)?;
-                                        assembler.quarantine(event, wire_relations.get(&id.0).context("row before source relation")?)?;
+                                if let Some((xid, id)) = row_table {
+                                    let reason = if registry.is_blocked(id) {
+                                        Some("source table is blocked".to_owned())
+                                    } else {
+                                        assembler.provisional_block(xid, id).map(str::to_owned)
+                                    };
+                                    if let Some(reason) = reason {
+                                        registry.quarantine(id, event, wire_relations.get(&id.0).context("row before source relation")?, &reason, &mut assembler)?;
                                         continue;
                                     }
+                                }
+                                if let SourceEvent::Commit { xid, .. } = &event {
+                                    registry.commit_provisional(*xid, &mut assembler)?;
+                                }
                                 if let SourceEvent::Commit { xid, end_lsn, .. } = &event
                                     && *end_lsn > journal.staged_lsn() {
                                     if registry.validation_may_query() {
@@ -451,12 +464,11 @@ pub(crate) async fn capture_loop(
                                 let retained = row_table.map(|_| event.clone());
                                 let commit_xid = match &event { SourceEvent::Commit { xid, .. } => Some(*xid), _ => None };
                                 if let Err(error) = assembler.push_buffered_at(event, source.received_lsn, &mut journal) {
-                                    if let Some(id) = row_table
+                                    if let Some((_, id)) = row_table
                                         && matches!(&error, flow_pg_source::Error::Row(_) | flow_pg_source::Error::Value(_)
                                             | flow_pg_source::Error::ReplicaIdentity(_) | flow_pg_source::Error::DefaultIdentity(_) | flow_pg_source::Error::UnchangedToast(_)) {
-                                            registry.block(id, crate::schema::schema_block_reason(&error.into()))?;
-                                            registry.block_decoder(id, &mut assembler)?;
-                                            assembler.quarantine(retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?)?;
+                                            let reason = crate::schema::schema_block_reason(&error.into()).to_owned();
+                                            registry.quarantine(id, retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?, &reason, &mut assembler)?;
                                             continue;
                                         }
                                     if let Some(xid) = commit_xid

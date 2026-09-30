@@ -63,7 +63,11 @@ opaque quarantined mutations in the existing transaction spool/journal. Commit
 proof failures quarantine that table's decoded evidence too. The failed table
 remains in every affected transaction descriptor, including mixed transactions;
 its publications and the shared completed acknowledgement frontier cannot advance.
-Subtransaction rollback still removes its spool records. Explicitly excluded cells
+Subtransaction rollback still removes its spool records. Inside a streamed,
+still-uncommitted transaction these decisions are provisional: they quarantine
+only that transaction's changes, other transactions keep publishing the table,
+and the block is latched only if the transaction commits with them; a rollback
+or savepoint rollback discards them. Explicitly excluded cells
 are projected out before quarantine, including when a selected column disappears.
 
 A source-table block persists across restart and source repair. Use an explicit

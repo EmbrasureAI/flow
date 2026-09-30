@@ -1,6 +1,7 @@
 //! Durable source schema versions and the serialized Iceberg schema barrier.
 //! Relation messages choose a decoder; only surviving committed source changes
-//! authorize a public schema transition.
+//! authorize a public schema transition or, from a streamed transaction, a
+//! durable table block.
 
 use crate::config::Table as ConfiguredTable;
 use anyhow::{Context, Result, ensure};
@@ -258,6 +259,59 @@ impl SchemaRegistry {
 
     pub(crate) fn block(&mut self, table: TableId, reason: &str) -> Result<()> {
         self.block_with(table, CaptureBlock::SchemaIncompatible, reason)
+    }
+
+    /// Quarantine one change and block its table. pgoutput streams changes of
+    /// transactions that may still roll back, so a decision inside a streamed
+    /// transaction stays provisional: it blocks the table only when that
+    /// transaction commits with the change, see [`Self::commit_provisional`].
+    /// Other transactions keep publishing the table meanwhile.
+    pub(crate) fn quarantine(
+        &mut self,
+        table: TableId,
+        event: flow_pg_source::SourceEvent,
+        relation: &Relation,
+        reason: &str,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        if !self.is_blocked(table) && assembler.streaming().is_some() {
+            assembler.quarantine_provisionally(event, relation, reason)?;
+            return Ok(());
+        }
+        self.block(table, reason)?;
+        self.block_decoder(table, assembler)?;
+        assembler.quarantine(event, relation)?;
+        Ok(())
+    }
+
+    /// A Relation capture cannot decode. Inside a streamed transaction it only
+    /// quarantines that transaction's later changes of the table.
+    pub(crate) fn reject_relation(
+        &mut self,
+        table: TableId,
+        reason: &str,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        if !self.is_blocked(table) && assembler.streaming().is_some() {
+            assembler.set_undecodable(table, Some(reason))?;
+            return Ok(());
+        }
+        self.block(table, reason)
+    }
+
+    /// Called at every Commit before schema validation and the assembler: make
+    /// the committed transaction's surviving provisional blocks durable, so its
+    /// quarantined and earlier decoded changes of those tables commit quarantined.
+    pub(crate) fn commit_provisional(
+        &mut self,
+        xid: u32,
+        assembler: &mut CaptureAssembler,
+    ) -> Result<()> {
+        for (table, reason) in assembler.provisional_blocks(xid) {
+            self.block(table, &reason)?;
+            self.block_decoder(table, assembler)?;
+        }
+        Ok(())
     }
 
     /// The publication no longer covers this configured table's changes.
@@ -1046,6 +1100,166 @@ mod target_identity_tests {
         );
         let after = catalog.load_table(original.identifier()).await.unwrap();
         assert_eq!(after.metadata(), replacement.metadata());
+    }
+
+    fn persist_base(registry: &SchemaRegistry, base: &TableSchema) {
+        registry
+            .persist(&SchemaRecord {
+                format: 2,
+                storage_id: base.table_id.0,
+                attribute_numbers: vec![1, 2],
+                schema: base.clone(),
+                relation: Relation {
+                    id: base.table_id.0,
+                    namespace: "public".into(),
+                    name: format!("t{}", base.table_id.0),
+                    replica_identity: b'f',
+                    columns: base
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, column)| flow_pg_source::Column {
+                            name: column.name.clone(),
+                            type_oid: if index == 0 { 20 } else { 25 },
+                            type_modifier: -1,
+                            identity: index == 0,
+                        })
+                        .collect(),
+                },
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn streamed_decisions_block_only_when_their_transaction_commits() {
+        use flow_pg_source::{SourceEvent, SpoolConfig, TransactionSpool};
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            root.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let bases = [config.tables[0].schema(11), config.tables[0].schema(12)];
+        let source = SourceId("streamed".into());
+        let mut registry = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
+        for base in &bases {
+            persist_base(&registry, base);
+        }
+        let (mut journal, _) = flow_ingress_journal::Journal::open(
+            root.path().join("journal"),
+            flow_ingress_journal::JournalConfig::default(),
+        )
+        .unwrap();
+        let spool =
+            TransactionSpool::open(root.path().join("spool"), SpoolConfig::default()).unwrap();
+        let mut assembler =
+            CaptureAssembler::new(source.clone(), spool, bases.clone(), 1 << 16).unwrap();
+        let mut push = |assembler: &mut CaptureAssembler, event| {
+            assembler
+                .push_buffered_at(event, flow_model::PgLsn(0), &mut journal)
+                .unwrap()
+        };
+        let truncate = |xid, subxid| SourceEvent::Truncate {
+            xid,
+            subxid,
+            relations: vec![11],
+            cascade: false,
+            restart_identity: false,
+        };
+        let commit = |xid, lsn| SourceEvent::Commit {
+            xid,
+            commit_lsn: flow_model::PgLsn(lsn),
+            end_lsn: flow_model::PgLsn(lsn + 1),
+            commit_timestamp_micros: 0,
+        };
+        let (table, other) = (TableId(11), TableId(12));
+        let relation = registry.saved_relation(table).unwrap();
+        let unblocked = |registry: &SchemaRegistry, assembler: &CaptureAssembler| {
+            !registry.is_blocked(table)
+                && !assembler.is_blocked(table)
+                && capture_block(&store, &source, table).unwrap().is_none()
+        };
+
+        // A rolled-back streamed TRUNCATE and undecodable Relation leave no block.
+        push(
+            &mut assembler,
+            SourceEvent::StreamStart {
+                xid: 42,
+                first: true,
+            },
+        );
+        registry
+            .quarantine(
+                table,
+                truncate(42, 42),
+                &relation,
+                "truncated",
+                &mut assembler,
+            )
+            .unwrap();
+        registry
+            .reject_relation(other, "type changed", &mut assembler)
+            .unwrap();
+        assert!(assembler.is_undecodable(other) && !registry.is_blocked(other));
+        assert!(unblocked(&registry, &assembler));
+        push(&mut assembler, SourceEvent::StreamStop);
+        push(
+            &mut assembler,
+            SourceEvent::Abort {
+                xid: 42,
+                subxid: 42,
+            },
+        );
+        registry.commit_provisional(42, &mut assembler).unwrap();
+        assert!(unblocked(&registry, &assembler));
+
+        // Committed, it blocks durably before the commit reaches the assembler.
+        push(
+            &mut assembler,
+            SourceEvent::StreamStart {
+                xid: 43,
+                first: true,
+            },
+        );
+        registry
+            .quarantine(
+                table,
+                truncate(43, 43),
+                &relation,
+                "truncated",
+                &mut assembler,
+            )
+            .unwrap();
+        push(&mut assembler, SourceEvent::StreamStop);
+        assert!(unblocked(&registry, &assembler));
+        registry.commit_provisional(43, &mut assembler).unwrap();
+        assert!(registry.is_blocked(table) && assembler.is_blocked(table));
+        assert_eq!(
+            capture_block(&store, &source, table).unwrap(),
+            Some(CaptureBlock::SchemaIncompatible)
+        );
+        push(&mut assembler, commit(43, 100));
+        assert!(!registry.is_blocked(other));
+
+        // Outside a stream, PostgreSQL has already committed: block at once.
+        push(
+            &mut assembler,
+            SourceEvent::Begin {
+                xid: 44,
+                final_lsn: flow_model::PgLsn(200),
+                commit_timestamp_micros: 0,
+            },
+        );
+        registry
+            .reject_relation(other, "type changed", &mut assembler)
+            .unwrap();
+        assert!(registry.is_blocked(other) && !assembler.is_undecodable(other));
+        assert_eq!(
+            capture_block(&store, &source, other).unwrap(),
+            Some(CaptureBlock::SchemaIncompatible)
+        );
     }
 
     #[test]

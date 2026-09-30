@@ -83,9 +83,10 @@ table from the publication blocks that table (`publication_changed`).
 | Operation | Effect on Flow | Action |
 | --- | --- | --- |
 | Restart, minor upgrade, network interruption | Capture reconnects from the durable journal | None |
-| Add a nullable column without a default | Captured automatically | None |
+| Add a column without a default, then set a default, backfill or `SET NOT NULL` | Captured automatically as an optional Iceberg field | None |
+| Add a column with a non-NULL default (`ADD COLUMN ... DEFAULT x`) | The table is blocked: existing rows gain the value without row changes | Add it without a default, then `SET DEFAULT` and backfill; otherwise resynchronize |
 | `VACUUM FULL`, `CLUSTER`, `pg_repack`, rewriting `ALTER TABLE` | The rewritten table is blocked; other tables continue | Resynchronize the source. Plain `VACUUM` is safe |
-| `TRUNCATE` of a configured table | That table is blocked | Resynchronize the source |
+| `TRUNCATE` of a configured table | That table is blocked once the transaction commits; a rolled-back TRUNCATE has no effect | Resynchronize the source |
 | A configured table leaves the publication or gains a row filter or column list | That table is blocked with `publication_changed` | Avoid it; otherwise resynchronize |
 | The publication is dropped or stops publishing an operation | Capture stops with a resynchronization requirement | Avoid it; otherwise resynchronize |
 | Physical standby promotion (failover) | Source timeline changes; capture stops | Resynchronize from the promoted primary |
