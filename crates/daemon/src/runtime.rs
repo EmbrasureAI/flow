@@ -169,9 +169,13 @@ pub async fn run(config: Config, compaction: bool) -> Result<()> {
             crate::bootstrap::resume(&config, store.clone(), catalog.clone(), &mut boot).await;
         crate::lifecycle::record_publication_changed(&config, resumed)?;
     }
-    let (journal, recovery) =
-        Journal::open(config.state_dir.join("journal"), journal_config(&config))?;
+    // Recovery may truncate only a torn tail above what the ledger recorded.
     let mut ledger = ledger(&store, &config)?;
+    let (journal, recovery) = Journal::open_with_floor(
+        config.state_dir.join("journal"),
+        journal_config(&config),
+        ledger.watermarks().journal_durable_lsn,
+    )?;
     ensure!(
         journal.durable_lsn() >= ledger.watermarks().journal_durable_lsn,
         "journal lost previously durable transactions; source recovery is required before acknowledgement"

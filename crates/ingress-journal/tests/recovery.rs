@@ -92,6 +92,12 @@ fn interleaved_transactions_recover_only_terminal_commits_and_reuse_xids() {
 
 #[test]
 fn torn_and_corrupt_suffix_is_removed_before_accepting_new_commits() {
+    // Only the final segment can hold an unsynchronized suffix; keep it all there.
+    let config = || JournalConfig {
+        segment_bytes: 64 << 10,
+        quota_bytes: 1 << 20,
+        ..config()
+    };
     for corrupt_crc in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let (mut journal, _) = Journal::open(dir.path(), config()).unwrap();
@@ -1089,4 +1095,159 @@ fn commit_can_spend_its_own_pending_abort_reservation() {
     drop(journal);
     let (_, recovered) = Journal::open(dir.path(), limited).unwrap();
     assert_eq!(recovered.transactions.len(), 4);
+}
+
+fn segment_files(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "segment"))
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_str().unwrap().to_owned(),
+                fs::read(&path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Seven committed transactions, one 300-byte chunk each, spread over several
+/// 600-byte segments. Returns each transaction's chunk reference.
+fn seven_transactions(dir: &std::path::Path) -> Vec<JournalChunkRef> {
+    let (mut journal, _) = Journal::open(dir, config()).unwrap();
+    let mut chunks = Vec::new();
+    for xid in 1..=7 {
+        let reference = journal.append_chunk(xid, &[xid as u8; 300]).unwrap();
+        journal
+            .commit(transaction(
+                xid,
+                u64::from(xid) * 10,
+                vec![reference.clone()],
+            ))
+            .unwrap();
+        chunks.push(reference);
+    }
+    chunks
+}
+
+#[test]
+fn damage_before_the_final_segment_fails_closed_without_modifying_segments() {
+    for corrupt_crc in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = seven_transactions(dir.path());
+        let damaged = &chunks[1];
+        let last = chunks.last().unwrap().segment;
+        assert!(damaged.segment < last, "fixture must span segments");
+        let path = dir.path().join(format!("{:020}.segment", damaged.segment));
+        let pristine = fs::read(&path).unwrap();
+        if corrupt_crc {
+            // A single flipped payload byte in a closed, synchronized segment.
+            let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(damaged.offset + 28 + 17))
+                .unwrap();
+            file.write_all(&[0xff]).unwrap();
+        } else {
+            // A closed segment can never be short after a crash.
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(damaged.offset + 31)
+                .unwrap();
+        }
+        let before = segment_files(dir.path());
+        for _ in 0..2 {
+            let error = Journal::open(dir.path(), config()).err().unwrap();
+            let Error::SegmentCorrupt {
+                segment, offset, ..
+            } = error
+            else {
+                panic!("expected SegmentCorrupt, got {error}");
+            };
+            assert_eq!((segment, offset), (damaged.segment, damaged.offset));
+            assert_eq!(segment_files(dir.path()), before, "no segment may change");
+        }
+        // Restoring the damaged segment recovers every durable transaction.
+        fs::write(&path, pristine).unwrap();
+        let (journal, recovered) = Journal::open(dir.path(), config()).unwrap();
+        assert_eq!(recovered.truncated_bytes, 0);
+        assert_eq!(recovered.transactions.len(), 7);
+        assert_eq!(journal.durable_lsn(), PgLsn(71));
+    }
+}
+
+#[test]
+fn torn_final_segment_recovers_every_earlier_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks = seven_transactions(dir.path());
+    let torn = chunks.last().unwrap();
+    assert!(torn.segment > chunks[0].segment);
+    let path = dir.path().join(format!("{:020}.segment", torn.segment));
+    let length = fs::metadata(&path).unwrap().len();
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(length - 5)
+        .unwrap();
+    let earlier: Vec<_> = segment_files(dir.path())
+        .into_iter()
+        .filter(|(name, _)| *name != format!("{:020}.segment", torn.segment))
+        .collect();
+    // The last transaction was not yet registered by the caller, so a floor
+    // at the previous transaction permits discarding its torn terminal.
+    let (mut journal, recovered) =
+        Journal::open_with_floor(dir.path(), config(), PgLsn(61)).unwrap();
+    assert!(recovered.truncated_bytes > 0 && recovered.truncated_bytes < length);
+    assert_eq!(recovered.transactions.len(), 6);
+    assert_eq!(journal.durable_lsn(), PgLsn(61));
+    let after = segment_files(dir.path());
+    for (name, bytes) in &earlier {
+        assert_eq!(&after[name], bytes, "{name} must be untouched");
+    }
+    let replacement = journal.append_chunk(7, b"resent").unwrap();
+    journal
+        .commit(transaction(7, 70, vec![replacement]))
+        .unwrap();
+    drop(journal);
+    let (_, recovered) = Journal::open(dir.path(), config()).unwrap();
+    assert_eq!(recovered.transactions.len(), 7);
+}
+
+#[test]
+fn torn_tail_below_the_recorded_durable_floor_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks = seven_transactions(dir.path());
+    let torn = chunks.last().unwrap();
+    let path = dir.path().join(format!("{:020}.segment", torn.segment));
+    let length = fs::metadata(&path).unwrap().len();
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(length - 5)
+        .unwrap();
+    let before = segment_files(dir.path());
+    // The caller recorded transaction 7 as durable: its loss is not a torn write.
+    let error = Journal::open_with_floor(dir.path(), config(), PgLsn(71))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            error,
+            Error::DurableTail {
+                recovered: PgLsn(61),
+                floor: PgLsn(71),
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(segment_files(dir.path()), before);
+    // An intact journal satisfies the same floor.
+    let dir = tempfile::tempdir().unwrap();
+    seven_transactions(dir.path());
+    let (journal, recovered) = Journal::open_with_floor(dir.path(), config(), PgLsn(71)).unwrap();
+    assert_eq!(recovered.truncated_bytes, 0);
+    assert_eq!(journal.durable_lsn(), PgLsn(71));
 }

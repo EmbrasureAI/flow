@@ -25,12 +25,16 @@ batch_bytes = 8388608
 # Additional per-worker collapse retention; 0 forces the disk path.
 collapse_memory_bytes = 33554432
 parquet_row_group_bytes = 33554432
+# The largest single row change; a larger one blocks its table.
 chunk_bytes = 4194304
 pending_transactions = 256
 table_workers = 4
 commits_per_second = 100
 journal_bytes = 68719476736
 spool_bytes = 34359738368
+# Concurrently open source transactions, and savepoints with rows per transaction.
+# spool_transactions = 1024
+# spool_subtransactions = 1048576
 wal_soft_bytes = 17179869184
 wal_hard_bytes = 34359738368
 # Time-travel window. Every retained snapshot enlarges the metadata file each commit rewrites.

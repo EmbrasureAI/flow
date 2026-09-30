@@ -103,6 +103,11 @@ impl Table {
 pub struct Limits {
     pub journal_bytes: u64,
     pub spool_bytes: u64,
+    /// Source transactions open in the capture spool at once, including
+    /// streamed in-progress transactions.
+    pub spool_transactions: usize,
+    /// Savepoints with captured rows per open source transaction.
+    pub spool_subtransactions: usize,
     pub chunk_bytes: u32,
     /// A pgoutput UPDATE includes both row images and text bytea expansion.
     pub source_message_bytes: usize,
@@ -131,6 +136,8 @@ impl Default for Limits {
         Self {
             journal_bytes: 64 << 30,
             spool_bytes: 32 << 30,
+            spool_transactions: SpoolConfig::default().max_transactions,
+            spool_subtransactions: SpoolConfig::default().max_subtransactions,
             chunk_bytes: 4 << 20,
             source_message_bytes: 32 << 20,
             batch_rows: 1024,
@@ -251,6 +258,8 @@ impl Config {
         SpoolConfig {
             quota_bytes: l.spool_bytes,
             max_chunk_bytes: l.chunk_bytes,
+            max_transactions: l.spool_transactions,
+            max_subtransactions: l.spool_subtransactions,
             ..SpoolConfig::default()
         }
         .validate()
@@ -372,7 +381,21 @@ mod tests {
         type Case = (&'static str, Invalidate, &'static str);
 
         valid_config().validate().unwrap();
-        let cases: [Case; 5] = [
+        let cases: [Case; 7] = [
+            (
+                "no spool transactions",
+                |limits| {
+                    limits.spool_transactions = 0;
+                },
+                "invalid spool limits",
+            ),
+            (
+                "no spool subtransactions",
+                |limits| {
+                    limits.spool_subtransactions = 0;
+                },
+                "invalid spool limits",
+            ),
             (
                 "journal quota below one segment",
                 |limits| {

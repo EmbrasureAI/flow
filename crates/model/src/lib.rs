@@ -353,6 +353,9 @@ pub enum MutationKind {
 pub enum QuarantineFormat {
     PostgresEventV1,
     DecodedMutationV1,
+    /// Evidence too large for one journal chunk. The payload records only
+    /// `(table_id: u32, encoded_bytes: u64)`; the table needs a resync anyway.
+    OversizedV1,
 }
 
 #[derive(Debug, thiserror::Error)]

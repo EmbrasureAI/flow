@@ -149,6 +149,7 @@ impl SourceEvent {
 
 pub struct Decoder {
     max_message_bytes: usize,
+    max_streamed_transactions: usize,
     normal_xid: Option<u32>,
     stream_xid: Option<u32>,
     streamed: HashSet<u32>,
@@ -159,6 +160,7 @@ impl Decoder {
     pub fn new(max_message_bytes: usize) -> Self {
         Self {
             max_message_bytes,
+            max_streamed_transactions: 1024,
             normal_xid: None,
             stream_xid: None,
             streamed: HashSet::new(),
@@ -167,6 +169,11 @@ impl Decoder {
     }
     pub fn relation(&self, id: u32) -> Option<&Relation> {
         self.relations.get(&id)
+    }
+
+    /// Bound concurrently streamed transactions; each also holds a spool slot.
+    pub fn set_max_streamed_transactions(&mut self, limit: usize) {
+        self.max_streamed_transactions = limit.max(1);
     }
 
     pub fn decode(&mut self, bytes: Bytes) -> Result<SourceEvent> {
@@ -208,8 +215,10 @@ impl Decoder {
                     _ => return Err(Error::Protocol("invalid stream first flag")),
                 };
                 if first {
-                    if self.streamed.len() >= 1024 {
-                        return Err(Error::Protocol("too many streamed transactions"));
+                    if self.streamed.len() >= self.max_streamed_transactions {
+                        return Err(Error::Protocol(
+                            "too many concurrently streamed transactions; increase limits.spool_transactions",
+                        ));
                     }
                     if !self.streamed.insert(xid) {
                         return Err(Error::Protocol("duplicate first StreamStart"));

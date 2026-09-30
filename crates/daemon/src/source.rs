@@ -41,6 +41,8 @@ fn spool_config(config: &Config) -> SpoolConfig {
     SpoolConfig {
         quota_bytes: config.limits.spool_bytes,
         max_chunk_bytes: config.limits.chunk_bytes,
+        max_transactions: config.limits.spool_transactions,
+        max_subtransactions: config.limits.spool_subtransactions,
         ..Default::default()
     }
 }
@@ -205,7 +207,7 @@ pub(crate) async fn capture_loop(
             let (client, replication_connection) = match connected {
                 Ok(client) => client,
                 Err(error) if retryable_connection(&error) => {
-                    tracing::warn!(%error, "source reconnect pending");
+                    tracing::warn!(%error, hint = retry_hint(&error), "source reconnect pending");
                     tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
                     delay = (delay * 2).min(Duration::from_secs(30));
                     continue;
@@ -238,6 +240,7 @@ pub(crate) async fn capture_loop(
                     config.limits.source_message_bytes,
                 )
                 .await?;
+                source.set_max_streamed_transactions(config.limits.spool_transactions);
                 let initial_progress = *ack.borrow_and_update();
                 acknowledge_and_reclaim(&mut source, &mut journal, initial_progress).await?;
                 Ok((source, sql, sql_connection, effective_schemas))
@@ -247,7 +250,7 @@ pub(crate) async fn capture_loop(
                 Ok(source) => source,
                 Err(error) if retryable_connection(&error) => {
                     drop(replication_connection);
-                    tracing::warn!(%error, "source disconnected during replication setup");
+                    tracing::warn!(%error, hint = retry_hint(&error), "source disconnected during replication setup");
                     tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
                     delay = (delay * 2).min(Duration::from_secs(30));
                     continue;
@@ -452,9 +455,8 @@ pub(crate) async fn capture_loop(
                                 let commit_xid = match &event { SourceEvent::Commit { xid, .. } => Some(*xid), _ => None };
                                 if let Err(error) = assembler.push_buffered_at(event, source.received_lsn, &mut journal) {
                                     if let Some(id) = row_table
-                                        && matches!(&error, flow_pg_source::Error::Row(_) | flow_pg_source::Error::Value(_)
-                                            | flow_pg_source::Error::ReplicaIdentity(_) | flow_pg_source::Error::DefaultIdentity(_) | flow_pg_source::Error::UnchangedToast(_)) {
-                                            registry.block(id, crate::schema::schema_block_reason(&error.into()))?;
+                                        && table_scoped(&error) {
+                                            registry.block(id, &table_block_reason(error))?;
                                             registry.block_decoder(id, &mut assembler)?;
                                             assembler.quarantine(retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?)?;
                                             continue;
@@ -482,6 +484,12 @@ pub(crate) async fn capture_loop(
                             Ok(None) => break,
                             Err(flow_pg_source::Error::Postgres(error)) if retryable_postgres(&error) => {
                                 tracing::warn!(%error, "source disconnected; reconnecting from durable journal"); break;
+                            }
+                            Err(flow_pg_source::Error::Postgres(error)) if rejected_message(&error) => {
+                                return Err(anyhow::Error::new(error).context(format!(
+                                    "a replication message was malformed or exceeded limits.source_message_bytes ({} bytes) before its table could be identified; capture stopped for all tables. Raise the limit above the largest row change (an UPDATE carries both row images)",
+                                    config.limits.source_message_bytes
+                                )));
                             }
                             Err(error) => return Err(error.into()),
                         }
@@ -645,35 +653,89 @@ pub(crate) fn record_journaled(transaction: &flow_model::SourceTransaction) {
     );
 }
 
-fn retryable_postgres(error: &flow_pg_source::tokio_postgres::Error) -> bool {
-    // Malformed or over-limit advertised frames cannot be repaired by replay.
-    // Treat transport admission failures as fatal rather than reconnecting to
-    // the same unprocessable row forever.
+/// Row errors confined to one identifiable table. Capture durably blocks and
+/// quarantines that table instead of stopping every table.
+fn table_scoped(error: &flow_pg_source::Error) -> bool {
+    use flow_pg_source::Error;
+    matches!(
+        error,
+        Error::Row(_)
+            | Error::Value(_)
+            | Error::ReplicaIdentity(_)
+            | Error::DefaultIdentity(_)
+            | Error::UnchangedToast(_)
+            | Error::AppendOnly { .. }
+            | Error::RowLimit { .. }
+    )
+}
+
+/// Row decoding errors keep their fixed schema reasons, which never include
+/// source values; limit and contract errors name the setting to change.
+fn table_block_reason(error: flow_pg_source::Error) -> String {
+    match error {
+        error @ (flow_pg_source::Error::AppendOnly { .. }
+        | flow_pg_source::Error::RowLimit { .. }) => error.to_string(),
+        error => crate::schema::schema_block_reason(&error.into()).to_owned(),
+    }
+}
+
+/// The transport rejected a malformed or over-limit advertised frame. Replay
+/// would reach the same unprocessable message, so reconnecting cannot help.
+fn rejected_message(error: &flow_pg_source::tokio_postgres::Error) -> bool {
     let mut cause = std::error::Error::source(error);
     while let Some(error) = cause {
         if error
             .downcast_ref::<std::io::Error>()
             .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
         {
-            return false;
+            return true;
         }
         cause = error.source();
     }
-    // PostgreSQL sends ErrorResponse before closing an administratively stopped
-    // connection. Retry those connection failures, not arbitrary SQL errors such
-    // as authentication failures, missing slots, or invalid replication options.
-    error.code().is_none_or(|code| {
-        matches!(
-            *code,
-            SqlState::ADMIN_SHUTDOWN
-                | SqlState::CRASH_SHUTDOWN
-                | SqlState::CANNOT_CONNECT_NOW
-                | SqlState::CONNECTION_EXCEPTION
-                | SqlState::CONNECTION_DOES_NOT_EXIST
-                | SqlState::CONNECTION_FAILURE
-                | SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION
-        )
-    })
+    false
+}
+
+fn retryable_postgres(error: &flow_pg_source::tokio_postgres::Error) -> bool {
+    !rejected_message(error) && error.code().is_none_or(retryable_sqlstate)
+}
+
+/// PostgreSQL sends ErrorResponse before closing an administratively stopped
+/// connection. Retry those connection failures, not arbitrary SQL errors such
+/// as authentication failures, missing slots, or invalid replication options.
+/// A slot still held by a previous walsender (55006) is released once that
+/// backend notices the disconnect or reaches `wal_sender_timeout`, and a full
+/// server (53300) frees connections on its own: both retry with backoff.
+fn retryable_sqlstate(code: &SqlState) -> bool {
+    matches!(
+        *code,
+        SqlState::ADMIN_SHUTDOWN
+            | SqlState::CRASH_SHUTDOWN
+            | SqlState::CANNOT_CONNECT_NOW
+            | SqlState::CONNECTION_EXCEPTION
+            | SqlState::CONNECTION_DOES_NOT_EXIST
+            | SqlState::CONNECTION_FAILURE
+            | SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION
+            | SqlState::OBJECT_IN_USE
+            | SqlState::TOO_MANY_CONNECTIONS
+    )
+}
+
+/// Operator guidance for retried conditions that are not disconnects.
+fn retry_hint(error: &anyhow::Error) -> &'static str {
+    let code = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<flow_pg_source::tokio_postgres::Error>()
+            .and_then(|error| error.code())
+    });
+    match code {
+        Some(&SqlState::OBJECT_IN_USE) => {
+            "the replication slot is active in another session, usually this daemon's previous walsender; retrying until PostgreSQL releases it (at most wal_sender_timeout). If it persists, find the holder in pg_replication_slots.active_pid"
+        }
+        Some(&SqlState::TOO_MANY_CONNECTIONS) => {
+            "PostgreSQL has no free connection slots for this role, database or server; retrying"
+        }
+        _ => "retrying with backoff",
+    }
 }
 
 pub(crate) fn retryable_connection(error: &anyhow::Error) -> bool {
@@ -1445,6 +1507,66 @@ mod tests {
     }
 
     #[test]
+    fn busy_slot_and_full_server_retry_but_other_sql_errors_do_not() {
+        for code in [SqlState::OBJECT_IN_USE, SqlState::TOO_MANY_CONNECTIONS] {
+            assert!(retryable_sqlstate(&code), "{code:?}");
+        }
+        for code in [
+            SqlState::INVALID_PASSWORD,
+            SqlState::UNDEFINED_OBJECT,
+            SqlState::INSUFFICIENT_PRIVILEGE,
+            SqlState::PROTOCOL_VIOLATION,
+        ] {
+            assert!(!retryable_sqlstate(&code), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn append_only_changes_and_oversized_rows_block_only_their_table() {
+        use flow_pg_source::Error;
+        let append_only = Error::AppendOnly {
+            table: 7,
+            operation: "DELETE",
+        };
+        assert!(table_scoped(&append_only));
+        let reason = table_block_reason(append_only);
+        assert!(
+            reason.contains("append-only table 7 received DELETE")
+                && reason.contains("resynchronization or append_only = false"),
+            "{reason}"
+        );
+        let oversized = Error::RowLimit {
+            table: 7,
+            bytes: 5 << 20,
+            limit: 4 << 20,
+        };
+        assert!(table_scoped(&oversized));
+        assert!(table_block_reason(oversized).contains("limits.chunk_bytes"));
+        // Existing row errors keep their fixed reasons, free of source values.
+        let toast = Error::UnchangedToast(7);
+        assert!(table_scoped(&toast));
+        assert_eq!(
+            table_block_reason(toast),
+            "source row has unresolved unchanged TOAST values"
+        );
+        // Shared capture state and transaction-wide limits stay source-wide.
+        for error in [
+            Error::SpoolQuota {
+                used: 1,
+                requested: 2,
+                quota: 2,
+            },
+            Error::SpoolTransactions { limit: 1 },
+            Error::SpoolSubtransactions { xid: 1, limit: 1 },
+            Error::Config("capture configuration"),
+            Error::Protocol("framing"),
+            Error::Journal(flow_ingress_journal::Error::Corrupt),
+        ] {
+            assert!(!table_scoped(&error), "{error}");
+        }
+    }
+
+    #[test]
     fn only_violations_after_slot_creation_are_recorded_as_publication_changed() {
         let root = tempfile::tempdir().unwrap();
         let mut config: Config =
@@ -1814,3 +1936,7 @@ mod tests {
 #[cfg(test)]
 #[path = "publication_tests.rs"]
 mod publication_tests;
+
+#[cfg(test)]
+#[path = "source_live_tests.rs"]
+mod source_live_tests;

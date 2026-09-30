@@ -499,7 +499,12 @@ pub(crate) async fn resume(
     let initial_cut = boot
         .consistent_lsn
         .context("missing initial snapshot cut")?;
-    let (mut journal, _) = Journal::open(config.state_dir.join("journal"), journal_config(config))?;
+    let mut ledger = ledger(&store, config)?;
+    let (mut journal, _) = Journal::open_with_floor(
+        config.state_dir.join("journal"),
+        journal_config(config),
+        ledger.watermarks().journal_durable_lsn,
+    )?;
     if journal.durable_lsn() < initial_cut {
         ensure!(
             journal.durable_lsn() == PgLsn(0),
@@ -519,7 +524,6 @@ pub(crate) async fn resume(
         .next()
         .transpose()?
         .filter(|transaction| transaction.xid == 0 && transaction.end_lsn == initial_cut);
-    let mut ledger = ledger(&store, config)?;
     ensure!(
         journal.durable_lsn() >= ledger.watermarks().journal_durable_lsn,
         "bootstrap journal lost previously durable transactions; recover storage before acknowledging"
