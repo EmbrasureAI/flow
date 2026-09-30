@@ -1462,6 +1462,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rocksdb",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "tempfile",

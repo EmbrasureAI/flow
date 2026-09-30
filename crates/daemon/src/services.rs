@@ -60,10 +60,26 @@ async fn rest_catalog(mut properties: HashMap<String, String>) -> Result<Arc<dyn
     for property in plaintext_credential_urls(&properties) {
         tracing::warn!(
             property = %format!("catalog.{property}"),
-            "catalog credentials are sent over plaintext HTTP to a non-loopback host; use https"
+            "catalog credentials or custom headers are sent over plaintext HTTP to a non-loopback host; use https"
         );
     }
     let ca_file = properties.remove(CATALOG_CA_FILE);
+    let https = CATALOG_AUTH_URLS.iter().any(|key| {
+        properties
+            .get(*key)
+            .and_then(|url| url.get(..8))
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    });
+    if https && ca_file.is_none() {
+        let native = rustls_native_certs::load_native_certs();
+        if native.certs.is_empty() {
+            // reqwest accepts an empty store; every HTTPS handshake would then fail.
+            tracing::warn!(
+                load_errors = native.errors.len(),
+                "no trusted CA certificates found for the HTTPS catalog; install the system CA bundle, set SSL_CERT_FILE, or set catalog.tls_ca_file"
+            );
+        }
+    }
     Ok(Arc::new(
         RestCatalogBuilder::default()
             .with_client(catalog_http_client(ca_file.as_deref().map(Path::new))?)
@@ -84,8 +100,13 @@ fn catalog_http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(60));
     if let Some(path) = ca_file {
         // Parse errors may quote file content; report only the property.
-        let pem = std::fs::read(path)
-            .map_err(|_| anyhow::anyhow!("cannot read catalog.{CATALOG_CA_FILE}"))?;
+        let pem = std::fs::read(path).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot read catalog.{CATALOG_CA_FILE} {}: {}",
+                path.display(),
+                error.kind()
+            )
+        })?;
         let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
             anyhow::anyhow!("catalog.{CATALOG_CA_FILE} must contain PEM certificates")
         })?;
@@ -102,10 +123,14 @@ fn catalog_http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
         .context("cannot configure the catalog HTTP client")
 }
 
-/// Catalog URL properties that would send a configured token or credential in
-/// plaintext to another host. Loopback endpoints, such as a local proxy, are exempt.
+/// Catalog URL properties that would send a configured token, credential or
+/// custom header (often an API key) in plaintext to another host. Loopback
+/// endpoints, such as a local proxy, are exempt.
 fn plaintext_credential_urls(properties: &HashMap<String, String>) -> Vec<&'static str> {
-    if !properties.contains_key("token") && !properties.contains_key("credential") {
+    if !properties.contains_key("token")
+        && !properties.contains_key("credential")
+        && !properties.keys().any(|key| key.starts_with("header."))
+    {
         return Vec::new();
     }
     CATALOG_AUTH_URLS
@@ -147,109 +172,176 @@ pub(crate) fn target(namespace: &[String], name: &str) -> Result<TableIdent> {
 mod tests {
     use super::*;
     use base64::Engine;
+    use iceberg::{TableCommit, TableRequirement};
+    use std::sync::Mutex;
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
         net::TcpListener,
     };
 
-    /// One scripted request and its response. Every response closes the connection.
-    struct Exchange {
-        request: &'static str,
-        authorization: Option<&'static str>,
+    const TOKEN: &str = "POST /v1/oauth/tokens ";
+    const CONFIG: &str = "GET /v1/config ";
+    const NAMESPACES: &str = "GET /v1/namespaces ";
+    const COMMIT: &str = "POST /v1/namespaces/ns/tables/t ";
+
+    /// A request received by the test catalog.
+    struct Seen {
+        line: String,
+        authorization: Option<String>,
+        body: String,
+    }
+
+    impl Seen {
+        fn is(&self, request: &str) -> bool {
+            self.line.starts_with(request)
+        }
+    }
+
+    struct Reply {
         status: &'static str,
-        body: &'static str,
+        body: String,
+        delay: Duration,
     }
 
-    const CONFIG: Exchange = Exchange {
-        request: "GET /v1/config ",
-        authorization: None,
-        status: "200 OK",
-        body: r#"{"defaults":{},"overrides":{}}"#,
-    };
-    const NAMESPACES: Exchange = Exchange {
-        request: "GET /v1/namespaces ",
-        authorization: None,
-        status: "200 OK",
-        body: r#"{"namespaces":[]}"#,
-    };
-
-    fn with(exchange: Exchange, authorization: &'static str, status: &'static str) -> Exchange {
-        Exchange {
-            authorization: Some(authorization),
+    fn reply(status: &'static str, body: impl Into<String>) -> Reply {
+        Reply {
             status,
-            ..exchange
+            body: body.into(),
+            delay: Duration::ZERO,
         }
     }
 
-    fn token(access_token: &'static str) -> Exchange {
-        Exchange {
-            request: "POST /v1/oauth/tokens ",
-            authorization: None,
-            status: "200 OK",
-            body: access_token,
-        }
+    fn token(value: &str) -> Reply {
+        reply(
+            "200 OK",
+            format!(r#"{{"access_token":"{value}","token_type":"bearer","expires_in":3600}}"#),
+        )
     }
 
-    async fn respond(mut stream: impl AsyncRead + AsyncWrite + Unpin, exchange: &Exchange) {
-        let mut request = Vec::new();
-        loop {
-            let mut buffer = [0; 4096];
-            let read = stream.read(&mut buffer).await.unwrap();
-            assert!(read > 0 && request.len() < 16384);
-            request.extend_from_slice(&buffer[..read]);
-            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&request[..end]).into_owned();
-                let header = |name: &str| {
-                    headers.lines().find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        key.eq_ignore_ascii_case(name)
-                            .then(|| value.trim().to_owned())
-                    })
-                };
-                let length = header("content-length").map_or(0, |value| value.parse().unwrap());
-                if request.len() < end + 4 + length {
-                    continue;
-                }
-                assert!(headers.starts_with(exchange.request), "{headers}");
-                if let Some(expected) = exchange.authorization {
-                    assert_eq!(header("authorization").as_deref(), Some(expected));
-                }
-                break;
-            }
-        }
-        let body = if exchange.request.starts_with("POST /v1/oauth/tokens ") {
-            format!(
-                r#"{{"access_token":"{}","token_type":"bearer","expires_in":3600}}"#,
-                exchange.body
-            )
+    fn catalog_reply(request: &Seen) -> Reply {
+        if request.is(CONFIG) {
+            reply("200 OK", r#"{"defaults":{},"overrides":{}}"#)
+        } else if request.is(NAMESPACES) {
+            reply("200 OK", r#"{"namespaces":[]}"#)
         } else {
-            exchange.body.to_owned()
-        };
-        let response = format!(
-            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            exchange.status,
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
+            panic!("unexpected request: {}", request.line)
+        }
     }
 
+    fn count(log: &[Seen], request: &str) -> usize {
+        log.iter().filter(|seen| seen.is(request)).count()
+    }
+
+    type Log = Arc<Mutex<Vec<Seen>>>;
+    type Route = Arc<dyn Fn(&Seen, &[Seen]) -> Reply + Send + Sync>;
+
+    /// Method, path and bearer header of every request so far.
+    fn trace(log: &Log) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|seen| {
+                let request = seen.line.split(' ').take(2).collect::<Vec<_>>().join(" ");
+                format!("{request} {}", seen.authorization.as_deref().unwrap_or("-"))
+            })
+            .collect()
+    }
+
+    /// Serves each connection concurrently; `route` sees the request and all earlier ones.
     async fn serve(
-        exchanges: Vec<Exchange>,
         tls: Option<tokio_rustls::TlsAcceptor>,
-    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        route: impl Fn(&Seen, &[Seen]) -> Reply + Send + Sync + 'static,
+    ) -> (std::net::SocketAddr, Log) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for exchange in &exchanges {
-                let (stream, _) = listener.accept().await.unwrap();
-                match &tls {
-                    Some(tls) => respond(tls.accept(stream).await.unwrap(), exchange).await,
-                    None => respond(stream, exchange).await,
-                }
+        let log = Log::default();
+        let route: Route = Arc::new(route);
+        let server_log = log.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (route, log, tls) = (route.clone(), server_log.clone(), tls.clone());
+                tokio::spawn(async move {
+                    match tls {
+                        Some(tls) => {
+                            // Untrusting clients abort the handshake.
+                            if let Ok(stream) = tls.accept(stream).await {
+                                respond(stream, &route, &log).await;
+                            }
+                        }
+                        None => respond(stream, &route, &log).await,
+                    }
+                });
             }
         });
-        (address, server)
+        (address, log)
+    }
+
+    async fn respond(mut stream: impl AsyncRead + AsyncWrite + Unpin, route: &Route, log: &Log) {
+        let mut request = Vec::new();
+        let seen = loop {
+            let mut buffer = [0; 4096];
+            let Ok(read) = stream.read(&mut buffer).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..end]).into_owned();
+            let header = |name: &str| {
+                headers.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_owned())
+                })
+            };
+            let length: usize = header("content-length").map_or(0, |value| value.parse().unwrap());
+            if request.len() >= end + 4 + length {
+                break Seen {
+                    line: headers.lines().next().unwrap_or_default().to_owned(),
+                    authorization: header("authorization"),
+                    body: String::from_utf8_lossy(&request[end + 4..end + 4 + length]).into_owned(),
+                };
+            }
+        };
+        let reply = {
+            let mut log = log.lock().unwrap();
+            let reply = route(&seen, &log);
+            log.push(seen);
+            reply
+        };
+        tokio::time::sleep(reply.delay).await;
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            reply.status,
+            reply.body.len(),
+            reply.body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
+    async fn oauth_catalog(address: std::net::SocketAddr) -> Arc<dyn Catalog> {
+        rest_catalog(HashMap::from([
+            ("uri".into(), format!("http://{address}")),
+            ("credential".into(), "client:secret".into()),
+        ]))
+        .await
+        .unwrap()
+    }
+
+    /// Moves the runtime clock forward, which the REST client's token expiry uses.
+    async fn advance(duration: Duration) {
+        tokio::time::pause();
+        tokio::time::advance(duration).await;
+        tokio::time::resume();
+    }
+
+    fn code(error: iceberg::Error) -> Option<&'static str> {
+        crate::runtime::blocked::publication_error_code(&anyhow::Error::new(error))
     }
 
     /// A short-lived CA and a `localhost` server certificate it signed.
@@ -312,32 +404,21 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let ca_file = root.path().join("catalog-ca.pem");
         std::fs::write(&ca_file, ca).unwrap();
-        let (address, server) = serve(vec![CONFIG, NAMESPACES], Some(acceptor.clone())).await;
+        let (address, log) = serve(Some(acceptor), |request, _| catalog_reply(request)).await;
+        let uri = format!("https://localhost:{}", address.port());
         let catalog = rest_catalog(HashMap::from([
-            (
-                "uri".into(),
-                format!("https://localhost:{}", address.port()),
-            ),
+            ("uri".into(), uri.clone()),
             (CATALOG_CA_FILE.into(), ca_file.display().to_string()),
         ]))
         .await
         .unwrap();
         assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
-        server.await.unwrap();
+        assert_eq!(count(&log.lock().unwrap(), NAMESPACES), 1);
 
         // Without the private CA, the handshake fails certificate verification.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            assert!(acceptor.accept(stream).await.is_err());
-        });
-        let catalog = rest_catalog(HashMap::from([(
-            "uri".into(),
-            format!("https://localhost:{}", address.port()),
-        )]))
-        .await
-        .unwrap();
+        let catalog = rest_catalog(HashMap::from([("uri".into(), uri)]))
+            .await
+            .unwrap();
         let error = anyhow::Error::new(catalog.list_namespaces(None).await.unwrap_err());
         let diagnostics = format!("{error:?}");
         assert!(
@@ -348,15 +429,20 @@ mod tests {
         );
         assert!(diagnostics.contains("certificate"), "{diagnostics}");
         assert!(!diagnostics.contains("scheme"), "{diagnostics}");
-        server.await.unwrap();
+        assert_eq!(log.lock().unwrap().len(), 2);
     }
 
     #[test]
-    fn catalog_ca_file_errors_omit_file_content() {
+    fn catalog_ca_file_errors_name_the_file_but_omit_its_content() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("missing.pem");
-        let error = catalog_http_client(Some(&missing)).unwrap_err();
-        assert_eq!(error.to_string(), "cannot read catalog.tls_ca_file");
+        let error = catalog_http_client(Some(&missing)).unwrap_err().to_string();
+        assert!(
+            error.starts_with("cannot read catalog.tls_ca_file"),
+            "{error}"
+        );
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        assert!(error.contains("not found"), "{error}");
         let empty = root.path().join("empty.pem");
         std::fs::write(&empty, "FAKE_SECRET_CONTENT").unwrap();
         let error = catalog_http_client(Some(&empty)).unwrap_err();
@@ -380,6 +466,13 @@ mod tests {
         );
         assert_eq!(
             urls(&[
+                ("uri", "http://catalog.internal:8181"),
+                ("header.x-api-key", "key"),
+            ]),
+            ["uri"]
+        );
+        assert_eq!(
+            urls(&[
                 ("uri", "https://catalog.example.com"),
                 ("oauth2-server-uri", "http://10.0.0.5/token"),
                 ("credential", "id:secret"),
@@ -399,39 +492,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_oauth_tokens_are_replaced_and_static_rejections_are_catalog_auth() {
-        let (address, server) = serve(
-            vec![
-                token("first-token"),
-                with(CONFIG, "Bearer first-token", "200 OK"),
-                with(NAMESPACES, "Bearer first-token", "401 Unauthorized"),
-                token("second-token"),
-                with(NAMESPACES, "Bearer second-token", "200 OK"),
-            ],
-            None,
-        )
+    async fn oauth_tokens_are_renewed_before_the_reported_expiry() {
+        let (address, log) = serve(None, |request, prior| {
+            if !request.is(TOKEN) {
+                return catalog_reply(request);
+            }
+            token(["first", "second"][count(prior, TOKEN)])
+        })
         .await;
-        let catalog = rest_catalog(HashMap::from([
-            ("uri".into(), format!("http://{address}")),
-            ("credential".into(), "client:secret".into()),
-        ]))
-        .await
-        .unwrap();
-        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
-        server.await.unwrap();
+        let catalog = oauth_catalog(address).await;
+        catalog.list_namespaces(None).await.unwrap();
+        advance(Duration::from_secs(3299)).await;
+        catalog.list_namespaces(None).await.unwrap();
+        // Five minutes before the one-hour expiry, the token is renewed.
+        advance(Duration::from_secs(1)).await;
+        catalog.list_namespaces(None).await.unwrap();
+        assert_eq!(
+            trace(&log),
+            [
+                "POST /v1/oauth/tokens -",
+                "GET /v1/config Bearer first",
+                "GET /v1/namespaces Bearer first",
+                "GET /v1/namespaces Bearer first",
+                "POST /v1/oauth/tokens -",
+                "GET /v1/namespaces Bearer second",
+            ]
+        );
+    }
 
-        for (status, code) in [
+    #[tokio::test]
+    async fn failed_renewal_neither_blocks_requests_nor_repeats_immediately() {
+        let (address, log) = serve(None, |request, prior| {
+            if !request.is(TOKEN) {
+                return catalog_reply(request);
+            }
+            match count(prior, TOKEN) {
+                0 => token("first"),
+                // A slow, failing token endpoint during the early renewal.
+                1 => Reply {
+                    delay: Duration::from_secs(2),
+                    ..reply("503 Service Unavailable", "")
+                },
+                _ => token("second"),
+            }
+        })
+        .await;
+        let catalog = oauth_catalog(address).await;
+        catalog.list_namespaces(None).await.unwrap();
+        advance(Duration::from_secs(3300)).await;
+
+        let started = std::time::Instant::now();
+        let results =
+            futures::future::join_all((0..5).map(|_| catalog.list_namespaces(None))).await;
+        assert!(results.iter().all(Result::is_ok));
+        // Only the renewing request waits for the token endpoint.
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        // Within the backoff, requests use the unexpired token without renewing.
+        catalog.list_namespaces(None).await.unwrap();
+        assert_eq!(count(&log.lock().unwrap(), TOKEN), 2);
+        assert_eq!(
+            trace(&log)
+                .iter()
+                .filter(|request| request.as_str() == "GET /v1/namespaces Bearer first")
+                .count(),
+            7
+        );
+
+        // The backoff is at most 30 seconds.
+        advance(Duration::from_secs(31)).await;
+        catalog.list_namespaces(None).await.unwrap();
+        assert_eq!(
+            trace(&log)[10..],
+            [
+                "POST /v1/oauth/tokens -",
+                "GET /v1/namespaces Bearer second",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_oauth_tokens_are_replaced_once() {
+        for accept_second in [true, false] {
+            let (address, log) = serve(None, move |request, prior| {
+                if request.is(TOKEN) {
+                    return token(["first", "second"][count(prior, TOKEN)]);
+                }
+                let rejected =
+                    request.authorization.as_deref() == Some("Bearer first") || !accept_second;
+                if request.is(NAMESPACES) && rejected {
+                    return reply("401 Unauthorized", "");
+                }
+                catalog_reply(request)
+            })
+            .await;
+            let catalog = oauth_catalog(address).await;
+            let result = catalog.list_namespaces(None).await;
+            if accept_second {
+                assert!(result.unwrap().is_empty());
+            } else {
+                assert_eq!(code(result.unwrap_err()), Some("catalog_auth"));
+            }
+            assert_eq!(
+                trace(&log),
+                [
+                    "POST /v1/oauth/tokens -",
+                    "GET /v1/config Bearer first",
+                    "GET /v1/namespaces Bearer first",
+                    "POST /v1/oauth/tokens -",
+                    "GET /v1/namespaces Bearer second",
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_token_rejections_are_catalog_auth_and_not_retried() {
+        for (status, expected) in [
             ("401 Unauthorized", "catalog_auth"),
             ("403 Forbidden", "catalog_auth"),
             ("503 Service Unavailable", "catalog_unavailable"),
         ] {
-            let (address, server) = serve(
-                vec![
-                    with(CONFIG, "Bearer static-token", "200 OK"),
-                    with(NAMESPACES, "Bearer static-token", status),
-                ],
-                None,
-            )
+            let (address, log) = serve(None, move |request, _| {
+                if request.is(NAMESPACES) {
+                    return reply(status, "");
+                }
+                catalog_reply(request)
+            })
             .await;
             let catalog = rest_catalog(HashMap::from([
                 ("uri".into(), format!("http://{address}")),
@@ -439,36 +629,62 @@ mod tests {
             ]))
             .await
             .unwrap();
-            let error = anyhow::Error::new(catalog.list_namespaces(None).await.unwrap_err());
+            let error = catalog.list_namespaces(None).await.unwrap_err();
+            assert_eq!(code(error), Some(expected), "{status}");
             assert_eq!(
-                crate::runtime::blocked::publication_error_code(&error),
-                Some(code),
-                "{status}"
+                trace(&log),
+                [
+                    "GET /v1/config Bearer static-token",
+                    "GET /v1/namespaces Bearer static-token",
+                ]
             );
-            server.await.unwrap();
         }
 
         // Revoked client credentials are an authentication failure too.
-        let (address, server) = serve(
-            vec![Exchange {
-                status: "401 Unauthorized",
-                body: "",
-                ..token("unused")
-            }],
-            None,
-        )
+        let (address, log) = serve(None, |_, _| reply("401 Unauthorized", "")).await;
+        let catalog = oauth_catalog(address).await;
+        let error = catalog.list_namespaces(None).await.unwrap_err();
+        assert_eq!(code(error), Some("catalog_auth"));
+        assert_eq!(trace(&log), ["POST /v1/oauth/tokens -"]);
+    }
+
+    /// A commit rejected after it was applied (for example by a proxy) is resent with
+    /// the same base assertion, so the catalog answers 409 instead of applying it
+    /// twice. Publication recovery then finds the applied commit by its marker.
+    #[tokio::test]
+    async fn rejected_commit_is_resent_with_its_original_base_assertion() {
+        let (address, log) = serve(None, |request, prior| {
+            if request.is(TOKEN) {
+                return token(["first", "second"][count(prior, TOKEN)]);
+            }
+            if request.is(COMMIT) {
+                return match request.authorization.as_deref() {
+                    Some("Bearer first") => reply("401 Unauthorized", ""),
+                    _ => reply("409 Conflict", ""),
+                };
+            }
+            catalog_reply(request)
+        })
         .await;
-        let catalog = rest_catalog(HashMap::from([
-            ("uri".into(), format!("http://{address}")),
-            ("credential".into(), "client:revoked".into()),
-        ]))
-        .await
-        .unwrap();
-        let error = anyhow::Error::new(catalog.list_namespaces(None).await.unwrap_err());
-        assert_eq!(
-            crate::runtime::blocked::publication_error_code(&error),
-            Some("catalog_auth")
+        let catalog = oauth_catalog(address).await;
+        let commit = TableCommit::builder()
+            .ident(TableIdent::from_strs(["ns", "t"]).unwrap())
+            .requirements(vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "main".into(),
+                snapshot_id: Some(7),
+            }])
+            .updates(Vec::new())
+            .build();
+        let error = catalog.update_table(commit).await.unwrap_err();
+        assert_eq!(code(error), Some("catalog_conflict"));
+        let log = log.lock().unwrap();
+        let commits: Vec<_> = log.iter().filter(|seen| seen.is(COMMIT)).collect();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].body, commits[1].body);
+        assert!(
+            commits[0].body.contains(r#""snapshot-id":7"#),
+            "{}",
+            commits[0].body
         );
-        server.await.unwrap();
     }
 }

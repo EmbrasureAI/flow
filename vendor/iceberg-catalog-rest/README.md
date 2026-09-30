@@ -51,8 +51,10 @@ reqwest is built with its rustls backend and the platform trust store
 (`SSL_CERT_FILE` and `SSL_CERT_DIR` replace that store when set), so `https://`
 catalogs work with the default client. OAuth tokens obtained from client
 credentials are exchanged again before the `expires_in` the token endpoint
-reports: five minutes early, or after nine tenths of a shorter lifetime. A
-failed early exchange keeps using the current token until it expires. When the
+reports: five minutes early, or after nine tenths of a shorter lifetime. One
+request renews the token while others keep using the unexpired one. A failed
+early exchange keeps using the current token until it expires, retrying after a
+backoff of at most 30 seconds. When the
 catalog answers 401 or 419 and credentials are configured, the client obtains a
 new token and sends the request once more. Errors caused by rejected credentials
 (catalog 401, 403 or 419; token endpoint 400, 401 or 403) carry the public

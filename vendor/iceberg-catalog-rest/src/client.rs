@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
@@ -26,6 +26,8 @@ use reqwest::header::HeaderMap;
 use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
+// The runtime clock lets tests advance time across token lifetimes.
+use tokio::time::Instant;
 
 use crate::types::TokenResponse;
 use crate::RestCatalogConfig;
@@ -33,6 +35,9 @@ use crate::RestCatalogConfig;
 /// Replace an OAuth token this long before the server-reported expiry, or after
 /// nine tenths of a shorter lifetime, so requests do not race the expiry.
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
+/// After a failed early renewal, wait at most this long (or a quarter of the
+/// remaining lifetime) before another request tries again.
+const TOKEN_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Marks an error caused by the catalog rejecting the request's credentials.
 ///
@@ -86,6 +91,18 @@ impl CachedToken {
 
     fn expired(&self, now: Instant) -> bool {
         self.expires_at.is_some_and(|at| now >= at)
+    }
+
+    fn usable(&self, now: Instant) -> bool {
+        !self.refresh_due(now) && !self.expired(now)
+    }
+
+    /// Postpones the next renewal attempt after a failed one, within the lifetime.
+    fn defer_refresh(&mut self, now: Instant) {
+        let remaining = self
+            .expires_at
+            .map_or(TOKEN_RETRY_BACKOFF, |at| at.saturating_duration_since(now));
+        self.refresh_at = now.checked_add(TOKEN_RETRY_BACKOFF.min(remaining / 4));
     }
 }
 
@@ -298,23 +315,31 @@ impl HttpClient {
     /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
     ///
     /// When both `credential` and `token` are present, `token` takes precedence until the
-    /// catalog rejects it. An OAuth token is exchanged again before its reported expiry; if
-    /// that early exchange fails, the current token is used until it actually expires.
+    /// catalog rejects it. An OAuth token is exchanged again before its reported expiry.
+    /// While the current token is unexpired, requests never wait for a renewal: one request
+    /// renews it and the others keep sending the current token. If that renewal fails, the
+    /// current token is used until it expires and the next attempt is backed off.
     async fn current_token(&self) -> Result<Option<String>> {
         // Clone the token from lock without holding the lock for entire function.
         let cached = self.token.lock().await.clone();
-        match &cached {
-            Some(token) if !token.refresh_due(Instant::now()) => {
-                return Ok(Some(token.value.clone()));
-            }
+        let now = Instant::now();
+        let current = match cached {
+            Some(token) if token.usable(now) => return Ok(Some(token.value)),
             None if self.credential.is_none() => return Ok(None),
-            _ => {}
-        }
+            cached => cached.filter(|token| !token.expired(now)),
+        };
 
-        let _refresh = self.refresh.lock().await;
+        let _refresh = match &current {
+            Some(token) => match self.refresh.try_lock() {
+                Ok(guard) => guard,
+                // Another request is renewing; the current token is still valid.
+                Err(_) => return Ok(Some(token.value.clone())),
+            },
+            None => self.refresh.lock().await,
+        };
         // Another request may have replaced the token while this one waited.
         if let Some(token) = self.token.lock().await.as_ref()
-            && !token.refresh_due(Instant::now())
+            && token.usable(Instant::now())
         {
             return Ok(Some(token.value.clone()));
         }
@@ -326,10 +351,16 @@ impl HttpClient {
                 *self.token.lock().await = Some(token);
                 Ok(Some(value))
             }
-            Err(error) => match cached {
-                Some(token) if !token.expired(Instant::now()) => Ok(Some(token.value)),
-                _ => Err(error),
-            },
+            Err(error) => {
+                let now = Instant::now();
+                match self.token.lock().await.as_mut() {
+                    Some(token) if !token.expired(now) => {
+                        token.defer_refresh(now);
+                        Ok(Some(token.value.clone()))
+                    }
+                    _ => Err(error),
+                }
+            }
         }
     }
 
@@ -338,7 +369,7 @@ impl HttpClient {
         let _refresh = self.refresh.lock().await;
         if let Some(token) = self.token.lock().await.as_ref()
             && token.value != rejected
-            && !token.refresh_due(Instant::now())
+            && token.usable(Instant::now())
         {
             return Ok(token.value.clone());
         }
@@ -387,9 +418,11 @@ impl HttpClient {
     // returns a `Response`.
     //
     // When OAuth credentials are configured and the catalog rejects the token, the
-    // credential is exchanged for a new token and the request is sent once more. A
-    // rejected request was not processed, so repeating it is safe. Configured tokens
-    // without credentials cannot be replaced; their rejection is returned.
+    // credential is exchanged for a new token and the request is sent once more.
+    // Configured tokens without credentials cannot be replaced; their rejection is
+    // returned. A proxy or server could reject a request after applying it, so the
+    // caller must make resending safe: commits carry the same requirements, which fail
+    // with 409 when an earlier attempt already moved the table.
     pub async fn query_catalog(&self, mut request: Request) -> Result<Response> {
         let retry = self
             .credential
@@ -602,7 +635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_early_refresh_uses_the_unexpired_token() {
+    async fn failed_early_refresh_uses_the_unexpired_token_and_backs_off() {
         let mut server = mockito::Server::new_async().await;
         let oauth = server
             .mock("POST", "/v1/oauth/tokens")
@@ -614,7 +647,7 @@ mod tests {
             .mock("GET", "/v1/namespaces")
             .match_header("authorization", "Bearer current")
             .with_status(200)
-            .expect(1)
+            .expect(2)
             .create_async()
             .await;
         let client = HttpClient::new(
@@ -633,17 +666,20 @@ mod tests {
             refresh_at: Some(now),
             expires_at: Some(now + Duration::from_secs(60)),
         });
-        let request = client
-            .request(Method::GET, format!("{}/v1/namespaces", server.url()))
-            .build()
-            .unwrap();
-        assert_eq!(
-            client.query_catalog(request).await.unwrap().status(),
-            StatusCode::OK
-        );
+        // The first request tries to renew; the second is inside the backoff.
+        for _ in 0..2 {
+            let request = client
+                .request(Method::GET, format!("{}/v1/namespaces", server.url()))
+                .build()
+                .unwrap();
+            assert_eq!(
+                client.query_catalog(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
 
         // Once the token has expired, the exchange failure is returned.
-        client.token.lock().await.as_mut().unwrap().expires_at = Some(now);
+        client.token.lock().await.as_mut().unwrap().expires_at = Some(Instant::now());
         let request = client
             .request(Method::GET, format!("{}/v1/namespaces", server.url()))
             .build()

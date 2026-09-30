@@ -33,16 +33,22 @@ paths through the public catalog API. This correction changes `src/client.rs`.
 HTTPS catalogs are supported through reqwest's rustls backend with the platform
 trust store (`rustls-tls-native-roots`); the upstream manifest enabled no TLS
 backend. OAuth client-credential tokens are renewed before the reported
-`expires_in`, and a request rejected with 401 or 419 is sent once more with a
-newly exchanged token. A rejected request was not processed, so repeating it,
-including a table commit, cannot apply a change twice. Configured tokens without
-credentials are never retried. Errors from rejected credentials carry the new
+`expires_in` by one request at a time; while the current token is unexpired,
+other requests keep using it instead of waiting, and a failed renewal is retried
+after a backoff of at most 30 seconds. A request rejected with 401 or 419 is sent
+once more with a newly exchanged token. A proxy or server may reject a request
+after applying it, so resending relies on the caller: Flow's commits assert the
+exact base snapshot of the branch, so a resent commit that already applied fails
+with 409, and Flow then finds the applied commit by its operation-id marker.
+Configured tokens without credentials are never retried. Expiry uses the tokio
+clock (the crate now enables tokio's `time` feature). Errors from rejected credentials carry the new
 public `AuthRejected` source marker so callers can classify them without
 parsing messages; response bodies remain omitted. The HTTP client's `Debug`
 output lists configured header names without their values, since
 `header.Authorization` and API-key headers carry credentials. Unit tests cover
-the refresh schedule, a failed early refresh, re-authentication with one retry,
-the marker, and `Debug` redaction. This correction changes `Cargo.toml`, `Cargo.toml.orig`, `README.md`,
+the refresh schedule, a failed early refresh and its backoff, re-authentication
+with one retry, the marker, and `Debug` redaction; daemon tests repeat the
+refresh, concurrency and retry cases through the public catalog API. This correction changes `Cargo.toml`, `Cargo.toml.orig`, `README.md`,
 `public-api.txt`, `src/catalog.rs`, `src/client.rs` and `src/lib.rs`.
 
 From an extracted crate, apply these repository patches in order (use absolute

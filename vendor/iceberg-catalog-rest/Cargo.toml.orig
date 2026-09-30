@@ -41,7 +41,8 @@ reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# Local change: token expiry uses the runtime clock.
+tokio = { workspace = true, features = ["time"] }
 typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
