@@ -219,8 +219,8 @@ class FaultRun(Run):
             offset = len(self.proxy.events)
         self.proxy.arm_drop(**outcome)
         barrier = self.fault_writes(name)
-        if not self.proxy.dropped.wait(timeout=self.args.timeout):
-            raise AssertionError(f"proxy never hid a successful ingestion commit ({fault})")
+        # Fail fast, with its log, if the daemon exits before the fault fires.
+        self.until(f"proxy never hid a successful ingestion commit ({fault})", self.proxy.dropped.is_set)
         result = self.recover(barrier, name)
         # A late response is recorded only after its delayed write.
         dropped = self.until(f"{fault} was not recorded", lambda: [

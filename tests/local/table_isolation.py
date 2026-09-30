@@ -255,6 +255,8 @@ class IsolationRun(Run):
         self.proxy.reject_table("orders", 503, methods=("POST",))
         blocked_barrier = self.transaction(["UPDATE orders SET payload='quota-blocked' WHERE id=1"])
         self.wait_blocked()
+        pid = self.process.pid
+        log = self.directory / f"daemon-{self.generation}.log"
         # About 80 MiB of explicit row payload against a 64 MiB journal. Each
         # transaction and row fits normal framing; host disk exhaustion is never used.
         for index in range(80):
@@ -262,18 +264,17 @@ class IsolationRun(Run):
                 "INSERT INTO orders (id,tenant,payload) SELECT i,1,repeat(md5(i::text),512) "
                 f"FROM generate_series({10000 + index * 64},{10063 + index * 64}) i"
             ])
-        code = self.process.wait(timeout=self.args.timeout)
-        assert code != 0, "journal quota must stop the shared capture runtime"
-        log = (self.directory / f"daemon-{self.generation}.log").read_text()
-        assert "journal quota exhausted" in log
+        # A full journal pauses capture; the daemon keeps serving healthy work
+        # and the slot retains everything not yet journaled.
+        self.until("journal quota did not pause capture", lambda:
+                   "journal quota reached; pausing capture" in log.read_text())
         evidence = self.check_ack(blocked_barrier)
-        self.stop()
-        self.config.write_text(self.config.read_text().replace(
-            "journal_bytes = 67108864", "journal_bytes = 268435456"))
+        self.until("capture pause is not exported", lambda: self.metrics().get("flow_capture_journal_full") == 1,
+                   timeout=30)
         self.proxy.allow_table("orders")
-        self.start()
         self.wait_materialized(barrier)
-        return {"exit_code": code, "at_quota": evidence, "recovered": self.catch_up(barrier, "quota-recovered")}
+        assert self.process.pid == pid, "journal quota restarted the daemon"
+        return {"paused_pid": pid, "at_quota": evidence, "recovered": self.catch_up(barrier, "quota-recovered")}
 
     def execute(self):
         try:
@@ -321,7 +322,7 @@ def main():
     parser.add_argument("--binary", type=Path, default=Path("target/debug/embrasure-flow"))
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
-    parser.add_argument("--quota", action="store_true", help="run the separate 64 MiB journal exhaustion case")
+    parser.add_argument("--quota", action="store_true", help="run the separate 64 MiB journal-full pause and drain case")
     args = parser.parse_args()
     if not args.postgres_url:
         parser.error("provide --postgres-url or FLOW_POSTGRES_URL")

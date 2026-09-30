@@ -29,7 +29,17 @@ const LOST_JOURNAL: &[&str] = &[
 ];
 const AHEAD_OF_JOURNAL: &[&str] =
     &["PostgreSQL slot has acknowledged beyond the local durable journal"];
-const LOST_WAL: &[&str] = &["replication slot lost required WAL"];
+const RESTORED: &[&str] = &[
+    "PostgreSQL slot has acknowledged beyond the local durable journal",
+    // A table worker can load the catalog first: the restored index does not
+    // know the snapshots published after the backup.
+    "paused publication: UnknownServiceOperation",
+];
+const LOST_WAL: &[&str] = &[
+    // Capture's slot validation, or the WAL health monitor if it runs first.
+    "replication slot lost required WAL",
+    "replication slot lost WAL; resynchronization required",
+];
 
 struct Fixture {
     name: String,
@@ -355,7 +365,7 @@ async fn restored_older_state_dir(sql: &Client) -> String {
             .await;
         std::fs::rename(state, state.with_file_name("newer")).unwrap();
         std::fs::rename(&backup, state).unwrap();
-        AHEAD_OF_JOURNAL
+        RESTORED
     })
     .await
 }

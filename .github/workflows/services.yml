@@ -185,8 +185,11 @@ jobs:
         run: target/debug/schema_batch_tests batched_metadata --ignored
       - name: Publication isolation and fail-closed storage-loss guards
         # Serial: the lost-WAL guard lowers max_slot_wal_keep_size server-wide.
+        # The publication tests use PostgreSQL 15 row filters and schema publications.
         if: matrix.suite == 'compatibility'
-        run: target/debug/daemon_tests live_ --ignored --test-threads=1 --nocapture
+        env:
+          LIVE_TESTS: ${{ matrix.postgres == '14.24' && 'live_storage' || 'live_' }}
+        run: target/debug/daemon_tests "$LIVE_TESTS" --ignored --test-threads=1 --nocapture
       - name: Superset publication captures only configured tables
         if: matrix.suite == 'compatibility'
         run: target/debug/superset_publication_tests live_ --ignored

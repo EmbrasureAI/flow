@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, ensure};
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, Int64Array, LargeBinaryArray, RecordBatch, StringArray,
+};
 use flow_iceberg_ext::{ArtifactSet, ArtifactTracker};
 use flow_model::{ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableSchema, Value};
 use iceberg::{
@@ -331,7 +333,23 @@ impl DataWriter {
             .await?;
         let mut batch = rows_to_batch(&self.schema, rows)?;
         if let Some(schema) = &self.lineage_schema {
-            let mut columns = batch.columns().to_vec();
+            // Iceberg's Arrow conversion maps binary to LargeBinary; rows are
+            // built as Binary. Both encode the same Parquet BYTE_ARRAY values.
+            let mut columns = batch
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(
+                    |(column, field)| match column.as_any().downcast_ref::<BinaryArray>() {
+                        Some(binary)
+                            if field.data_type() == &arrow_schema::DataType::LargeBinary =>
+                        {
+                            Arc::new(binary.iter().collect::<LargeBinaryArray>()) as ArrayRef
+                        }
+                        _ => column.clone(),
+                    },
+                )
+                .collect::<Vec<_>>();
             for row_id in [true, false] {
                 let values = (0..rows.len()).map(|index| {
                     lineage.and_then(|values| {
