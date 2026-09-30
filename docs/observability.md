@@ -40,7 +40,7 @@ for liveness and `/readyz` for readiness probes. Do not restart on a failed
 readiness check: WAL pressure and publication outages clear readiness while
 capture continues. The endpoints are unauthenticated and read-only.
 
-`state_dir/metrics.prom` uses Prometheus text format for a textfile collector. Its integer LSN text remains exact; Prometheus stores floating-point samples, so use `status` for exact comparisons beyond its integer precision. Metrics reset on process restart. `init` installs its own recorder and flushes bootstrap duration, outcome and I/O diagnostics on success or failure. The next `init` or `run` replaces that process snapshot; archive `metrics.prom` after initialization to retain COPY cost diagnostics. Labels contain configured table IDs, not row keys or object paths.
+`state_dir/metrics.prom` uses Prometheus text format for a textfile collector. Like the rest of `state_dir`, it is readable only by the user running Flow, so a collector must run as that user; otherwise scrape `/metrics`. Its integer LSN text remains exact; Prometheus stores floating-point samples, so use `status` for exact comparisons beyond its integer precision. Metrics reset on process restart. `init` installs its own recorder and flushes bootstrap duration, outcome and I/O diagnostics on success or failure. The next `init` or `run` replaces that process snapshot; archive `metrics.prom` after initialization to retain COPY cost diagnostics. Labels contain configured table IDs, not row keys or object paths.
 
 Source ledger completion and ACK feedback precede observation writes. Status
 updates immediately on completion; full Prometheus rendering and atomic export

@@ -43,3 +43,8 @@ patch -p3 < docs/patches/iceberg-rest-response-redaction.patch
 The patches include prominent local-modification notices. This provenance file is
 added separately. The crate's original Cargo.lock is omitted because the repository
 uses its root Cargo.lock. No upstream submission is claimed.
+
+`RestCatalogConfig` formats its properties in `Debug` output as key names with
+redacted values, since they carry the OAuth credential, bearer token and storage
+secrets. `RestCatalogBuilder` and `RestCatalog` print it. This changes
+`src/catalog.rs`.

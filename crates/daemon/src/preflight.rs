@@ -45,6 +45,9 @@ pub(crate) async fn check_source(config: &Config) -> Result<()> {
 }
 
 async fn run(config: &Config, report: &mut Report) {
+    if let Some(pg) = crate::source_tls::configured(config) {
+        source_tls(&pg, report);
+    }
     let mut sql = match connect(config, false).await {
         Ok(sql) => sql,
         Err(error) => return report.add(Level::Fail, "connection", format!("{error:#}")),
@@ -66,6 +69,25 @@ async fn run(config: &Config, report: &mut Report) {
     tables(&mut sql, config, report).await;
     if let Err(error) = slots(&sql, config, initialized, report).await {
         report.add(Level::Fail, "replication slot", format!("{error:#}"));
+    }
+}
+
+/// Defaults stay libpq-compatible, so opportunistic TLS is only a warning.
+fn source_tls(pg: &flow_pg_source::tokio_postgres::Config, report: &mut Report) {
+    if let Err(error) = crate::source_tls::connector(pg) {
+        return report.add(Level::Fail, "source TLS", format!("{error:#}"));
+    }
+    match crate::source_tls::weakness(pg) {
+        Some(weakness) => report.add(
+            Level::Warn,
+            "source TLS",
+            format!("{weakness}; {}", crate::source_tls::RECOMMENDATION),
+        ),
+        None => report.add(
+            Level::Ok,
+            "source TLS",
+            "server authenticated, or the connection does not leave this host",
+        ),
     }
 }
 
@@ -520,6 +542,26 @@ mod tests {
         assert_eq!(wal_keep(-1, 32 << 30).0, Level::Warn);
         assert_eq!(wal_keep(1024, 32 << 30).0, Level::Warn);
         assert_eq!(wal_keep(64 * 1024, 32 << 30).0, Level::Ok);
+    }
+
+    #[test]
+    fn opportunistic_or_unauthenticated_source_tls_is_a_warning() {
+        for (settings, level) in [
+            ("host=db.example.com", Level::Warn),
+            ("host=db.example.com sslmode=require", Level::Warn),
+            ("host=db.example.com sslmode=disable", Level::Warn),
+            ("host=db.example.com sslmode=verify-full", Level::Ok),
+            ("host=/var/run/postgresql", Level::Ok),
+            ("host=db.example.com sslmode=verify-ca", Level::Fail),
+        ] {
+            let mut report = Report::default();
+            source_tls(&settings.parse().unwrap(), &mut report);
+            assert_eq!(report.count(level), 1, "{settings}");
+            assert_eq!(report.0.len(), 1);
+        }
+        let mut report = Report::default();
+        source_tls(&"host=db.example.com".parse().unwrap(), &mut report);
+        assert!(report.0[0].2.contains("sslmode=verify-full"));
     }
 
     #[test]

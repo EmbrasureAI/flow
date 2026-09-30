@@ -150,7 +150,7 @@ impl RestCatalogBuilder {
 }
 
 /// Rest catalog configuration.
-#[derive(Clone, Debug, TypedBuilder)]
+#[derive(Clone, TypedBuilder)]
 pub(crate) struct RestCatalogConfig {
     #[builder(default, setter(strip_option))]
     name: Option<String>,
@@ -165,6 +165,22 @@ pub(crate) struct RestCatalogConfig {
 
     #[builder(default)]
     client: Option<Client>,
+}
+
+/// Properties carry the OAuth credential, bearer token and storage secrets, so
+/// debug output names the configured keys without their values.
+impl std::fmt::Debug for RestCatalogConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let props: std::collections::BTreeMap<_, _> =
+            self.props.keys().map(|key| (key, "<redacted>")).collect();
+        f.debug_struct("RestCatalogConfig")
+            .field("name", &self.name)
+            .field("uri", &self.uri)
+            .field("warehouse", &self.warehouse)
+            .field("props", &props)
+            .field("client", &self.client)
+            .finish()
+    }
 }
 
 impl RestCatalogConfig {

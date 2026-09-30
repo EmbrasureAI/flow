@@ -128,7 +128,10 @@ The configured column list defines the initial source schema; see the [type mapp
 Configure the REST catalog URI, warehouse and object-store endpoint for your own
 services. Flow needs catalog access to load/create tables and commit snapshots,
 and object access to read, write, list and delete its files. Use a persistent,
-writable `state_dir`; do not share it between running Flow processes.
+writable `state_dir`; do not share it between running Flow processes. It holds
+replicated row data, so Flow creates it and every file in it readable only by
+the user running Flow, and removes group and other access from an existing
+`state_dir` owned by that user.
 
 `check` validates the configuration locally. `check --source` also connects to
 PostgreSQL read-only and reports server settings, slot and sender capacity,
@@ -143,16 +146,26 @@ Mutable tables require a primary key and a [supported replica identity](#replica
 An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values block the affected table rather than publishing an incomplete row.
 
 ```sh
-export FLOW_POSTGRES_URL='postgres://user:password@host/database?sslmode=require'
+export FLOW_POSTGRES_URL='postgres://user:password@host/database?sslmode=verify-full&sslrootcert=/etc/flow/postgres-ca.pem'
 ./target/release/embrasure-flow --config flow.toml init
 ./target/release/embrasure-flow --config flow.toml run
 ```
+
+The URL follows libpq, including its default `sslmode=prefer`, which silently
+falls back to plaintext. Use `sslmode=verify-full` whenever the connection
+crosses a network: it verifies the server certificate and hostname, against
+`sslrootcert` when set or the system trust store otherwise. `sslmode=require`
+encrypts without authenticating the server unless `sslrootcert` is set.
+`sslmode=verify-ca` checks the chain but not the hostname, so it requires
+`sslrootcert` naming a private CA. `init`, `run` and `check --source` warn when
+a non-local connection does not authenticate the server. Client certificates
+(`sslcert`/`sslkey`) are not supported.
 
 `init` creates a replication slot and copies up to four tables concurrently while capturing CDC into the durable journal. Each table has its own staging journal and publishes reader-sized initial files. Source acknowledgement stays at the initial cut until every table has a published base. Restart reuses completed staging and recopies only unfinished tables from a new temporary snapshot; the original replication slot and source identity stay intact. The service never drops or resets permanent slots automatically.
 
 The default combined roles are `ingest,coordinator,compactor`. `--roles=ingest,coordinator` disables built-in compaction. At a hard reader-debt limit the affected table pauses publication and retries, while capture continues within its disk budget. External maintenance can clear that debt and resume publication without restarting the daemon. An optional `[compaction]` section configures the thresholds. Workers and rebuild facilities are also available as Rust libraries.
 
-`status` reads an atomic status file without locking the index. It reports exact source watermarks, readiness, process identity and freshness while running or stopped. `state_dir/metrics.prom` supports a Prometheus textfile collector. To serve probes and metrics over HTTP instead, add:
+`status` reads an atomic status file without locking the index. It reports exact source watermarks, readiness, process identity and freshness while running or stopped. `state_dir/metrics.prom` supports a Prometheus textfile collector running as the Flow user; the `state_dir` is private to that user (see [security](../SECURITY.md#deployment)). To serve probes and metrics over HTTP instead, add:
 
 ```toml
 [http]

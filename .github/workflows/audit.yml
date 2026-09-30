@@ -1,0 +1,29 @@
+name: Audit
+# Check Cargo.lock against the RustSec advisory database. Runs daily as well,
+# since new advisories appear without any change to this repository.
+# Justified exceptions live in .cargo/audit.toml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit
+      # Invoke the binary directly: no Rust toolchain is needed to read Cargo.lock.
+      - run: cargo-audit audit

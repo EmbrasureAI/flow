@@ -1,7 +1,70 @@
 //! Apply PostgreSQL connection TLS policy to the native TLS transport.
 use anyhow::{Context, Result, bail, ensure};
-use flow_pg_source::tokio_postgres::{Config, config::SslMode};
+use flow_pg_source::tokio_postgres::{
+    Config,
+    config::{Host, SslMode},
+};
 use native_tls::{Certificate, TlsConnector};
+
+/// Describe how the configured TLS mode falls short of authenticating the
+/// server, or `None` when it does. Connections that never leave the host
+/// (Unix sockets and loopback addresses) are not flagged.
+pub(crate) fn weakness(pg: &Config) -> Option<&'static str> {
+    let local = !(pg.get_hosts().is_empty() && pg.get_hostaddrs().is_empty())
+        && pg.get_hosts().iter().all(|host| match host {
+            Host::Tcp(name) => {
+                name.eq_ignore_ascii_case("localhost")
+                    || name
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            }
+            #[cfg(unix)]
+            Host::Unix(_) => true,
+        })
+        && pg
+            .get_hostaddrs()
+            .iter()
+            .all(|address| address.is_loopback());
+    if local {
+        return None;
+    }
+    match pg.get_ssl_mode() {
+        SslMode::Disable => {
+            Some("sslmode=disable sends credentials and replicated rows in plaintext")
+        }
+        SslMode::Prefer => Some(
+            "sslmode=prefer (the default when unset) silently falls back to plaintext and does not authenticate the server",
+        ),
+        SslMode::Require if pg.get_ssl_root_cert().is_none() => Some(
+            "sslmode=require without sslrootcert encrypts but does not authenticate the server, so an on-path attacker can intercept the connection",
+        ),
+        _ => None,
+    }
+}
+
+/// Operator guidance appended to [`weakness`] warnings.
+pub(crate) const RECOMMENDATION: &str =
+    "use sslmode=verify-full with sslrootcert set to the server's CA bundle";
+
+/// The configured source connection settings, when they can be read. A missing
+/// or invalid URL is reported by the connection attempt itself.
+pub(crate) fn configured(config: &crate::config::Config) -> Option<Config> {
+    std::env::var(&config.source.connection_env)
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Warn once at startup when the source connection does not authenticate the
+/// server. libpq-compatible defaults are kept; this only makes them visible.
+pub(crate) fn warn_if_unauthenticated(config: &crate::config::Config) {
+    if let Some(weakness) = configured(config).as_ref().and_then(weakness) {
+        tracing::warn!(
+            recommendation = RECOMMENDATION,
+            "PostgreSQL source TLS is not authenticated: {weakness}"
+        );
+    }
+}
 
 pub(crate) fn connector(pg: &Config) -> Result<TlsConnector> {
     // These parameters are parsed by tokio-postgres but are not applied by its
@@ -16,7 +79,16 @@ pub(crate) fn connector(pg: &Config) -> Result<TlsConnector> {
         // Match libpq: require encrypts without authentication unless a CA was
         // configured, in which case it has verify-ca semantics.
         SslMode::Require => (roots.is_some(), false),
-        SslMode::VerifyCa => (true, false),
+        // libpq refuses verify-ca without a root certificate. Chain checks
+        // against the public system roots without a hostname check would
+        // accept any publicly trusted certificate issued for any name.
+        SslMode::VerifyCa => {
+            ensure!(
+                roots.is_some(),
+                "sslmode=verify-ca requires sslrootcert: it checks the certificate chain but not the server hostname, so it is only meaningful against a private CA. Set sslrootcert to the CA bundle that issued the server certificate, or use sslmode=verify-full to also verify the hostname"
+            );
+            (true, false)
+        }
         SslMode::VerifyFull => (true, true),
         _ => bail!("unsupported PostgreSQL TLS mode"),
     };
@@ -187,6 +259,8 @@ mod tests {
             ("require", Some(&untrusted), "localhost", false),
             ("verify-ca", Some(&trusted), "wrong.invalid", true),
             ("verify-ca", Some(&untrusted), "localhost", false),
+            // Rejected before connecting: public roots without a hostname check.
+            ("verify-ca", None, "localhost", false),
             ("verify-full", None, "localhost", false),
             ("verify-full", Some(&trusted), "localhost", true),
             ("verify-full", Some(&untrusted), "localhost", false),
@@ -196,8 +270,15 @@ mod tests {
             if let Some(root) = root {
                 pg.ssl_root_cert(root);
             }
+            let connected = match connector(&pg) {
+                Ok(_) => handshake(&pg, hostname, &identity),
+                Err(error) => {
+                    assert!(format!("{error:#}").contains("requires sslrootcert"));
+                    false
+                }
+            };
             assert_eq!(
-                handshake(&pg, hostname, &identity),
+                connected,
                 expected,
                 "mode={mode}, configured_root={}, hostname={hostname}",
                 root.is_some()
@@ -283,6 +364,41 @@ mod tests {
         pg.ssl_root_cert(&std::fs::read(dir.path().join("unrelated.crt")).unwrap());
         assert!(handshake(&pg, "localhost", &leaf));
         assert!(!handshake(&pg, "wrong.invalid", &leaf));
+    }
+
+    #[test]
+    fn weak_tls_policies_are_reported_for_network_connections() {
+        let root = b"configured CA".as_slice();
+        for (settings, root, weak) in [
+            ("host=db.example.com", None, true),
+            ("host=db.example.com sslmode=disable", None, true),
+            ("host=db.example.com sslmode=prefer", None, true),
+            ("host=db.example.com sslmode=require", None, true),
+            ("host=db.example.com sslmode=require", Some(root), false),
+            ("host=db.example.com sslmode=verify-ca", Some(root), false),
+            ("host=db.example.com sslmode=verify-full", None, false),
+            ("host=db.example.com sslmode=verify-full", Some(root), false),
+            ("host=10.0.0.5 sslmode=require", None, true),
+            ("host=localhost,db.example.com sslmode=disable", None, true),
+            (
+                "host=localhost hostaddr=10.0.0.5 sslmode=disable",
+                None,
+                true,
+            ),
+            ("hostaddr=10.0.0.5", None, true),
+            // Traffic that never leaves the host cannot be intercepted on the network.
+            ("host=localhost sslmode=disable", None, false),
+            ("host=127.0.0.1", None, false),
+            ("host=::1 sslmode=prefer", None, false),
+            ("host=/var/run/postgresql", None, false),
+            ("hostaddr=127.0.0.1", None, false),
+        ] {
+            let mut pg: Config = settings.parse().unwrap();
+            if let Some(root) = root {
+                pg.ssl_root_cert(root);
+            }
+            assert_eq!(weakness(&pg).is_some(), weak, "{settings}");
+        }
     }
 
     #[test]
