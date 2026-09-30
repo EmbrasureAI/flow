@@ -5,7 +5,7 @@ use flow_model::{PgLsn, TableId};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -169,21 +169,23 @@ impl Drop for Lifecycle {
     }
 }
 
+/// Set once this process holds the state directory's database lock. A
+/// process refused by the lock never writes an exit reason over the
+/// observation of the process that holds it.
+static STATE_LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn state_lock_acquired() {
+    STATE_LOCK_HELD.store(true, Ordering::Relaxed);
+}
+
 /// Record why `init` or `run` failed, after cleanup marked it stopped. Best
-/// effort: an unwritable or never-created state directory keeps only the log.
-/// A process refused by the state lock must not overwrite the observation of
-/// the live process that holds it.
+/// effort: an unwritable state directory keeps only the log.
 pub(crate) fn record_exit(config: &Config, error: &anyhow::Error) {
-    if !config.state_dir.is_dir() {
-        return;
-    }
-    if let Ok(status) = read(config)
-        && owned_by_live_process(&status, std::process::id(), now_ms().unwrap_or_default())
-    {
-        tracing::warn!(
-            process_id = status.process_id,
-            "another process owns the local status; not recording this exit"
-        );
+    record_exit_as(config, error, STATE_LOCK_HELD.load(Ordering::Relaxed));
+}
+
+fn record_exit_as(config: &Config, error: &anyhow::Error, lock_held: bool) {
+    if !lock_held {
         return;
     }
     let (class, message) = crate::exit::classify(error);
@@ -204,12 +206,22 @@ pub(crate) fn record_exit(config: &Config, error: &anyhow::Error) {
     }
 }
 
-/// Another process wrote this observation as starting or running within
-/// the readiness expiry window; a killed process ages out of it.
-fn owned_by_live_process(status: &Status, process_id: u32, now_ms: u64) -> bool {
-    status.process_id != process_id
-        && matches!(status.state, ProcessState::Starting | ProcessState::Running)
-        && now_ms.saturating_sub(status.updated_at_ms) <= 15_000
+/// A clean exit, such as a completed `init`, replaces an earlier failure.
+pub(crate) fn record_clean_exit(config: &Config) {
+    record_clean_exit_as(config, STATE_LOCK_HELD.load(Ordering::Relaxed));
+}
+
+fn record_clean_exit_as(config: &Config, lock_held: bool) {
+    if !lock_held || !config.state_dir.join("status.json").exists() {
+        return;
+    }
+    if let Err(error) = update(config, |status| {
+        status.ready = false;
+        status.state = ProcessState::Stopped;
+        status.last_error = None;
+    }) {
+        tracing::warn!(%error, "could not record the clean exit in local status");
+    }
 }
 
 /// Monotonic milliseconds of the run loop's latest iteration; zero outside
@@ -433,8 +445,15 @@ pub(crate) fn read(config: &Config) -> Result<Status> {
     Ok(status)
 }
 
+/// Atomic replacement. The temporary name is unique to this write, so a
+/// concurrent writer (another process, even one with the same PID in another
+/// container) cannot rename or truncate it.
 pub(crate) fn write_observation(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
-    let temporary = path.with_extension("tmp");
+    let temporary = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(&temporary, bytes)?;
     std::fs::rename(temporary, path)?;
     Ok(())
@@ -509,10 +528,11 @@ mod status_tests {
         )
         .unwrap();
         drop(lifecycle);
-        record_exit(
+        record_exit_as(
             &config,
             &crate::exit::resync("replication slot lost WAL; resynchronization required")
                 .context("health check"),
+            true,
         );
         let stopped = status(&config);
         assert_eq!(stopped["state"], "stopped");
@@ -535,9 +555,10 @@ mod status_tests {
         assert_eq!(starting["last_error"]["exit_code"], 79);
 
         // Unclassified errors never persist their text.
-        record_exit(
+        record_exit_as(
             &config,
             &anyhow::anyhow!("postgres://flow:secret@db failed"),
+            true,
         );
         let failed = status(&config);
         assert_eq!(failed["last_error"]["class"], "failure");
@@ -577,31 +598,51 @@ mod status_tests {
     }
 
     #[test]
-    fn a_refused_process_leaves_the_live_owner_status_alone() {
+    fn a_process_that_never_held_the_state_lock_writes_no_exit() {
         let _serial = LIVENESS_TEST_LOCK.blocking_lock();
         let (_root, config) = config();
-        let _lifecycle = Lifecycle::start(&config).unwrap();
-        let mut status: Status =
-            serde_json::from_slice(&std::fs::read(config.state_dir.join("status.json")).unwrap())
-                .unwrap();
-        let now = status.updated_at_ms;
-        assert!(!owned_by_live_process(&status, status.process_id, now));
-        assert!(owned_by_live_process(&status, status.process_id + 1, now));
-        assert!(!owned_by_live_process(
-            &status,
-            status.process_id + 1,
-            now + 15_001
-        ));
-        status.state = ProcessState::Stopped;
-        assert!(!owned_by_live_process(&status, status.process_id + 1, now));
+        // The owner is starting (for example, a long index rebuild).
+        let _owner = Lifecycle::start(&config).unwrap();
+        let before = std::fs::read(config.state_dir.join("status.json")).unwrap();
+        record_exit_as(&config, &crate::exit::config("refused by the lock"), false);
+        record_clean_exit_as(&config, false);
+        assert_eq!(
+            std::fs::read(config.state_dir.join("status.json")).unwrap(),
+            before
+        );
     }
 
     #[test]
-    fn exit_reason_is_not_written_without_a_state_directory() {
-        let (root, mut config) = config();
-        config.state_dir = root.path().join("missing");
-        record_exit(&config, &crate::exit::config("source is not initialized"));
-        assert!(!config.state_dir.exists());
+    fn a_clean_exit_clears_an_earlier_failure() {
+        let (_root, config) = config();
+        record_clean_exit_as(&config, true);
+        assert!(!config.state_dir.join("status.json").exists());
+        record_exit_as(&config, &crate::exit::config("init failed"), true);
+        assert_eq!(status(&config)["last_error"]["exit_code"], 78);
+        record_clean_exit_as(&config, true);
+        let clean = status(&config);
+        assert_eq!(clean["state"], "stopped");
+        assert!(clean.get("last_error").is_none());
+    }
+
+    #[test]
+    fn concurrent_observation_writers_never_share_a_temporary_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("status.json");
+        let writers = (0..4)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        write_observation(&path, format!("{writer}")).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }
 

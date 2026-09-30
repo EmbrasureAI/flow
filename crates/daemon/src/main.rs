@@ -124,16 +124,19 @@ fn fatal(error: &anyhow::Error, plain: bool) -> ExitCode {
         error = %format!("{error:#}"),
         "embrasure-flow stopped"
     );
-    if plain {
+    // A RUST_LOG that filters out this target must not hide why it stopped.
+    if plain || !tracing::enabled!(tracing::Level::ERROR) {
         eprintln!("error: {error:#}");
     }
     ExitCode::from(class.code())
 }
 
-/// Keep why `init` or `run` stopped in `status`, after its cleanup ran.
+/// Keep why `init` or `run` stopped in `status`, after its cleanup ran; a
+/// clean exit replaces an earlier failure.
 fn record_exit(config: &config::Config, result: Result<()>) -> Result<ExitCode> {
-    if let Err(error) = &result {
-        lifecycle::record_exit(config, error);
+    match &result {
+        Ok(()) => lifecycle::record_clean_exit(config),
+        Err(error) => lifecycle::record_exit(config, error),
     }
     result.map(|()| ExitCode::SUCCESS)
 }

@@ -11,7 +11,9 @@ exit class (`config`, `resync_required`, `unavailable` or `failure`), the
 [exit code](operations.md#exit-codes), the time (`at_ms`) and, for the
 operator-action classes, Flow's own message. Other error chains can contain
 URLs or row values, so they appear only in the `fatal` log event. The next
-process keeps `last_error` while `starting` and clears it once `running`.
+process keeps `last_error` while `starting` and clears it once `running`; a
+successful `init` also clears it. A process that never obtained the state
+directory's lock (because another process holds it) records nothing.
 
 `source_health` reports `unknown` before the first WAL check, then `healthy`,
 `warning`, `at_risk`, `unavailable`, `slot_lost`, or `publication_changed`. Hard
@@ -374,7 +376,7 @@ credentials; do not use it in production.
 A failure that stops the process is logged once as an `ERROR` event with
 `event: "fatal"`, the complete error chain in `error`, its `class` and the
 `exit_code`; `init` and `run` do not print it separately to standard error
-unless it is a terminal. Other commands also print a plain `error:` line on
+unless it is a terminal or `RUST_LOG` filters the event out. Other commands also print a plain `error:` line on
 standard error. Source storage pressure is logged when its state changes and
 repeated at most every five minutes while unchanged (`warning` at `WARN`,
 `at_risk` at `ERROR`); the metrics carry every five-second check. A retried

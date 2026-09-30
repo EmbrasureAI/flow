@@ -18,9 +18,11 @@ pub(crate) fn transient(error: &anyhow::Error) -> bool {
     })
 }
 
-/// The catalog and source outages that the running service retries.
+/// The catalog and source outages that the running service retries. An
+/// error that needs an operator is never retried, whatever it wraps.
 pub(crate) fn startup_transient(error: &anyhow::Error) -> bool {
-    transient(error) || crate::source::retryable_connection(error)
+    !crate::exit::operator_action(error)
+        && (transient(error) || crate::source::retryable_connection(error))
 }
 
 pub(crate) fn delay(attempt: u32) -> Duration {

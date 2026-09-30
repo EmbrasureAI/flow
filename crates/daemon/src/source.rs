@@ -138,9 +138,13 @@ pub(crate) async fn connect_owned(
             "source connection environment variable is missing: {connection_env}"
         ))
     })?;
-    let mut pg: PgConfig = url
-        .parse()
-        .context("invalid PostgreSQL connection settings")?;
+    let mut pg: PgConfig = url.parse().map_err(|error| {
+        // Option names only; values are never echoed. Not retryable.
+        crate::exit::config(format!(
+            "invalid PostgreSQL connection settings in {connection_env}: {}",
+            postgres_error_text(&error)
+        ))
+    })?;
     if replication {
         pg.replication_mode(ReplicationMode::Logical);
     }
@@ -153,7 +157,7 @@ pub(crate) async fn connect_owned(
     let (client, connection) = tokio::time::timeout(Duration::from_secs(30), pg.connect(tls))
         .await
         .context("PostgreSQL connection timed out")?
-        .context("connect to PostgreSQL")?;
+        .map_err(connect_failure)?;
     let connection = ConnectionTask::spawn(connection);
     if !replication {
         source_deadline(async {
@@ -651,6 +655,45 @@ pub(crate) fn record_journaled(transaction: &flow_model::SourceTransaction) {
     );
 }
 
+/// Settings the server or TLS peer rejected before any SQL (a missing
+/// password, an unsupported authentication method, a refused or unverified
+/// TLS handshake) recur on every attempt and need an operator. Transport
+/// failures, including a socket error during the handshake, stay retryable.
+fn connect_failure(error: flow_pg_source::tokio_postgres::Error) -> anyhow::Error {
+    let text = postgres_error_text(&error);
+    let mut cause = std::error::Error::source(&error);
+    let mut transport = false;
+    while let Some(error) = cause {
+        transport |= error.is::<std::io::Error>();
+        cause = error.source();
+    }
+    let settings = error.code().is_none()
+        && !transport
+        && [
+            "invalid configuration",
+            "authentication error",
+            "error performing TLS handshake",
+        ]
+        .iter()
+        .any(|kind| text.starts_with(kind));
+    if settings {
+        crate::exit::config(format!("connect to PostgreSQL: {text}"))
+    } else {
+        anyhow::Error::new(error).context("connect to PostgreSQL")
+    }
+}
+
+/// The driver's kind followed by its causes; its own Display is the kind only.
+fn postgres_error_text(error: &flow_pg_source::tokio_postgres::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = std::error::Error::source(error);
+    while let Some(error) = cause {
+        text = format!("{text}: {error}");
+        cause = error.source();
+    }
+    text
+}
+
 /// The heartbeat commits on capture's SQL session. With a matching
 /// `synchronous_standby_names`, Flow's own walsender can be the synchronous
 /// standby; a remote-ack commit would then wait for the capture loop it blocks.
@@ -677,6 +720,81 @@ fn heartbeat_error(error: anyhow::Error) -> anyhow::Error {
 #[cfg(test)]
 mod heartbeat_tests {
     use super::*;
+
+    /// Serve one scripted response to a connecting client.
+    async fn scripted_server(response: &'static [u8]) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 512];
+            let _ = stream.read(&mut request).await;
+            stream.write_all(response).await.unwrap();
+            // Hold the socket until the client gives up.
+            let _ = stream.read(&mut request).await;
+        });
+        address
+    }
+
+    async fn connect_error(settings: &str) -> anyhow::Error {
+        let pg: PgConfig = settings.parse().unwrap();
+        let tls =
+            postgres_native_tls::MakeTlsConnector::new(native_tls::TlsConnector::new().unwrap());
+        connect_failure(pg.connect(tls).await.err().unwrap())
+    }
+
+    #[tokio::test]
+    async fn rejected_connection_settings_are_not_retried() {
+        let parsed = "host=localhost port=notaport password=hunter2"
+            .parse::<PgConfig>()
+            .unwrap_err();
+        let text = postgres_error_text(&parsed);
+        assert_eq!(
+            text,
+            "invalid connection string: invalid value for option `port`"
+        );
+        // The raw driver error would be retried; the settings error is not.
+        assert!(retryable_connection(&parsed.into()));
+        assert!(!crate::retry::startup_transient(&crate::exit::config(text)));
+
+        // TLS required, but the server declines it.
+        let server = scripted_server(b"N").await;
+        let error = connect_error(&format!(
+            "host=127.0.0.1 port={} user=flow sslmode=require",
+            server.port()
+        ))
+        .await;
+        assert_eq!(crate::exit::classify(&error).0, crate::exit::Class::Config);
+        assert!(!crate::retry::startup_transient(&error), "{error:#}");
+
+        // The server asks for a cleartext password the settings lack.
+        let server = scripted_server(b"R\0\0\0\x08\0\0\0\x03").await;
+        let error = connect_error(&format!(
+            "host=127.0.0.1 port={} user=flow sslmode=disable",
+            server.port()
+        ))
+        .await;
+        assert!(
+            format!("{error:#}").contains("password missing"),
+            "{error:#}"
+        );
+        assert_eq!(crate::exit::classify(&error).0, crate::exit::Class::Config);
+
+        // Network failures stay retryable.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let error = connect_error(&format!(
+            "host=127.0.0.1 port={port} user=flow sslmode=disable"
+        ))
+        .await;
+        assert!(crate::retry::startup_transient(&error), "{error:#}");
+        assert_eq!(
+            crate::exit::classify(&error).0,
+            crate::exit::Class::Unavailable
+        );
+    }
 
     #[test]
     fn heartbeat_failures_name_a_missing_grant_only_when_reported() {

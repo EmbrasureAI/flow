@@ -90,6 +90,11 @@ impl From<Stop> for Class {
     }
 }
 
+pub(crate) fn operator_action(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<OperatorAction>().is_some()
+        || error.is::<crate::source::PublicationChanged>()
+}
+
 /// The exit class and, for operator stops, a message safe to persist. Other
 /// error chains can contain URLs or row values and stay in the log only.
 pub(crate) fn classify(error: &anyhow::Error) -> (Class, Option<String>) {
@@ -106,28 +111,40 @@ pub(crate) fn classify(error: &anyhow::Error) -> (Class, Option<String>) {
 }
 
 /// Capture reports its terminal error as text across a channel. The first
-/// operator stop it saw keeps its class for the process exit.
-static CAPTURE_STOP: OnceLock<Stop> = OnceLock::new();
+/// operator stop it saw keeps its class and safe message for the process exit.
+static CAPTURE_STOP: OnceLock<(Stop, String)> = OnceLock::new();
 
 pub(crate) fn remember_capture_stop(error: &anyhow::Error) {
-    let stop = match classify(error).0 {
+    if let Some(stop) = operator_stop(error) {
+        let _ = CAPTURE_STOP.set(stop);
+    }
+}
+
+fn operator_stop(error: &anyhow::Error) -> Option<(Stop, String)> {
+    let (class, message) = classify(error);
+    let stop = match class {
         Class::Config => Stop::Config,
         Class::Resync => Stop::Resync,
-        Class::Failure | Class::Unavailable => return,
+        Class::Failure | Class::Unavailable => return None,
     };
-    let _ = CAPTURE_STOP.set(stop);
+    Some((stop, message?))
 }
 
 /// The coordinator's error for a stopped capture actor, keeping its class.
 pub(crate) fn capture_failure(error: anyhow::Error) -> anyhow::Error {
-    let message = format!("source capture stopped: {error}");
-    match CAPTURE_STOP.get() {
-        Some(stop) => OperatorAction {
+    capture_failure_with(error, CAPTURE_STOP.get())
+}
+
+/// The complete chain stays in the log; status keeps only the safe message.
+fn capture_failure_with(error: anyhow::Error, stop: Option<&(Stop, String)>) -> anyhow::Error {
+    let context = format!("source capture stopped: {error}");
+    match stop {
+        Some((stop, message)) => anyhow::Error::new(OperatorAction {
             stop: *stop,
-            message,
-        }
-        .into(),
-        None => anyhow::Error::msg(message),
+            message: message.clone(),
+        })
+        .context(context),
+        None => anyhow::Error::msg(context),
     }
 }
 
@@ -181,6 +198,13 @@ mod tests {
             .into();
         let transient = transient.context("connect to PostgreSQL");
         assert_eq!(classify(&transient), (Class::Unavailable, None));
+        // An operator stop is never retried, whatever it wraps.
+        let settings = transient.context(OperatorAction {
+            stop: Stop::Config,
+            message: "invalid settings".into(),
+        });
+        assert!(!crate::retry::startup_transient(&settings));
+        assert_eq!(classify(&settings).0, Class::Config);
         assert_eq!(
             [
                 Class::Failure,
@@ -191,5 +215,25 @@ mod tests {
             .map(Class::code),
             [1, 75, 78, 79]
         );
+    }
+
+    #[test]
+    fn a_capture_stop_persists_only_its_own_message() {
+        let raw = resync("replication slot lost required WAL")
+            .context("query failed for postgres://flow:secret@db");
+        let stop = operator_stop(&raw).unwrap();
+        // Capture sends the full chain as text; only the safe message is kept.
+        let failure = capture_failure_with(anyhow::anyhow!("{raw:#}"), Some(&stop));
+        assert_eq!(
+            classify(&failure),
+            (
+                Class::Resync,
+                Some("replication slot lost required WAL".into())
+            )
+        );
+        assert!(format!("{failure:#}").contains("secret"));
+        let plain = capture_failure_with(anyhow::anyhow!("disconnected"), None);
+        assert_eq!(classify(&plain), (Class::Failure, None));
+        assert_eq!(plain.to_string(), "source capture stopped: disconnected");
     }
 }

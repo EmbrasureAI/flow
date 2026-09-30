@@ -26,7 +26,7 @@ pub(crate) async fn run(config: Config, inventory: &Path, apply: bool) -> Result
     // RocksDB rejects a concurrent daemon/importer. Pause via the supervisor
     // first; do not change its desired state or start source capture here.
     let control = ControlStore::open(config.state_dir.join("control"))?;
-    let boot = bootstrap::bootstrap(&control)?;
+    let boot = bootstrap::bootstrap(&control, &config)?;
     bootstrap::validate_identity(&config, &boot)?;
     ensure!(
         boot.copied

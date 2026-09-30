@@ -59,8 +59,8 @@ log the resolved path at startup.
 | 1 | Failure that a restart may clear | Restart with backoff |
 | 2 | Invalid command line | Fix the command |
 | 3 | `status` only: the service is not ready | None |
-| 75 | A source or catalog dependency stayed unavailable through the ten-minute startup retry window | Restart with backoff |
-| 78 | Configuration invalid or incompatible with the state directory (changed tables, schema, targets, slot or publication; missing environment; `init` on an existing slot) | Stop; fix the configuration |
+| 75 | A source or catalog failure classified as transient (a timeout, or a PostgreSQL connection error without an SQLSTATE): at startup after the ten-minute retry window, or whenever such an error stops the process | Restart with backoff |
+| 78 | Configuration invalid or incompatible with the state directory (changed tables, schema, targets, slot or publication; missing environment; unparseable connection settings, a missing password, or a refused or unverified TLS handshake; `init` on an existing slot; `run` before `init`) | Stop; fix the configuration |
 | 79 | Resynchronization required (lost or changed slot, publication contract violation, source identity or timeline change, replaced target, lost journal) | Stop; [resynchronize](#resynchronize-a-source) |
 
 Codes 78 and 79 recur on every restart until an operator acts, so configure the

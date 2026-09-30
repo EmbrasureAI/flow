@@ -61,6 +61,20 @@ fn failed_init_exports_process_metrics_without_hiding_the_primary_error() {
     // `status` prints the observation and exits 3 while not ready.
     assert_eq!(status_command.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&status_command.stdout).contains("\"last_error\""));
+    // A filter that disables the fatal event still reports the error.
+    let filtered = Command::new(env!("CARGO_BIN_EXE_embrasure-flow"))
+        .args(["--config", path.to_str().unwrap(), "init"])
+        .env_remove("FLOW_INIT_TEST_MISSING_CONNECTION")
+        .env("RUST_LOG", "flow_events=debug")
+        .output()
+        .unwrap();
+    assert_eq!(filtered.status.code(), Some(78));
+    assert!(
+        String::from_utf8_lossy(&filtered.stderr)
+            .contains("source connection environment variable is missing"),
+        "{}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
     let metrics = std::fs::read_to_string(state.join("metrics.prom")).unwrap();
     assert!(
         metrics.contains("flow_bootstrap_runs_total{outcome=\"error\"} 1"),

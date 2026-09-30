@@ -58,11 +58,12 @@ pub fn status(config: Config) -> Result<bool> {
 pub async fn run(config: Config, compaction: bool) -> Result<()> {
     let mut observation = crate::observation::Observation::install()?;
     let control = ControlStore::open(config.state_dir.join("control"))?;
+    crate::lifecycle::state_lock_acquired();
     let opened = crate::generation::open(&config, control.clone());
     let lifecycle = crate::lifecycle::Lifecycle::start(&config)?;
     observation.record_source_health(lifecycle.source_health());
     crate::lifecycle::refuse_if_resync_required(&config)?;
-    let mut boot = bootstrap(&control)?;
+    let mut boot = bootstrap(&control, &config)?;
     crate::bootstrap::validate_identity(&config, &boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len(),
