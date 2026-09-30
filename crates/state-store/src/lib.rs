@@ -109,6 +109,10 @@ pub struct StateStoreOptions {
     /// Maximum prepared deltas decoded and looked up together while building an
     /// atomic apply batch.
     pub apply_lookup_rows: usize,
+    /// RocksDB table-file descriptor cache. Files beyond it are reopened on
+    /// demand, so a large index cannot exhaust the process descriptor limit.
+    /// `-1` keeps every table file open.
+    pub max_open_files: i32,
 }
 impl Default for StateStoreOptions {
     fn default() -> Self {
@@ -117,6 +121,7 @@ impl Default for StateStoreOptions {
             write_buffer_bytes: 16 << 20,
             apply_batch_rows: 1024,
             apply_lookup_rows: 1024,
+            max_open_files: 4096,
         }
     }
 }
@@ -283,6 +288,7 @@ impl StateStore {
             || config.apply_lookup_rows == 0
             || config.write_buffer_bytes == 0
             || config.block_cache_bytes == 0
+            || (config.max_open_files != -1 && config.max_open_files <= 0)
         {
             return Err(Error::InvalidState(
                 "state store budgets must be positive".into(),
@@ -306,6 +312,13 @@ impl StateStore {
         options.create_missing_column_families(true);
         options.set_max_background_jobs(4);
         options.set_atomic_flush(true);
+        options.set_max_open_files(config.max_open_files);
+        #[cfg(test)]
+        if tests::SIMULATE_POWER_LOSS.get() {
+            // Keep unsynced WAL writes in process memory so copying the
+            // directory captures only what a synced write made durable.
+            options.set_manual_wal_flush(true);
+        }
         let columns = STATE_COLUMN_FAMILIES.map(|name| {
             let mut cf = Options::default();
             cf.set_block_based_table_factory(&table);
@@ -356,6 +369,12 @@ impl StateStore {
         let guard = self.0.writer.lock().map_err(|_| Error::Poisoned)?;
         self.ensure_writable()?;
         Ok(guard)
+    }
+
+    /// Whether a durable transition failed in this process. The generation is
+    /// then fenced and must be revalidated before reuse.
+    pub fn has_failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -913,6 +932,31 @@ impl StateStore {
         self.write(batch)
     }
 
+    /// Atomically apply independent SOURCE puts followed by deletes, with one
+    /// durable write. A key must not appear in both sets.
+    pub fn write_source_records<'a>(
+        &self,
+        puts: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        deletes: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<()> {
+        let _guard = if self.0.control.is_none() {
+            Some(self.lock()?)
+        } else {
+            None
+        };
+        let cf = self.0.db.cf_handle(SOURCE).expect("opened column family");
+        let mut batch = StateBatch::default();
+        for (key, value) in puts {
+            batch.control.put(control::record_key(SOURCE, key), value);
+            batch.put_cf(&cf, key, value);
+        }
+        for key in deletes {
+            batch.control.delete(control::record_key(SOURCE, key));
+            batch.delete_cf(&cf, key);
+        }
+        self.write(batch)
+    }
+
     /// Atomically persist ledger metadata, transaction updates, and
     /// reclaim a completed key range. Payloads contain journal references, never
     /// source rows; the caller bounds the number of descriptors in the batch.
@@ -1172,9 +1216,10 @@ impl StateStore {
         }
     }
     /// Derived state uses the WAL without forcing a disk flush per chunk.
-    /// Sealing synchronizes the standalone index WAL or the separate control
-    /// revision. Controlled index writes remain unsynced and require revision
-    /// validation on reopen, with rebuild on mismatch. Never disable the WAL here.
+    /// The next revision-bearing write syncs the index WAL, including this
+    /// prefix, before any control revision names it. Staged batches after the
+    /// last such write may be lost and are replayed or discarded under their
+    /// durable publication fence. Never disable the WAL here.
     fn write_staged(&self, batch: StateBatch) -> Result<()> {
         self.write_staged_observed(batch).map(|_| ())
     }
@@ -1410,6 +1455,35 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Open indexes on this thread with manual WAL flushing: unsynced
+        /// writes stay in process memory until a synced write flushes them.
+        pub(crate) static SIMULATE_POWER_LOSS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    #[test]
+    fn open_rejects_a_zero_descriptor_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        for invalid in [0, -2] {
+            let options = StateStoreOptions {
+                max_open_files: invalid,
+                ..Default::default()
+            };
+            assert!(matches!(
+                StateStore::open(directory.path(), options),
+                Err(Error::InvalidState(_))
+            ));
+        }
+        for valid in [-1, 64] {
+            let options = StateStoreOptions {
+                max_open_files: valid,
+                ..Default::default()
+            };
+            drop(StateStore::open(directory.path(), options).unwrap());
+        }
+    }
 
     #[test]
     fn damaged_sealed_deltas_fence_apply_copy_and_reopen() {

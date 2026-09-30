@@ -20,10 +20,14 @@ bounded pages, advancing its progress marker in the same durable write. These
 SOURCE records are mirrored through the authoritative control store and survive
 index-generation recovery. They do not introduce another payload journal.
 
-Queued and running descriptors share the configured `pending_transactions`
-budget. Admission rotates across eligible tables, including when there are more
-tables than available descriptors. A failed worker must return before its queued
-and running reservations are evicted. Eviction removes only volatile admission:
+Queued descriptors share the configured `pending_transactions` lookahead.
+Admission rotates across eligible tables, including when there are more tables
+than available descriptors. Queued work only makes a table schedulable: a
+dispatched epoch leaves the lookahead and continues in order through that table's
+durable references, up to the 32 MiB payload limit and a fixed per-epoch
+descriptor-memory limit, so a busy table does not hold lookahead another table
+needs. A failed or deferred worker must return before its queued and running
+reservations are evicted; its epoch is reloaded from the ledger. Eviction removes only volatile admission:
 restarting the cursor at zero finds exactly the references that still need work.
 It neither completes a transaction nor advances an acknowledgement.
 
@@ -57,13 +61,28 @@ proved at commit before publication; streamed NULL rows may select a provisional
 decoder while the committed catalog proof is still pending.
 
 Incompatible names/types, selected-column loss, primary-key/replica-identity drift,
-row decoding failures, and TRUNCATE latch a source-table block
-(`source_schema_incompatible`) in the authoritative control store. Subsequent selected row images and wire metadata are retained as
-opaque quarantined mutations in the existing transaction spool/journal. Commit
+row decoding failures, UPDATE or DELETE on an `append_only` table, a single row
+change larger than `limits.chunk_bytes`, and TRUNCATE latch a source-table block
+(`source_schema_incompatible`) in the authoritative control store; the logged
+reason names the cause. Subsequent selected row images and wire metadata are retained as
+opaque quarantined mutations in the existing transaction spool/journal. Row
+limits reserve room to wrap any admitted decoded row as quarantine. Only raw
+wire evidence larger than one chunk (text-encoded row images, or the row that
+exceeded `limits.chunk_bytes` itself) is replaced by a bounded marker recording
+its table and size. Commit
 proof failures quarantine that table's decoded evidence too. The failed table
 remains in every affected transaction descriptor, including mixed transactions;
 its publications and the shared completed acknowledgement frontier cannot advance.
-Subtransaction rollback still removes its spool records. Explicitly excluded cells
+Subtransaction rollback still removes its spool records. Inside a streamed,
+still-uncommitted transaction these decisions are provisional: they quarantine
+only that transaction's changes, other transactions keep publishing the table,
+and the block is latched only if the transaction commits with them; a rollback
+or savepoint rollback discards them. Incompatible DDL that commits after all of
+its streamed rows were rolled back to a savepoint is blocked by the table's next
+Relation message or the five-second catalog refresh rather than at its own
+commit, still before any row of the new shape is published. `ADD COLUMN ...
+DEFAULT` blocks even on an empty table, because PostgreSQL still records a
+missing value for it; add the column without a default to avoid that. Explicitly excluded cells
 are projected out before quarantine, including when a selected column disappears.
 
 A source-table block persists across restart and source repair. Use an explicit
@@ -74,7 +93,14 @@ connection. Journal/spool quotas and source WAL pressure still bound how long
 healthy tables can continue; a full journal pauses capture without dropping changes.
 
 Journal corruption, source connection/slot/identity failures, state-store failures,
-invalid shared invariants, and unclassified errors remain connection-wide. Completed bootstrap with intact local authority
+spool limits, a replication message larger than `limits.source_message_bytes`
+(rejected before its table can be read), invalid shared invariants, and
+unclassified errors remain connection-wide. A replication slot still held by a
+previous session (SQLSTATE 55006) and a server out of connection slots (53300)
+are retried with backoff like a disconnect; PostgreSQL releases a stale
+walsender's slot within `wal_sender_timeout`. Retries never stop, so after five
+minutes (or twice `wal_sender_timeout`) of failures capture logs an error with
+the slot holder's `active_pid` and sets `flow_capture_reconnect_stalled`. Completed bootstrap with intact local authority
 can load and recover targets independently. Initial snapshot/bootstrap, legacy
 target-identity adoption, and whole-index reconstruction still require their
 existing coordinated recovery path. Unknown/replaced source identities also

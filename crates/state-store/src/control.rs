@@ -1,13 +1,16 @@
 //! Recovery authority independent of disposable row-index generations.
 //!
 //! The index WAL and control WAL deliberately do not form a distributed commit.
-//! Each durable transition appends an atomic index batch with revision N, then
+//! Each durable transition syncs an atomic index batch with revision N, then
 //! syncs one control batch with the same revision. Recovery accepts only equal
-//! revisions. Either crash window fences the index; the control records retain
-//! source progress and catalog operation identity for reconstruction. A matching
-//! index revision is in the same WAL batch as its rows/cursor, and RocksDB WAL
-//! recovery preserves that prefix across rotation. Intermediate staging batches
-//! may be replayed or discarded under their still-durable publication fence.
+//! revisions. A crash between the two syncs fences the index; the control
+//! records retain source progress and catalog operation identity for
+//! reconstruction. Syncing the index first means host crash or power loss
+//! outside that window leaves equal revisions, so it does not force a rebuild.
+//! A matching index revision is in the same WAL batch as its rows/cursor, and
+//! RocksDB WAL recovery preserves that prefix across rotation. Intermediate
+//! staging batches may be replayed or discarded under their still-durable
+//! publication fence.
 
 use crate::{
     Error, OPERATIONS, OperationPhase, OperationRecord, RawEntry, Result, SOURCE, StateBatch,
@@ -15,7 +18,7 @@ use crate::{
     prefix_end,
 };
 use flow_model::{OperationId, TableId};
-use rocksdb::{DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions};
+use rocksdb::{DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -28,6 +31,7 @@ const INITIALIZING: &[u8] = b"initializing-generation";
 const REVISION: &[u8] = b"control-revision";
 const CHECKPOINT: u8 = 4;
 const VERSION: &[u8] = b"control-format-version";
+const CONTROL_MAX_OPEN_FILES: i32 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationState {
@@ -60,6 +64,8 @@ impl ControlStore {
         options.set_write_buffer_size(4 << 20);
         options.set_max_write_buffer_number(2);
         options.set_max_background_jobs(2);
+        // Authority is small; bound its share of the process descriptor limit.
+        options.set_max_open_files(CONTROL_MAX_OPEN_FILES);
         let db = DB::open(&options, path)?;
         match db.get(VERSION)? {
             Some(version) if version != [1] => {
@@ -212,10 +218,12 @@ impl ControlStore {
             batch.index.put(REVISION, active.revision.to_be_bytes());
             batch.control.put(ACTIVE, bincode::serialize(&active)?);
             let observation = WriteObservation::capture(&batch.index);
+            // Control may name revision N only after the index WAL holding N
+            // (and every staged batch before it) is on stable storage.
             index
                 .0
                 .db
-                .write_opt(std::mem::take(&mut batch.index), &WriteOptions::default())?;
+                .write_opt(std::mem::take(&mut batch.index), &durable_write())?;
             self.0
                 .db
                 .write_opt(std::mem::take(&mut batch.control), &durable_write())?;
@@ -685,7 +693,272 @@ fn copy_directory_tree(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::SIMULATE_POWER_LOSS;
     use flow_model::PgLsn;
+
+    /// The bytes a host crash would leave: a copy of every file as written so
+    /// far. Under `SIMULATE_POWER_LOSS`, unsynced index WAL is not yet written.
+    fn crash_image(path: &Path) -> tempfile::TempDir {
+        let image = tempfile::tempdir().unwrap();
+        fs::remove_dir(image.path()).unwrap();
+        copy_directory_tree(path, image.path()).unwrap();
+        image
+    }
+
+    fn restore_image(image: &tempfile::TempDir, path: &Path) {
+        fs::remove_dir_all(path).unwrap();
+        copy_directory_tree(image.path(), path).unwrap();
+    }
+
+    #[test]
+    fn power_loss_after_committed_transitions_does_not_require_a_rebuild() {
+        SIMULATE_POWER_LOSS.set(true);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index");
+        let control_path = root.path().join("control");
+        let control = ControlStore::open(&control_path).unwrap();
+        let index = control
+            .initialize_index(&path, StateStoreOptions::default())
+            .unwrap();
+        for sequence in 0..8_u32 {
+            index
+                .update_source_ledger((b"ledger", &sequence.to_be_bytes()), [], None)
+                .unwrap();
+        }
+        index.complete_noop(&TableId(1), PgLsn(10), 1).unwrap();
+        let revision = control.active_generation().unwrap().unwrap().revision;
+        let index_image = crash_image(&path);
+        let control_image = crash_image(&control_path);
+        drop(index);
+        drop(control);
+        SIMULATE_POWER_LOSS.set(false);
+        restore_image(&index_image, &path);
+        restore_image(&control_image, &control_path);
+
+        let control = ControlStore::open(&control_path).unwrap();
+        assert_eq!(
+            control.active_generation().unwrap().unwrap().revision,
+            revision
+        );
+        let index =
+            StateStore::open_with_control(&path, StateStoreOptions::default(), control.clone())
+                .unwrap();
+        assert_eq!(
+            index.table_state(&TableId(1)).unwrap().materialized_lsn,
+            PgLsn(10)
+        );
+        assert_eq!(
+            index.source_transaction(b"ledger").unwrap(),
+            Some(7_u32.to_be_bytes().to_vec())
+        );
+    }
+
+    fn row_delta(key: u8) -> crate::IndexDelta {
+        crate::IndexDelta {
+            key: flow_model::PrimaryKey(vec![key]),
+            expected: None,
+            replacement: Some(flow_model::RowLocation {
+                data_file_id: flow_model::FileId("data.parquet".into()),
+                row_position: u64::from(key),
+                data_sequence_number: 1,
+                spec_id: 0,
+                partition: vec![],
+                source_commit_lsn: PgLsn(10),
+                row_version: 1,
+                row_fingerprint: [key; 16],
+            }),
+        }
+    }
+
+    fn row_operation() -> crate::PreparedOperation {
+        crate::PreparedOperation {
+            id: OperationId("power-loss".into()),
+            table_id: TableId(3),
+            kind: crate::OperationKind::Ingest,
+            base_snapshot_id: None,
+            last_lsn: PgLsn(10),
+            schema_version: 1,
+            artifacts: vec!["data.parquet".into()],
+            payload: vec![1],
+        }
+    }
+
+    const ROWS: u8 = 6;
+    fn two_row_batches() -> StateStoreOptions {
+        StateStoreOptions {
+            apply_batch_rows: 2,
+            ..Default::default()
+        }
+    }
+
+    /// Lose power with both databases open, then reopen the surviving bytes.
+    fn power_loss(
+        control: ControlStore,
+        index: StateStore,
+        root: &Path,
+    ) -> (ControlStore, StateStore) {
+        let (path, control_path) = (root.join("index"), root.join("control"));
+        let index_image = crash_image(&path);
+        let control_image = crash_image(&control_path);
+        drop(index);
+        drop(control);
+        SIMULATE_POWER_LOSS.set(false);
+        restore_image(&index_image, &path);
+        restore_image(&control_image, &control_path);
+        let control = ControlStore::open(&control_path).unwrap();
+        let index = StateStore::open_with_control(&path, two_row_batches(), control.clone())
+            .expect("equal revisions after power loss");
+        (control, index)
+    }
+
+    fn assert_published(control: &ControlStore, index: &StateStore) {
+        let id = row_operation().id;
+        assert_eq!(
+            index.operation(&id).unwrap().unwrap().phase,
+            crate::OperationPhase::Applied
+        );
+        let state = index.table_state(&TableId(3)).unwrap();
+        assert_eq!(state.snapshot_id, Some(5));
+        assert_eq!(state.materialized_lsn, PgLsn(10));
+        assert_eq!(state.pending_operation, None);
+        assert_eq!(control.table_state(&TableId(3)).unwrap(), Some(state));
+        for key in 0..ROWS {
+            assert_eq!(
+                index
+                    .lookup(&TableId(3), &flow_model::PrimaryKey(vec![key]))
+                    .unwrap(),
+                row_delta(key).replacement
+            );
+        }
+        assert_eq!(
+            index
+                .file_live_row_counts(
+                    &TableId(3),
+                    Some(5),
+                    &[flow_model::FileId("data.parquet".into())]
+                )
+                .unwrap(),
+            [u64::from(ROWS)]
+        );
+    }
+
+    #[test]
+    fn power_loss_during_multi_batch_apply_loses_only_the_staged_tail() {
+        SIMULATE_POWER_LOSS.set(true);
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let index = control
+            .initialize_index(root.path().join("index"), two_row_batches())
+            .unwrap();
+        let id = row_operation().id;
+        index
+            .prepare(row_operation(), (0..ROWS).map(row_delta))
+            .unwrap();
+        index.mark_committed(&id, 5, 5).unwrap();
+        // Intermediate apply batches are staged without their own sync.
+        for _ in 0..2 {
+            assert!(
+                !index
+                    .apply_batch(&id, false)
+                    .unwrap()
+                    .into_result()
+                    .complete
+            );
+        }
+        assert_eq!(index.operation(&id).unwrap().unwrap().applied_count, 4);
+
+        let (control, index) = power_loss(control, index, root.path());
+        let record = index.operation(&id).unwrap().unwrap();
+        assert_eq!(record.phase, crate::OperationPhase::Committed);
+        assert_eq!(record.applied_count, 0, "the unsynced tail was lost");
+        assert!(index.index_is_empty(&TableId(3)).unwrap());
+        index.apply_committed(&id).unwrap();
+        assert_published(&control, &index);
+    }
+
+    #[test]
+    fn power_loss_during_delta_staging_resumes_from_the_durable_count() {
+        SIMULATE_POWER_LOSS.set(true);
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let index = control
+            .initialize_index(root.path().join("index"), two_row_batches())
+            .unwrap();
+        let operation = row_operation();
+        let id = operation.id.clone();
+        index.begin_prepare(operation.clone()).unwrap();
+        index.stage_deltas(&id, (0..4).map(row_delta)).unwrap();
+        assert_eq!(index.operation(&id).unwrap().unwrap().delta_count, 4);
+
+        let (control, index) = power_loss(control, index, root.path());
+        let record = index.operation(&id).unwrap().unwrap();
+        assert_eq!(record.phase, crate::OperationPhase::Building);
+        assert_eq!(record.delta_count, 0, "the unsynced staging was lost");
+        assert_eq!(
+            control
+                .table_state(&TableId(3))
+                .unwrap()
+                .unwrap()
+                .pending_operation,
+            Some(id.clone())
+        );
+        // Staging restarts from the durable count without duplicate markers.
+        index.stage_deltas(&id, (0..ROWS).map(row_delta)).unwrap();
+        index
+            .seal_prepare(&id, operation.artifacts, operation.payload)
+            .unwrap();
+        assert_eq!(
+            index.prepared_deltas(&id).unwrap().count(),
+            usize::from(ROWS)
+        );
+        index.mark_committed(&id, 5, 5).unwrap();
+        index.apply_committed(&id).unwrap();
+        assert_published(&control, &index);
+    }
+
+    #[test]
+    fn index_revision_is_durable_before_control_is_written() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index");
+        let control_path = root.path().join("control");
+        let control = ControlStore::open(&control_path).unwrap();
+        drop(
+            control
+                .initialize_index(&path, StateStoreOptions::default())
+                .unwrap(),
+        );
+        let before = control.active_generation().unwrap().unwrap().revision;
+        drop(control);
+
+        // Read-only authority rejects the control write after the index write.
+        SIMULATE_POWER_LOSS.set(true);
+        let control = ControlStore(Arc::new(Inner {
+            db: DB::open_for_read_only(&Options::default(), &control_path, false).unwrap(),
+            writer: Mutex::new(()),
+        }));
+        let index =
+            StateStore::open_with_control(&path, StateStoreOptions::default(), control.clone())
+                .unwrap();
+        let mut batch = StateBatch::default();
+        index.put_source_record(&mut batch, b"ledger", b"20");
+        assert!(control.commit_index(&index, &mut batch).is_err());
+        let image = crash_image(&path);
+        drop(index);
+        drop(control);
+        SIMULATE_POWER_LOSS.set(false);
+
+        let recovered = DB::open_cf_for_read_only(
+            &Options::default(),
+            image.path(),
+            crate::STATE_COLUMN_FAMILIES,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.get(REVISION).unwrap(),
+            Some((before + 1).to_be_bytes().to_vec())
+        );
+    }
 
     #[test]
     fn failed_control_write_fences_following_ledger_commits_before_unlock() {

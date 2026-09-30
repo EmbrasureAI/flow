@@ -10,6 +10,11 @@ use std::{
     time::Instant,
 };
 
+/// Bytes that wrapping a decoded mutation as `DecodedMutationV1` quarantine
+/// adds: the outer table, version, kind and format tags and the payload length.
+/// Rows reserve it so a blocked table keeps every row's complete evidence.
+pub const QUARANTINE_WRAP_BYTES: u64 = 24;
+
 struct Buffer {
     xid: u32,
     subxid: u32,
@@ -23,6 +28,19 @@ struct PendingTransaction {
     begin_lsn: PgLsn,
     // A hint only: subtransaction rollback can remove some referenced versions.
     schemas: BTreeMap<TableId, BTreeSet<u32>>,
+    /// Tables this streamed transaction quarantined without blocking them for
+    /// other transactions: the spool position of the first such change and
+    /// why. A later change of the same table cannot survive a rollback that
+    /// removes the first, so one entry per table is exact.
+    provisional: Vec<(u64, TableId, String)>,
+    /// Tables whose Relation in this streamed transaction capture cannot
+    /// decode. pgoutput sends every transaction its own current Relation, so
+    /// this does not affect other transactions. A savepoint rollback does not
+    /// clear it: the Relation precedes the first change it describes, so its
+    /// spool position cannot tell DDL inside a rolled-back savepoint from DDL
+    /// just before it. PostgreSQL re-sends the Relation at the next streamed
+    /// change after catalog invalidation, which replaces this entry either way.
+    undecodable: BTreeMap<TableId, String>,
 }
 
 /// Bounded source-wide transaction assembly. Only one pgoutput segment is
@@ -35,6 +53,8 @@ pub struct CaptureAssembler {
     schemas: HashMap<TableId, TableSchema>,
     relations: HashMap<u32, Relation>,
     transactions: HashMap<u32, PendingTransaction>,
+    /// The transaction of the active StreamStart..StreamStop segment.
+    streaming: Option<u32>,
     buffer: Option<Buffer>,
     chunk_bytes: u64,
     pending_commits: Vec<SourceTransaction>,
@@ -74,6 +94,7 @@ impl CaptureAssembler {
             schemas: configured,
             relations: HashMap::new(),
             transactions: HashMap::new(),
+            streaming: None,
             buffer: None,
             chunk_bytes: u64::from(chunk_bytes),
             pending_commits: Vec::new(),
@@ -160,54 +181,154 @@ impl CaptureAssembler {
     /// Retain only projected cells, together with their wire relation. The
     /// normal spool owns rollback/quotas and the journal owns committed payloads.
     pub fn quarantine(&mut self, event: SourceEvent, relation: &Relation) -> Result<()> {
-        let (xid, subxid, table) = match &event {
-            SourceEvent::Insert {
-                xid,
-                subxid,
-                relation,
-                ..
-            }
-            | SourceEvent::Update {
-                xid,
-                subxid,
-                relation,
-                ..
-            }
-            | SourceEvent::Delete {
-                xid,
-                subxid,
-                relation,
-                ..
-            } => (*xid, *subxid, TableId(*relation)),
-            SourceEvent::Truncate {
-                xid,
-                subxid,
-                relations,
-                ..
-            } if relations.len() == 1 => (*xid, *subxid, TableId(relations[0])),
-            _ => {
-                return Err(Error::Config(
-                    "only single-table source events can be quarantined",
-                ));
-            }
-        };
-        if relation.id != table.0 {
-            return Err(Error::Protocol("quarantine relation identity mismatch"));
-        }
+        let (_, _, table) = quarantined_change(&event, relation)?;
         self.block_table(table)?;
+        self.spool_quarantine(event, relation)
+    }
+
+    /// The transaction of the active streamed segment. pgoutput streams
+    /// changes before PostgreSQL decides whether their transaction commits.
+    pub fn streaming(&self) -> Option<u32> {
+        self.streaming
+    }
+
+    /// Quarantine a change of a streamed, still undecided transaction without
+    /// blocking its table for other transactions. The decision survives only
+    /// with the (sub)transaction that made it: a rollback discards it with the
+    /// change. The caller must block each table [`Self::provisional_blocks`]
+    /// reports before that transaction's Commit; Commit rejects it otherwise.
+    pub fn quarantine_provisionally(
+        &mut self,
+        event: SourceEvent,
+        relation: &Relation,
+        reason: &str,
+    ) -> Result<()> {
+        let (xid, _, table) = quarantined_change(&event, relation)?;
+        if !self.schemas.contains_key(&table) {
+            return Err(Error::Config("unconfigured blocked table"));
+        }
+        // Start a chunk here so its spool position is this change's position.
+        self.flush()?;
+        let position = self.spool.position(xid)?;
+        let transaction = self
+            .transactions
+            .get_mut(&xid)
+            .ok_or(Error::Protocol("mutation outside capture transaction"))?;
+        if !transaction
+            .provisional
+            .iter()
+            .any(|(_, provisional, _)| *provisional == table)
+        {
+            transaction
+                .provisional
+                .push((position, table, reason.to_owned()));
+        }
+        self.spool_quarantine(event, relation)
+    }
+
+    /// Record that the active streamed segment described `table` with a
+    /// Relation capture cannot decode; `None` records a decodable one.
+    pub fn set_undecodable(&mut self, table: TableId, reason: Option<&str>) -> Result<()> {
+        let xid = self
+            .streaming
+            .ok_or(Error::Protocol("streamed relation outside a stream"))?;
+        let transaction = self.transactions.get_mut(&xid).ok_or(Error::Protocol(
+            "streamed relation outside capture transaction",
+        ))?;
+        match reason {
+            Some(reason) => transaction.undecodable.insert(table, reason.to_owned()),
+            None => transaction.undecodable.remove(&table),
+        };
+        Ok(())
+    }
+
+    /// Whether the active streamed segment described `table` with a Relation
+    /// capture cannot decode.
+    pub fn is_undecodable(&self, table: TableId) -> bool {
+        self.streaming
+            .and_then(|xid| self.transactions.get(&xid))
+            .is_some_and(|transaction| transaction.undecodable.contains_key(&table))
+    }
+
+    /// Why `xid`'s later changes of `table` must be quarantined, if a
+    /// provisional decision of that transaction still stands.
+    pub fn provisional_block(&self, xid: u32, table: TableId) -> Option<&str> {
+        let transaction = self.transactions.get(&xid)?;
+        transaction
+            .undecodable
+            .get(&table)
+            .or_else(|| {
+                transaction
+                    .provisional
+                    .iter()
+                    .find_map(|(_, provisional, reason)| (*provisional == table).then_some(reason))
+            })
+            .map(String::as_str)
+    }
+
+    /// Schema versions an open transaction spooled or buffered, or that a
+    /// decoder uses for its next rows. Other unpersisted versions are unused.
+    pub fn schema_versions_in_use(&self) -> BTreeSet<(TableId, u32)> {
+        let mut versions: BTreeSet<_> = self
+            .schemas
+            .values()
+            .map(|schema| (schema.table_id, schema.version))
+            .collect();
+        for transaction in self.transactions.values() {
+            for (table, spooled) in &transaction.schemas {
+                versions.extend(spooled.iter().map(|version| (*table, *version)));
+            }
+        }
+        if let Some(buffer) = &self.buffer {
+            versions.insert((buffer.table_id, buffer.schema_version));
+        }
+        versions
+    }
+
+    /// Tables whose provisional quarantine survived every rollback of `xid`.
+    pub fn provisional_blocks(&self, xid: u32) -> Vec<(TableId, String)> {
+        self.transactions
+            .get(&xid)
+            .map(|transaction| {
+                transaction
+                    .provisional
+                    .iter()
+                    .map(|(_, table, reason)| (*table, reason.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn spool_quarantine(&mut self, event: SourceEvent, relation: &Relation) -> Result<()> {
+        let (xid, subxid, table) = quarantined_change(&event, relation)?;
         let version = self.schemas[&table].version;
-        self.append(
-            xid,
-            subxid,
-            Mutation {
-                table_id: table,
-                schema_version: version,
-                kind: MutationKind::Quarantined {
-                    format: flow_model::QuarantineFormat::PostgresEventV1,
-                    payload: bincode::serialize(&(relation, event))?,
-                },
+        let mutation = Mutation {
+            table_id: table,
+            schema_version: version,
+            kind: MutationKind::Quarantined {
+                format: flow_model::QuarantineFormat::PostgresEventV1,
+                payload: bincode::serialize(&(relation, event))?,
             },
-        )
+        };
+        // Evidence for a row that exceeded the chunk limit cannot fit either.
+        // A bounded marker still holds this transaction for the blocked table.
+        let mutation = self.fit_quarantine(mutation)?;
+        self.append(xid, subxid, mutation)
+    }
+
+    /// Replace quarantined evidence that cannot fit one chunk with a marker.
+    fn fit_quarantine(&self, mutation: Mutation) -> Result<Mutation> {
+        let bytes = bincode::serialized_size(&mutation)?;
+        if bytes + 16 <= self.chunk_bytes {
+            return Ok(mutation);
+        }
+        Ok(Mutation {
+            kind: MutationKind::Quarantined {
+                format: flow_model::QuarantineFormat::OversizedV1,
+                payload: bincode::serialize(&(mutation.table_id.0, bytes))?,
+            },
+            ..mutation
+        })
     }
 
     pub fn pending_commit_count(&self) -> usize {
@@ -358,8 +479,13 @@ impl CaptureAssembler {
                     PendingTransaction {
                         begin_lsn: received_lsn,
                         schemas: BTreeMap::new(),
+                        provisional: Vec::new(),
+                        undecodable: BTreeMap::new(),
                     },
                 );
+                if matches!(event, SourceEvent::StreamStart { .. }) {
+                    self.streaming = Some(xid);
+                }
             }
             SourceEvent::StreamStart { xid, first: false } => {
                 self.flush()?;
@@ -368,8 +494,12 @@ impl CaptureAssembler {
                         "continuation of unknown capture transaction",
                     ));
                 }
+                self.streaming = Some(xid);
             }
-            SourceEvent::StreamStop => self.flush()?,
+            SourceEvent::StreamStop => {
+                self.flush()?;
+                self.streaming = None;
+            }
             SourceEvent::Relation(relation) => {
                 let schema = self
                     .schemas
@@ -404,7 +534,10 @@ impl CaptureAssembler {
             } => {
                 let (schema, metadata) = self.table(relation)?;
                 if schema.append_only {
-                    return Err(Error::Config("UPDATE on an append-only table"));
+                    return Err(Error::AppendOnly {
+                        table: relation,
+                        operation: "UPDATE",
+                    });
                 }
                 if row.iter().any(|cell| matches!(cell, Cell::UnchangedToast)) {
                     // pgoutput omits unchanged TOAST values from the new tuple,
@@ -446,7 +579,10 @@ impl CaptureAssembler {
             } => {
                 let (schema, metadata) = self.table(relation)?;
                 if schema.append_only {
-                    return Err(Error::Config("DELETE on an append-only table"));
+                    return Err(Error::AppendOnly {
+                        table: relation,
+                        operation: "DELETE",
+                    });
                 }
                 let key = decode_key(schema, metadata, &old, &self.types)?;
                 let mutation = Mutation {
@@ -461,6 +597,14 @@ impl CaptureAssembler {
                     return Err(Error::Protocol("cannot abort a staged capture commit"));
                 }
                 self.flush()?;
+                // Provisional decisions roll back exactly with their spooled changes.
+                if let Some(start) = self.spool.savepoint(xid, subxid)
+                    && let Some(transaction) = self.transactions.get_mut(&xid)
+                {
+                    transaction
+                        .provisional
+                        .retain(|(position, _, _)| *position < start);
+                }
                 self.spool.abort(xid, subxid)?;
                 if xid == subxid {
                     self.transactions.remove(&xid);
@@ -488,6 +632,19 @@ impl CaptureAssembler {
                 if self.pending_commits.len() >= self.pending_commit_limit {
                     return Err(Error::Config(
                         "pending commit limit reached; flush the journal commit group",
+                    ));
+                }
+                // A surviving provisional quarantine must not reach a table
+                // that other transactions keep publishing to.
+                if self.transactions[&xid]
+                    .provisional
+                    .iter()
+                    .any(|(_, table, _)| {
+                        !self.blocked.contains(table) && !self.dropped.contains(table)
+                    })
+                {
+                    return Err(Error::Protocol(
+                        "provisionally quarantined table was not blocked before commit",
                     ));
                 }
                 let mut tables = BTreeMap::<TableId, (u32, u64)>::new();
@@ -525,14 +682,32 @@ impl CaptureAssembler {
                             .deserialize(&bytes[8..])?;
                         for mutation in &mut mutations {
                             if !matches!(&mutation.kind, MutationKind::Quarantined { .. }) {
-                                mutation.kind = MutationKind::Quarantined {
-                                    format: flow_model::QuarantineFormat::DecodedMutationV1,
-                                    payload: bincode::serialize(mutation)?,
-                                };
+                                *mutation = self.fit_quarantine(Mutation {
+                                    table_id: mutation.table_id,
+                                    schema_version: mutation.schema_version,
+                                    kind: MutationKind::Quarantined {
+                                        format: flow_model::QuarantineFormat::DecodedMutationV1,
+                                        payload: bincode::serialize(mutation)?,
+                                    },
+                                })?;
                             }
                             mutation.schema_version = self.schemas[&table_id].version;
                         }
-                        journal.append_chunk(xid, &bincode::serialize(&mutations)?)?;
+                        // Wrapping grows each mutation, so the spooled chunk
+                        // may no longer fit one journal frame. Split it.
+                        let mut batch: Vec<Mutation> = Vec::new();
+                        let mut batch_bytes = 16;
+                        for mutation in mutations {
+                            let bytes = bincode::serialized_size(&mutation)?;
+                            if !batch.is_empty() && batch_bytes + bytes > self.chunk_bytes {
+                                journal.append_chunk(xid, &bincode::serialize(&batch)?)?;
+                                batch.clear();
+                                batch_bytes = 16;
+                            }
+                            batch.push(mutation);
+                            batch_bytes += bytes;
+                        }
+                        journal.append_chunk(xid, &bincode::serialize(&batch)?)?;
                         entry.0 = self.schemas[&table_id].version;
                     } else {
                         journal.append_chunk(xid, &bytes[8..])?;
@@ -605,10 +780,17 @@ impl CaptureAssembler {
             return Err(Error::Protocol("mutation outside capture transaction"));
         }
         let bytes = bincode::serialized_size(&mutation)?;
-        if bytes + 16 > self.chunk_bytes {
-            return Err(Error::Config(
-                "single mutation exceeds capture chunk limit; increase row/chunk limits",
-            ));
+        let reserve = if matches!(mutation.kind, MutationKind::Quarantined { .. }) {
+            0
+        } else {
+            QUARANTINE_WRAP_BYTES
+        };
+        if bytes + 16 + reserve > self.chunk_bytes {
+            return Err(Error::RowLimit {
+                table: mutation.table_id.0,
+                bytes: bytes + 16 + reserve,
+                limit: self.chunk_bytes,
+            });
         }
         if self.buffer.as_ref().is_some_and(|b| {
             b.xid != xid
@@ -649,6 +831,45 @@ impl CaptureAssembler {
         }
         Ok(())
     }
+}
+
+/// The single-table change a quarantine event carries, with its relation.
+fn quarantined_change(event: &SourceEvent, relation: &Relation) -> Result<(u32, u32, TableId)> {
+    let change = match event {
+        SourceEvent::Insert {
+            xid,
+            subxid,
+            relation,
+            ..
+        }
+        | SourceEvent::Update {
+            xid,
+            subxid,
+            relation,
+            ..
+        }
+        | SourceEvent::Delete {
+            xid,
+            subxid,
+            relation,
+            ..
+        } => (*xid, *subxid, TableId(*relation)),
+        SourceEvent::Truncate {
+            xid,
+            subxid,
+            relations,
+            ..
+        } if relations.len() == 1 => (*xid, *subxid, TableId(relations[0])),
+        _ => {
+            return Err(Error::Config(
+                "only single-table source events can be quarantined",
+            ));
+        }
+    };
+    if relation.id != change.2.0 {
+        return Err(Error::Protocol("quarantine relation identity mismatch"));
+    }
+    Ok(change)
 }
 
 pub(crate) fn validate_relation(schema: &TableSchema, relation: &Relation) -> Result<()> {

@@ -133,10 +133,16 @@ See the [architecture](docs/architecture.md) and
 
 ## Support and status
 
-**Flow is beta software.** The replication, recovery and compaction protocols
-are tested in CI against PostgreSQL 14–18, MinIO, an Iceberg REST catalog and
-independent readers (DuckDB, Trino and Spark), including crash, outage and
-external-maintenance scenarios. Performance qualification is ongoing; the
+**Flow is beta software.** Every change runs service tests against real
+PostgreSQL, MinIO and an Iceberg REST catalog, reading results with stock DuckDB.
+On each of PostgreSQL 14–18 they cover snapshot/CDC type compatibility, schema
+changes, SIGKILL and catalog/object-store/PostgreSQL outage recovery, and the
+fail-closed checks for a lost or rewound slot or journal. Table isolation,
+REPLICA IDENTITY DEFAULT, lifecycle and compaction scenarios run on PostgreSQL
+14 and 18; Iceberg v3, a randomized crash loop and the Trino and Spark
+external-maintenance checks run on PostgreSQL 18, with a longer crash loop and
+a resource soak nightly. Power loss (unsynced page cache) is not simulated.
+See [the fault suite](tests/production/FAULTS.md). Performance qualification is ongoing; the
 [benchmark report](docs/performance.md) records measured throughput, latency
 and the targets still open. Configuration and on-disk state may change between
 minor releases, with the upgrade path stated in the [changelog](CHANGELOG.md);

@@ -96,6 +96,24 @@ pub enum Error {
     FrameLimit { length: u32, limit: u32 },
     #[error("journal frame is corrupt")]
     Corrupt,
+    #[error(
+        "journal segment {segment} is damaged at byte {offset} ({reason}); segments are synchronized before rollover, so damage before the final segment is storage corruption, not a torn write. No segment file was modified; restore the state directory or resynchronize the source"
+    )]
+    SegmentCorrupt {
+        segment: u64,
+        offset: u64,
+        reason: &'static str,
+    },
+    #[error(
+        "journal tail damage in segment {segment} at byte {offset} ({reason}) would leave the journal at {recovered}, below its recorded durable position {floor}. No segment file was modified; restore the state directory or resynchronize the source"
+    )]
+    DurableTail {
+        segment: u64,
+        offset: u64,
+        reason: &'static str,
+        recovered: PgLsn,
+        floor: PgLsn,
+    },
     #[error("journal writer experienced an IO failure; reopen it to resolve the durable prefix")]
     Poisoned,
 }
@@ -157,7 +175,7 @@ impl ChunkReader for Journal {
 pub struct Recovery {
     /// Ordered complete transactions above the durable reclamation watermark.
     pub transactions: TransactionLog,
-    /// Bytes discarded starting at the first torn or corrupt frame.
+    /// Torn-tail bytes discarded from the final segment.
     pub truncated_bytes: u64,
     pub reclaimed_lsn: PgLsn,
 }
@@ -186,6 +204,20 @@ pub struct Journal {
 
 impl Journal {
     pub fn open(path: impl AsRef<Path>, config: JournalConfig) -> Result<(Self, Recovery)> {
+        Self::open_with_floor(path, config, PgLsn(0))
+    }
+
+    /// Open and recover the journal. Only the final segment can hold a torn
+    /// write, since rollover synchronizes a segment before closing it; damage
+    /// in an earlier segment is corruption and fails without modifying any
+    /// file. A torn tail is truncated only if every transaction through
+    /// `durable_floor`, a durable position the caller recorded independently
+    /// (such as its source ledger's), survives; otherwise open fails too.
+    pub fn open_with_floor(
+        path: impl AsRef<Path>,
+        config: JournalConfig,
+        durable_floor: PgLsn,
+    ) -> Result<(Self, Recovery)> {
         config.validate()?;
         let root = path.as_ref().to_path_buf();
         create_dir_all_durable(&root, &mut sync_dir)?;
@@ -217,17 +249,14 @@ impl Journal {
         let mut sequence = None;
         let mut durable_lsn = reclaimed_lsn;
         let mut segment_pins = BTreeMap::new();
-        let mut damaged = false;
+        let mut truncated = false;
         let mut repaired = BTreeMap::new();
+        let last = segments.last_key_value().map(|(&id, _)| id);
         for (&id, &size) in &segments {
             let path = segment_path(&root, id);
-            if damaged {
-                truncated_bytes += size;
-                fs::remove_file(path)?;
-                continue;
-            }
             let mut file = OpenOptions::new().read(true).write(true).open(path)?;
             let mut offset = 0;
+            let mut damage = None;
             while offset < size {
                 let frame = match read_frame(&mut file, config.max_frame_bytes) {
                     Ok(frame) => frame,
@@ -239,13 +268,17 @@ impl Journal {
                         | Error::RecordKind(_)
                         | Error::FrameLimit { .. }),
                     ) => return Err(error),
+                    Err(Error::Io(_)) => {
+                        damage = Some("incomplete frame");
+                        break;
+                    }
                     Err(_) => {
-                        damaged = true;
+                        damage = Some("frame header or checksum mismatch");
                         break;
                     }
                 };
                 if sequence.is_some_and(|s| frame.sequence != s) {
-                    damaged = true;
+                    damage = Some("frame sequence gap");
                     break;
                 }
                 let reference = JournalChunkRef {
@@ -306,20 +339,39 @@ impl Journal {
                     kind => return Err(Error::RecordKind(kind)),
                 };
                 if !accepted {
-                    damaged = true;
+                    damage = Some("invalid transaction record");
                     break;
                 }
                 sequence = Some(frame.sequence.checked_add(1).ok_or(Error::Corrupt)?);
                 offset += HEADER as u64 + frame.payload.len() as u64;
             }
-            if damaged {
+            if let Some(reason) = damage {
+                // Refuse before modifying anything: later segments hold
+                // transactions that were synchronized after this damage.
+                if Some(id) != last {
+                    return Err(Error::SegmentCorrupt {
+                        segment: id,
+                        offset,
+                        reason,
+                    });
+                }
+                if durable_lsn < durable_floor {
+                    return Err(Error::DurableTail {
+                        segment: id,
+                        offset,
+                        reason,
+                        recovered: durable_lsn,
+                        floor: durable_floor,
+                    });
+                }
                 truncated_bytes += size - offset;
                 file.set_len(offset)?;
                 file.sync_all()?;
+                truncated = true;
             }
             repaired.insert(id, offset);
         }
-        if damaged {
+        if truncated {
             sync_dir(&root)?;
         }
         // Incomplete transactions have no terminal marker and must be resent by
@@ -652,12 +704,13 @@ impl Journal {
             removed += index_bytes;
             self.terminal_writer.remove_segment(id);
             fs::remove_file(segment_path(&self.root, id))?;
+            // Persist removals oldest first. Recovery rejects a sequence gap
+            // before the final segment, which an older segment reappearing
+            // after a crash, next to a removed newer one, would create.
+            sync_dir(&self.root)?;
             self.segments.remove(&id);
             self.bytes -= size;
             removed += size;
-        }
-        if removed > 0 {
-            sync_dir(&self.root)?;
         }
         Ok(removed)
     }

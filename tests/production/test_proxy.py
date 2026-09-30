@@ -9,6 +9,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from urllib.parse import urlsplit
 
@@ -175,6 +176,53 @@ class ProxyTests(unittest.TestCase):
             self.assertTrue(proxy.dropped.is_set())
             self.assertEqual([request[1] for request in requests], ["/object", "/commit"])
             self.assertEqual(len(accepted), 1)
+
+    def test_catalog_unknown_commit_status_follows_upstream_success(self):
+        body = json.dumps({"updates": [{"action": "add-snapshot", "snapshot": {
+            "snapshot-id": 7, "summary": {"streaming.operation": "ingest", "flow.operation-id": "op-1"}}}]})
+        for status in (500, 502, 504):
+            with self.subTest(status=status), fixture(CatalogProxy) as (proxy, client, requests, _):
+                proxy.arm_drop(status=status)
+                client.request("POST", "/v1/namespaces/test/tables/orders", body)
+                response = client.getresponse()
+                self.assertEqual(response.status, status)
+                self.assertTrue(response.will_close)
+                self.assertEqual(json.loads(response.read())["error"]["code"], status)
+                self.assertTrue(proxy.dropped.is_set())
+                self.assertEqual(len(requests), 1, "the rewritten commit must reach upstream exactly once")
+                # The proxy records its event after responding; wait for it.
+                deadline = time.monotonic() + 5
+                while not [event for event in proxy.events if event.get("fault")] and time.monotonic() < deadline:
+                    time.sleep(.01)
+                event, = [event for event in proxy.events if event.get("fault")]
+                self.assertEqual(event["fault"], "unknown-status-after-successful-commit")
+                self.assertEqual((event["operation_id"], event["snapshot_id"], event["upstream_status"]),
+                                 ("op-1", 7, 200))
+                # Only the armed commit is affected.
+                client.close()
+                client.request("POST", "/v1/namespaces/test/tables/orders", body)
+                self.assertEqual(client.getresponse().read(), b"abcde")
+        with self.assertRaises(ValueError):
+            CatalogProxy.arm_drop(None, status=503)
+
+    def test_catalog_late_commit_response_outlives_client_timeout(self):
+        with fixture(CatalogProxy) as (proxy, client, requests, _):
+            proxy.arm_drop(delay_seconds=1.5)
+            client.timeout = 0.3
+            body = json.dumps({"updates": [{"action": "add-snapshot", "snapshot": {
+                "summary": {"streaming.operation": "ingest", "flow.operation-id": "op-2"}}}]})
+            client.request("POST", "/v1/namespaces/test/tables/orders", body)
+            with self.assertRaises(TimeoutError):
+                client.getresponse()
+            self.assertTrue(proxy.dropped.is_set())
+            self.assertEqual(len(requests), 1)
+            client.close()
+            deadline = time.monotonic() + 5
+            while not any(event.get("fault") == "late-after-successful-commit" for event in proxy.events):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.05)
+            event, = [event for event in proxy.events if event.get("fault")]
+            self.assertEqual((event["operation_id"], event["upstream_status"]), ("op-2", 200))
 
     def test_table_rejection_matches_exact_table_and_selected_methods(self):
         with fixture(CatalogProxy) as (proxy, client, requests, _):

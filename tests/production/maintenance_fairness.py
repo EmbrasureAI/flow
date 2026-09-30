@@ -29,7 +29,7 @@ class FairnessRun(ConcurrentRun):
             "min_file_age_ms": 0,
         }
         text = self.config.read_text().replace("table_workers = 4", "table_workers = 2")
-        text = text.replace("pending_transactions = 32", "pending_transactions = 16")
+        text = text.replace("pending_transactions = 32", "pending_transactions = 16\nepoch_max_transactions = 8")
         # A low token rate introduces permit gaps in which even a starving
         # scheduler can run maintenance. Keep permits faster than real commits.
         text = text.replace("commits_per_second = 100", "commits_per_second = 10000")

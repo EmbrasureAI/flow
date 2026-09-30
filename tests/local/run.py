@@ -143,6 +143,9 @@ deleted_rows_percent = 1
 delete_files_soft = 1
 delete_files_hard = 2
 '''
+        # Version 2 is the default; leave existing fixture configurations unchanged.
+        version = getattr(self.args, "format_version", 2)
+        format_line = f"format_version = {version}\n" if version != 2 else ""
         for table, fields in (("orders", columns), ("accounts", [columns[0], columns[3]])):
             text += f'''\n[[tables]]
 source_namespace = "{self.name}"
@@ -150,7 +153,7 @@ source_table = "{table}"
 target_namespace = ["{self.name}"]
 target_table = "{table}"
 primary_key = [0]
-columns = [\n'''
+{format_line}columns = [\n'''
             for index, (name, kind, nullable) in enumerate(fields, 1):
                 data_type = ('{ Decimal = { precision = 18, scale = 4 } }'
                              if isinstance(kind, dict) else json.dumps(kind))
@@ -160,6 +163,12 @@ columns = [\n'''
         self.config = self.directory / "flow.toml"
         self.config.write_text(text)
         self.environment = os.environ | {"FLOW_LOCAL_POSTGRES_URL": self.args.postgres_url}
+
+    def format_version(self):
+        return getattr(self.args, "format_version", 2)
+
+    def format_line(self):
+        return f"format_version = {self.format_version()}\n" if self.format_version() != 2 else ""
 
     def phase(self, name, action):
         start = time.monotonic()
@@ -304,14 +313,16 @@ columns = [\n'''
             self.avro_cache[path] = list(fastavro.reader(io.BytesIO(body)))
         return self.avro_cache[path]
 
-    def audit(self, table):
+    def audit(self, table, last=None):
+        """Check every retained snapshot, or only the `last` most recent ones."""
         metadata = self.table(table)["metadata"]
-        assert metadata["format-version"] == 2
+        assert metadata["format-version"] == self.format_version()
         operations = set()
         delete_snapshots = 0
         compactions = 0
         current = None
-        for snapshot in metadata["snapshots"]:
+        snapshots = sorted(metadata["snapshots"], key=lambda snapshot: snapshot["sequence-number"])
+        for snapshot in snapshots[-last:] if last else snapshots:
             summary = snapshot["summary"]
             operation = summary.get("flow.operation-id") or summary["local-test.compaction-id"]
             assert operation not in operations, "same logical operation committed twice"
@@ -331,6 +342,9 @@ columns = [\n'''
                         continue
                     file = entry["data_file"]
                     path = file["file_path"]
+                    if file.get("file_format", "").upper() == "PUFFIN":
+                        # Several v3 deletion vectors can share one Puffin object.
+                        path = (path, file["content_offset"])
                     assert path not in live, "duplicate live file reference"
                     data_sequence = entry.get("sequence_number")
                     if data_sequence is None:
@@ -356,7 +370,18 @@ columns = [\n'''
             deletes = [file for file in live.values() if file["content"] == 1]
             assert all(file["content"] in (0, 1) for file in live.values())
             delete_snapshots += bool(deletes)
+            vector_targets = set()
             for file in deletes:
+                if file.get("file_format", "").upper() == "PUFFIN":
+                    assert metadata["format-version"] >= 3, "deletion vector in a v2 table"
+                    target = file["referenced_data_file"]
+                    assert target not in vector_targets, "multiple live deletion vectors for one data file"
+                    vector_targets.add(target)
+                    assert target in live and live[target]["content"] == 0
+                    assert 0 < file["record_count"] <= live[target]["record_count"]
+                    assert file["content_offset"] >= 4 and file["content_size_in_bytes"] > 0
+                    assert file["content_offset"] + file["content_size_in_bytes"] <= file["file_size_in_bytes"]
+                    continue
                 positions = self.duck.execute("SELECT file_path, pos FROM read_parquet(?)", [file["file_path"]]).fetchall()
                 assert positions == sorted(set(positions)), "positions must be sorted and unique"
                 assert len(positions) == file["record_count"]

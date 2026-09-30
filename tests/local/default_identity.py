@@ -1,4 +1,14 @@
-"""Production-image DEFAULT identity qualification; invoked by default_identity.sh."""
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["duckdb==1.5.5", "psycopg[binary]==3.3.5", "boto3==1.43.88", "fastavro==1.12.2"]
+# ///
+"""DEFAULT replica identity qualification against disposable services.
+
+Runs standalone (CI, local Compose) or inside the product runner image built by
+default_identity.sh, which additionally runs the product's CDC preflight.
+"""
+import argparse
 import json
 import os
 import signal
@@ -10,7 +20,12 @@ import traceback
 from types import SimpleNamespace
 
 from run import Run, dump, lsn
-from src.services.warehouse_ingestion_runtime import _cdc_preflight_report
+
+try:
+    # Present only in the product runner image; the engine checks run without it.
+    from src.services.warehouse_ingestion_runtime import _cdc_preflight_report
+except ImportError:
+    _cdc_preflight_report = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'production'))
 from proxy import CatalogProxy
@@ -54,7 +69,7 @@ class DefaultRun(Run):
         self.pg.execute("INSERT INTO accounts SELECT i, (SELECT string_agg(md5(v::text), '') FROM generate_series(1,4096) v) FROM generate_series(1,3) i")
         self.pg.execute("INSERT INTO projected VALUES (1,10,repeat('excluded',10000))")
         self.pg.execute(f'CREATE PUBLICATION {self.name} FOR TABLE orders, accounts, projected')
-        assert self.pg.execute("SHOW server_version_num").fetchone()[0].startswith('16')
+        return {'server_version_num': self.pg.execute("SHOW server_version_num").fetchone()[0]}
 
     def product_preflight(self):
         tables = [dict(source_schema=self.name, source_table=name, primary_key_columns=key,
@@ -216,9 +231,11 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
 '''
         path.write_text(text)
         result = subprocess.run([str(self.args.binary),'--config',str(path),'init'],env=self.environment,capture_output=True,text=True,timeout=60)
-        (self.directory/'rejected-init.log').write_text(result.stdout+result.stderr)
-        assert result.returncode != 0 and 'rejected' in result.stderr and 'REPLICA IDENTITY FULL' in result.stderr
-        return {'exit':result.returncode, 'message':result.stderr}
+        output = result.stdout+result.stderr
+        (self.directory/'rejected-init.log').write_text(output)
+        # A daemon command reports its fatal error as a JSON log event on stdout.
+        assert result.returncode != 0 and 'rejected' in output and 'REPLICA IDENTITY FULL' in output
+        return {'exit':result.returncode, 'message':output}
 
     def unsupported_change(self, identity=False):
         # On a new run, fail one table after initial progress. Neither its target
@@ -246,8 +263,10 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
 
     def execute(self):
         try:
-            self.phase('seed-pg16',self.seed)
-            self.phase('real-product-preflight',self.product_preflight)
+            self.phase('seed',self.seed)
+            if self.args.product_preflight == 'require' or (
+                    self.args.product_preflight == 'auto' and _cdc_preflight_report is not None):
+                self.phase('real-product-preflight',self.product_preflight)
             self.phase('native-rejection',self.rejected_init)
             self.phase('snapshot-with-concurrent-writes',self.initialize)
             self.start()
@@ -268,11 +287,28 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
             self.pg.close(); self.duck.close()
 
 
+def main():
+    # Defaults are the product runner container's service names (default_identity.sh).
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--postgres-url', default=os.environ.get(
+        'FLOW_POSTGRES_URL', 'postgres://flow:local-test-password@postgres:5432/flow?sslmode=disable'))
+    parser.add_argument('--catalog-uri', default='http://rest:8181')
+    parser.add_argument('--s3-endpoint', default='http://minio:9000')
+    parser.add_argument('--warehouse', default='s3://warehouse/')
+    parser.add_argument('--binary', type=Path, default=Path('/usr/local/bin/embrasure-flow'))
+    parser.add_argument('--artifacts', type=Path, default=Path('/artifacts'),
+                        help='new directory; the run and identity-change cases use subdirectories')
+    parser.add_argument('--timeout', type=float, default=180)
+    parser.add_argument('--product-preflight', choices=('auto', 'require', 'skip'), default='auto',
+                        help='also check the product CDC preflight; auto runs it when importable')
+    args = parser.parse_args()
+    if args.product_preflight == 'require' and _cdc_preflight_report is None:
+        parser.error('the product CDC preflight is not importable here')
+    for case, identity_only in (('run', False), ('identity-change', True)):
+        DefaultRun(SimpleNamespace(**(vars(args) | {'artifacts': args.artifacts / case,
+                                                    'identity_only': identity_only}))).execute()
+    print(f'PASS: {args.artifacts.resolve()}', flush=True)
+
+
 if __name__ == '__main__':
-    args=SimpleNamespace(postgres_url='postgres://flow:local-test-password@postgres:5432/flow?sslmode=disable',
-        catalog_uri='http://rest:8181',s3_endpoint='http://minio:9000',warehouse='s3://warehouse/',
-        binary=Path('/usr/local/bin/embrasure-flow'),artifacts=Path('/artifacts/run'),timeout=180,identity_only=False)
-    DefaultRun(args).execute()
-    args.artifacts = Path('/artifacts/identity-change')
-    args.identity_only = True
-    DefaultRun(args).execute()
+    main()

@@ -30,7 +30,7 @@ Coordinator commits require the exact snapshot represented by their index. Even 
 
 The source ledger has one owner. Its complete SOURCE-only write batches use the control commit mutex without waiting for the row/spool mutation mutex. Row, table and operation read-modify-write paths retain that mutex. The control commit lock serializes both database revisions and fences a failed durable transition before another write can enter; checkpoints acquire the row lock followed by the control lock.
 
-The durable control store owns bootstrap and source-ledger records, table watermarks, and pending operation headers, artifacts and prepared payloads. Row locations, inverse mappings, per-file live-row counts, mutation spools and apply cursors belong to a replaceable index generation. Each durable transition writes an atomic index batch with its revision, then synchronizes the control batch with the same revision. Intermediate index apply batches retain atomic cursors and WAL protection without a second fsync. A crash can leave either database ahead, but reopening requires equal revisions before ordinary publication or source acknowledgement. Any mismatch fences the index and requires recovery from control authority and the catalog.
+The durable control store owns bootstrap and source-ledger records, table watermarks, and pending operation headers, artifacts and prepared payloads. Row locations, inverse mappings, per-file live-row counts, mutation spools and apply cursors belong to a replaceable index generation. Each durable transition synchronizes an atomic index batch with its revision, then synchronizes the control batch with the same revision. Syncing the index first means a host crash or power loss leaves equal revisions except inside the window between the two syncs, so it does not ordinarily force a rebuild. Intermediate index apply batches retain atomic cursors and WAL protection without their own fsync; the next revision-bearing sync covers them. A crash can leave either database ahead, but reopening requires equal revisions before ordinary publication or source acknowledgement. Any mismatch fences the index and requires recovery from control authority and the catalog.
 
 Recovery resolves pending catalog operations before scanning current data and position deletes into a fresh generation. It preserves published LSNs and schema versions, checks target UUIDs, and rechecks catalog heads before activation. Physical checkpoint files and their directory entries are synced before registration; activation syncs the replacement generation before atomically switching the control pointer. A checkpoint is usable only when its watermarks and catalog snapshots still match. Stale, missing or unusable checkpoints fall back to a full scan. Index loss never substitutes zero watermarks for missing authority; loss of the control store requires restoring that authority. Index format 3 adds derived live-row counts. Older formats trigger reconstruction from the existing control authority and Iceberg; upgrading the index does not recreate the source slot or control store.
 
@@ -81,7 +81,7 @@ Independent maintenance uses its own idempotency-marker namespace. The local com
 
 ## Latency and reader health
 
-Only tables with pending CDC have publication deadlines. The scheduler subtracts estimated commit time from the publication budget, becomes ready at 10,000 source mutations, 32 MiB of serialized transaction payload or its deadline, and applies a global commit-rate budget. The row count is a readiness trigger, not an admitted-epoch ceiling. When a worker becomes available, it takes the already-queued ordered prefix of ordinary transactions within the 32 MiB payload limit and the existing loaded descriptor window; it never waits to fill that batch. A transaction with more than 10,000 mutations for the table or more than 32 MiB of payload is admitted alone. It may produce many files but still publishes in one snapshot per table. Zero-mutation work still receives a deadline and advances its local watermark without creating an empty snapshot.
+Only tables with pending CDC have publication deadlines. The scheduler subtracts estimated commit time from the publication budget, becomes ready at 10,000 source mutations, 32 MiB of serialized transaction payload or its deadline, and applies a global commit-rate budget. The row count is a readiness trigger, not an admitted-epoch ceiling. When a worker becomes available, it takes the table's already-queued ordered prefix of ordinary transactions and, once that queue is drained, continues through the table's durable ledger references, within the 32 MiB payload limit and about 4 MiB of in-memory transaction descriptors; it never waits to fill that batch. The shared `pending_transactions` window only admits queued lookahead that makes tables schedulable, so the number of other busy tables does not cap an epoch. A transaction with more than 10,000 mutations for the table or more than 32 MiB of payload is admitted alone. It may produce many files but still publishes in one snapshot per table. Zero-mutation work still receives a deadline and advances its local watermark without creating an empty snapshot.
 
 New terminals carry exact per-table mutation counts computed from surviving spool chunks, before collapse. Retained older terminals have explicitly unknown counts: they become ready immediately and publish one whole transaction at a time. This preserves compatibility without rereading payloads, at a temporary batching cost while old history drains.
 
@@ -89,11 +89,18 @@ Compaction debt can delay or stop publication. The source can continue into its 
 
 Metadata and garbage work has a separate due signal from soft data compaction.
 One periodic table actor may run at a time, and ready CDC receives a dispatch
-between periodic visits. Each visit checks manifest/history debt and scans one
-bounded garbage-registry page; continuation can resume after CDC gets its turn.
-The collector's scan budget is cooperative: retained-artifact checks and in-flight
-storage requests are not a hard wall-clock deadline. Builds, prepared publication
-and checkpoint protection retain their existing ownership rules.
+between periodic visits. Each visit checks manifest/history debt and processes
+one bounded garbage-registry page; continuation can resume after CDC gets its
+turn. WAL pressure suppresses these visits, so after publishing an epoch the CDC
+path itself expires history far past the snapshot cap and rewrites manifests
+past twice their limit, unless a background build owns the table; garbage
+collection remains optional. A garbage page reads only new and due registry
+records, checks them against an in-memory index of retained snapshots that
+reads each new manifest list once, and bounds deletions by count. Its time
+budget is cooperative: in-flight catalog and storage requests finish, so a page
+holds the table actor for about two catalog loads plus a few rounds of
+concurrent object requests. Builds, prepared publication and checkpoint
+protection retain their existing ownership rules.
 
 Checkpoint rotation does not wait for all tables to become idle. A checkpoint
 records pending operations consistently with its index and keeps their base and

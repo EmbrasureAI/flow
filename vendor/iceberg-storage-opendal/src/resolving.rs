@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -213,7 +214,7 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
 /// Sub-storages are lazily created on first use for each scheme and cached
 /// for subsequent operations. Scheme aliases like `s3`/`s3a`/`s3n` map to
 /// the same canonical scheme, so they share a storage instance.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct OpenDalResolvingStorage {
     /// Configuration properties shared across all backends.
     props: HashMap<String, String>,
@@ -228,6 +229,19 @@ pub struct OpenDalResolvingStorage {
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
     operator_cache: Arc<S3OperatorCache>,
+}
+
+/// Properties carry storage credentials, so debug output names the configured
+/// keys without their values. Cached storages keep OpenDAL's redacted output.
+impl std::fmt::Debug for OpenDalResolvingStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let props: std::collections::BTreeMap<_, _> =
+            self.props.keys().map(|key| (key, "<redacted>")).collect();
+        f.debug_struct("OpenDalResolvingStorage")
+            .field("props", &props)
+            .field("storages", &self.storages)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OpenDalResolvingStorage {

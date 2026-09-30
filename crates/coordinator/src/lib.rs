@@ -22,9 +22,10 @@ pub use artifacts::{import_catalog_metadata, register_catalog_metadata};
 pub use ledger::{AckMode, JournalDurability, SourceLedger, Watermarks};
 pub use maintenance::{
     BuildRegistration, DeleteRepairCursor, DeleteRewritePolicy, GarbagePolicy, GarbageProtection,
-    GarbageReport, Inventory, PreparationWait, PreparedCompaction, ReadyCompaction,
-    RetiringCompactionPreparation, RunningCompaction, RunningCompactionPreparation,
-    TableMaintenance, active_build_protection, discard_abandoned_builds,
+    GarbageReport, HistoryPlan, HistoryPolicy, Inventory, PreparationWait, PreparedCompaction,
+    ReadyCompaction, RetiringCompactionPreparation, RunningCompaction,
+    RunningCompactionPreparation, TableMaintenance, active_build_protection,
+    discard_abandoned_builds,
 };
 pub use publication::{
     CollapseLimits, CollapsedEpoch, Epoch, ReplanRequired, TablePublisher, collapse_epoch,

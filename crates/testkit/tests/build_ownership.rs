@@ -36,9 +36,11 @@ async fn collect(f: &Fixture, head: &Table) {
             f.schema.table_id,
             &GarbagePolicy {
                 grace: Duration::from_millis(1),
+                metadata_grace: Duration::from_millis(1),
                 max_objects: 512,
                 max_records: 64,
                 max_duration: Duration::from_secs(1),
+                ..Default::default()
             },
             &GarbageProtection::default(),
         )
@@ -115,7 +117,7 @@ async fn unfenced_build_protects_ancestry_and_uploads_through_index_loss_until_s
         .expire_history(
             &head,
             f.schema.table_id,
-            Duration::from_millis(1),
+            &flow_coordinator::HistoryPolicy::window(Duration::from_millis(1)),
             &BTreeSet::new(),
         )
         .await
@@ -176,13 +178,10 @@ async fn unfenced_build_protects_ancestry_and_uploads_through_index_loss_until_s
             .operations
             .is_empty()
     );
-    // Full grace begins only after ownership is retired, even for old outputs.
+    // The grace clock starts only when a sweep observes the output unfenced
+    // and unreferenced, after ownership is retired, even for old outputs.
+    // Recovery must not bypass that window.
     collect(&f, &head).await;
-    assert!(head.file_io().exists(&path).await.unwrap());
-    tokio::time::sleep(Duration::from_millis(3)).await;
-    collect(&f, &head).await;
-    // Once the upload/fence grace passes, an unreferenced observation starts
-    // the independent reader grace. Recovery must not bypass either window.
     assert!(head.file_io().exists(&path).await.unwrap());
     tokio::time::sleep(Duration::from_millis(3)).await;
     collect(&f, &head).await;

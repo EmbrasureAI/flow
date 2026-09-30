@@ -10,7 +10,7 @@ use tokio_postgres::GenericClient;
 pub struct ColumnMetadata {
     pub nullable: bool,
     pub unsupported_generated: bool,
-    pub null_default: bool,
+    /// No `attmissingval`: rows that predate the column read NULL for it.
     pub null_missing_value: bool,
 }
 #[derive(Debug)]
@@ -84,14 +84,10 @@ pub async fn fetch_table_metadata_batch(
                         WHERE i.indrelid=c.oid AND i.indisprimary
                           AND k.ordinal <= i.indnkeyatts AND k.attnum=a.attnum),
                 NOT a.attnotnull, (a.attgenerated::text <> '' AND (a.attgenerated::text <> 's' OR current_setting('server_version_num')::int < 180000)),
-                (NOT a.atthasdef OR pg_catalog.pg_get_expr(d.adbin, d.adrelid)
-                    IN ('NULL', 'NULL::' || pg_catalog.format_type(a.atttypid, a.atttypmod),
-                                'NULL::' || pg_catalog.format_type(a.atttypid, NULL))),
                 (NOT a.atthasmissing OR a.attmissingval IS NULL OR a.attmissingval::text = '{{NULL}}'), c.relfilenode, a.attnum, n.nspname, c.relname
          FROM pg_catalog.pg_class c
          JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
          JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
-         LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
          WHERE {filter} AND c.relkind IN ('r','p')
          ORDER BY n.nspname, c.relname, a.attnum");
         let rows = client.query(&query, &params).await?;
@@ -99,7 +95,7 @@ pub async fn fetch_table_metadata_batch(
             std::collections::BTreeMap::<(String, String), Vec<tokio_postgres::Row>>::new();
         for row in rows {
             grouped
-                .entry((row.get(13), row.get(14)))
+                .entry((row.get(12), row.get(13)))
                 .or_default()
                 .push(row);
         }
@@ -184,15 +180,14 @@ async fn decode_table_metadata(
         .map(|row| ColumnMetadata {
             nullable: row.get(7),
             unsupported_generated: row.get(8),
-            null_default: row.get::<_, Option<bool>>(9).unwrap_or(false),
-            null_missing_value: row.get(10),
+            null_missing_value: row.get(9),
         })
         .collect();
     let types = crate::TypeRegistry::fetch(client, &relation).await?;
     Ok(TableMetadata {
         types,
-        storage_id: first.get(11),
-        attribute_numbers: rows.iter().map(|row| row.get(12)).collect(),
+        storage_id: first.get(10),
+        attribute_numbers: rows.iter().map(|row| row.get(11)).collect(),
         relation,
         columns,
     })
@@ -313,14 +308,15 @@ pub fn validate_schema_metadata(
                 "generated columns require PostgreSQL 18 stored publication",
             ));
         }
-        // Historical decoded rows remain valid after DROP NOT NULL. The daemon
-        // installs a nullable successor before decoding new rows; do not reject
-        // an older transaction merely because the live catalog has relaxed.
-        if index >= base.columns.len()
-            && (!attributes.nullable || !attributes.null_default || !attributes.null_missing_value)
-        {
+        // Rows that predate an added column must read NULL. A constant ADD
+        // COLUMN default is stored as `attmissingval` and backfills them
+        // without row events; a volatile one rewrites the heap, which the
+        // storage identity check rejects. Later SET DEFAULT, backfill UPDATEs
+        // and SET NOT NULL are ordinary row events, so the live catalog's
+        // default and nullability do not matter: the column stays optional.
+        if index >= base.columns.len() && !attributes.null_missing_value {
             return Err(Error::Config(
-                "new columns must be nullable with no default or a literal NULL default and no non-NULL missing value; backfill is required",
+                "new column has a non-NULL ADD COLUMN default that backfills existing rows without row changes; resynchronization is required",
             ));
         }
     }

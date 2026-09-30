@@ -197,6 +197,7 @@ fn valid_error_code(code: &str) -> bool {
             | "publication_replan"
             | "maintenance_pressure"
             | "catalog_unavailable"
+            | "catalog_auth"
             | "catalog_conflict"
             | "target_not_found"
             | "publication_transport"
@@ -250,6 +251,13 @@ pub(crate) fn publication_error_code(error: &anyhow::Error) -> Option<&'static s
         Some(flow_compactor::Error::MaintenanceRequired | flow_compactor::Error::DependencyBudget)
     ) {
         return Some("maintenance_pressure");
+    }
+    // Rejected credentials need an operator; alert on them apart from outages.
+    if error
+        .chain()
+        .any(|cause| cause.is::<iceberg_catalog_rest::AuthRejected>())
+    {
+        return Some("catalog_auth");
     }
     for cause in error.chain() {
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
@@ -408,6 +416,11 @@ mod tests {
         let wrapped = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "outer")
             .with_source(flow_ingress_journal::Error::Corrupt);
         assert_eq!(publication_error_code(&wrapped.into()), None);
+        let rejected = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "401 Unauthorized")
+            .with_source(iceberg_catalog_rest::AuthRejected);
+        let rejected = anyhow::Error::from(rejected).context("commit table");
+        assert_eq!(publication_error_code(&rejected), Some("catalog_auth"));
+        assert!(valid_error_code("catalog_auth"));
         let invalid = iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "invalid metadata");
         assert_eq!(publication_error_code(&invalid.into()), None);
         assert_eq!(

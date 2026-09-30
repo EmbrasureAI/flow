@@ -11,8 +11,12 @@ use tokio::{
 };
 
 const MAX_REQUEST_BYTES: usize = 8 << 10;
+/// Probes and scrapers send a small head at once; slow or idle clients must
+/// release their connection slot quickly.
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CONNECTIONS: usize = 16;
+/// Each connection holds a file descriptor alongside RocksDB's open files.
+const MAX_CONNECTIONS: usize = 64;
 
 /// Aborts the listener when the command that started it returns.
 pub(crate) struct Server(tokio::task::JoinHandle<()>);
@@ -63,7 +67,12 @@ async fn serve(config: Config, listener: TcpListener) {
 }
 
 async fn handle(config: &Config, mut stream: TcpStream) {
-    let Some((method, path)) = read_request(&mut stream).await else {
+    let Ok(request) = tokio::time::timeout(REQUEST_HEAD_TIMEOUT, read_request(&mut stream)).await
+    else {
+        // Close without a response; the client has not finished a request.
+        return;
+    };
+    let Some((method, path)) = request else {
         let _ = respond(&mut stream, 400, "text/plain", b"bad request\n", true).await;
         return;
     };
@@ -78,8 +87,23 @@ async fn handle(config: &Config, mut stream: TcpStream) {
 
 fn route(config: &Config, path: &str) -> (u16, &'static str, Vec<u8>) {
     match path {
-        // The process is serving requests; stuck work is reported by /readyz.
-        "/healthz" | "/livez" => (200, "text/plain", b"ok\n".to_vec()),
+        // Fails only when the running service's main loop stops advancing.
+        // Blocked tables and source outages are readiness and alert signals.
+        "/healthz" | "/livez" => {
+            let timeout = config
+                .http
+                .as_ref()
+                .map_or(0, |http| http.liveness_timeout_secs);
+            match crate::lifecycle::liveness(Duration::from_secs(timeout)) {
+                Ok(()) => (200, "text/plain", b"ok\n".to_vec()),
+                Err(stalled) => (
+                    503,
+                    "text/plain",
+                    format!("run loop has not progressed for {}s\n", stalled.as_secs())
+                        .into_bytes(),
+                ),
+            }
+        }
         "/readyz" => match crate::lifecycle::read(config) {
             Ok(status) => {
                 let ready = status.ready_in(std::process::id());
@@ -169,6 +193,7 @@ mod tests {
         config.state_dir = directory.path().to_owned();
         config.http = Some(crate::config::Http {
             listen: "127.0.0.1:0".parse().unwrap(),
+            liveness_timeout_secs: 1,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -193,11 +218,24 @@ mod tests {
         let head = get(address, "HEAD /metrics HTTP/1.1\r\n\r\n").await;
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n") && head.ends_with("\r\n\r\n"));
 
+        let _serial = crate::lifecycle::LIVENESS_TEST_LOCK.lock().await;
         let lifecycle = crate::lifecycle::Lifecycle::start(&config).unwrap();
         crate::lifecycle::emit(&config, None, None, true, None, None).unwrap();
         let ready = get(address, "GET /readyz HTTP/1.1\r\n\r\n").await;
         assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"), "{ready}");
+
+        // A run loop that stops advancing fails liveness after its timeout.
+        crate::lifecycle::run_loop_progress();
+        let live = get(address, "GET /livez HTTP/1.1\r\n\r\n").await;
+        assert!(live.starts_with("HTTP/1.1 200 OK\r\n"), "{live}");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let stalled = get(address, "GET /healthz HTTP/1.1\r\n\r\n").await;
+        assert!(stalled.starts_with("HTTP/1.1 503"), "{stalled}");
+        assert!(stalled.contains("run loop has not progressed"), "{stalled}");
+        // Leaving the run loop (here, dropping its lifecycle) ends judgement.
         drop(lifecycle);
+        let health = get(address, "GET /healthz HTTP/1.1\r\n\r\n").await;
+        assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
 
         assert!(
             get(address, "POST /metrics HTTP/1.1\r\n\r\n")
@@ -214,5 +252,44 @@ mod tests {
                 .await
                 .starts_with("HTTP/1.1 400")
         );
+    }
+
+    #[tokio::test]
+    async fn idle_and_slow_clients_cannot_starve_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = directory.path().to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = Server(tokio::spawn(serve(config, listener)));
+
+        // More idle connections than the former 16-slot cap.
+        let mut idle = Vec::new();
+        for _ in 0..32 {
+            idle.push(TcpStream::connect(address).await.unwrap());
+        }
+        let mut slow = TcpStream::connect(address).await.unwrap();
+        slow.write_all(b"GET /healthz HTTP/1.1\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let health = tokio::time::timeout(
+            Duration::from_secs(1),
+            get(address, "GET /healthz HTTP/1.1\r\n\r\n"),
+        )
+        .await
+        .expect("probe served while other clients hold connections");
+        assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        // Clients that never finish a request head are closed after the head
+        // timeout rather than holding a slot for the full request timeout.
+        let started = std::time::Instant::now();
+        for stream in idle.iter_mut().take(4).chain([&mut slow]) {
+            let mut rest = Vec::new();
+            let read = tokio::time::timeout(REQUEST_TIMEOUT, stream.read_to_end(&mut rest))
+                .await
+                .expect("incomplete request closed before the request timeout");
+            assert!(read.is_err() || rest.is_empty());
+        }
+        assert!(started.elapsed() < REQUEST_TIMEOUT);
     }
 }

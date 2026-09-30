@@ -33,11 +33,18 @@ class FaultRun(Run):
         super().configure()
         # Recovery assertions require structured activation events regardless
         # of the caller's logging preference.
-        self.environment["RUST_LOG"] = "info"
+        self.environment["RUST_LOG"] = "info,flow_events=debug"
         # FULL old/new text tuples can exceed twice the decoded row size because
         # bytea is hex encoded. Keep the fixture bounded without rejecting its
         # intentional wide-row workload at the ordinary smoke test's 64 KiB cap.
         self.config.write_text(self.config.read_text().replace("chunk_bytes = 65536", "chunk_bytes = 262144"))
+        if self.args.ack_mode == "journaled":
+            # Journaled ACK lets PostgreSQL release WAL once a transaction is in
+            # the local journal; the fixture declares that journal independent.
+            self.config.write_text(self.config.read_text()
+                                   .replace('ack_mode = "materialized"', 'ack_mode = "journaled"')
+                                   .replace('journal_durability = "local-disk"',
+                                            'journal_durability = "independent-storage"'))
 
     def __init__(self, args):
         self.upstream = args.catalog_uri
@@ -54,7 +61,8 @@ class FaultRun(Run):
         args.catalog_uri = self.proxy.url
         self.configure()
         self.report.update(compose_project=args.compose_project, availability_incidents=self.incidents,
-                           recovery_times=self.recovery_times, fault_seconds=args.fault_seconds)
+                           recovery_times=self.recovery_times, fault_seconds=args.fault_seconds,
+                           format_version=args.format_version, ack_mode=args.ack_mode)
 
     @staticmethod
     def compose_command(args):
@@ -185,7 +193,13 @@ class FaultRun(Run):
         confirmed = self.pg.execute("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = %s",
                                     (self.name,)).fetchone()[0]
         metrics = self.metrics()
-        assert lsn(confirmed) < barrier, "PostgreSQL acknowledged a source transaction before publication"
+        if self.args.ack_mode == "journaled":
+            # The metrics file is periodic; a later export can only be higher.
+            durable = self.until("journal durability did not cover the source ACK", lambda: (
+                value if (value := self.metrics().get("flow_journal_durable_lsn", 0)) >= lsn(confirmed) else None))
+            assert lsn(confirmed) <= durable, "PostgreSQL acknowledged a transaction missing from the journal"
+        else:
+            assert lsn(confirmed) < barrier, "PostgreSQL acknowledged a source transaction before publication"
         assert metrics.get("flow_materialized_lsn", 0) < barrier
         assert metrics.get("flow_materialized_lsn", 0) <= metrics.get("flow_journal_durable_lsn", 0)
         return {"confirmed_flush_lsn": confirmed, "barrier": barrier, "metrics": metrics}
@@ -199,14 +213,20 @@ class FaultRun(Run):
             "UPDATE accounts SET amount = COALESCE(amount,0) + 1.25 WHERE id <= 8",
         ])
 
-    def lost_response(self):
-        self.proxy.arm_drop()
-        barrier = self.fault_writes("lost-commit-response")
-        if not self.proxy.dropped.wait(timeout=self.args.timeout):
-            raise AssertionError("proxy never dropped a successful ingestion commit response")
-        result = self.recover(barrier, "lost-commit-response")
-        dropped = [event for event in self.proxy.events if event.get("fault") == "drop-after-successful-commit"]
+    def lost_response(self, name="lost-commit-response", fault="drop-after-successful-commit", **outcome):
+        """Upstream commits, but its caller learns nothing, an error, or too late."""
+        with self.proxy.lock:
+            offset = len(self.proxy.events)
+        self.proxy.arm_drop(**outcome)
+        barrier = self.fault_writes(name)
+        # Fail fast, with its log, if the daemon exits before the fault fires.
+        self.until(f"proxy never hid a successful ingestion commit ({fault})", self.proxy.dropped.is_set)
+        result = self.recover(barrier, name)
+        # A late response is recorded only after its delayed write.
+        dropped = self.until(f"{fault} was not recorded", lambda: [
+            event for event in self.proxy.events[offset:] if event.get("fault") == fault])
         assert len(dropped) == 1
+        assert 200 <= dropped[0]["upstream_status"] < 300
         operation = dropped[0]["operation_id"]
         assert operation
         snapshots = [snapshot for table in ("orders", "accounts") for snapshot in self.table(table)["metadata"]["snapshots"]
@@ -216,6 +236,14 @@ class FaultRun(Run):
         result["confirmed_upstream_commit"] = dropped[0]
         result["matching_logical_commits"] = len(snapshots)
         return result
+
+    def unknown_status(self, status):
+        return self.lost_response(f"commit-state-unknown-{status}", "unknown-status-after-successful-commit",
+                                  status=status)
+
+    def late_response(self):
+        return self.lost_response("late-commit-response", "late-after-successful-commit",
+                                  delay_seconds=self.args.late_response_seconds)
 
     def catalog_outage(self):
         self.proxy.reject = True
@@ -455,6 +483,9 @@ class FaultRun(Run):
             self.phase("snapshot-wal-handoff", self.handoff)
             self.start_compactor()
             self.phase("actual-committed-response-loss", self.lost_response)
+            for status in (500, 502, 504):
+                self.phase(f"committed-then-reported-{status}", lambda status=status: self.unknown_status(status))
+            self.phase("committed-response-after-client-timeout", self.late_response)
             self.phase("catalog-http-outage", self.catalog_outage)
             self.phase("durable-catalog-service-restart", lambda: self.service_outage("rest", self.upstream + "/v1/config"))
             self.phase("durable-object-store-service-restart", lambda: self.service_outage("minio", self.args.s3_endpoint + "/minio/health/live"))
@@ -498,6 +529,11 @@ def main():
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--fault-seconds", type=float, default=5)
+    parser.add_argument("--late-response-seconds", type=float, default=65,
+                        help="hold one committed response beyond the daemon's 60-second catalog request timeout")
+    parser.add_argument("--format-version", type=int, choices=(2, 3), default=2)
+    parser.add_argument("--ack-mode", choices=("materialized", "journaled"), default="materialized",
+                        help="journaled declares independent journal storage and checks ACK <= journal durability")
     args = parser.parse_args()
     if not args.postgres_url:
         parser.error("provide --postgres-url or FLOW_POSTGRES_URL")

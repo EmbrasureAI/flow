@@ -20,12 +20,17 @@ jemalloc = ["dep:rocksdb", "rocksdb/jemalloc", "dep:tikv-jemalloc-ctl"]
 rocksdb = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { version = "=0.6.0", optional = true, features = ["stats", "use_std"] }
 
+[target.'cfg(unix)'.dependencies]
+# Safe umask and effective-UID access for state_dir protection.
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "process", "std"] }
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 bincode.workspace = true
 bytes.workspace = true
 clap.workspace = true
+fs2 = "0.4"
 flow-compactor.workspace = true
 flow-coordinator.workspace = true
 flow-iceberg-ext.workspace = true
@@ -43,7 +48,9 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 native-tls = "0.2"
 opendal = { version = "=0.57.0", default-features = false }
 postgres-native-tls = { git = "https://github.com/iambriccardo/rust-postgres", rev = "c4b8de06aaa99f71800126bedcca6e623d368357" }
-reqwest = { version = "0.12", default-features = false }
+# HTTPS catalogs: rustls with the platform trust store (SSL_CERT_FILE/SSL_CERT_DIR override it).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+rustls-native-certs = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -54,7 +61,12 @@ typetag = "0.2"
 uuid.workspace = true
 
 [dev-dependencies]
+base64 = "0.22"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 tempfile.workspace = true
+time = { version = "0.3", default-features = false, features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

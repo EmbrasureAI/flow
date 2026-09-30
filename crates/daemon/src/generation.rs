@@ -86,20 +86,165 @@ impl RebuildCandidate {
 fn options(config: &Config) -> StateStoreOptions {
     StateStoreOptions {
         apply_batch_rows: config.limits.batch_rows,
+        max_open_files: crate::disk::index_max_open_files(),
         ..Default::default()
     }
 }
 
+/// Present only between a clean exit and the next open. Its absence means the
+/// previous process crashed, lost power, or stopped with an error.
+const CLEAN_SHUTDOWN: &str = "index-clean-shutdown";
+
 pub(crate) fn open(config: &Config, control: ControlStore) -> Result<StateStore> {
+    crate::disk::warn_if_insufficient(config);
+    // Consume the marker first: any exit that does not record a new one makes
+    // the next start verify the complete index again.
+    let clean = take_clean_shutdown(&config.state_dir)?;
     let store = match control.active_generation()? {
         Some(active) => StateStore::open_with_control(active.path, options(config), control)?,
         None => control.initialize_index(config.state_dir.join("index"), options(config))?,
     };
-    // RocksDB opens metadata lazily and may not touch a damaged SST until its
-    // first point lookup. Verify the complete replaceable index now so a
-    // supervisor restart deterministically enters the rebuild path.
-    store.validate_storage()?;
+    if config.storage.verify_index_on_start || !clean {
+        // RocksDB opens metadata lazily and may not touch a damaged SST until
+        // its first point lookup. After an unclean exit (including one caused
+        // by a corrupt read), verify the complete replaceable index so a
+        // supervisor restart deterministically enters the rebuild path.
+        let started = Instant::now();
+        store.validate_storage()?;
+        tracing::info!(
+            event = "index_storage_verified",
+            after_clean_shutdown = clean,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "verified every row index checksum"
+        );
+    } else {
+        // Reads still verify block checksums; a corrupt read stops the process
+        // without a clean marker, so the next start runs the full scan.
+        tracing::info!("previous exit was clean; skipping the full index checksum scan");
+    }
     Ok(store)
+}
+
+/// Decides, after `run` returns, whether the next start may skip the full index
+/// scan. Only a process that opened a usable index, never failed a durable
+/// transition, joined capture, and stopped cleanly or on an external outage
+/// qualifies. Its index clone is dropped before the marker is written.
+#[derive(Default)]
+pub(crate) struct ShutdownWitness {
+    store: std::sync::Mutex<Option<StateStore>>,
+    detached: std::sync::atomic::AtomicBool,
+}
+
+impl ShutdownWitness {
+    pub(crate) fn observe(&self, store: &StateStore) {
+        *self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store.clone());
+    }
+
+    /// Capture did not stop in time and may still use the index.
+    pub(crate) fn capture_detached(&self) {
+        self.detached
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn finish(self, state_dir: &Path, result: &Result<()>) {
+        let Some(store) = self
+            .store
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        else {
+            return;
+        };
+        let healthy = !store.has_failed();
+        drop(store);
+        let benign = match result {
+            Ok(()) => true,
+            Err(error) => external_outage(error),
+        };
+        if healthy && benign && !self.detached.into_inner() {
+            record_clean_shutdown(state_dir);
+        }
+    }
+}
+
+/// A transient catalog/object-store failure or a PostgreSQL error that never
+/// passed through local state. Anything else (including untyped errors) keeps
+/// the conservative full scan on the next start.
+fn external_outage(error: &anyhow::Error) -> bool {
+    let local = error.chain().any(|cause| {
+        cause.is::<flow_state_store::Error>() || cause.is::<flow_ingress_journal::Error>()
+    });
+    !local
+        && (crate::retry::transient(error)
+            || error
+                .chain()
+                .any(|cause| cause.is::<flow_pg_source::tokio_postgres::Error>()))
+}
+
+/// Record that this process stopped without an error, so the next start may
+/// skip the full index scan. Failure only costs that next start a full scan.
+pub(crate) fn record_clean_shutdown(state_dir: &Path) {
+    let recorded = fs::File::create(state_dir.join(CLEAN_SHUTDOWN))
+        .and_then(|marker| marker.sync_all())
+        .and_then(|()| fs::File::open(state_dir)?.sync_all());
+    if let Err(error) = recorded {
+        tracing::warn!(%error, "could not record a clean shutdown; the next start verifies the full index");
+    }
+}
+
+fn take_clean_shutdown(state_dir: &Path) -> Result<bool> {
+    match fs::remove_file(state_dir.join(CLEAN_SHUTDOWN)) {
+        Ok(()) => {
+            fs::File::open(state_dir)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `check --storage`: verify every checksum and the index/control revision of
+/// the selected generation while the service is stopped. A generation that
+/// requires rebuilding is rebuilt by the next start.
+pub(crate) fn check_storage(config: &Config) -> Result<()> {
+    let control_path = config.state_dir.join("control");
+    ensure!(
+        control_path.is_dir(),
+        "{} has no control store; run `init` first",
+        config.state_dir.display()
+    );
+    let control = ControlStore::open(&control_path)
+        .context("open the control store; stop the service before `check --storage`")?;
+    let active = control
+        .active_generation()?
+        .context("the control store has not selected an index generation")?;
+    let started = Instant::now();
+    let verified = StateStore::open_with_control(&active.path, options(config), control)
+        .and_then(|store| store.validate_storage());
+    match verified {
+        Ok(()) => {
+            // Just verified: the next start need not repeat the scan.
+            record_clean_shutdown(&config.state_dir);
+            println!(
+                "index storage verified in {:.1}s: {}",
+                started.elapsed().as_secs_f64(),
+                active.path.display()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            // Any failure, including I/O errors, makes the next start rescan.
+            take_clean_shutdown(&config.state_dir)?;
+            if error.requires_index_rebuild() {
+                anyhow::bail!(
+                    "index storage check failed: {error}; the next start rebuilds the index from control and Iceberg"
+                )
+            }
+            Err(anyhow::Error::new(error).context("index storage check failed"))
+        }
+    }
 }
 
 /// The caller must validate persisted target UUIDs before invoking this method.
@@ -114,6 +259,13 @@ pub(crate) async fn rebuild(
 ) -> Result<StateStore> {
     let started = Instant::now();
     let previous = control.active_generation()?;
+    // A rebuild writes a complete new generation. Reclaim what interrupted
+    // attempts left first; the selected generation is retained for diagnosis.
+    if let Some(previous) = &previous
+        && let Err(error) = sweep_abandoned_generations(&config.state_dir, &previous.path)
+    {
+        tracing::warn!(%error, "failed to remove abandoned index rebuild directories");
+    }
     for operation in control.pending_operations()? {
         let table = targets
             .get(&operation.operation.table_id)
@@ -402,6 +554,25 @@ fn retire_superseded_generations(
     }
 }
 
+/// Remove `index-generations/index-<uuid>[.scratch]` directories except the
+/// selected one: candidates and scratch stores of interrupted rebuilds, and
+/// generations a completed rebuild would retire anyway. The legacy
+/// `state_dir/index` is left to post-activation retirement. Only one process
+/// owns the state directory.
+fn sweep_abandoned_generations(state_dir: &Path, active: &Path) -> Result<usize> {
+    let legacy = fs::canonicalize(state_dir)?.join("index");
+    let mut removed = 0;
+    for path in managed_generation_directories(state_dir)? {
+        if path == active || path == legacy {
+            continue;
+        }
+        remove_directory_and_sync(&path)?;
+        tracing::info!(path = %path.display(), "removed abandoned index generation");
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn managed_generation_directories(state_dir: &Path) -> Result<Vec<PathBuf>> {
     let root = fs::canonicalize(state_dir)?;
     let mut managed = Vec::new();
@@ -474,6 +645,206 @@ mod tests {
             "fresh rebuild stores must be empty"
         );
         Err(ReplanRequired.into())
+    }
+
+    fn test_config(state_dir: &Path) -> Config {
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = state_dir.to_owned();
+        config
+    }
+
+    /// Flip a byte in the first data block of the SOURCE family's table file.
+    /// Opening reads only metadata; iterating the family reads this block.
+    fn corrupt_source_table_file(index: &Path) {
+        let mut corrupted = 0;
+        for entry in fs::read_dir(index).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension() != Some(OsStr::new("sst")) {
+                continue;
+            }
+            let mut bytes = fs::read(&path).unwrap();
+            if bytes
+                .windows(b"source_transactions".len())
+                .any(|window| window == b"source_transactions")
+            {
+                bytes[10] ^= 0xff;
+                fs::write(&path, bytes).unwrap();
+                corrupted += 1;
+            }
+        }
+        assert_eq!(corrupted, 1);
+    }
+
+    fn requires_rebuild(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<flow_state_store::Error>()
+            .is_some_and(flow_state_store::Error::requires_index_rebuild)
+    }
+
+    #[test]
+    fn full_index_scan_runs_after_an_unclean_exit_on_request_or_when_configured() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let mut config = test_config(&state_dir);
+        let control = ControlStore::open(state_dir.join("control")).unwrap();
+        let store = open(&config, control.clone()).unwrap();
+        store
+            .update_source_ledger((b"ledger", &[7; 512]), [], None)
+            .unwrap();
+        // A checkpoint flushes every memtable into table files.
+        store.checkpoint(root.path().join("flushed")).unwrap();
+        let active = control.active_generation().unwrap().unwrap().path;
+        drop(store);
+        drop(control);
+        corrupt_source_table_file(&active);
+        let marker = state_dir.join(CLEAN_SHUTDOWN);
+
+        // After a clean exit, reads verify block checksums; startup is fast.
+        record_clean_shutdown(&state_dir);
+        let control = ControlStore::open(state_dir.join("control")).unwrap();
+        drop(open(&config, control).unwrap());
+        assert!(!marker.exists(), "an open consumes the clean marker");
+
+        // Without a new clean marker, the next start verifies everything.
+        let control = ControlStore::open(state_dir.join("control")).unwrap();
+        assert!(requires_rebuild(&open(&config, control).err().unwrap()));
+
+        // `check --storage` finds it offline and discards a clean marker.
+        record_clean_shutdown(&state_dir);
+        let error = check_storage(&config).unwrap_err();
+        assert!(format!("{error:#}").contains("the next start rebuilds the index"));
+        assert!(!marker.exists());
+
+        // Configuration forces the scan even after a clean exit.
+        record_clean_shutdown(&state_dir);
+        config.storage.verify_index_on_start = true;
+        let control = ControlStore::open(state_dir.join("control")).unwrap();
+        assert!(requires_rebuild(&open(&config, control).err().unwrap()));
+    }
+
+    #[test]
+    fn check_storage_verifies_an_intact_index_and_requires_initialization() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let config = test_config(&state_dir);
+        let error = check_storage(&config).unwrap_err();
+        assert!(error.to_string().contains("run `init` first"));
+        assert!(!state_dir.join("control").exists());
+        let control = ControlStore::open(state_dir.join("control")).unwrap();
+        drop(open(&config, control).unwrap());
+        check_storage(&config).unwrap();
+        assert!(state_dir.join(CLEAN_SHUTDOWN).exists());
+    }
+
+    #[test]
+    fn rebuild_start_sweeps_interrupted_candidates_but_keeps_the_selected_generation() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let control = ControlStore::open(state_dir.join("control")).unwrap();
+        drop(
+            control
+                .initialize_index(state_dir.join("index"), StateStoreOptions::default())
+                .unwrap(),
+        );
+        // A crash cannot run the candidate's Drop cleanup.
+        let mut interrupted = candidate_directory(&state_dir).unwrap();
+        interrupted.retain();
+        drop(StateStore::open(interrupted.path(), StateStoreOptions::default()).unwrap());
+        let scratch = interrupted.path().with_extension("scratch");
+        drop(StateStore::open(&scratch, StateStoreOptions::default()).unwrap());
+        let unrelated = state_dir.join("index-generations").join("notes");
+        fs::create_dir(&unrelated).unwrap();
+
+        let active = control.active_generation().unwrap().unwrap().path;
+        assert_eq!(sweep_abandoned_generations(&state_dir, &active).unwrap(), 2);
+        assert_eq!(
+            managed_generation_directories(&state_dir).unwrap(),
+            std::slice::from_ref(&active)
+        );
+        assert!(unrelated.exists());
+
+        // Once a rebuilt generation is selected, the legacy index is left to
+        // post-activation retirement; only managed candidates are swept.
+        let directory = candidate_directory(&state_dir).unwrap();
+        let replacement = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let mut candidate = RebuildCandidate::new(replacement, directory);
+        let rebuilt = control.activate_rebuilt(candidate.store()).unwrap();
+        candidate.directory.retain();
+        candidate.close();
+        let mut stale = candidate_directory(&state_dir).unwrap();
+        stale.retain();
+        fs::create_dir(stale.path()).unwrap();
+        assert_eq!(
+            sweep_abandoned_generations(&state_dir, &rebuilt.path).unwrap(),
+            1
+        );
+        assert!(active.exists());
+        assert!(rebuilt.path.exists());
+        assert!(!stale.path().exists());
+        drop(
+            StateStore::open_with_control(&rebuilt.path, StateStoreOptions::default(), control)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn shutdown_witness_records_only_clean_or_external_exits() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let config = test_config(&state_dir);
+        let store = open(
+            &config,
+            ControlStore::open(state_dir.join("control")).unwrap(),
+        )
+        .unwrap();
+        let marker = state_dir.join(CLEAN_SHUTDOWN);
+        let finish = |observe: bool, detached: bool, result: Result<()>| {
+            let witness = ShutdownWitness::default();
+            if observe {
+                witness.observe(&store);
+            }
+            if detached {
+                witness.capture_detached();
+            }
+            witness.finish(&state_dir, &result);
+            let recorded = marker.exists();
+            let _ = fs::remove_file(&marker);
+            recorded
+        };
+        let outage = || {
+            Err(anyhow::Error::new(
+                iceberg::Error::new(iceberg::ErrorKind::Unexpected, "503").with_retryable(true),
+            )
+            .context("load target table"))
+        };
+
+        assert!(finish(true, false, Ok(())));
+        assert!(!finish(false, false, Ok(())), "no usable index was opened");
+        assert!(
+            !finish(true, true, Ok(())),
+            "capture may still use the index"
+        );
+        assert!(finish(true, false, outage()));
+        assert!(!finish(
+            true,
+            false,
+            Err(
+                anyhow::Error::new(flow_state_store::Error::RecoveryRequired(
+                    "revision differs".into()
+                ))
+                .context("load target table")
+            )
+        ));
+        assert!(!finish(
+            true,
+            false,
+            Err(anyhow::anyhow!("source capture stopped: disk I/O error"))
+        ));
     }
 
     #[test]

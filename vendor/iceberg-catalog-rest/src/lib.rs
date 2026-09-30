@@ -57,6 +57,7 @@ mod client;
 mod types;
 
 pub use catalog::*;
+pub use client::AuthRejected;
 pub use types::*;
 
 #[cfg(feature = "metrics")]

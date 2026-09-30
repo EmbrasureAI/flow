@@ -36,7 +36,7 @@ class ContractRun(Run):
         self.configure()
         self.config.write_text(self.config.read_text().replace(
             "snapshot_retention_secs = 3600", "snapshot_retention_secs = 3600\ncheckpoint_interval_secs = 2\nretained_checkpoints = 2"))
-        self.environment["RUST_LOG"] = "info"
+        self.environment["RUST_LOG"] = "info,flow_events=debug"
 
     def fields(self, table):
         metadata = self.table(table)["metadata"]
@@ -184,7 +184,7 @@ class ContractRun(Run):
         elif case == "non-null-default":
             self.pg.execute("ALTER TABLE orders ADD COLUMN unsafe integer DEFAULT 7")
             self.pg.execute("ALTER TABLE orders ALTER COLUMN unsafe DROP DEFAULT")
-            expected = "new columns must be nullable"
+            expected = "non-NULL ADD COLUMN default"
         elif case == "volatile-default":
             self.pg.execute("ALTER TABLE orders ADD COLUMN unsafe double precision DEFAULT random()")
             self.pg.execute("ALTER TABLE orders ALTER COLUMN unsafe DROP DEFAULT")
@@ -272,13 +272,18 @@ class ContractRun(Run):
         self.wait_materialized(barrier)
         return self.compare("checkpoint-restore-after-ddl")
 
+    def status_command(self):
+        # `status` exits 0 when ready and 3 (not ready) after printing the observation.
+        result = subprocess.run(self.command("status"), env=self.environment, stdout=subprocess.PIPE)
+        status = json.loads(result.stdout)
+        assert result.returncode == (0 if status["ready"] else 3), result.returncode
+        return status
+
     def terminate(self):
-        status = json.loads(subprocess.check_output(self.command("status"), env=self.environment))
-        assert status["ready"]
+        assert self.status_command()["ready"]
         self.process.send_signal(signal.SIGTERM)
         assert self.process.wait(timeout=15) == 0, "SIGTERM did not shut down gracefully"
-        status = json.loads(subprocess.check_output(self.command("status"), env=self.environment))
-        assert not status["ready"]
+        assert not self.status_command()["ready"]
         self.stop()
         self.start()
         barrier = self.transaction(["UPDATE accounts SET amount=amount+0.5 WHERE id=1"])

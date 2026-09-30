@@ -74,9 +74,13 @@ responses, and commits completed after the caller is killed. Ordinary table
 failures must preserve the daemon PID. Native manifest audits verify unique
 operation identities and exact reader results. Source connection/slot/identity failure remains global. Classified table schema/row errors and TRUNCATE are isolated.
 
-Run it again with `--quota` and a new artifact directory for the separate 64 MiB
-journal-limit scenario. That run verifies a safe stop with unpublished changes
-retained, then explicitly increases the fixture limit and checks exact replay.
+CI runs both cases on PostgreSQL 14 and 18 (`isolation` shard), together with
+[`default_identity.py`](DEFAULT_IDENTITY.md#engine-only-run).
+
+Run it again with `--quota` and a new artifact directory for the separate 128 MiB
+journal-limit scenario. With one table's publication denied, the journal fills;
+capture must pause (not exit) with the source ACK held, then resume and replay
+exactly once the table can publish and the journal drains.
 This is a journal quota; it does not bound all index, control, or object storage.
 
 ## Sustained concurrency and background compaction

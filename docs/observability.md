@@ -1,12 +1,27 @@
 # Service observations
 
 `embrasure-flow status` reads an atomic local observation without locking the state database. It reports the source identity, process, readiness, observation timestamp, captured durable LSN, ledger watermarks and registered pending transactions. Readiness expires after fifteen seconds without an update. SIGINT and SIGTERM clear it before shutdown. This file is not recovery authority.
+`status` exits 0 when the observation reports ready, 3 when it does not (the
+JSON is still printed), and 1 when there is no readable observation.
+
+`state` is `starting` from process start through recovery, index rebuild and
+startup source validation, `running` once the main loop is serving, and
+`stopped` after exit. When `init` or `run` fails, `last_error` records the
+exit class (`config`, `resync_required`, `unavailable` or `failure`), the
+[exit code](operations.md#exit-codes), the time (`at_ms`) and, for the
+operator-action classes, Flow's own message. Other error chains can contain
+URLs or row values, so they appear only in the `fatal` log event. The next
+process keeps `last_error` while `starting` and clears it once `running`; a
+successful `init` also clears it. A process that never obtained the state
+directory's lock (because another process holds it) records nothing.
 
 `source_health` reports `unknown` before the first WAL check, then `healthy`,
 `warning`, `at_risk`, `unavailable`, `slot_lost`, or `publication_changed`. Hard
 WAL/journal pressure and failed monitoring clear readiness while capture and
 publication can continue. A successful later check restores readiness; a lost
-slot is recorded before the process exits for resynchronization.
+slot is recorded before the process exits for resynchronization. A restart
+keeps reporting `slot_lost`, with readiness withheld, until a WAL check proves
+otherwise; a slot that is really lost then stops the process again.
 `source_health: publication_changed` means the publication no longer covers the
 capture contract for every table after slot creation: it is missing, or an
 operation flag was unpublished. The violation writes the durable
@@ -32,15 +47,33 @@ configured table removed and re-added between checks, so `healthy` and an empty
 `blocked_tables` do not prove that no change was skipped. Initial `unknown` permits startup readiness
 and is distinguished from a failed check by the health-availability metric.
 
-With `[http] listen = "host:port"` configured, `init` and `run` also serve these
-observations over HTTP: `/healthz` answers 200 while the process runs, `/readyz`
-answers 200 only while this process reports ready (503 otherwise, with the
-status JSON), and `/metrics` returns the current `metrics.prom`. Use `/healthz`
-for liveness and `/readyz` for readiness probes. Do not restart on a failed
-readiness check: WAL pressure and publication outages clear readiness while
-capture continues. The endpoints are unauthenticated and read-only.
+## Readiness and liveness
 
-`state_dir/metrics.prom` uses Prometheus text format for a textfile collector. Its integer LSN text remains exact; Prometheus stores floating-point samples, so use `status` for exact comparisons beyond its integer precision. Metrics reset on process restart. `init` installs its own recorder and flushes bootstrap duration, outcome and I/O diagnostics on success or failure. The next `init` or `run` replaces that process snapshot; archive `metrics.prom` after initialization to retain COPY cost diagnostics. Labels contain configured table IDs, not row keys or object paths.
+Readiness means the service is running and its source is safe: the main loop
+has started and the latest WAL check did not report hard pressure, a lost slot,
+a publication contract violation or a failed check. It does not mean every
+table is publishing. A blocked table, a catalog or object-store outage, or a
+growing publication lag leave readiness unchanged, because capture and the
+other tables continue and a restart would not help. Watch those through
+`blocked_tables` and the [stall signals](#stall-and-lag-signals) below.
+
+With `[http] listen = "host:port"` configured, `init` and `run` also serve these
+observations over HTTP: `/healthz` (or `/livez`) for liveness, `/readyz`
+answers 200 only while this process reports ready (503 otherwise, with the
+status JSON), and `/metrics` returns the current `metrics.prom`. Do not restart
+on a failed readiness check: WAL pressure clears readiness while capture
+continues. The endpoints are unauthenticated and read-only.
+
+`/healthz` answers 503 only when the running service's main loop has not
+advanced for `[http] liveness_timeout_secs` (default 300; 0 disables the
+check). The loop wakes at least every five seconds, and each step is bounded,
+so a stall means the process is wedged and a restart is appropriate. Startup
+recovery, index rebuild, startup source validation and `init`'s initial COPY
+are never judged, however long they take; they report `state: starting`.
+
+## Metrics and diagnostic events
+
+`state_dir/metrics.prom` uses Prometheus text format for a textfile collector. Like the rest of `state_dir`, it is readable only by the user running Flow, so a collector must run as that user; otherwise scrape `/metrics`. Its integer LSN text remains exact; Prometheus stores floating-point samples, so use `status` for exact comparisons beyond its integer precision. Metrics reset on process restart. `init` installs its own recorder and flushes bootstrap duration, outcome and I/O diagnostics on success or failure. The next `init` or `run` replaces that process snapshot; archive `metrics.prom` after initialization to retain COPY cost diagnostics. Labels contain configured table IDs, not row keys or object paths.
 
 Source ledger completion and ACK feedback precede observation writes. Status
 updates immediately on completion; full Prometheus rendering and atomic export
@@ -54,6 +87,14 @@ No separate export task is created.
 
 | Observation | Meaning |
 | --- | --- |
+| `flow_up`, `flow_ready` | 1 in every export; 1 while the exporting process reports ready |
+| `flow_process_start_time_seconds`, `flow_last_update_timestamp_seconds` | Wall-clock process start and export time. A textfile collector keeps serving the last file after the process exits, so alert on the export's age |
+| `flow_blocked_tables` | Number of tables in `blocked_tables` |
+| `flow_table_blocked{table_id,code}` | 1 for each blocked table, labelled with its stable error code; the series disappears when the block clears |
+| `flow_table_blocked_since_timestamp_seconds{table_id,code}` | When the table's current block began |
+| `flow_table_materialized_lsn{table_id}` | The table's last successfully published source position |
+| `flow_table_lag_bytes{table_id}` | Captured WAL from the start of the table's oldest registered, unpublished transaction to the captured durable LSN; 0 when the table has none |
+| `flow_table_lag_seconds{table_id}` | Age of that transaction's source commit (source clock); 0 when the table has none |
 | `flow_journal_durable_lsn` | Actual capture frontier after journal sync |
 | `flow_ledger_registered_lsn` | Prefix registered with source-wide completion tracking |
 | `flow_materialized_lsn` | Contiguous source prefix published across every affected table |
@@ -61,6 +102,12 @@ No separate export task is created.
 | `flow_source_health_check_available` | Whether the latest WAL check returned a result; zero before the first result or after a monitoring failure |
 | `flow_source_at_risk` | Latest check found hard WAL/journal pressure or a lost slot; inspect availability before interpreting zero as healthy |
 | `flow_capture_journal_full` | 1 while capture is paused because the journal quota is full; publication keeps draining and capture resumes automatically |
+| `flow_capture_connected` | 1 while replication is streaming, 0 while capture is retrying its connection or replication start |
+| `flow_capture_reconnect_failures_total{reason}` | Failed capture (re)connect attempts: `slot_in_use` (SQLSTATE 55006), `too_many_connections` (53300) or `unavailable` |
+| `flow_capture_reconnect_stalled` | 1 once reconnects have failed for 5 minutes, or twice `wal_sender_timeout` if longer; an error log names the slot's `active_pid`. Retries continue and it resets on reconnect. Alert on it: no changes are captured meanwhile |
+| `flow_capture_disk_low` | 1 while capture is paused because the state volume has less than `storage.min_free_bytes` free; see [disk capacity](operations.md#disk-capacity) |
+| `flow_state_volume_available_bytes` | Free bytes on the state volume at the last startup or capture check (about every five seconds) |
+| `flow_observation_write_skipped_total` | `status.json`/`metrics.prom` updates skipped because the state volume was full |
 | `flow_commit_to_journal_seconds` | Source commit timestamp to successful journal durability |
 | `flow_journal_committed_payload_bytes_total` | Serialized mutation-chunk payload bytes in successfully synced source transactions; excludes aborted subtransactions, journal framing and terminal records |
 | `flow_source_registration_seconds` | Successful dispatcher page read and durable source-ledger registration, before feedback; includes blocking database work |
@@ -77,7 +124,7 @@ No separate export task is created.
 | `flow_state_apply_batch_size` | Apply cursor rows, serialized index `WriteBatch` bytes, submitted update-record count and reverse-owner reads; fixed measurement, operation-kind and controlled/standalone labels |
 | `flow_state_stage_batch_seconds` | Delta-batch construction, duplicate lookup and staged write; fixed operation-kind and controlled/standalone labels |
 | `flow_state_collapse_batch_seconds` | Disk-collapse batch setup, fold, prior spool reads, index lookup, binding and staged write; fixed phase and controlled/standalone labels |
-| `flow_table_*` | L0 count/bytes/age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
+| `flow_table_l0_*`, `flow_table_small_files`, `flow_table_*delete_files`, `flow_table_reclaimable_bytes`, `flow_table_manifest*`, `flow_table_publication_pressure` | L0 count/bytes/age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
 | `flow_compaction_finalization_actor_lane_hold_seconds` | Completed data-build finalization from actual table-lane reservation through cleanup and lane release |
@@ -88,6 +135,12 @@ No separate export task is created.
 | `flow_external_reconciliations_total` | External snapshots successfully verified and durably applied to the row index, labelled by table and bounded reconciliation kind |
 | `flow_artifact_{files,bytes}_written_total` | Successfully finished data/delete artifacts, including attempts later invalidated |
 | `flow_garbage_delete_requests_total` | Conservative deletion requests against registered obsolete artifacts |
+| `flow_metadata_maintenance_failures_total` | Table-scoped manifest rewrite, snapshot expiration or garbage collection failures, labelled by `task`; each is retried with backoff |
+| `flow_table_maintenance_failing` | 1 after five consecutive failures of one metadata task (`table_id`, `task`) until it succeeds; CDC continues, the task needs attention |
+| `flow_expiration_missing_protections_total` | Checkpoint or operation snapshots another process expired before Flow; their protection is dropped |
+| `flow_snapshots_over_cap` | Snapshots above `limits.snapshot_max_count` that protection or table policy retain. Checkpoints protect about `retained_checkpoints` × `checkpoint_interval_secs` of commits, so tables committing faster than about `snapshot_max_count` / 600 per second (1.7 at defaults) stay above the cap |
+| `flow_snapshot_cap_exceeded_by_table_policy` | 1 when an explicit table `history.expire.max-snapshot-age-ms` keeps the table above the snapshot cap |
+| `flow_snapshot_expiration_disabled` | 1 for targets with `gc.enabled=false`; Flow never expires their history |
 
 Recovered catalog markers are counted separately and excluded from latency samples. Source-to-service times require synchronized clocks; the production benchmark records calibration uncertainty and complete per-transaction observations. Artifact counters do not include internal SDK retry traffic or catalog-owned metadata writes and must not be presented as cloud billing measurements.
 
@@ -95,7 +148,7 @@ Recovered catalog markers are counted separately and excluded from latency sampl
 number and reconciliation kind. It is emitted only after the verified snapshot
 has been durably applied to the row index and the applied operation is cleared.
 
-`transaction_journaled` includes `journal_payload_bytes` from the durable chunk
+`transaction_journaled` is a debug event (see [logging](#logging)). It includes `journal_payload_bytes` from the durable chunk
 descriptor. This counts bincode mutation vectors after rollback and before
 collapse: vector headers, table/schema identifiers, insert/update row images,
 update old keys and delete keys. Complete PostgreSQL old tuples used to resolve
@@ -271,7 +324,79 @@ last successful materialized LSN. These positions may advance independently of t
 connection's contiguous materialized watermark. A blocked table retains its last
 successful position while other tables continue. See
 [table publication isolation](table-publication-isolation.md) for recovery and
-storage limits.
+storage limits. Code `catalog_auth` means the catalog or its OAuth endpoint
+rejected Flow's credentials or permissions (after one token renewal when OAuth
+credentials are configured) and needs operator action; `catalog_unavailable`
+covers catalog outages and other unexpected responses.
+
+## Stall and lag signals
+
+The table gauges above are rendered from the same observation as `status`:
+blocked-table series exist only while the block does, and every label is a
+configured table ID or a fixed error code, so series count is bounded by the
+table count. Per-table lag refreshes with each table's completion and with the
+five-second health observation, so newly captured work appears within one
+interval. Registration of captured work is bounded; compare
+`flow_journal_durable_lsn` with `flow_ledger_registered_lsn` for the backlog not
+yet attributed to tables. Lag seconds use the source commit timestamp, so they
+require synchronized clocks.
+
+Example Prometheus alerting rules; tune thresholds to your latency targets:
+
+```yaml
+groups:
+  - name: embrasure-flow
+    rules:
+      - alert: FlowTableBlocked
+        expr: flow_table_blocked == 1
+        for: 10m
+        annotations:
+          summary: "Table {{ $labels.table_id }} blocked ({{ $labels.code }})"
+          description: "Healthy tables continue, but source WAL and the journal grow until it is resolved. See status blocked_tables."
+      - alert: FlowTableLagging
+        expr: flow_table_lag_seconds > 900
+        for: 10m
+      - alert: FlowNotReady
+        expr: flow_ready == 0
+        for: 5m
+      - alert: FlowObservationStale
+        expr: time() - flow_last_update_timestamp_seconds > 120
+      - alert: FlowJournalFull
+        expr: flow_capture_journal_full == 1
+        for: 15m
+      - alert: FlowSourceAtRisk
+        expr: flow_source_at_risk == 1 or flow_source_health_check_available == 0
+        for: 5m
+      - alert: FlowSourceWalRetention
+        # Only where PostgreSQL caps retention (max_slot_wal_keep_size).
+        expr: flow_source_safe_wal_bytes < 4 * 1024 * 1024 * 1024
+        for: 5m
+```
+
+With `/metrics` scraped directly, Prometheus' own `up` covers a stopped process;
+`FlowObservationStale` covers the textfile collector and a wedged exporter.
+
+## Logging
+
+`init` and `run` log one JSON object per line on standard output. `RUST_LOG`
+selects levels with [`tracing` filter directives](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html);
+the default is `info`. Per-transaction and per-epoch evidence
+(`transaction_journaled`, `ingest_prepared`, `epoch_collapsed`,
+`table_published`, `epoch_completed`) is logged at debug level under the
+`flow_events` target. Enable only those with `RUST_LOG=info,flow_events=debug`;
+the benchmark and service suites do. `RUST_LOG=debug` for every target is
+verbose, and third-party libraries can then log request details, including
+credentials; do not use it in production.
+
+A failure that stops the process is logged once as an `ERROR` event with
+`event: "fatal"`, the complete error chain in `error`, its `class` and the
+`exit_code`; `init` and `run` do not print it separately to standard error
+unless it is a terminal or `RUST_LOG` filters the event out. Other commands also print a plain `error:` line on
+standard error. Source storage pressure is logged when its state changes and
+repeated at most every five minutes while unchanged (`warning` at `WARN`,
+`at_risk` at `ERROR`); the metrics carry every five-second check. A retried
+startup dependency logs `event: "startup_retry"` with the step, attempt and
+delay.
 
 ## Storage and REST cost diagnostics
 

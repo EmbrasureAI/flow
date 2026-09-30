@@ -28,7 +28,9 @@ impl Default for SpoolConfig {
             quota_bytes: 16 << 30,
             max_chunk_bytes: 4 << 20,
             max_transactions: 1024,
-            max_subtransactions: 131_072,
+            // Tracked per open transaction, only for subtransactions that
+            // captured rows: roughly 100 bytes of memory each.
+            max_subtransactions: 1 << 20,
         }
     }
 }
@@ -113,7 +115,9 @@ impl TransactionSpool {
             return Err(Error::Protocol("duplicate transaction in spool"));
         }
         if self.transactions.len() >= self.config.max_transactions {
-            return Err(Error::SpoolQuota);
+            return Err(Error::SpoolTransactions {
+                limit: self.config.max_transactions,
+            });
         }
         let path = self.root.join(format!("txn-{xid}"));
         let started = Instant::now();
@@ -156,11 +160,17 @@ impl TransactionSpool {
     /// is retained in memory after this call returns.
     pub fn append(&mut self, xid: u32, subxid: u32, payload: &[u8]) -> Result<()> {
         if payload.len() > self.config.max_chunk_bytes as usize {
-            return Err(Error::SpoolQuota);
+            return Err(Error::Protocol(
+                "capture chunk exceeds the spool frame limit",
+            ));
         }
         let length = payload.len() as u64 + HEADER;
         if self.bytes + length > self.config.quota_bytes {
-            return Err(Error::SpoolQuota);
+            return Err(Error::SpoolQuota {
+                used: self.bytes,
+                requested: length,
+                quota: self.config.quota_bytes,
+            });
         }
         let txn = self
             .transactions
@@ -168,7 +178,10 @@ impl TransactionSpool {
             .ok_or(Error::Protocol("spool append without begin"))?;
         if subxid != xid && !txn.subtransactions.contains_key(&subxid) {
             if txn.savepoints.len() >= self.config.max_subtransactions {
-                return Err(Error::SpoolQuota);
+                return Err(Error::SpoolSubtransactions {
+                    xid,
+                    limit: self.config.max_subtransactions,
+                });
             }
             txn.subtransactions.insert(subxid, txn.savepoints.len());
             txn.savepoints.push(Savepoint {
@@ -195,6 +208,23 @@ impl TransactionSpool {
         txn.bytes += length;
         self.bytes += length;
         Ok(())
+    }
+
+    /// Bytes this transaction has spooled: the position of its next chunk.
+    pub fn position(&self, xid: u32) -> Result<u64> {
+        Ok(self
+            .transactions
+            .get(&xid)
+            .ok_or(Error::Protocol("position of unknown spool transaction"))?
+            .bytes)
+    }
+
+    /// The position `abort(xid, subxid)` truncates to, if the subtransaction
+    /// spooled anything: chunks at or after it do not survive that rollback.
+    pub fn savepoint(&self, xid: u32, subxid: u32) -> Option<u64> {
+        let txn = self.transactions.get(&xid)?;
+        let &index = txn.subtransactions.get(&subxid)?;
+        Some(txn.savepoints[index].bytes)
     }
 
     /// Match PostgreSQL's serial streamed-apply rollback: truncate to the first

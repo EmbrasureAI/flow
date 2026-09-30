@@ -16,7 +16,7 @@ pub use schema::{
     nullable_successor, nullable_successor_with_types, same_wire_schema, validate_schema_metadata,
 };
 mod spool;
-pub use capture::{CaptureAssembler, decode_row, decode_row_with_types};
+pub use capture::{CaptureAssembler, QUARANTINE_WRAP_BYTES, decode_row, decode_row_with_types};
 pub use protocol::{Cell, Column, Decoder, Relation, SourceEvent, Tuple};
 pub use snapshot::{
     SnapshotSession, TablePreflight, decode_copy_row, decode_copy_row_with_types, export_snapshot,
@@ -57,9 +57,31 @@ pub enum Error {
     #[error("source spool IO: {0}")]
     Io(#[from] std::io::Error),
     #[error(
-        "source spool quota exceeded; drain committed transactions or increase the configured quota"
+        "source spool quota exhausted: {used} bytes in use, {requested} requested, limit {quota} (limits.spool_bytes); open source transactions hold their rows here until they commit"
     )]
-    SpoolQuota,
+    SpoolQuota {
+        used: u64,
+        requested: u64,
+        quota: u64,
+    },
+    #[error(
+        "more than {limit} source transactions are open in the capture spool; increase limits.spool_transactions"
+    )]
+    SpoolTransactions { limit: usize },
+    #[error(
+        "source transaction {xid} captured rows in more than {limit} subtransactions (savepoints); increase limits.spool_subtransactions"
+    )]
+    SpoolSubtransactions { xid: u32, limit: usize },
+    /// Table-scoped: PostgreSQL changed an existing row of an insert-only target.
+    #[error(
+        "append-only table {table} received {operation}; resynchronization or append_only = false is required"
+    )]
+    AppendOnly { table: u32, operation: &'static str },
+    /// Table-scoped: one row change cannot fit a journal chunk.
+    #[error(
+        "a row change on table {table} needs {bytes} bytes including 40 bytes of chunk framing, exceeding limits.chunk_bytes ({limit} bytes); raise limits.chunk_bytes and resynchronize the table"
+    )]
+    RowLimit { table: u32, bytes: u64, limit: u64 },
     #[error("ingress journal: {0}")]
     Journal(#[from] flow_ingress_journal::Error),
     #[error("mutation encoding: {0}")]
@@ -136,6 +158,11 @@ impl PgOutputSource {
             acknowledgement: Acknowledgement::default(),
             received_lsn: resume_lsn,
         })
+    }
+
+    /// Bound concurrently streamed transactions to the capture spool's limit.
+    pub fn set_max_streamed_transactions(&mut self, limit: usize) {
+        self.decoder.set_max_streamed_transactions(limit);
     }
 
     async fn feedback(&mut self, progress: Acknowledgement) -> Result<()> {

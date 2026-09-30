@@ -6,8 +6,14 @@ Copyright 2023-2026 The Apache Software Foundation
 This product includes software developed at
 The Apache Software Foundation (http://www.apache.org/).
 
-Iceberg Rust and its REST catalog contain local modifications described in
-vendor/iceberg/LOCAL_CHANGES.md and vendor/iceberg-catalog-rest/LOCAL_CHANGES.md.
+Iceberg Rust, its REST catalog and its OpenDAL storage adapter contain local
+modifications described in vendor/iceberg/LOCAL_CHANGES.md,
+vendor/iceberg-catalog-rest/LOCAL_CHANGES.md and
+vendor/iceberg-storage-opendal/LOCAL_CHANGES.md.
+
+This product includes tokio-postgres from rust-postgres, Copyright (c) 2016
+Steven Fackler, licensed under the MIT or Apache-2.0 license, with local
+modifications described in vendor/tokio-postgres/LOCAL_CHANGES.md.
 
 The binary distribution includes third-party license and copyright notices
 under /usr/share/licenses/embrasure-flow. Its index.json identifies the locked

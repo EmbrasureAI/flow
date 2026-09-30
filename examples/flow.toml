@@ -1,3 +1,4 @@
+# Relative to this file's directory; use an absolute path under a supervisor.
 state_dir = "./data"
 
 [source]
@@ -13,6 +14,8 @@ uri = "http://localhost:8181"
 # Optional REST authentication: name a process environment variable, not a secret.
 # token_env = "FLOW_CATALOG_TOKEN"
 # credential_env = "FLOW_CATALOG_CREDENTIAL" # client_id:client_secret for OAuth
+# Additional PEM CA bundle for an https:// catalog signed by a private CA.
+# tls_ca_file = "/etc/flow/catalog-ca.pem"
 warehouse = "s3://warehouse/"
 "s3.endpoint" = "http://localhost:9000"
 "s3.region" = "us-east-1"
@@ -25,12 +28,20 @@ batch_bytes = 8388608
 # Additional per-worker collapse retention; 0 forces the disk path.
 collapse_memory_bytes = 33554432
 parquet_row_group_bytes = 33554432
+# The largest single row change; a larger one blocks its table.
 chunk_bytes = 4194304
+# Queued lookahead descriptors shared by all tables. It only makes tables
+# schedulable; a dispatched epoch reads further from the durable ledger.
 pending_transactions = 256
+# Optional cap on source transactions per publication epoch; unset by default.
+# epoch_max_transactions = 10000
 table_workers = 4
 commits_per_second = 100
 journal_bytes = 68719476736
 spool_bytes = 34359738368
+# Concurrently open source transactions, and savepoints with rows per transaction.
+# spool_transactions = 1024
+# spool_subtransactions = 1048576
 wal_soft_bytes = 17179869184
 wal_hard_bytes = 34359738368
 # Time-travel window. Every retained snapshot enlarges the metadata file each commit rewrites.
@@ -38,6 +49,16 @@ snapshot_retention_secs = 3600
 # Disable only when another process performs coordinated expiration; without it
 # table metadata and files replaced by compaction are never reclaimed.
 snapshot_expiration = true
+# Never expire below this many snapshots on main.
+snapshot_retain_last = 128
+# Expire the oldest unprotected snapshots beyond this count, even inside the window.
+snapshot_max_count = 1000
+
+[storage]
+# Capture pauses below this much free space on the state volume (0 disables).
+min_free_bytes = 4294967296
+# Verify every row index checksum on each start, not only after an unclean exit.
+verify_index_on_start = false
 
 [parquet_read]
 footer_bytes = 8388608
@@ -49,6 +70,8 @@ batch_bytes = 134217728
 # Unauthenticated; bind to a private interface.
 # [http]
 # listen = "0.0.0.0:9464"
+# /healthz fails after the running main loop stalls this long; 0 disables.
+# liveness_timeout_secs = 300
 
 # Generate these blocks with `embrasure-flow --config flow.toml discover`.
 [[tables]]

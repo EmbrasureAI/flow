@@ -11,7 +11,7 @@ use flow_state_store::StateStore;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::{
     fmt::Write,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const EXPORT_INTERVAL: Duration = Duration::from_secs(1);
@@ -23,6 +23,7 @@ pub(crate) struct Observation {
     blocked_tables: Vec<BlockedTable>,
     table_progress: Vec<TableProgress>,
     table_sources: std::collections::BTreeMap<TableId, (String, String)>,
+    started_at: SystemTime,
     #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
     allocator_sample: Option<(Instant, Option<crate::allocator::MemoryUsage>)>,
 }
@@ -58,6 +59,7 @@ impl Observation {
             blocked_tables: Vec::new(),
             table_progress: Vec::new(),
             table_sources: Default::default(),
+            started_at: SystemTime::now(),
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         })
@@ -81,21 +83,33 @@ impl Observation {
     }
 
     /// Refresh only changed tables; unrelated progress stays cached. The runtime
-    /// supplies all tables at startup and during its periodic health observation.
+    /// supplies all tables at startup and during its periodic health observation,
+    /// so newly registered work appears in table lag within one health interval.
     pub(crate) fn table_states(
         &mut self,
         store: &StateStore,
+        ledger: &SourceLedger,
         blocked: &BlockedTables,
         ids: impl IntoIterator<Item = TableId>,
     ) -> Result<()> {
         let progress = ids
             .into_iter()
             .map(|table_id| {
+                // Table admission references are ordered by end LSN.
+                let oldest = ledger
+                    .pending_table_transactions_after(table_id, PgLsn(0))
+                    .next()
+                    .transpose()?;
                 Ok(TableProgress {
                     table_id,
                     materialized_lsn: store.table_state(&table_id)?.materialized_lsn,
                     source_namespace: self.table_sources.get(&table_id).map(|name| name.0.clone()),
                     source_table: self.table_sources.get(&table_id).map(|name| name.1.clone()),
+                    oldest_unpublished_lsn: oldest
+                        .as_ref()
+                        .map(|transaction| transaction.begin_lsn),
+                    oldest_unpublished_commit_micros: oldest
+                        .map(|transaction| transaction.commit_timestamp_micros),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -128,7 +142,15 @@ impl Observation {
         captured: PgLsn,
         ready: bool,
     ) -> Result<bool> {
-        self.write_at(config, ledger, captured, ready, Instant::now())
+        // These files are observations, never recovery authority. A full
+        // volume must not stop the service; capture pauses on its own watermark.
+        match self.write_at(config, ledger, captured, ready, Instant::now()) {
+            Err(error) if crate::disk::is_storage_full(&error) => {
+                crate::disk::warn_observation_skipped(&error);
+                Ok(false)
+            }
+            result => result,
+        }
     }
 
     fn write_at(
@@ -140,13 +162,13 @@ impl Observation {
         now: Instant,
     ) -> Result<bool> {
         let ready = ready && self.source_health.permits_readiness();
-        crate::lifecycle::emit(
+        crate::lifecycle::emit_running(
             config,
-            Some(ledger),
-            Some(captured),
+            ledger,
+            captured,
             ready,
-            Some(self.source_health),
-            Some((&self.blocked_tables, &self.table_progress)),
+            self.source_health,
+            (&self.blocked_tables, &self.table_progress),
         )?;
         if self.last_export.is_some_and(|(last, was_ready)| {
             ready == was_ready && now.duration_since(last) < EXPORT_INTERVAL
@@ -200,11 +222,114 @@ impl Observation {
         ] {
             writeln!(text, "# TYPE {name} gauge\n{name} {value}")?;
         }
+        self.render_process_and_tables(&mut text, captured, ready)?;
         crate::lifecycle::write_observation(&config.state_dir.join("metrics.prom"), text)?;
         // Failed exports remain due. Readiness transitions bypass the cadence.
         self.last_export = Some((now, ready));
         Ok(true)
     }
+}
+
+impl Observation {
+    /// Stall signals rendered from the current observation, so a cleared block
+    /// or a changed code leaves no stale series. Labels are configured table
+    /// IDs and fixed error codes: cardinality is bounded by the table count.
+    fn render_process_and_tables(
+        &self,
+        text: &mut String,
+        captured: PgLsn,
+        ready: bool,
+    ) -> Result<()> {
+        let now = SystemTime::now();
+        let seconds = |time: SystemTime| {
+            time.duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+        };
+        let now_micros = i64::try_from(
+            now.duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros(),
+        )
+        .unwrap_or(i64::MAX);
+        for (name, value) in [
+            ("flow_up", 1.0),
+            ("flow_ready", f64::from(u8::from(ready))),
+            ("flow_process_start_time_seconds", seconds(self.started_at)),
+            ("flow_last_update_timestamp_seconds", seconds(now)),
+            ("flow_blocked_tables", self.blocked_tables.len() as f64),
+        ] {
+            writeln!(text, "# TYPE {name} gauge\n{name} {value}")?;
+        }
+        writeln!(text, "# TYPE flow_table_blocked gauge")?;
+        for record in &self.blocked_tables {
+            writeln!(
+                text,
+                "flow_table_blocked{{table_id=\"{}\",code=\"{}\"}} 1",
+                record.table_id.0, record.error_code
+            )?;
+        }
+        writeln!(
+            text,
+            "# TYPE flow_table_blocked_since_timestamp_seconds gauge"
+        )?;
+        for record in &self.blocked_tables {
+            writeln!(
+                text,
+                "flow_table_blocked_since_timestamp_seconds{{table_id=\"{}\",code=\"{}\"}} {}",
+                record.table_id.0,
+                record.error_code,
+                record.blocked_at_ms as f64 / 1000.0
+            )?;
+        }
+        writeln!(text, "# TYPE flow_table_materialized_lsn gauge")?;
+        for table in &self.table_progress {
+            writeln!(
+                text,
+                "flow_table_materialized_lsn{{table_id=\"{}\"}} {}",
+                table.table_id.0, table.materialized_lsn.0
+            )?;
+        }
+        writeln!(text, "# TYPE flow_table_lag_bytes gauge")?;
+        for table in &self.table_progress {
+            writeln!(
+                text,
+                "flow_table_lag_bytes{{table_id=\"{}\"}} {}",
+                table.table_id.0,
+                table_lag_bytes(table, captured)
+            )?;
+        }
+        writeln!(text, "# TYPE flow_table_lag_seconds gauge")?;
+        for table in &self.table_progress {
+            writeln!(
+                text,
+                "flow_table_lag_seconds{{table_id=\"{}\"}} {}",
+                table.table_id.0,
+                table_lag_seconds(table, now_micros)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Captured WAL from the start of the table's oldest unpublished transaction;
+/// zero when the table has no registered, unpublished work.
+fn table_lag_bytes(table: &TableProgress, captured: PgLsn) -> u64 {
+    table.oldest_unpublished_lsn.map_or(0, |begin| {
+        captured
+            .0
+            .saturating_sub(begin.max(table.materialized_lsn).0)
+    })
+}
+
+/// Age of the oldest unpublished source commit by the source's clock.
+fn table_lag_seconds(table: &TableProgress, now_micros: i64) -> f64 {
+    table
+        .oldest_unpublished_commit_micros
+        .filter(|commit| *commit > 0)
+        .map_or(0.0, |commit| {
+            now_micros.saturating_sub(commit).max(0) as f64 / 1_000_000.0
+        })
 }
 
 pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
@@ -250,6 +375,121 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn stall_gauges_report_blocked_tables_and_table_lag() {
+        let temp = TempDir::new().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = temp.path().to_owned();
+        let store =
+            StateStore::open(temp.path().join("index"), StateStoreOptions::default()).unwrap();
+        let source = SourceId(config.source.id.clone());
+        let mut ledger = SourceLedger::open(
+            store.clone(),
+            source.clone(),
+            AckMode::Materialized,
+            JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        store.complete_noop(&TableId(1), PgLsn(90), 1).unwrap();
+        store.complete_noop(&TableId(2), PgLsn(80), 1).unwrap();
+        let committed = SystemTime::now() - Duration::from_secs(120);
+        let commit_micros = committed.duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
+        ledger
+            .journaled(flow_model::SourceTransaction {
+                source_id: source.clone(),
+                xid: 7,
+                begin_lsn: PgLsn(100),
+                commit_lsn: PgLsn(140),
+                end_lsn: PgLsn(150),
+                commit_timestamp_micros: commit_micros,
+                schema_versions: vec![],
+                affected_tables: vec![TableId(1)],
+                mutation_chunks: Default::default(),
+                table_mutation_counts: Some(vec![flow_model::TableMutationCount {
+                    table_id: TableId(1),
+                    mutations: 1,
+                }]),
+            })
+            .unwrap();
+        let mut blocked = BlockedTables::load(&store, &source).unwrap();
+        blocked
+            .record(TableId(1), "catalog_unavailable", None)
+            .unwrap();
+        let mut observation = Observation::install().unwrap();
+        observation
+            .table_states(&store, &ledger, &blocked, [TableId(1), TableId(2)])
+            .unwrap();
+        observation
+            .write_at(&config, &ledger, PgLsn(400), true, Instant::now())
+            .unwrap();
+        let metrics = std::fs::read_to_string(temp.path().join("metrics.prom")).unwrap();
+        for line in [
+            "flow_up 1\n",
+            "flow_ready 1\n",
+            "flow_blocked_tables 1\n",
+            "flow_table_blocked{table_id=\"1\",code=\"catalog_unavailable\"} 1\n",
+            "flow_table_materialized_lsn{table_id=\"1\"} 90\n",
+            "flow_table_materialized_lsn{table_id=\"2\"} 80\n",
+            // Captured WAL since the oldest unpublished transaction began.
+            "flow_table_lag_bytes{table_id=\"1\"} 300\n",
+            "flow_table_lag_bytes{table_id=\"2\"} 0\n",
+            "flow_table_lag_seconds{table_id=\"2\"} 0\n",
+        ] {
+            assert!(metrics.contains(line), "{line}{metrics}");
+        }
+        let lag = metrics
+            .lines()
+            .find_map(|line| line.strip_prefix("flow_table_lag_seconds{table_id=\"1\"} "))
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!((120.0..180.0).contains(&lag), "{lag}");
+        assert!(metrics.contains("flow_table_blocked_since_timestamp_seconds{table_id=\"1\""));
+        let updated = metrics
+            .lines()
+            .find_map(|line| line.strip_prefix("flow_last_update_timestamp_seconds "))
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!(updated > commit_micros as f64 / 1e6);
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["state"], "running");
+        assert_eq!(status["table_progress"][0]["oldest_unpublished_lsn"], 100);
+        assert!(
+            status["table_progress"][1]
+                .get("oldest_unpublished_lsn")
+                .is_none()
+        );
+
+        // A cleared block and completed work leave no stale blocked series.
+        blocked.clear(TableId(1)).unwrap();
+        ledger
+            .table_materialized(PgLsn(150), TableId(1), 1)
+            .unwrap();
+        observation
+            .table_states(&store, &ledger, &blocked, [TableId(1)])
+            .unwrap();
+        observation
+            .write_at(
+                &config,
+                &ledger,
+                PgLsn(400),
+                true,
+                Instant::now() + EXPORT_INTERVAL,
+            )
+            .unwrap();
+        let metrics = std::fs::read_to_string(temp.path().join("metrics.prom")).unwrap();
+        assert!(metrics.contains("flow_blocked_tables 0\n"), "{metrics}");
+        assert!(!metrics.contains("flow_table_blocked{"), "{metrics}");
+        assert!(
+            metrics.contains("flow_table_lag_bytes{table_id=\"1\"} 0\n"),
+            "{metrics}"
+        );
+    }
+
+    #[test]
     fn export_cadence_keeps_status_current_and_retries_failed_writes() {
         let temp = TempDir::new().unwrap();
         let mut config: Config =
@@ -271,6 +511,7 @@ mod tests {
             blocked_tables: Vec::new(),
             table_progress: Vec::new(),
             table_sources: Default::default(),
+            started_at: SystemTime::now(),
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         };
@@ -294,10 +535,10 @@ mod tests {
             .record(TableId(1), "catalog_unavailable", None)
             .unwrap();
         observation
-            .table_states(&store, &blocked, [TableId(2)])
+            .table_states(&store, &ledger, &blocked, [TableId(2)])
             .unwrap();
         observation
-            .table_states(&store, &blocked, [TableId(1)])
+            .table_states(&store, &ledger, &blocked, [TableId(1)])
             .unwrap();
         observation.record_source_health(SourceHealth::Healthy);
         assert!(
@@ -318,7 +559,7 @@ mod tests {
         blocked.clear(TableId(1)).unwrap();
         store.complete_noop(&TableId(1), PgLsn(9), 1).unwrap();
         observation
-            .table_states(&store, &blocked, [TableId(1)])
+            .table_states(&store, &ledger, &blocked, [TableId(1)])
             .unwrap();
         let first = std::fs::read(&metrics).unwrap();
         assert!(

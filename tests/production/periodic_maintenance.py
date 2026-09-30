@@ -23,12 +23,14 @@ class PeriodicRun(FairnessRun):
     def __init__(self, args):
         super().__init__(args)
         text = self.config.read_text().replace("pending_transactions = 16", "pending_transactions = 4")
+        text = text.replace("epoch_max_transactions = 8", "epoch_max_transactions = 2")
         text = text.replace("table_workers = 2", f"table_workers = {args.table_workers}")
-        text = text.replace("snapshot_retention_secs = 3600", "snapshot_retention_secs = 2\nsnapshot_expiration = true\n"
+        text = text.replace("snapshot_retention_secs = 3600", "snapshot_retention_secs = 2\nsnapshot_expiration = true\nsnapshot_retain_last = 8\n"
                             "manifest_max_count = 4\ngarbage_interval_secs = 1\norphan_grace_secs = 1\n"
                             "checkpoint_interval_secs = 2\nretained_checkpoints = 2")
-        # The finite backlog exceeds the 128-snapshot history trigger. Native
-        # rewrites remain enabled: expired L0 birth snapshots imply hard age.
+        # The finite backlog pushes the pre-backlog head well past the retain
+        # floor. Native rewrites remain enabled: expired L0 birth snapshots
+        # imply hard age.
         for key, value in self.policy.items():
             if "_files" in key:
                 replacement = 2 if key == "l0_soft_files" else 512
@@ -37,7 +39,7 @@ class PeriodicRun(FairnessRun):
         self.config.write_text(text)
         self.report.update(pending_transactions=4, table_workers=args.table_workers, compaction_policy=self.policy,
                            native_compaction=True, manifest_max_count=4,
-                           snapshot_retention_secs=2, garbage_interval_secs=1,
+                           snapshot_retention_secs=2, snapshot_retain_last=8, garbage_interval_secs=1,
                            orphan_grace_secs=1, checkpoint_interval_secs=2,
                            catalog_request_delay_seconds=.01, timeout_seconds=args.timeout,
                            drain_timeout_seconds=args.drain_timeout or args.timeout)

@@ -53,11 +53,14 @@ pub(crate) fn persist_bootstrap(store: &StateStore, bootstrap: &Bootstrap) -> Re
     store.put_source_transaction(BOOTSTRAP, &serde_json::to_vec(bootstrap)?)?;
     Ok(())
 }
-pub(crate) fn bootstrap(store: &ControlStore) -> Result<Bootstrap> {
+pub(crate) fn bootstrap(store: &ControlStore, config: &Config) -> Result<Bootstrap> {
     Ok(serde_json::from_slice(
-        &store
-            .source_transaction(BOOTSTRAP)?
-            .context("source is not initialized; run init first")?,
+        &store.source_transaction(BOOTSTRAP)?.ok_or_else(|| {
+            crate::exit::config(format!(
+                "source is not initialized in state_dir {}; run init first (a relative state_dir resolves against the configuration file's directory)",
+                config.state_dir.display()
+            ))
+        })?,
     )?)
 }
 pub(crate) async fn tables(
@@ -168,8 +171,9 @@ pub async fn initialize(config: Config) -> Result<()> {
     let started = std::time::Instant::now();
     let result = async {
         crate::lifecycle::refuse_if_resync_required(&config)?;
-        let catalog = catalog(&config).await?;
+        let catalog = crate::retry::startup("catalog", || catalog(&config)).await?;
         let store = open_bootstrap_state(&config, catalog.clone()).await?;
+        crate::lifecycle::state_lock_acquired();
         let mut boot = match store.source_transaction(BOOTSTRAP)? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => prepare_source(&config, &store, catalog.as_ref()).await?,
@@ -179,6 +183,9 @@ pub async fn initialize(config: Config) -> Result<()> {
     }
     .await;
     let result = crate::lifecycle::record_publication_changed(&config, result);
+    if result.is_ok() {
+        crate::generation::record_clean_shutdown(&config.state_dir);
+    }
     let outcome = if result.is_ok() { "success" } else { "error" };
     metrics::counter!("flow_bootstrap_runs_total", "outcome" => outcome).increment(1);
     metrics::histogram!("flow_bootstrap_seconds", "outcome" => outcome)
@@ -202,7 +209,8 @@ async fn open_bootstrap_state(config: &Config, catalog: Arc<dyn Catalog>) -> Res
                 .is_some_and(flow_state_store::Error::requires_index_rebuild) =>
         {
             let control = ControlStore::open(config.state_dir.join("control"))?;
-            let boot = bootstrap(&control)?;
+            crate::lifecycle::state_lock_acquired();
+            let boot = bootstrap(&control, config)?;
             validate_config(config, &boot)?;
             ensure!(
                 boot.target_uuids.len() == boot.schemas.len(),
@@ -231,7 +239,9 @@ pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Re
                 .enumerate()
                 .filter_map(|(index, table)| table.projection().map(|_| index))
                 .collect::<Vec<_>>(),
-        "column selection mode differs from durable bootstrap; resynchronization is required"
+        crate::exit::config(
+            "column selection mode differs from durable bootstrap; resynchronization is required"
+        )
     );
     Ok(())
 }
@@ -242,7 +252,7 @@ pub(crate) fn validate_identity(config: &Config, boot: &Bootstrap) -> Result<()>
         boot.source_id == config.source.id
             && boot.slot == config.source.slot
             && boot.publication == config.source.publication,
-        "source incarnation differs from durable bootstrap"
+        crate::exit::config("source incarnation differs from durable bootstrap")
     );
     Ok(())
 }
@@ -251,7 +261,7 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
     validate_identity(config, boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len() && boot.targets.len() == config.tables.len(),
-        "configured source tables differ from durable bootstrap"
+        crate::exit::config("configured source tables differ from durable bootstrap")
     );
     for (index, configured) in config.tables.iter().enumerate() {
         ensure!(
@@ -260,7 +270,7 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
                     configured.target_namespace.clone(),
                     configured.target_table.clone()
                 ) == boot.targets[index],
-            "configured schema or target differs from durable bootstrap"
+            crate::exit::config("configured schema or target differs from durable bootstrap")
         );
     }
     Ok(())
@@ -271,11 +281,17 @@ async fn prepare_source(
     store: &StateStore,
     catalog: &dyn Catalog,
 ) -> Result<Bootstrap> {
-    let sql = connect(config, false).await?;
-    ensure!(
-        slot_cut(&sql, &config.source.slot).await?.is_none(),
-        "initialization requires a new permanent replication slot"
-    );
+    let sql = crate::retry::startup("source connection", || connect(config, false)).await?;
+    let slot = &config.source.slot;
+    if let Some(row) = sql
+        .query_opt(
+            "SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[slot],
+        )
+        .await?
+    {
+        return Err(existing_slot(config, row.get(0)));
+    }
     let mut schemas = Vec::new();
     let mut target_uuids = Vec::new();
     for configured in &config.tables {
@@ -352,6 +368,22 @@ async fn prepare_source(
     Ok(boot)
 }
 
+/// `init` never adopts an existing slot. Never suggest dropping one that a
+/// consumer is streaming from.
+fn existing_slot(config: &Config, active: bool) -> anyhow::Error {
+    let slot = &config.source.slot;
+    let state_dir = config.state_dir.display();
+    crate::exit::config(if active {
+        format!(
+            "replication slot {slot:?} already exists and is in use by a connected consumer; init only creates a new slot. If a Flow instance owns it, keep using that instance's state_dir with run; otherwise set a new source.slot. state_dir {state_dir} has no initialization record for it"
+        )
+    } else {
+        format!(
+            "replication slot {slot:?} already exists, but state_dir {state_dir} has no initialization record for it; init only creates a new slot. To resume an initialized source, set state_dir to its original state directory and use run. Otherwise set a new source.slot, or drop the stale slot after confirming no Flow instance uses it: SELECT pg_drop_replication_slot('{slot}');"
+        )
+    })
+}
+
 async fn slot_cut(
     sql: &flow_pg_source::tokio_postgres::Client,
     slot: &str,
@@ -363,7 +395,9 @@ async fn slot_cut(
             && row.get::<_, Option<bool>>(3) == Some(true)
             && !row.get::<_, bool>(4)
             && !row.get::<_, bool>(5),
-        "bootstrap slot is active or differs from its recorded source contract"
+        crate::exit::config(
+            "bootstrap slot is active or differs from its recorded source contract"
+        )
     );
     Ok(Some(
         row.get::<_, Option<String>>(0)
@@ -427,7 +461,7 @@ pub(crate) async fn resume(
         return Ok(());
     }
     validate_config(config, boot)?;
-    let sql = connect(config, false).await?;
+    let sql = crate::retry::startup("source connection", || connect(config, false)).await?;
     let mut registry = crate::schema::SchemaRegistry::new(
         store.clone(),
         SourceId(config.source.id.clone()),
@@ -499,7 +533,8 @@ pub(crate) async fn resume(
     let initial_cut = boot
         .consistent_lsn
         .context("missing initial snapshot cut")?;
-    let (mut journal, _) = Journal::open(config.state_dir.join("journal"), journal_config(config))?;
+    let mut ledger = ledger(&store, config)?;
+    let (mut journal, _) = crate::source::open_source_journal(config, &ledger)?;
     if journal.durable_lsn() < initial_cut {
         ensure!(
             journal.durable_lsn() == PgLsn(0),
@@ -519,7 +554,6 @@ pub(crate) async fn resume(
         .next()
         .transpose()?
         .filter(|transaction| transaction.xid == 0 && transaction.end_lsn == initial_cut);
-    let mut ledger = ledger(&store, config)?;
     ensure!(
         journal.durable_lsn() >= ledger.watermarks().journal_durable_lsn,
         "bootstrap journal lost previously durable transactions; recover storage before acknowledging"
@@ -806,8 +840,32 @@ fn staged_copy(
         if !path.is_dir() {
             return Ok(None);
         }
-        let (journal, _) = Journal::open(path, journal_config(config))?;
-        journal.reader()
+        match Journal::open(&path, journal_config(config)) {
+            Ok((journal, _)) => journal.reader(),
+            // An unpublished staging copy is disposable, like a missing one:
+            // the caller recopies the table from a new snapshot instead.
+            Err(
+                error @ (flow_ingress_journal::Error::SegmentCorrupt { .. }
+                | flow_ingress_journal::Error::DurableTail { .. }
+                | flow_ingress_journal::Error::Corrupt),
+            ) => {
+                tracing::warn!(
+                    table_id = schema.table_id.0,
+                    %error,
+                    "initial COPY staging journal is damaged; discarding it and copying the table again"
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "open initial COPY staging journal for table {} at {}",
+                        schema.table_id.0,
+                        path.display()
+                    )
+                });
+            }
+        }
     };
     let transaction = reader
         .transactions_after(PgLsn(copy.cut.0.saturating_sub(1)))?
@@ -890,7 +948,13 @@ async fn copy_and_publish(
         let stream = BinaryCopyOutStream::new(output, &types);
         tokio::pin!(stream);
         let (mut journal, recovered) =
-            Journal::open(copy.path(config, schema.table_id)?, journal_config(config))?;
+            Journal::open(copy.path(config, schema.table_id)?, journal_config(config))
+                .with_context(|| {
+                    format!(
+                        "open new initial COPY staging journal for table {}",
+                        schema.table_id.0
+                    )
+                })?;
         ensure!(
             recovered.transactions.is_empty(),
             "new COPY staging directory is not empty"
@@ -994,6 +1058,30 @@ mod tests {
     use super::*;
     use flow_coordinator::{AckMode, JournalDurability};
     use flow_state_store::StateStoreOptions;
+
+    #[test]
+    fn operator_messages_name_the_state_directory_and_spare_active_slots() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().join("state");
+        let control = ControlStore::open(config.state_dir.join("control")).unwrap();
+        let error = bootstrap(&control, &config).err().unwrap();
+        assert_eq!(crate::exit::classify(&error).0, crate::exit::Class::Config);
+        let message = error.to_string();
+        assert!(message.contains(&config.state_dir.display().to_string()));
+        assert!(message.contains("relative state_dir resolves against the configuration"));
+
+        let stale = existing_slot(&config, false).to_string();
+        assert!(
+            stale.contains("pg_drop_replication_slot('embrasure_flow')"),
+            "{stale}"
+        );
+        let active = existing_slot(&config, true);
+        assert_eq!(crate::exit::classify(&active).0, crate::exit::Class::Config);
+        assert!(!active.to_string().contains("drop"), "{active}");
+        assert!(active.to_string().contains("in use"), "{active}");
+    }
 
     #[tokio::test]
     async fn bootstrap_rebuild_preserves_control_and_rejects_replaced_targets() {
@@ -1181,5 +1269,41 @@ mod tests {
         recover_published_copy(&config, &store, &mut ledger, table, &copy, cut, 0).unwrap();
         assert_eq!(ledger.acknowledgement(), cut);
         assert!(!staging.exists());
+    }
+
+    /// Unpublished COPY staging is disposable: a damaged staging journal means
+    /// "copy this table again", not "restore or resynchronize the source".
+    #[test]
+    fn damaged_unpublished_copy_staging_is_recopied() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().to_owned();
+        let table = TableId(17);
+        let schema = config.tables[0].schema(table.0);
+        let copy = TableCopy {
+            cut: PgLsn(41),
+            staging: format!("table-{}-{}", table.0, uuid::Uuid::new_v4()),
+            phase: CopyPhase::Staged,
+            rows: 3,
+            schema_version: 0,
+        };
+        let staging = copy.path(&config, table).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        // A damaged closed segment followed by the active one.
+        std::fs::write(staging.join("00000000000000000000.segment"), [7; 64]).unwrap();
+        std::fs::write(staging.join("00000000000000000001.segment"), []).unwrap();
+        let (main, _) =
+            Journal::open(root.path().join("journal"), journal_config(&config)).unwrap();
+        assert!(
+            staged_copy(&config, &schema, &copy, &main.reader())
+                .unwrap()
+                .is_none()
+        );
+        // Damage is only discarded by the recopy that replaces the directory.
+        assert_eq!(
+            std::fs::read(staging.join("00000000000000000000.segment")).unwrap(),
+            [7; 64]
+        );
     }
 }

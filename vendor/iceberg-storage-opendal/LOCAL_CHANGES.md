@@ -25,3 +25,9 @@ clones on every file operation would build a recursive executor chain and could
 overflow the stack during execution or shutdown. S3 cache hits return the fully
 layered operator; other backends keep their existing layer path. A bounded-stack
 regression repeatedly constructs S3 writers and drops the final cache owner.
+
+`OpenDalResolvingStorage` formats its shared properties in `Debug` output as key
+names with redacted values, since they carry object-store credentials. Changed
+file: `src/resolving.rs`; `docs/patches/iceberg-storage-opendal-debug-redaction.patch`
+(`patch -p3`) applies it on top of the operator cache change. `src/s3_operator_cache.rs` is new Embrasure Flow code
+and carries its own Apache-2.0 header.

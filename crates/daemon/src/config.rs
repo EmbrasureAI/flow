@@ -12,6 +12,7 @@ use std::{
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// A relative path is resolved against the configuration file's directory.
     pub state_dir: PathBuf,
     pub source: Source,
     pub catalog: HashMap<String, String>,
@@ -27,12 +28,41 @@ pub struct Config {
     /// Optional HTTP endpoints for probes and Prometheus scraping.
     #[serde(default)]
     pub http: Option<Http>,
+    /// Local state volume safety.
+    #[serde(default)]
+    pub storage: Storage,
+}
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Storage {
+    /// Capture pauses while the state volume has fewer free bytes, and resumes
+    /// a quarter above it. Zero disables the watermark.
+    pub min_free_bytes: u64,
+    /// Verify every index checksum on each start. Otherwise the full scan runs
+    /// only after an unclean exit or `check --storage`.
+    pub verify_index_on_start: bool,
+}
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: 4 << 30,
+            verify_index_on_start: false,
+        }
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Http {
     /// For example `0.0.0.0:9464`; serves /healthz, /readyz and /metrics.
     pub listen: std::net::SocketAddr,
+    /// /healthz fails once the running service's main loop has not advanced
+    /// for this long; zero disables the check. Startup, index rebuild and
+    /// initial COPY are never judged.
+    #[serde(default = "default_liveness_timeout_secs")]
+    pub liveness_timeout_secs: u64,
+}
+fn default_liveness_timeout_secs() -> u64 {
+    300
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,6 +133,11 @@ impl Table {
 pub struct Limits {
     pub journal_bytes: u64,
     pub spool_bytes: u64,
+    /// Source transactions open in the capture spool at once, including
+    /// streamed in-progress transactions.
+    pub spool_transactions: usize,
+    /// Savepoints with captured rows per open source transaction.
+    pub spool_subtransactions: usize,
     pub chunk_bytes: u32,
     /// A pgoutput UPDATE includes both row images and text bytea expansion.
     pub source_message_bytes: usize,
@@ -111,7 +146,13 @@ pub struct Limits {
     /// Additional retained collapse state per table worker; zero uses disk only.
     pub collapse_memory_bytes: usize,
     pub parquet_row_group_bytes: usize,
+    /// Queued lookahead descriptors shared by all tables. It makes tables
+    /// schedulable; a dispatched epoch continues from the durable ledger up to
+    /// its payload and descriptor-memory limits, so this does not cap batches.
     pub pending_transactions: usize,
+    /// Optional cap on source transactions in one publication epoch, bounding
+    /// per-epoch commit work; unset, payload and memory limits size epochs.
+    pub epoch_max_transactions: Option<usize>,
     pub table_workers: usize,
     pub commits_per_second: u32,
     pub wal_soft_bytes: u64,
@@ -120,17 +161,33 @@ pub struct Limits {
     /// Without expiration, table metadata and replaced files grow without bound.
     /// Disable only when another coordinated process expires snapshots.
     pub snapshot_expiration: bool,
+    /// Expiration never leaves fewer snapshots than this on `main`.
+    pub snapshot_retain_last: usize,
+    /// Expiration removes the oldest unprotected snapshots beyond this count,
+    /// even inside the retention window. Each commit rewrites all retained history.
+    pub snapshot_max_count: usize,
     pub checkpoint_interval_secs: u64,
     pub retained_checkpoints: usize,
     pub manifest_max_count: usize,
     pub garbage_interval_secs: u64,
     pub orphan_grace_secs: u64,
+    /// Grace for superseded catalog metadata JSON once it leaves the catalog
+    /// metadata log. Defaults to the smaller of 3600 and `orphan_grace_secs`.
+    pub metadata_json_grace_secs: Option<u64>,
+}
+impl Limits {
+    pub fn metadata_json_grace_secs(&self) -> u64 {
+        self.metadata_json_grace_secs
+            .unwrap_or(self.orphan_grace_secs.min(3600))
+    }
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
             journal_bytes: 64 << 30,
             spool_bytes: 32 << 30,
+            spool_transactions: SpoolConfig::default().max_transactions,
+            spool_subtransactions: SpoolConfig::default().max_subtransactions,
             chunk_bytes: 4 << 20,
             source_message_bytes: 32 << 20,
             batch_rows: 1024,
@@ -138,17 +195,50 @@ impl Default for Limits {
             collapse_memory_bytes: 32 << 20,
             parquet_row_group_bytes: 32 << 20,
             pending_transactions: 256,
+            epoch_max_transactions: None,
             table_workers: 4,
             commits_per_second: 100,
             wal_soft_bytes: 16 << 30,
             wal_hard_bytes: 32 << 30,
             snapshot_retention_secs: 3600,
             snapshot_expiration: true,
+            snapshot_retain_last: 128,
+            snapshot_max_count: 1000,
             checkpoint_interval_secs: 300,
             retained_checkpoints: 2,
             manifest_max_count: 64,
             garbage_interval_secs: 300,
             orphan_grace_secs: 86400,
+            metadata_json_grace_secs: None,
+        }
+    }
+}
+/// Anchor a relative `state_dir` to the configuration file, not the working
+/// directory, so every command and supervisor finds the same state.
+fn resolve_state_dir(config: &std::path::Path, state_dir: &std::path::Path) -> Result<PathBuf> {
+    if state_dir.is_absolute() {
+        return Ok(state_dir.to_owned());
+    }
+    let config = std::path::absolute(config).context("resolve configuration path")?;
+    let directory = config
+        .parent()
+        .context("configuration path has no parent directory")?;
+    let relative = state_dir
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect::<PathBuf>();
+    Ok(if relative.as_os_str().is_empty() {
+        directory.to_owned()
+    } else {
+        directory.join(relative)
+    })
+}
+impl Limits {
+    pub fn history_policy(&self) -> flow_coordinator::HistoryPolicy {
+        flow_coordinator::HistoryPolicy {
+            retention: std::time::Duration::from_secs(self.snapshot_retention_secs),
+            retain_last: self.snapshot_retain_last,
+            max_snapshots: self.snapshot_max_count,
         }
     }
 }
@@ -162,7 +252,7 @@ impl Config {
     /// Validate everything except the table list, for `discover`.
     pub fn load_without_tables(path: &std::path::Path) -> Result<Self> {
         let input = std::fs::read_to_string(path).context("read configuration")?;
-        let config: Self = toml::from_str(&input).map_err(|error: toml::de::Error| {
+        let mut config: Self = toml::from_str(&input).map_err(|error: toml::de::Error| {
             // Both source excerpts and serde messages can contain secret values.
             // Retain the location without chaining the original error.
             let offset = error.span().map_or(0, |span| span.start).min(input.len());
@@ -178,6 +268,13 @@ impl Config {
             anyhow::anyhow!("invalid configuration at line {line}, column {column}")
         })?;
         config.validate_source()?;
+        config.state_dir = resolve_state_dir(path, &config.state_dir)?;
+        // Like state_dir, a relative CA bundle belongs to the configuration.
+        if let Some(file) = config.catalog.get_mut("tls_ca_file") {
+            *file = resolve_state_dir(path, std::path::Path::new(file.as_str()))?
+                .to_string_lossy()
+                .into_owned();
+        }
         Ok(config)
     }
 
@@ -195,13 +292,13 @@ impl Config {
             if let Some(name) = properties.remove(&format!("{key}_env")) {
                 // EnvVarError::NotUnicode can include the secret in its Debug output.
                 let value = lookup(&name).ok_or_else(|| {
-                    anyhow::anyhow!(
+                    crate::exit::config(format!(
                         "catalog.{key}_env must name a set, Unicode environment variable"
-                    )
+                    ))
                 })?;
                 ensure!(
                     !value.is_empty(),
-                    "catalog.{key}_env resolved to an empty value"
+                    crate::exit::config(format!("catalog.{key}_env resolved to an empty value"))
                 );
                 properties.insert(key.to_owned(), value);
             }
@@ -251,6 +348,8 @@ impl Config {
         SpoolConfig {
             quota_bytes: l.spool_bytes,
             max_chunk_bytes: l.chunk_bytes,
+            max_transactions: l.spool_transactions,
+            max_subtransactions: l.spool_subtransactions,
             ..SpoolConfig::default()
         }
         .validate()
@@ -263,6 +362,7 @@ impl Config {
                 && l.parquet_row_group_bytes >= l.batch_bytes
                 && l.batch_bytes <= i32::MAX as usize
                 && l.pending_transactions > 0
+                && l.epoch_max_transactions != Some(0)
                 && l.table_workers > 0
                 && l.commits_per_second > 0,
             "invalid batching limits"
@@ -278,8 +378,13 @@ impl Config {
                 && l.manifest_max_count >= 2,
             "invalid history, checkpoint, or manifest maintenance limits"
         );
+        l.history_policy()
+            .validate()
+            .context("invalid snapshot history limits")?;
         ensure!(
-            l.garbage_interval_secs > 0 && l.orphan_grace_secs > 0,
+            l.garbage_interval_secs > 0
+                && l.orphan_grace_secs > 0
+                && l.metadata_json_grace_secs != Some(0),
             "garbage interval and orphan grace must be positive"
         );
         let mut sources = BTreeMap::new();
@@ -320,6 +425,43 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_state_dir_resolves_against_the_configuration_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let example = include_str!("../../../examples/flow.toml");
+        assert!(example.contains("\nstate_dir = \"./data\"\n"));
+        let path = root.path().join("flow.toml");
+        std::fs::write(&path, example).unwrap();
+        let root = std::path::absolute(root.path()).unwrap();
+        assert_eq!(Config::load(&path).unwrap().state_dir, root.join("data"));
+        std::fs::write(&path, example.replacen("./data", "..", 1)).unwrap();
+        assert_eq!(Config::load(&path).unwrap().state_dir, root.join(".."));
+        std::fs::write(&path, example.replacen("./data", ".", 1)).unwrap();
+        assert_eq!(Config::load(&path).unwrap().state_dir, root);
+        std::fs::write(&path, example.replacen("./data", "/srv/flow", 1)).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().state_dir,
+            PathBuf::from("/srv/flow")
+        );
+        let with_ca = |value: &str| {
+            example.replacen(
+                "[catalog]\n",
+                &format!("[catalog]\ntls_ca_file = \"{value}\"\n"),
+                1,
+            )
+        };
+        std::fs::write(&path, with_ca("certs/ca.pem")).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().catalog["tls_ca_file"],
+            root.join("certs/ca.pem").to_string_lossy()
+        );
+        std::fs::write(&path, with_ca("/etc/ssl/ca.pem")).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().catalog["tls_ca_file"],
+            "/etc/ssl/ca.pem"
+        );
+    }
 
     fn valid_config() -> Config {
         toml::from_str(include_str!("../../../examples/flow.toml")).unwrap()
@@ -372,7 +514,21 @@ mod tests {
         type Case = (&'static str, Invalidate, &'static str);
 
         valid_config().validate().unwrap();
-        let cases: [Case; 5] = [
+        let cases: [Case; 8] = [
+            (
+                "no spool transactions",
+                |limits| {
+                    limits.spool_transactions = 0;
+                },
+                "invalid spool limits",
+            ),
+            (
+                "no spool subtransactions",
+                |limits| {
+                    limits.spool_subtransactions = 0;
+                },
+                "invalid spool limits",
+            ),
             (
                 "journal quota below one segment",
                 |limits| {
@@ -409,6 +565,13 @@ mod tests {
                 "zero orphan grace",
                 |limits| {
                     limits.orphan_grace_secs = 0;
+                },
+                "garbage interval and orphan grace must be positive",
+            ),
+            (
+                "zero metadata JSON grace",
+                |limits| {
+                    limits.metadata_json_grace_secs = Some(0);
                 },
                 "garbage interval and orphan grace must be positive",
             ),

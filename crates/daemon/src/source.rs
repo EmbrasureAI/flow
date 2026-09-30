@@ -41,8 +41,23 @@ fn spool_config(config: &Config) -> SpoolConfig {
     SpoolConfig {
         quota_bytes: config.limits.spool_bytes,
         max_chunk_bytes: config.limits.chunk_bytes,
+        max_transactions: config.limits.spool_transactions,
+        max_subtransactions: config.limits.spool_subtransactions,
         ..Default::default()
     }
+}
+
+/// Open the source's CDC journal. Recovery may truncate only a torn tail above
+/// the position the source ledger recorded as durable, never below it.
+pub(crate) fn open_source_journal(
+    config: &Config,
+    ledger: &flow_coordinator::SourceLedger,
+) -> Result<(Journal, flow_ingress_journal::Recovery)> {
+    Ok(Journal::open_with_floor(
+        config.state_dir.join("journal"),
+        crate::services::journal_config(config),
+        ledger.watermarks().journal_durable_lsn,
+    )?)
 }
 
 /// FULL replica identity describes row images, not the uniqueness contract.
@@ -133,12 +148,18 @@ pub(crate) async fn connect_owned(
     replication: bool,
 ) -> Result<(Client, ConnectionTask)> {
     let connection_env = &config.source.connection_env;
-    let url = std::env::var(connection_env).with_context(|| {
-        format!("source connection environment variable is missing: {connection_env}")
+    let url = std::env::var(connection_env).map_err(|_| {
+        crate::exit::config(format!(
+            "source connection environment variable is missing: {connection_env}"
+        ))
     })?;
-    let mut pg: PgConfig = url
-        .parse()
-        .context("invalid PostgreSQL connection settings")?;
+    let mut pg: PgConfig = url.parse().map_err(|error| {
+        // Option names only; values are never echoed. Not retryable.
+        crate::exit::config(format!(
+            "invalid PostgreSQL connection settings in {connection_env}: {}",
+            postgres_error_text(&error)
+        ))
+    })?;
     if replication {
         pg.replication_mode(ReplicationMode::Logical);
     }
@@ -151,7 +172,7 @@ pub(crate) async fn connect_owned(
     let (client, connection) = tokio::time::timeout(Duration::from_secs(30), pg.connect(tls))
         .await
         .context("PostgreSQL connection timed out")?
-        .context("connect to PostgreSQL")?;
+        .map_err(connect_failure)?;
     let connection = ConnectionTask::spawn(connection);
     if !replication {
         source_deadline(async {
@@ -195,6 +216,7 @@ pub(crate) async fn capture_loop(
         let mut registry =
             SchemaRegistry::new(store, SourceId(config.source.id.clone()), &schemas)?;
         let mut delay = Duration::from_millis(250);
+        let mut stall = ReconnectStall::default();
         let mut journal_drained_at = None;
         metrics::gauge!("flow_capture_journal_full").set(0.0);
         loop {
@@ -205,7 +227,8 @@ pub(crate) async fn capture_loop(
             let (client, replication_connection) = match connected {
                 Ok(client) => client,
                 Err(error) if retryable_connection(&error) => {
-                    tracing::warn!(%error, "source reconnect pending");
+                    tracing::warn!(%error, hint = retry_hint(&error), "source reconnect pending");
+                    stall.failed(&config, &error).await;
                     tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
                     delay = (delay * 2).min(Duration::from_secs(30));
                     continue;
@@ -215,6 +238,7 @@ pub(crate) async fn capture_loop(
             let started = source_deadline(async {
                 verify_source_identity(&client, &config, false).await?;
                 let (sql, sql_connection) = connect_owned(&config, false).await?;
+                prepare_heartbeat_session(&sql).await?;
                 validate_slot(&sql, &config, journal.durable_lsn()).await?;
                 // IDENTIFY_SYSTEM above proved this URL on the replication
                 // connection, and this SQL session was opened to it just now; a
@@ -238,16 +262,21 @@ pub(crate) async fn capture_loop(
                     config.limits.source_message_bytes,
                 )
                 .await?;
+                source.set_max_streamed_transactions(config.limits.spool_transactions);
                 let initial_progress = *ack.borrow_and_update();
                 acknowledge_and_reclaim(&mut source, &mut journal, initial_progress).await?;
                 Ok((source, sql, sql_connection, effective_schemas))
             })
             .await;
             let (mut source, sql, sql_connection, effective_schemas) = match started {
-                Ok(source) => source,
-                Err(error) if retryable_connection(&error) => {
+                Ok(source) => {
+                    stall.connected();
+                    source
+                }
+                Err(error) if retryable_connection(&error) || lock_busy(&error) => {
                     drop(replication_connection);
-                    tracing::warn!(%error, "source disconnected during replication setup");
+                    tracing::warn!(%error, hint = retry_hint(&error), "source disconnected during replication setup");
+                    stall.failed(&config, &error).await;
                     tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = send.closed() => return Ok(()) }
                     delay = (delay * 2).min(Duration::from_secs(30));
                     continue;
@@ -289,6 +318,7 @@ pub(crate) async fn capture_loop(
             delay = Duration::from_millis(250);
             let mut group_deadline = None;
             let mut journal_full = None;
+            let mut disk_low = false;
             loop {
                 tokio::select! {
                     biased;
@@ -325,13 +355,17 @@ pub(crate) async fn capture_loop(
                                 tracing::warn!(%error, "source WAL heartbeat disconnected");
                                 break;
                             }
-                            return Err(error.context("Postgres CDC requires EXECUTE on pg_logical_emit_message for idle WAL progress"));
+                            return Err(heartbeat_error(error));
                         }
                     }
                     _ = feedback_tick.tick() => {
                         // Do not hold a validated group across SQL/network waits.
                         flush_capture(&mut assembler, &mut journal, &send)?;
                         group_deadline = None;
+                        if crate::disk::capture_should_pause(&crate::disk::available_space, &config.state_dir, config.storage.min_free_bytes) {
+                            disk_low = true;
+                            break;
+                        }
                         if let Err(error) = source_deadline(registry.initialize(&sql, &config.tables)).await {
                             if retryable_connection(&error) {
                                 tracing::warn!(%error, "source schema refresh interrupted; reconnecting");
@@ -349,6 +383,12 @@ pub(crate) async fn capture_loop(
                                             assembler.drop_table(violation.table)?;
                                         }
                                     }
+                                    publication_checked_at = Instant::now();
+                                }
+                                // Keep streaming; the lock holder's changes still need
+                                // capture. Try again after one full interval.
+                                Err(error) if lock_busy(&error) => {
+                                    tracing::warn!(%error, "publication check deferred while a published table is locked");
                                     publication_checked_at = Instant::now();
                                 }
                                 Err(error) if retryable_connection(&error) => {
@@ -375,19 +415,22 @@ pub(crate) async fn capture_loop(
                                 // Unconfigured publication members never reach
                                 // the registry, projector, quarantine or spool.
                                 let Some(event) = assembler.configured(event) else { continue };
+                                // Inside a streamed transaction, TRUNCATE and undecodable
+                                // Relation or row decisions stay provisional until it commits.
                                 if let SourceEvent::Truncate { xid, subxid, relations, cascade, restart_identity } = &event {
                                     for id in relations {
                                         let table = TableId(*id);
-                                        registry.block(table, "source table was truncated; resynchronization is required")?;
-                                        registry.block_decoder(table, &mut assembler)?;
-                                        assembler.quarantine(SourceEvent::Truncate { xid:*xid,subxid:*subxid,
+                                        let relation = registry.saved_relation(table)?;
+                                        registry.quarantine(table, SourceEvent::Truncate { xid:*xid,subxid:*subxid,
                                             relations:vec![*id],cascade:*cascade,restart_identity:*restart_identity },
-                                            &registry.saved_relation(table)?)?;
+                                            &relation, "source table was truncated; resynchronization is required", &mut assembler)?;
                                     }
                                     continue;
                                 }
                                 let event = if let SourceEvent::Relation(relation) = &event {
                                     let id = TableId(relation.id);
+                                    // Each streamed Relation replaces its transaction's wire shape.
+                                    if assembler.streaming().is_some() { assembler.set_undecodable(id, None)?; }
                                     let projected = if registry.is_blocked(id) {
                                         SourceEvent::Relation(projector.quarantine_relation(relation))
                                     } else {
@@ -396,36 +439,46 @@ pub(crate) async fn capture_loop(
                                             Err(error) => {
                                                 let error = anyhow::Error::new(error);
                                                 if !crate::schema::table_schema_error(&error) { return Err(error); }
-                                                registry.block(id, crate::schema::schema_block_reason(&error))?;
+                                                registry.reject_relation(id, crate::schema::schema_block_reason(&error), &mut assembler)?;
                                                 SourceEvent::Relation(projector.quarantine_relation(relation))
                                             }
                                         }
                                     };
                                     let SourceEvent::Relation(projected_relation) = &projected else { unreachable!() };
-                                    if !registry.is_blocked(id)
+                                    if !registry.is_blocked(id) && !assembler.is_undecodable(id)
                                         && let Err(error) = source_deadline(registry.observe_relation(&sql, projected_relation, &mut assembler)).await {
                                             if retryable_connection(&error) { break; }
                                             if !crate::schema::table_schema_error(&error) { return Err(error); }
-                                            registry.block(id, crate::schema::schema_block_reason(&error))?;
+                                            registry.reject_relation(id, crate::schema::schema_block_reason(&error), &mut assembler)?;
                                         }
                                     wire_relations.insert(relation.id, projected_relation.clone());
                                     if registry.is_blocked(id) {
                                         registry.block_decoder(id, &mut assembler)?;
                                         continue;
                                     }
+                                    // Keep the committed decoder for other transactions.
+                                    if assembler.is_undecodable(id) { continue; }
                                     projected
                                 } else { projector.project(event)? };
                                 let row_table = match &event {
-                                    SourceEvent::Insert { relation, .. } | SourceEvent::Update { relation, .. }
-                                    | SourceEvent::Delete { relation, .. } => Some(TableId(*relation)),
+                                    SourceEvent::Insert { xid, relation, .. } | SourceEvent::Update { xid, relation, .. }
+                                    | SourceEvent::Delete { xid, relation, .. } => Some((*xid, TableId(*relation))),
                                     _ => None,
                                 };
-                                if let Some(id) = row_table
-                                    && registry.is_blocked(id) {
-                                        registry.block_decoder(id, &mut assembler)?;
-                                        assembler.quarantine(event, wire_relations.get(&id.0).context("row before source relation")?)?;
+                                if let Some((xid, id)) = row_table {
+                                    let reason = if registry.is_blocked(id) {
+                                        Some("source table is blocked".to_owned())
+                                    } else {
+                                        assembler.provisional_block(xid, id).map(str::to_owned)
+                                    };
+                                    if let Some(reason) = reason {
+                                        registry.quarantine(id, event, wire_relations.get(&id.0).context("row before source relation")?, &reason, &mut assembler)?;
                                         continue;
                                     }
+                                }
+                                if let SourceEvent::Commit { xid, .. } = &event {
+                                    registry.commit_provisional(*xid, &mut assembler)?;
+                                }
                                 if let SourceEvent::Commit { xid, end_lsn, .. } = &event
                                     && *end_lsn > journal.staged_lsn() {
                                     if registry.validation_may_query() {
@@ -450,13 +503,12 @@ pub(crate) async fn capture_loop(
                                 registry.observe_nulls(&event, &mut assembler)?;
                                 let retained = row_table.map(|_| event.clone());
                                 let commit_xid = match &event { SourceEvent::Commit { xid, .. } => Some(*xid), _ => None };
+                                let ended = commit_xid.is_some() || matches!(&event, SourceEvent::Abort { .. });
                                 if let Err(error) = assembler.push_buffered_at(event, source.received_lsn, &mut journal) {
-                                    if let Some(id) = row_table
-                                        && matches!(&error, flow_pg_source::Error::Row(_) | flow_pg_source::Error::Value(_)
-                                            | flow_pg_source::Error::ReplicaIdentity(_) | flow_pg_source::Error::DefaultIdentity(_) | flow_pg_source::Error::UnchangedToast(_)) {
-                                            registry.block(id, crate::schema::schema_block_reason(&error.into()))?;
-                                            registry.block_decoder(id, &mut assembler)?;
-                                            assembler.quarantine(retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?)?;
+                                    if let Some((_, id)) = row_table
+                                        && table_scoped(&error) {
+                                            let reason = table_block_reason(error);
+                                            registry.quarantine(id, retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?, &reason, &mut assembler)?;
                                             continue;
                                         }
                                     if let Some(xid) = commit_xid
@@ -470,6 +522,7 @@ pub(crate) async fn capture_loop(
                                         }
                                     return Err(error.into());
                                 }
+                                if ended { registry.forget_unused_candidates(&assembler); }
                                 if assembler.pending_commit_count() > 0 {
                                     group_deadline.get_or_insert_with(|| tokio::time::Instant::now() + JOURNAL_GROUP_DELAY);
                                     if assembler.pending_commit_count() >= JOURNAL_GROUP_TRANSACTIONS
@@ -483,6 +536,12 @@ pub(crate) async fn capture_loop(
                             Err(flow_pg_source::Error::Postgres(error)) if retryable_postgres(&error) => {
                                 tracing::warn!(%error, "source disconnected; reconnecting from durable journal"); break;
                             }
+                            Err(flow_pg_source::Error::Postgres(error)) if rejected_message(&error) => {
+                                return Err(anyhow::Error::new(error).context(format!(
+                                    "a replication message was malformed or exceeded limits.source_message_bytes ({} bytes) before its table could be identified; capture stopped for all tables. Raise the limit above the largest row change (an UPDATE carries both row images)",
+                                    config.limits.source_message_bytes
+                                )));
+                            }
                             Err(error) => return Err(error.into()),
                         }
                     }
@@ -493,6 +552,21 @@ pub(crate) async fn capture_loop(
             flush_capture(&mut assembler, &mut journal, &send)?;
             drop(sql_connection);
             drop(replication_connection);
+            if disk_low {
+                if !wait_for_free_space(
+                    &mut journal,
+                    &mut ack,
+                    &send,
+                    &config.state_dir,
+                    config.storage.min_free_bytes,
+                    &crate::disk::available_space,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                continue;
+            }
             if let Some(xid) = journal_full {
                 if !wait_for_journal_drain(
                     &mut journal,
@@ -518,6 +592,7 @@ pub(crate) async fn capture_loop(
         result = capture => result,
     };
     if let Err(error) = result {
+        crate::exit::remember_capture_stop(&error);
         send.send_replace(CaptureProgress {
             durable_lsn: journal.durable_lsn(),
             error: Some(format!("{error:#}")),
@@ -594,6 +669,63 @@ async fn wait_for_journal_drain(
     Ok(drained)
 }
 
+/// Low free space on the state volume pauses capture like a full journal:
+/// journaled work keeps draining through publication (reclaiming segments)
+/// while the slot retains the unjournaled WAL. Optional maintenance and
+/// checkpoints are suppressed meanwhile. Returns false when the coordinator
+/// stops capture while waiting.
+async fn wait_for_free_space(
+    journal: &mut Journal,
+    ack: &mut watch::Receiver<Acknowledgement>,
+    send: &watch::Sender<CaptureProgress>,
+    state_dir: &std::path::Path,
+    min_free_bytes: u64,
+    available: &crate::disk::SpaceProbe,
+) -> Result<bool> {
+    const WARNING_INTERVAL: Duration = Duration::from_secs(300);
+    let _pause = crate::disk::SpacePause::start(state_dir);
+    journal.reclaim(ack.borrow_and_update().materialized)?;
+    let started = Instant::now();
+    let mut warned = started;
+    let mut poll = tokio::time::interval(Duration::from_secs(5));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let resumed = loop {
+        tokio::select! {
+            _ = send.closed() => break false,
+            changed = ack.changed() => {
+                if changed.is_err() {
+                    break false;
+                }
+                journal.reclaim(ack.borrow_and_update().materialized)?;
+            }
+            _ = poll.tick() => {
+                let free = crate::disk::measure(available, state_dir);
+                if free.is_some_and(|free| free >= crate::disk::resume_bytes(min_free_bytes)) {
+                    break true;
+                }
+                if warned.elapsed() >= WARNING_INTERVAL {
+                    warned = Instant::now();
+                    tracing::warn!(
+                        available_bytes = free,
+                        resume_bytes = crate::disk::resume_bytes(min_free_bytes),
+                        paused_seconds = started.elapsed().as_secs(),
+                        journal_bytes = journal.bytes_used(),
+                        "capture still paused for state volume free space; the source slot retains WAL meanwhile"
+                    );
+                }
+            }
+        }
+    };
+    if resumed {
+        tracing::info!(
+            paused_seconds = started.elapsed().as_secs_f64(),
+            journal_bytes = journal.bytes_used(),
+            "state volume free space recovered; resuming capture"
+        );
+    }
+    Ok(resumed)
+}
+
 /// Publish observations only after the shared journal reader frontier is durable.
 fn flush_capture(
     assembler: &mut CaptureAssembler,
@@ -633,7 +765,9 @@ pub(crate) fn record_journaled(transaction: &flow_model::SourceTransaction) {
                 .record(latency as f64 / 1_000_000.0);
         }
     }
-    tracing::info!(
+    // Per-transaction evidence; enable with RUST_LOG=info,flow_events=debug.
+    tracing::debug!(
+        target: "flow_events",
         event = "transaction_journaled",
         source_id = %transaction.source_id.0,
         xid = transaction.xid,
@@ -645,35 +779,363 @@ pub(crate) fn record_journaled(transaction: &flow_model::SourceTransaction) {
     );
 }
 
-fn retryable_postgres(error: &flow_pg_source::tokio_postgres::Error) -> bool {
-    // Malformed or over-limit advertised frames cannot be repaired by replay.
-    // Treat transport admission failures as fatal rather than reconnecting to
-    // the same unprocessable row forever.
+/// Settings the server or TLS peer rejected before any SQL (a missing
+/// password, an unsupported authentication method, a refused or unverified
+/// TLS handshake) recur on every attempt and need an operator. Transport
+/// failures, including a socket error during the handshake, stay retryable.
+fn connect_failure(error: flow_pg_source::tokio_postgres::Error) -> anyhow::Error {
+    let text = postgres_error_text(&error);
+    let mut cause = std::error::Error::source(&error);
+    let mut transport = false;
+    while let Some(error) = cause {
+        transport |= error.is::<std::io::Error>();
+        cause = error.source();
+    }
+    let settings = error.code().is_none()
+        && !transport
+        && [
+            "invalid configuration",
+            "authentication error",
+            "error performing TLS handshake",
+        ]
+        .iter()
+        .any(|kind| text.starts_with(kind));
+    if settings {
+        crate::exit::config(format!("connect to PostgreSQL: {text}"))
+    } else {
+        anyhow::Error::new(error).context("connect to PostgreSQL")
+    }
+}
+
+/// The driver's kind followed by its causes; its own Display is the kind only.
+fn postgres_error_text(error: &flow_pg_source::tokio_postgres::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = std::error::Error::source(error);
+    while let Some(error) = cause {
+        text = format!("{text}: {error}");
+        cause = error.source();
+    }
+    text
+}
+
+/// The heartbeat commits on capture's SQL session. With a matching
+/// `synchronous_standby_names`, Flow's own walsender can be the synchronous
+/// standby; a remote-ack commit would then wait for the capture loop it blocks.
+async fn prepare_heartbeat_session(sql: &Client) -> Result<()> {
+    sql.batch_execute("SET synchronous_commit = local").await?;
+    Ok(())
+}
+
+/// Name the missing grant only when PostgreSQL reported one.
+fn heartbeat_error(error: anyhow::Error) -> anyhow::Error {
+    let denied = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<flow_pg_source::tokio_postgres::Error>()
+            .and_then(flow_pg_source::tokio_postgres::Error::code)
+            == Some(&SqlState::INSUFFICIENT_PRIVILEGE)
+    });
+    error.context(if denied {
+        "Postgres CDC requires EXECUTE on pg_logical_emit_message for idle WAL progress"
+    } else {
+        "source WAL heartbeat failed"
+    })
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    /// Serve one scripted response to a connecting client.
+    async fn scripted_server(response: &'static [u8]) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 512];
+            let _ = stream.read(&mut request).await;
+            stream.write_all(response).await.unwrap();
+            // Hold the socket until the client gives up.
+            let _ = stream.read(&mut request).await;
+        });
+        address
+    }
+
+    async fn connect_error(settings: &str) -> anyhow::Error {
+        let pg: PgConfig = settings.parse().unwrap();
+        let tls =
+            postgres_native_tls::MakeTlsConnector::new(native_tls::TlsConnector::new().unwrap());
+        connect_failure(pg.connect(tls).await.err().unwrap())
+    }
+
+    #[tokio::test]
+    async fn rejected_connection_settings_are_not_retried() {
+        let parsed = "host=localhost port=notaport password=hunter2"
+            .parse::<PgConfig>()
+            .unwrap_err();
+        let text = postgres_error_text(&parsed);
+        assert_eq!(
+            text,
+            "invalid connection string: invalid value for option `port`"
+        );
+        // The raw driver error would be retried; the settings error is not.
+        assert!(retryable_connection(&parsed.into()));
+        assert!(!crate::retry::startup_transient(&crate::exit::config(text)));
+
+        // TLS required, but the server declines it.
+        let server = scripted_server(b"N").await;
+        let error = connect_error(&format!(
+            "host=127.0.0.1 port={} user=flow sslmode=require",
+            server.port()
+        ))
+        .await;
+        assert_eq!(crate::exit::classify(&error).0, crate::exit::Class::Config);
+        assert!(!crate::retry::startup_transient(&error), "{error:#}");
+
+        // The server asks for a cleartext password the settings lack.
+        let server = scripted_server(b"R\0\0\0\x08\0\0\0\x03").await;
+        let error = connect_error(&format!(
+            "host=127.0.0.1 port={} user=flow sslmode=disable",
+            server.port()
+        ))
+        .await;
+        assert!(
+            format!("{error:#}").contains("password missing"),
+            "{error:#}"
+        );
+        assert_eq!(crate::exit::classify(&error).0, crate::exit::Class::Config);
+
+        // Network failures stay retryable.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let error = connect_error(&format!(
+            "host=127.0.0.1 port={port} user=flow sslmode=disable"
+        ))
+        .await;
+        assert!(crate::retry::startup_transient(&error), "{error:#}");
+        assert_eq!(
+            crate::exit::classify(&error).0,
+            crate::exit::Class::Unavailable
+        );
+    }
+
+    #[test]
+    fn heartbeat_failures_name_a_missing_grant_only_when_reported() {
+        let error = heartbeat_error(anyhow::anyhow!("server closed the connection"));
+        assert_eq!(
+            format!("{error:#}"),
+            "source WAL heartbeat failed: server closed the connection"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+    async fn live_heartbeat_session_commits_without_synchronous_standbys() {
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.source.connection_env = "FLOW_POSTGRES_URL".into();
+        let (sql, _connection) = connect_owned(&config, false).await.unwrap();
+        prepare_heartbeat_session(&sql).await.unwrap();
+        let setting: String = sql
+            .query_one("SHOW synchronous_commit", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(setting, "local");
+    }
+}
+
+/// Row errors confined to one identifiable table. Capture durably blocks and
+/// quarantines that table instead of stopping every table.
+fn table_scoped(error: &flow_pg_source::Error) -> bool {
+    use flow_pg_source::Error;
+    matches!(
+        error,
+        Error::Row(_)
+            | Error::Value(_)
+            | Error::ReplicaIdentity(_)
+            | Error::DefaultIdentity(_)
+            | Error::UnchangedToast(_)
+            | Error::AppendOnly { .. }
+            | Error::RowLimit { .. }
+    )
+}
+
+/// Row decoding errors keep their fixed schema reasons, which never include
+/// source values; limit and contract errors name the setting to change.
+fn table_block_reason(error: flow_pg_source::Error) -> String {
+    match error {
+        error @ (flow_pg_source::Error::AppendOnly { .. }
+        | flow_pg_source::Error::RowLimit { .. }) => error.to_string(),
+        error => crate::schema::schema_block_reason(&error.into()).to_owned(),
+    }
+}
+
+/// The transport rejected a malformed or over-limit advertised frame. Replay
+/// would reach the same unprocessable message, so reconnecting cannot help.
+fn rejected_message(error: &flow_pg_source::tokio_postgres::Error) -> bool {
     let mut cause = std::error::Error::source(error);
     while let Some(error) = cause {
         if error
             .downcast_ref::<std::io::Error>()
             .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
         {
-            return false;
+            return true;
         }
         cause = error.source();
     }
-    // PostgreSQL sends ErrorResponse before closing an administratively stopped
-    // connection. Retry those connection failures, not arbitrary SQL errors such
-    // as authentication failures, missing slots, or invalid replication options.
-    error.code().is_none_or(|code| {
-        matches!(
-            *code,
-            SqlState::ADMIN_SHUTDOWN
-                | SqlState::CRASH_SHUTDOWN
-                | SqlState::CANNOT_CONNECT_NOW
-                | SqlState::CONNECTION_EXCEPTION
-                | SqlState::CONNECTION_DOES_NOT_EXIST
-                | SqlState::CONNECTION_FAILURE
-                | SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION
-        )
+    false
+}
+
+fn retryable_postgres(error: &flow_pg_source::tokio_postgres::Error) -> bool {
+    !rejected_message(error) && error.code().is_none_or(retryable_sqlstate)
+}
+
+/// PostgreSQL sends ErrorResponse before closing an administratively stopped
+/// connection. Retry those connection failures, not arbitrary SQL errors such
+/// as authentication failures, missing slots, or invalid replication options.
+/// A slot still held by a previous walsender (55006) is released once that
+/// backend notices the disconnect or reaches `wal_sender_timeout`, and a full
+/// server (53300) frees connections on its own: both retry with backoff.
+fn retryable_sqlstate(code: &SqlState) -> bool {
+    matches!(
+        *code,
+        SqlState::ADMIN_SHUTDOWN
+            | SqlState::CRASH_SHUTDOWN
+            | SqlState::CANNOT_CONNECT_NOW
+            | SqlState::CONNECTION_EXCEPTION
+            | SqlState::CONNECTION_DOES_NOT_EXIST
+            | SqlState::CONNECTION_FAILURE
+            | SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION
+            | SqlState::OBJECT_IN_USE
+            | SqlState::TOO_MANY_CONNECTIONS
+    )
+}
+
+/// A catalog read gave up waiting for a lock held by another transaction.
+fn lock_busy(error: &anyhow::Error) -> bool {
+    retry_code(error) == Some(&SqlState::LOCK_NOT_AVAILABLE)
+}
+
+fn retry_code(error: &anyhow::Error) -> Option<&SqlState> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<flow_pg_source::tokio_postgres::Error>()
+            .and_then(|error| error.code())
     })
+}
+
+/// Operator guidance for retried conditions that are not disconnects.
+fn retry_hint(error: &anyhow::Error) -> &'static str {
+    match retry_code(error) {
+        Some(&SqlState::OBJECT_IN_USE) => {
+            "the replication slot is active in another session, usually this daemon's previous walsender; retrying until PostgreSQL releases it (at most wal_sender_timeout). If it persists, find the holder in pg_replication_slots.active_pid"
+        }
+        Some(&SqlState::TOO_MANY_CONNECTIONS) => {
+            "PostgreSQL has no free connection slots for this role, database or server; retrying"
+        }
+        Some(&SqlState::LOCK_NOT_AVAILABLE) => {
+            "another transaction holds an ACCESS EXCLUSIVE lock on a published table (a long TRUNCATE or ALTER); retrying until it ends"
+        }
+        _ => "retrying with backoff",
+    }
+}
+
+/// Reconnect retries have no attempt bound, so a slot that stays held or a
+/// server that stays full would otherwise stall capture with only warnings.
+/// Past this, or twice `wal_sender_timeout` when readable, it is reported.
+const RECONNECT_STALL_AFTER: Duration = Duration::from_secs(300);
+
+/// Tracks one run of failed (re)connect attempts for capture.
+#[derive(Default)]
+struct ReconnectStall {
+    since: Option<tokio::time::Instant>,
+    /// Raised to twice `wal_sender_timeout` once that has been read.
+    threshold: Option<Duration>,
+    reported: bool,
+}
+
+impl ReconnectStall {
+    fn connected(&mut self) {
+        if self.reported {
+            tracing::info!(
+                stalled_seconds = self
+                    .since
+                    .map_or(0.0, |since| since.elapsed().as_secs_f64()),
+                "source capture reconnected"
+            );
+        }
+        *self = Self::default();
+        metrics::gauge!("flow_capture_connected").set(1.0);
+        metrics::gauge!("flow_capture_reconnect_stalled").set(0.0);
+    }
+
+    /// Count a failed attempt. Returns how long attempts have been failing
+    /// once that first reaches the report threshold.
+    fn record_failure(&mut self, error: &anyhow::Error) -> Option<Duration> {
+        let reason = match retry_code(error) {
+            Some(&SqlState::OBJECT_IN_USE) => "slot_in_use",
+            Some(&SqlState::TOO_MANY_CONNECTIONS) => "too_many_connections",
+            _ => "unavailable",
+        };
+        metrics::counter!("flow_capture_reconnect_failures_total", "reason" => reason).increment(1);
+        metrics::gauge!("flow_capture_connected").set(0.0);
+        let elapsed = self
+            .since
+            .get_or_insert_with(tokio::time::Instant::now)
+            .elapsed();
+        (!self.reported && elapsed >= self.threshold.unwrap_or(RECONNECT_STALL_AFTER))
+            .then_some(elapsed)
+    }
+
+    /// Returns true when this stall should be reported now; false defers it
+    /// until a stale walsender could still be releasing the slot.
+    fn should_report(&mut self, elapsed: Duration, wal_sender_timeout: Option<Duration>) -> bool {
+        let threshold = wal_sender_timeout.map_or(RECONNECT_STALL_AFTER, |timeout| {
+            RECONNECT_STALL_AFTER.max(timeout * 2)
+        });
+        if elapsed < threshold {
+            self.threshold = Some(threshold);
+            return false;
+        }
+        self.reported = true;
+        true
+    }
+
+    async fn failed(&mut self, config: &Config, error: &anyhow::Error) {
+        let Some(elapsed) = self.record_failure(error) else {
+            return;
+        };
+        // Best effort: a full server or an outage can also refuse this query.
+        let holder = source_deadline(async {
+            let (sql, _connection) = connect_owned(config, false).await?;
+            let row = sql
+                .query_one(
+                    "SELECT (SELECT active_pid FROM pg_catalog.pg_replication_slots WHERE slot_name = $1), (SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name = 'wal_sender_timeout')",
+                    &[&config.source.slot],
+                )
+                .await?;
+            Ok((row.get::<_, Option<i32>>(0), row.get::<_, Option<i64>>(1)))
+        })
+        .await;
+        let (active_pid, timeout_ms) = holder.as_ref().map_or((None, None), |held| *held);
+        let wal_sender_timeout = timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| Duration::from_millis(ms as u64));
+        if !self.should_report(elapsed, wal_sender_timeout) {
+            return;
+        }
+        metrics::gauge!("flow_capture_reconnect_stalled").set(1.0);
+        tracing::error!(
+            %error,
+            hint = retry_hint(error),
+            slot = %config.source.slot,
+            active_pid,
+            stalled_seconds = elapsed.as_secs_f64(),
+            "source capture cannot reconnect; no changes are being captured while retries continue"
+        );
+    }
 }
 
 pub(crate) fn retryable_connection(error: &anyhow::Error) -> bool {
@@ -731,7 +1193,7 @@ pub(crate) async fn verify_source_identity(
     match std::fs::read(&path) {
         Ok(bytes) => {
             let expected: SourceIdentity = serde_json::from_slice(&bytes).context("invalid saved source identity")?;
-            ensure!(identity == expected, "PostgreSQL source system, database, timeline, or slot lineage changed; coordinated failover/resynchronization is required");
+            ensure!(identity == expected, crate::exit::resync("PostgreSQL source system, database, timeline, or slot lineage changed; coordinated failover/resynchronization is required"));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && initialize => {
             let temporary = path.with_extension("json.tmp");
@@ -748,17 +1210,21 @@ pub(crate) async fn verify_source_identity(
 
 async fn validate_slot(client: &Client, config: &Config, durable_lsn: PgLsn) -> Result<()> {
     let row = client.query_opt("SELECT plugin, slot_type, database = current_database(), confirmed_flush_lsn::text, restart_lsn::text, wal_status FROM pg_catalog.pg_replication_slots WHERE slot_name = $1", &[&config.source.slot]).await?
-        .context("replication slot disappeared; source resynchronization is required")?;
+        .ok_or_else(|| crate::exit::resync("replication slot disappeared; source resynchronization is required"))?;
     ensure!(
         row.get::<_, Option<String>>(0).as_deref() == Some("pgoutput")
             && row.get::<_, String>(1) == "logical"
             && row.get::<_, Option<bool>>(2) == Some(true),
-        "replication slot plugin/type/database differs from the initialized source"
+        crate::exit::resync(
+            "replication slot plugin/type/database differs from the initialized source"
+        )
     );
     ensure!(
         row.get::<_, Option<String>>(5).as_deref() != Some("lost")
             && row.get::<_, Option<String>>(4).is_some(),
-        "replication slot lost required WAL; source resynchronization is required"
+        crate::exit::resync(
+            "replication slot lost required WAL; source resynchronization is required"
+        )
     );
     let confirmed: PgLsn = row
         .get::<_, Option<String>>(3)
@@ -766,7 +1232,9 @@ async fn validate_slot(client: &Client, config: &Config, durable_lsn: PgLsn) -> 
         .parse()?;
     ensure!(
         confirmed <= durable_lsn,
-        "PostgreSQL slot has acknowledged beyond the local durable journal; another consumer or storage loss requires source reconciliation"
+        crate::exit::resync(
+            "PostgreSQL slot has acknowledged beyond the local durable journal; another consumer or storage loss requires source reconciliation"
+        )
     );
     Ok(())
 }
@@ -821,7 +1289,9 @@ pub(crate) async fn source_identity_matches(client: &Client, config: &Config) ->
     ensure!(
         row.try_get::<_, String>(0)? == expected.system_identifier
             && row.try_get::<_, String>(1)? == expected.database,
-        "PostgreSQL source system or database changed; coordinated failover/resynchronization is required"
+        crate::exit::resync(
+            "PostgreSQL source system or database changed; coordinated failover/resynchronization is required"
+        )
     );
     Ok(true)
 }
@@ -986,8 +1456,13 @@ async fn publication_facts(
     publication: &str,
     relations: &[u32],
 ) -> Result<PublicationFacts> {
+    // On PostgreSQL 16+, pg_publication_tables opens each member relation, so
+    // a long TRUNCATE or ALTER holding ACCESS EXCLUSIVE would stall the check,
+    // and with it capture. Give up quickly; callers retry later.
     client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL lock_timeout = '1s'",
+        )
         .await?;
     let facts = read_publication_facts(client, publication, relations).await;
     let end = client
@@ -1334,6 +1809,87 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn low_free_space_pauses_capture_until_the_volume_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut journal, _) = Journal::open(
+            directory.path(),
+            JournalConfig {
+                segment_bytes: 600,
+                quota_bytes: 2_400,
+                max_frame_bytes: 400,
+                max_open_transactions: 8,
+            },
+        )
+        .unwrap();
+        for xid in 1..=3 {
+            commit_test_transaction(&mut journal, xid, &[xid as u8; 300]);
+        }
+        let durable = journal.durable_lsn();
+        let journaled_bytes = journal.bytes_used();
+        let (acknowledge, mut ack) = watch::channel(Acknowledgement::default());
+        let (send, _progress) = watch::channel(CaptureProgress {
+            durable_lsn: durable,
+            error: None,
+            publication_changed: false,
+        });
+        let free = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(99));
+        let probe_free = free.clone();
+        let probe =
+            move |_: &std::path::Path| Ok(probe_free.load(std::sync::atomic::Ordering::SeqCst));
+        let state_dir = directory.path().to_owned();
+        assert!(crate::disk::capture_should_pause(&probe, &state_dir, 100));
+        let paused_dir = state_dir.clone();
+        let waiting = tokio::spawn(async move {
+            let resumed =
+                wait_for_free_space(&mut journal, &mut ack, &send, &state_dir, 100, &probe)
+                    .await
+                    .unwrap();
+            (resumed, journal)
+        });
+        // Publication progress still reclaims the journal while paused.
+        acknowledge.send_replace(Acknowledgement {
+            received: durable,
+            durable,
+            materialized: durable,
+        });
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(
+            !waiting.is_finished(),
+            "capture resumed below the watermark"
+        );
+        assert!(crate::disk::capture_paused_for_space(&paused_dir));
+        // At the watermark is not enough; resume a quarter above it.
+        free.store(110, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(!waiting.is_finished(), "capture flapped at the watermark");
+        free.store(125, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let (resumed, journal) = waiting.await.unwrap();
+        assert!(resumed);
+        assert!(journal.bytes_used() < journaled_bytes);
+        assert!(!crate::disk::capture_paused_for_space(&paused_dir));
+    }
+
+    #[tokio::test]
+    async fn free_space_wait_stops_with_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut journal, _) = Journal::open(directory.path(), JournalConfig::default()).unwrap();
+        let (_acknowledge, mut ack) = watch::channel(Acknowledgement::default());
+        let (send, progress) = watch::channel(CaptureProgress {
+            durable_lsn: journal.durable_lsn(),
+            error: None,
+            publication_changed: false,
+        });
+        drop(progress);
+        let low = |_: &std::path::Path| Ok(0);
+        assert!(
+            !wait_for_free_space(&mut journal, &mut ack, &send, directory.path(), 100, &low)
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn journal_drain_wait_stops_with_capture() {
         let directory = tempfile::tempdir().unwrap();
@@ -1442,6 +1998,146 @@ mod tests {
             observed.await.is_err(),
             "driver must release resources on reconnect"
         );
+    }
+
+    /// Runtime and bootstrap open the CDC journal through this helper, so a
+    /// torn tail below the ledger's durable position refuses startup untouched.
+    #[test]
+    fn source_journal_refuses_to_truncate_below_the_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().to_owned();
+        config.source.id = "source".into();
+        let store = StateStore::open(
+            root.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let mut ledger = crate::services::ledger(&store, &config).unwrap();
+        let (mut journal, _) = open_source_journal(&config, &ledger).unwrap();
+        for xid in 1..=3 {
+            commit_test_transaction(&mut journal, xid, &[xid as u8; 100]);
+        }
+        let transactions = journal
+            .transactions()
+            .iter()
+            .unwrap()
+            .collect::<flow_ingress_journal::Result<Vec<_>>>()
+            .unwrap();
+        ledger.journaled_batch(&transactions).unwrap();
+        assert_eq!(ledger.watermarks().journal_durable_lsn, PgLsn(31));
+        drop(journal);
+        let segment = root
+            .path()
+            .join("journal")
+            .join("00000000000000000000.segment");
+        let length = std::fs::metadata(&segment).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .unwrap()
+            .set_len(length - 5)
+            .unwrap();
+        let torn = std::fs::read(&segment).unwrap();
+        let error = open_source_journal(&config, &ledger).err().unwrap();
+        assert!(
+            matches!(
+                error.downcast_ref::<flow_ingress_journal::Error>(),
+                Some(flow_ingress_journal::Error::DurableTail {
+                    recovered: PgLsn(21),
+                    floor: PgLsn(31),
+                    ..
+                })
+            ),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&segment).unwrap(), torn);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_reconnect_failure_is_reported_after_a_bounded_time() {
+        let error = anyhow::anyhow!("slot held");
+        let mut stall = ReconnectStall::default();
+        assert_eq!(stall.record_failure(&error), None);
+        tokio::time::advance(RECONNECT_STALL_AFTER - Duration::from_secs(1)).await;
+        assert_eq!(stall.record_failure(&error), None);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let elapsed = stall.record_failure(&error).unwrap();
+        // A long wal_sender_timeout may still be releasing a stale slot.
+        assert!(!stall.should_report(elapsed, Some(Duration::from_secs(600))));
+        tokio::time::advance(Duration::from_secs(599)).await;
+        assert_eq!(stall.record_failure(&error), None);
+        tokio::time::advance(Duration::from_secs(301)).await;
+        let elapsed = stall.record_failure(&error).unwrap();
+        assert!(stall.should_report(elapsed, Some(Duration::from_secs(600))));
+        // Reported once per stall, and a successful start resets it.
+        assert_eq!(stall.record_failure(&error), None);
+        stall.connected();
+        assert_eq!(stall.record_failure(&error), None);
+        tokio::time::advance(RECONNECT_STALL_AFTER).await;
+        let elapsed = stall.record_failure(&error).unwrap();
+        assert!(stall.should_report(elapsed, None));
+    }
+
+    #[test]
+    fn busy_slot_and_full_server_retry_but_other_sql_errors_do_not() {
+        for code in [SqlState::OBJECT_IN_USE, SqlState::TOO_MANY_CONNECTIONS] {
+            assert!(retryable_sqlstate(&code), "{code:?}");
+        }
+        for code in [
+            SqlState::INVALID_PASSWORD,
+            SqlState::UNDEFINED_OBJECT,
+            SqlState::INSUFFICIENT_PRIVILEGE,
+            SqlState::PROTOCOL_VIOLATION,
+        ] {
+            assert!(!retryable_sqlstate(&code), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn append_only_changes_and_oversized_rows_block_only_their_table() {
+        use flow_pg_source::Error;
+        let append_only = Error::AppendOnly {
+            table: 7,
+            operation: "DELETE",
+        };
+        assert!(table_scoped(&append_only));
+        let reason = table_block_reason(append_only);
+        assert!(
+            reason.contains("append-only table 7 received DELETE")
+                && reason.contains("resynchronization or append_only = false"),
+            "{reason}"
+        );
+        let oversized = Error::RowLimit {
+            table: 7,
+            bytes: 5 << 20,
+            limit: 4 << 20,
+        };
+        assert!(table_scoped(&oversized));
+        assert!(table_block_reason(oversized).contains("limits.chunk_bytes"));
+        // Existing row errors keep their fixed reasons, free of source values.
+        let toast = Error::UnchangedToast(7);
+        assert!(table_scoped(&toast));
+        assert_eq!(
+            table_block_reason(toast),
+            "source row has unresolved unchanged TOAST values"
+        );
+        // Shared capture state and transaction-wide limits stay source-wide.
+        for error in [
+            Error::SpoolQuota {
+                used: 1,
+                requested: 2,
+                quota: 2,
+            },
+            Error::SpoolTransactions { limit: 1 },
+            Error::SpoolSubtransactions { xid: 1, limit: 1 },
+            Error::Config("capture configuration"),
+            Error::Protocol("framing"),
+            Error::Journal(flow_ingress_journal::Error::Corrupt),
+        ] {
+            assert!(!table_scoped(&error), "{error}");
+        }
     }
 
     #[test]
@@ -1814,3 +2510,7 @@ mod tests {
 #[cfg(test)]
 #[path = "publication_tests.rs"]
 mod publication_tests;
+
+#[cfg(test)]
+#[path = "source_live_tests.rs"]
+mod source_live_tests;
