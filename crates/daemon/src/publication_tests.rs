@@ -283,7 +283,7 @@ async fn publication_check_scopes_violations_to_tables_and_reads_one_snapshot() 
     };
     let log = || std::mem::take(&mut catalog.lock().unwrap().log);
     let snapshot = [
-        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL lock_timeout = '1s'",
         "Version",
         "Publication",
         "Members",
