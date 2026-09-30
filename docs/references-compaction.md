@@ -136,8 +136,9 @@ replaces a catalog pointer, register that immutable JSON with the manifest attem
 Schema and expiration-only commits register the same pointer durably before commit.
 A durable per-object clock requires a full grace after first observing an
 unreferenced file, independently of upload/fence age. Retained references reset
-that clock. Check absence before deleting obsolete siblings of a partially live
-owner, so repeat sweeps do not create endless S3 delete markers.
+that clock. JSON uses `limits.metadata_json_grace_secs`, other objects
+`limits.orphan_grace_secs`. Check absence before deleting obsolete siblings of a
+partially live owner, so repeat sweeps do not create endless S3 delete markers.
 
 Current metadata and all catalog metadata-log entries are protected by GC; empty
 metadata logs (including Glue REST) do not disable cleanup. JSON-only registry pages
@@ -145,8 +146,12 @@ avoid scanning manifests. `gc.enabled=false` disables all physical collection.
 
 New ownership records use `owned-artifacts/v2/`. The collector reads v1 and v2
 within the same bounded page and cursor. Old engines cannot safely classify JSON,
-so rollback must leave v2 records unread rather than delete their objects. The
-record format and durable control/index ownership protocol are otherwise unchanged.
+so rollback must leave v2 records unread rather than delete their objects. After
+its first examination a record moves to the due queue
+`owned-artifacts/v2/{table}/~/{due_ms}-{id}` with an unchanged value, so a
+release that predates the queue still reads and conservatively collects it after
+a rollback. The sweep cursor moved to `artifact-gc/v2/`. The record format and
+durable control/index ownership protocol are otherwise unchanged.
 
 Pre-registry JSON can be adopted with `metadata-import --inventory <ndjson>` while
 the daemon is stopped and supervisor desired state is paused. Entries contain

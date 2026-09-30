@@ -913,6 +913,31 @@ impl StateStore {
         self.write(batch)
     }
 
+    /// Atomically apply independent SOURCE puts followed by deletes, with one
+    /// durable write. A key must not appear in both sets.
+    pub fn write_source_records<'a>(
+        &self,
+        puts: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        deletes: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<()> {
+        let _guard = if self.0.control.is_none() {
+            Some(self.lock()?)
+        } else {
+            None
+        };
+        let cf = self.0.db.cf_handle(SOURCE).expect("opened column family");
+        let mut batch = StateBatch::default();
+        for (key, value) in puts {
+            batch.control.put(control::record_key(SOURCE, key), value);
+            batch.put_cf(&cf, key, value);
+        }
+        for key in deletes {
+            batch.control.delete(control::record_key(SOURCE, key));
+            batch.delete_cf(&cf, key);
+        }
+        self.write(batch)
+    }
+
     /// Atomically persist ledger metadata, transaction updates, and
     /// reclaim a completed key range. Payloads contain journal references, never
     /// source rows; the caller bounds the number of descriptors in the batch.

@@ -2,12 +2,15 @@ use super::{TableMaintenance, builds::active_build_protection};
 use crate::artifacts::{OwnedArtifacts, now_ms, registry_prefix};
 use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
-use flow_iceberg_ext::retained_artifacts;
+use flow_iceberg_ext::{RetainedIndex, retained_artifacts};
 use flow_model::{OperationId, TableId};
 use flow_state_store::CheckpointRecord;
+use futures::{StreamExt, TryStreamExt, stream};
 use iceberg::table::Table;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -15,21 +18,34 @@ use std::{
 /// the maximum duration of an interrupted upload. Only registered objects qualify.
 #[derive(Debug, Clone)]
 pub struct GarbagePolicy {
+    /// Minimum time an object must stay unreferenced before deletion. The
+    /// clock starts when a sweep first observes it unreferenced by retained
+    /// metadata after its operation fence was released, which is no earlier
+    /// than the moment a reader could last have planned it.
     pub grace: Duration,
+    /// The same clock for catalog metadata JSON once it has left the current
+    /// pointer and the catalog metadata log. Readers load the current JSON, so
+    /// this can be much shorter than `grace`.
+    pub metadata_grace: Duration,
     pub max_objects: usize,
     /// Maximum registry rows decoded by one invocation. A caller should run an
     /// immediate follow-up when the report requests continuation.
     pub max_records: usize,
-    /// Cooperative wall-clock budget for registry scanning. In-flight catalog
-    /// and object-store requests are allowed to finish.
+    /// Maximum object deletions per invocation, each preceded by an existence
+    /// check. Requests run concurrently in small batches.
+    pub max_deletes: usize,
+    /// Cooperative wall-clock budget for registry selection and reachability
+    /// indexing. In-flight catalog and object-store requests finish.
     pub max_duration: Duration,
 }
 impl Default for GarbagePolicy {
     fn default() -> Self {
         Self {
             grace: Duration::from_secs(24 * 60 * 60),
-            max_objects: 1024,
-            max_records: 64,
+            metadata_grace: Duration::from_secs(10 * 60),
+            max_objects: 4096,
+            max_records: 512,
+            max_deletes: 64,
             max_duration: Duration::from_millis(250),
         }
     }
@@ -69,21 +85,184 @@ pub struct GarbageReport {
     pub examined_records: usize,
     pub examined_objects: usize,
     pub protected_objects: usize,
+    /// Unreferenced objects still inside their grace.
+    pub deferred_objects: usize,
     pub delete_requests: usize,
     pub metadata_json_delete_requests: usize,
     pub retired_records: usize,
+    /// Records moved to a later position of the due queue.
+    pub rescheduled_records: usize,
+    /// Manifest lists read to extend the retained-artifact index.
+    pub manifest_list_reads: usize,
     /// The current forward sweep stopped at a record or time budget. Schedule
     /// another pass without waiting for the periodic garbage interval.
     pub continuation_required: bool,
 }
 
+/// Registration keeps its existing keys: `owned-artifacts/v1/` records of
+/// older engines and random or `catalog-` keys under `v2/`. The collector
+/// examines each such record once and then moves it to the due queue under
+/// `v2/{table}/~/`, ordered by the earliest time any of its objects can change
+/// state. A sweep reads unordered records, then the queue only up to its start
+/// time, so its cost follows new and due work rather than registry size. The
+/// queue stays inside `v2/`, whose records a rolled-back engine still reads.
+const QUEUE: &str = "~/";
+const DUE_DIGITS: usize = 20;
+/// Referenced objects are rechecked after half their age, within these bounds
+/// and never later than their grace. Observation only starts the grace clock,
+/// so a late recheck delays deletion and cannot shorten a reader's grace.
+const MIN_RECHECK: Duration = Duration::from_secs(60);
+const MAX_RECHECK: Duration = Duration::from_secs(60 * 60);
+const DELETE_CONCURRENCY: usize = 16;
+/// Estimated memory for all tables' retained-artifact indexes. A table that
+/// alone exceeds it falls back to per-page manifest walks.
+pub(super) const RETAINED_INDEX_BYTES: usize = 128 << 20;
+const OVERSIZED_RETRY: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Serialize, Deserialize)]
+struct Sweep {
+    started_ms: u64,
+    after: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct TableIndex {
+    index: RetainedIndex,
+    retry_after: Option<Instant>,
+}
+struct IndexSlot {
+    index: Arc<tokio::sync::Mutex<TableIndex>>,
+    bytes: usize,
+    used: Instant,
+}
+
+/// Per-process reachability indexes shared by all tables' collection pages.
+/// They are rebuilt after restart; nothing here is durable.
+pub(super) struct RetainedIndexes {
+    budget: usize,
+    tables: Mutex<HashMap<uuid::Uuid, IndexSlot>>,
+}
+impl RetainedIndexes {
+    pub(super) fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            tables: Mutex::default(),
+        }
+    }
+    fn slot(&self, table: uuid::Uuid) -> Result<Arc<tokio::sync::Mutex<TableIndex>>> {
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| anyhow::anyhow!("retained index lock poisoned"))?;
+        let slot = tables.entry(table).or_insert_with(|| IndexSlot {
+            index: Arc::default(),
+            bytes: 0,
+            used: Instant::now(),
+        });
+        slot.used = Instant::now();
+        Ok(slot.index.clone())
+    }
+    /// Record a table's size and evict least recently used other tables.
+    fn account(&self, table: uuid::Uuid, bytes: usize) -> Result<()> {
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| anyhow::anyhow!("retained index lock poisoned"))?;
+        if let Some(slot) = tables.get_mut(&table) {
+            slot.bytes = bytes;
+        }
+        while tables.values().map(|slot| slot.bytes).sum::<usize>() > self.budget {
+            let Some(victim) = tables
+                .iter()
+                .filter(|(id, _)| **id != table)
+                .min_by_key(|(_, slot)| slot.used)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            tables.remove(&victim);
+        }
+        Ok(())
+    }
+}
+
+/// Reference oracle for one page: catalog JSON from the head, plus either the
+/// complete incremental index or a walk intersected with this page's candidates.
+enum Referenced {
+    Index(tokio::sync::OwnedMutexGuard<TableIndex>),
+    Walk(BTreeSet<String>),
+}
+impl Referenced {
+    fn contains(&self, path: &str) -> bool {
+        match self {
+            Self::Index(table) => table.index.contains(path),
+            Self::Walk(protected) => protected.contains(path),
+        }
+    }
+}
+
+struct Selected {
+    key: Vec<u8>,
+    owner: OwnedArtifacts,
+    end: u64,
+    retained: bool,
+    next_due: Option<u64>,
+    finished: bool,
+}
+
+fn queue_prefix(table: uuid::Uuid) -> String {
+    format!("{}{QUEUE}", registry_prefix(table))
+}
+/// The due time of a queue key. Unparseable queue keys are due immediately.
+fn queue_due(key: &[u8], queue: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(queue)?;
+    Some(
+        rest.get(..DUE_DIGITS)
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or(0),
+    )
+}
+/// A stable identity across queue moves; unordered keys map deterministically.
+fn record_id(key: &[u8], queue: &[u8], table: uuid::Uuid) -> String {
+    if let Some(id) = key
+        .strip_prefix(queue)
+        .and_then(|rest| rest.get(DUE_DIGITS + 1..))
+        .filter(|id| !id.is_empty())
+        .and_then(|id| std::str::from_utf8(id).ok())
+    {
+        return id.to_owned();
+    }
+    uuid::Uuid::new_v5(&table, key).to_string()
+}
+fn marker_key(table: uuid::Uuid, path: &str) -> Vec<u8> {
+    format!(
+        "artifact-unreferenced/v1/{table}/{}",
+        uuid::Uuid::new_v5(&table, path.as_bytes())
+    )
+    .into_bytes()
+}
+fn is_metadata_json(path: &str) -> bool {
+    path.ends_with(".metadata.json")
+}
+fn millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
 impl TableMaintenance {
+    /// Bound the process-wide memory estimate of retained-artifact indexes.
+    pub fn with_retained_index_budget(mut self, bytes: usize) -> Self {
+        self.garbage = RetainedIndexes::new(bytes);
+        self
+    }
+
     /// Run on the serialized table actor, after reconciliation and expiration.
-    /// Each invocation scans one bounded registry page and intersects only its
-    /// finite candidates with retained metadata. The durable cursor advances
-    /// over protected and immature records too, so a sweep containing no
-    /// eligible work terminates instead of spinning. No warehouse listing is
-    /// performed.
+    /// Each invocation processes one bounded page of unordered and due registry
+    /// records. Reachability comes from an incremental in-memory index of the
+    /// retained snapshots, so a page reads only manifest lists committed since
+    /// the previous page. The durable cursor advances over protected records
+    /// too, so a sweep without eligible work terminates instead of spinning.
+    /// No warehouse listing is performed.
     pub async fn collect_garbage(
         &self,
         table: &Table,
@@ -93,46 +272,64 @@ impl TableMaintenance {
     ) -> Result<GarbageReport> {
         ensure!(
             !policy.grace.is_zero()
+                && !policy.metadata_grace.is_zero()
                 && policy.max_objects > 0
                 && policy.max_records > 0
+                && policy.max_deletes > 0
                 && !policy.max_duration.is_zero(),
             "garbage collection needs positive grace and budgets"
         );
         let started = Instant::now();
+        let deadline = started + policy.max_duration;
         let head = self.catalog.load_table(table.identifier()).await?;
         if !head.metadata().table_properties()?.gc_enabled {
             return Ok(GarbageReport::default());
         }
-        let prefix = registry_prefix(head.metadata().uuid()).into_bytes();
-        let legacy_prefix = format!("owned-artifacts/v1/{}/", head.metadata().uuid()).into_bytes();
-        let cursor_key = format!("artifact-gc/v1/{}", head.metadata().uuid()).into_bytes();
+        let uuid = head.metadata().uuid();
+        let now = now_ms()?;
+        let queue = queue_prefix(uuid).into_bytes();
+        let prefix = registry_prefix(uuid).into_bytes();
+        let legacy_prefix = format!("owned-artifacts/v1/{uuid}/").into_bytes();
+        let cursor_key = format!("artifact-gc/v2/{uuid}").into_bytes();
         let store = self.store.clone();
         let limit = policy.max_records;
         let saved_cursor_key = cursor_key.clone();
+        let saved_queue = queue.clone();
         let protected_head = head.clone();
-        let (cursor, indexed, pending, records, has_unseen_records, builds) = blocking(move || {
-            let cursor = store.source_transaction(&saved_cursor_key)?;
+        let (sweep, indexed, pending, records, has_unseen_records, builds) = blocking(move || {
+            let sweep = match store.source_transaction(&saved_cursor_key)? {
+                Some(bytes) => bincode::deserialize::<Sweep>(&bytes)?,
+                None => Sweep {
+                    started_ms: now,
+                    after: None,
+                },
+            };
             // v1 records remain readable across upgrades; new v2 records are
             // invisible to pre-JSON-protection engines after a rollback. The
-            // full key cursor orders both streams under the same page budget.
-            let mut entries = store
-                .source_transactions_after(&legacy_prefix, cursor.as_deref())
-                .chain(store.source_transactions_after(&prefix, cursor.as_deref()));
-            let records = entries
-                .by_ref()
-                .take(limit)
-                .map(|entry| {
-                    let (key, value) = entry?;
-                    Ok((
-                        key.to_vec(),
-                        bincode::deserialize::<OwnedArtifacts>(&value)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let has_unseen_records = entries.next().transpose()?.is_some();
-            drop(entries);
+            // full key cursor orders v1, unordered v2 and the v2 queue.
+            let entries = store
+                .source_transactions_after(&legacy_prefix, sweep.after.as_deref())
+                .chain(store.source_transactions_after(&prefix, sweep.after.as_deref()));
+            let mut records = Vec::new();
+            let mut has_unseen_records = false;
+            for entry in entries {
+                let (key, value) = entry?;
+                // Queue keys are ordered by due time. Records moved during this
+                // sweep are due after its start, which bounds the sweep.
+                if queue_due(&key, &saved_queue).is_some_and(|due| due > sweep.started_ms) {
+                    break;
+                }
+                if records.len() == limit {
+                    has_unseen_records = true;
+                    break;
+                }
+                records.push((
+                    key.to_vec(),
+                    bincode::deserialize::<OwnedArtifacts>(&value)?,
+                ));
+            }
             Ok((
-                cursor,
+                sweep,
                 store.table_state(&table_id)?,
                 store.pending_operations()?,
                 records,
@@ -163,12 +360,13 @@ impl TableMaintenance {
                 "protected garbage-collection snapshot {snapshot} is not retained"
             );
         }
-        let now = now_ms()?;
-        let cutoff = now.saturating_sub(policy.grace.as_millis().try_into()?);
+
+        // Select whole records, or a prefix of one large record, in key order.
+        // `order` keeps fenced records (None) so the sweep cursor can pass them.
         let page_records = records.len();
         let mut candidates = BTreeSet::new();
         let mut selected = Vec::new();
-        let mut next_cursor = cursor;
+        let mut order = Vec::new();
         let mut stopped_early = false;
         let mut report = GarbageReport::default();
         for (position, (key, mut owner)) in records.into_iter().enumerate() {
@@ -180,29 +378,15 @@ impl TableMaintenance {
             }
             report.examined_records += 1;
             owner.validate(&head, table_id)?;
+            // A fenced record may still gain reserved uploads, and its writer
+            // may rewrite it under the same key. Never examine or move it.
             if protected_operations.contains(&owner.operation) {
-                next_cursor = Some(key);
+                order.push((key, None));
                 continue;
             }
-            // A reserved ordinal may be uploaded long after the operation was
-            // created. Start a full grace only after its fence has disappeared;
-            // this also covers uploads interrupted near the end of a long build.
-            if owner.unfenced_since_ms.is_none() {
-                owner.unfenced_since_ms = Some(now);
-                let store = self.store.clone();
-                let saved_key = key.clone();
-                let value = bincode::serialize(&owner)?;
-                blocking(move || Ok(store.put_source_transaction(&saved_key, &value)?)).await?;
-            }
-            // Keep immature registrations out of the expensive retained-file
-            // walk. The independent reader grace starts once an eligible file
-            // is actually observed unreferenced, never merely from upload age.
-            if owner.created_ms > cutoff
-                || owner.unfenced_since_ms.is_some_and(|time| time > cutoff)
-            {
-                next_cursor = Some(key);
-                continue;
-            }
+            // Informational since the single-grace collector; older engines
+            // still start their record grace from it after a rollback.
+            owner.unfenced_since_ms.get_or_insert(now);
             let length = owner.artifacts.len().expect("validated count");
             let available = policy.max_objects.saturating_sub(candidates.len());
             if available == 0 {
@@ -213,23 +397,148 @@ impl TableMaintenance {
             for ordinal in owner.cursor..end {
                 candidates.insert(owner.artifacts.path(ordinal).expect("validated cursor"));
             }
-            selected.push((key.clone(), owner, end));
-            if end == length {
-                next_cursor = Some(key);
-            } else {
+            order.push((key.clone(), Some(selected.len())));
+            selected.push(Selected {
+                key,
+                owner,
+                end,
+                retained: false,
+                next_due: None,
+                finished: false,
+            });
+            if end < length {
                 stopped_early = true;
                 break;
             }
         }
         report.continuation_required =
             stopped_early || has_unseen_records || report.examined_records < page_records;
+        report.examined_objects = candidates.len();
 
-        if !selected.is_empty() {
-            let protected = if candidates.is_empty() {
-                BTreeSet::new()
+        let referenced = if candidates.iter().all(|path| is_metadata_json(path)) {
+            // JSON-only pages do not require reading any manifests.
+            Referenced::Walk(BTreeSet::new())
+        } else {
+            match self
+                .referenced(&head, &candidates, deadline, &mut report)
+                .await?
+            {
+                Some(referenced) => referenced,
+                None => {
+                    // The index is still being built. Keep every record and
+                    // the sweep cursor unchanged, and continue next page.
+                    report.continuation_required = true;
+                    return Ok(report);
+                }
+            }
+        };
+        // Catalog JSON is independent of snapshot expiration. Protect the
+        // current pointer and every version the catalog still advertises.
+        let catalog_json: HashSet<&str> = head
+            .metadata_location()
+            .into_iter()
+            .chain(
+                head.metadata()
+                    .metadata_log()
+                    .iter()
+                    .map(|entry| entry.metadata_file.as_str()),
+            )
+            .collect();
+
+        let store = self.store.clone();
+        let marker_paths: Vec<_> = candidates.iter().cloned().collect();
+        let markers: HashMap<String, u64> = blocking(move || {
+            let mut markers = HashMap::new();
+            for path in marker_paths {
+                if let Some(bytes) = store.source_transaction(&marker_key(uuid, &path))? {
+                    markers.insert(path, bincode::deserialize::<u64>(&bytes)?);
+                }
+            }
+            Ok(markers)
+        })
+        .await?;
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut deletes: Vec<Vec<u8>> = Vec::new();
+        let mut due: Vec<String> = Vec::new();
+        let mut due_paths = HashSet::new();
+        let mut observed = HashSet::new();
+        let mut truncated = None;
+        'records: for (position, record) in selected.iter_mut().enumerate() {
+            let age = now.saturating_sub(record.owner.created_ms);
+            for ordinal in record.owner.cursor..record.end {
+                let path = record
+                    .owner
+                    .artifacts
+                    .path(ordinal)
+                    .expect("validated range");
+                let grace = millis(if is_metadata_json(&path) {
+                    policy.metadata_grace
+                } else {
+                    policy.grace
+                });
+                let marker = markers.get(&path).copied();
+                if catalog_json.contains(path.as_str()) || referenced.contains(&path) {
+                    // A retained file may stay live long after its upload.
+                    // Its next unreferenced observation starts a new grace.
+                    if marker.is_some() && observed.insert(path.clone()) {
+                        deletes.push(marker_key(uuid, &path));
+                    }
+                    report.protected_objects += 1;
+                    record.retained = true;
+                    let recheck =
+                        millis(Duration::from_millis(age / 2).clamp(MIN_RECHECK, MAX_RECHECK))
+                            .min(grace)
+                            .max(1);
+                    let recheck = now.saturating_add(recheck);
+                    record.next_due = Some(record.next_due.map_or(recheck, |due| due.min(recheck)));
+                    continue;
+                }
+                let since = match marker {
+                    Some(since) => since,
+                    None => {
+                        if observed.insert(path.clone()) {
+                            puts.push((marker_key(uuid, &path), bincode::serialize(&now)?));
+                        }
+                        now
+                    }
+                };
+                if since.saturating_add(grace) > now {
+                    report.deferred_objects += 1;
+                    record.retained = true;
+                    let eligible = since.saturating_add(grace);
+                    record.next_due =
+                        Some(record.next_due.map_or(eligible, |due| due.min(eligible)));
+                    continue;
+                }
+                if due_paths.contains(&path) {
+                    continue;
+                }
+                if due.len() == policy.max_deletes {
+                    // Leave the rest of this record, and later records, for
+                    // the next page.
+                    record.end = ordinal;
+                    truncated = Some(position);
+                    break 'records;
+                }
+                due_paths.insert(path.clone());
+                due.push(path);
+            }
+        }
+        if let Some(position) = truncated {
+            report.continuation_required = true;
+            // Nothing of the truncated record may be recorded when it made no
+            // progress; its key and cursor stay unchanged.
+            let keep = if selected[position].end == selected[position].owner.cursor {
+                position
             } else {
-                retained_artifacts(&head, &candidates, &self.cache).await?
+                position + 1
             };
+            selected.truncate(keep);
+        }
+        drop(referenced);
+
+        if !due.is_empty() || !puts.is_empty() {
+            // Deletion and new clocks depend on the complete metadata above.
             let refreshed = self.catalog.load_table(table.identifier()).await?;
             if refreshed.metadata() != head.metadata()
                 || refreshed.metadata_location() != head.metadata_location()
@@ -241,105 +550,166 @@ impl TableMaintenance {
             if current != indexed {
                 return Err(ReplanRequired.into());
             }
-            report.examined_objects = candidates.len();
-            report.protected_objects = protected.len();
-            let mut deferred = BTreeSet::new();
-            for path in &candidates {
-                let key = format!(
-                    "artifact-unreferenced/v1/{}/{}",
-                    head.metadata().uuid(),
-                    uuid::Uuid::new_v5(&head.metadata().uuid(), path.as_bytes())
-                )
-                .into_bytes();
-                let store = self.store.clone();
-                let saved_key = key.clone();
-                if protected.contains(path) {
-                    // A retained file may stay live long after its upload grace.
-                    // Its next unreferenced observation must start a new grace.
-                    blocking(move || {
-                        if store.source_transaction(&saved_key)?.is_some() {
-                            store.delete_source_transaction(&saved_key)?;
-                        }
-                        Ok(())
-                    })
-                    .await?;
-                    continue;
-                }
-                // A partially live owner is rescanned. Do not repeatedly DELETE
-                // absent siblings: versioned S3 creates a new marker each time.
-                if !head.file_io().exists(path).await? {
-                    blocking(move || {
-                        if store.source_transaction(&saved_key)?.is_some() {
-                            store.delete_source_transaction(&saved_key)?;
-                        }
-                        Ok(())
-                    })
-                    .await?;
-                    continue;
-                }
-                let since = blocking(move || match store.source_transaction(&saved_key)? {
-                    Some(bytes) => Ok(bincode::deserialize::<u64>(&bytes)?),
-                    None => {
-                        store.put_source_transaction(&saved_key, &bincode::serialize(&now)?)?;
-                        Ok(now)
+        }
+        // Check existence first: versioned S3 creates a delete marker for every
+        // DELETE, including one for an object that is already absent.
+        // Owned inputs keep this future `Send` for the table actor.
+        let io = head.file_io().clone();
+        let deleted: Vec<bool> = stream::iter(due.clone())
+            .map(move |path| {
+                let io = io.clone();
+                async move {
+                    if !io.exists(&path).await? {
+                        return Ok::<_, iceberg::Error>(false);
                     }
-                })
-                .await?;
-                if since > cutoff {
-                    deferred.insert(path.clone());
-                    continue;
+                    io.delete(&path).await?;
+                    Ok(true)
                 }
-                head.file_io().delete(path).await?;
+            })
+            .buffered(DELETE_CONCURRENCY)
+            .try_collect()
+            .await?;
+        for (path, deleted) in due.iter().zip(deleted) {
+            deletes.push(marker_key(uuid, path));
+            if deleted {
                 report.delete_requests += 1;
-                report.metadata_json_delete_requests +=
-                    usize::from(path.ends_with(".metadata.json"));
-                let store = self.store.clone();
-                blocking(move || Ok(store.delete_source_transaction(&key)?)).await?;
-            }
-            for (key, mut owner, end) in selected {
-                owner.protected |= (owner.cursor..end).any(|ordinal| {
-                    let path = owner.artifacts.path(ordinal).expect("validated range");
-                    protected.contains(&path) || deferred.contains(&path)
-                });
-                owner.cursor = end;
-                let finished = end == owner.artifacts.len().expect("validated count");
-                let retire = finished && !owner.protected;
-                if finished {
-                    owner.cursor = 0;
-                    owner.protected = false;
-                }
-                let value = bincode::serialize(&owner)?;
-                let store = self.store.clone();
-                blocking(move || {
-                    if retire {
-                        store.delete_source_transaction(&key)?;
-                    } else {
-                        store.put_source_transaction(&key, &value)?;
-                    }
-                    Ok(())
-                })
-                .await?;
-                report.retired_records += usize::from(retire);
+                report.metadata_json_delete_requests += usize::from(is_metadata_json(path));
             }
         }
-        let continuation_required = report.continuation_required;
+
+        for record in &mut selected {
+            record.owner.protected |= record.retained;
+            record.owner.cursor = record.end;
+            let length = record.owner.artifacts.len().expect("validated count");
+            if record.end < length {
+                // Resume this record under the same key on the next page.
+                puts.push((record.key.clone(), bincode::serialize(&record.owner)?));
+                continue;
+            }
+            record.finished = true;
+            let retire = !record.owner.protected;
+            // A record completed across pages knows only its last chunk's
+            // schedule; earlier protected chunks are rechecked soon.
+            let next_due = record.next_due.unwrap_or_else(|| {
+                now + millis(MIN_RECHECK)
+                    .min(millis(policy.grace.min(policy.metadata_grace)))
+                    .max(1)
+            });
+            record.owner.cursor = 0;
+            record.owner.protected = false;
+            if retire {
+                deletes.push(record.key.clone());
+                report.retired_records += 1;
+                continue;
+            }
+            let moved = format!(
+                "{}{next_due:0width$}-{}",
+                String::from_utf8_lossy(&queue),
+                record_id(&record.key, &queue, uuid),
+                width = DUE_DIGITS
+            )
+            .into_bytes();
+            if moved != record.key {
+                deletes.push(record.key.clone());
+            }
+            puts.push((moved, bincode::serialize(&record.owner)?));
+            report.rescheduled_records += 1;
+        }
+        let mut next_cursor = sweep.after;
+        for (key, index) in order {
+            // Stop before a partial or untouched record; it is resumed next page.
+            if index.is_some_and(|index| selected.get(index).is_none_or(|record| !record.finished))
+            {
+                break;
+            }
+            next_cursor = Some(key);
+        }
+        if report.continuation_required {
+            let cursor = Sweep {
+                started_ms: sweep.started_ms,
+                after: next_cursor,
+            };
+            puts.push((cursor_key, bincode::serialize(&cursor)?));
+        } else {
+            // Reaching the due boundary completes this sweep. The next one
+            // starts again with unordered records and newly due queue entries.
+            deletes.push(cursor_key);
+        }
         let store = self.store.clone();
         blocking(move || {
-            if continuation_required {
-                if let Some(cursor) = next_cursor {
-                    store.put_source_transaction(&cursor_key, &cursor)?;
-                } else {
-                    store.delete_source_transaction(&cursor_key)?;
-                }
-            } else {
-                // Reaching the end completes this sweep. A future periodic pass
-                // starts at the beginning, including records that were too young
-                // or protected during this one.
-                store.delete_source_transaction(&cursor_key)?;
-            }
-            Ok(())
+            Ok(store.write_source_records(
+                puts.iter()
+                    .map(|(key, value)| (key.as_slice(), value.as_slice())),
+                deletes.iter().map(Vec::as_slice),
+            )?)
         })
         .await?;
         Ok(report)
+    }
+
+    /// Returns `None` while the incremental index is incomplete. A table whose
+    /// index exceeds the memory budget intersects this page's candidates with a
+    /// full manifest walk instead, as older engines did on every page.
+    async fn referenced(
+        &self,
+        head: &Table,
+        candidates: &BTreeSet<String>,
+        deadline: Instant,
+        report: &mut GarbageReport,
+    ) -> Result<Option<Referenced>> {
+        let uuid = head.metadata().uuid();
+        let mut table = self.garbage.slot(uuid)?.lock_owned().await;
+        if table
+            .retry_after
+            .is_none_or(|retry| retry <= Instant::now())
+        {
+            let progress = table
+                .index
+                .sync(head, &self.cache, deadline, self.garbage.budget)
+                .await?;
+            report.manifest_list_reads += progress.manifest_lists_read;
+            if progress.oversized {
+                table.retry_after = Some(Instant::now() + OVERSIZED_RETRY);
+                tracing::warn!(
+                    table_uuid = %uuid,
+                    budget_bytes = self.garbage.budget,
+                    "retained-artifact index exceeds its memory budget; garbage collection walks manifests per page"
+                );
+            } else {
+                table.retry_after = None;
+            }
+            self.garbage.account(uuid, table.index.estimated_bytes())?;
+            if !progress.oversized {
+                return Ok(progress.complete.then_some(Referenced::Index(table)));
+            }
+        }
+        drop(table);
+        Ok(Some(Referenced::Walk(
+            retained_artifacts(head, candidates, &self.cache).await?,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_keys_order_by_due_time_and_keep_their_identity() {
+        let table = uuid::Uuid::new_v4();
+        let queue = queue_prefix(table).into_bytes();
+        let key =
+            |due: u64, id: &str| format!("{}{due:020}-{id}", queue_prefix(table)).into_bytes();
+        assert!(key(9, "b") < key(10, "a"));
+        assert!(format!("{}{}", registry_prefix(table), uuid::Uuid::new_v4()).into_bytes() < queue);
+        assert!(format!("{}catalog-x", registry_prefix(table)).into_bytes() < queue);
+        assert_eq!(queue_due(&key(42, "id"), &queue), Some(42));
+        assert_eq!(queue_due(b"owned-artifacts/v2/x/abc", &queue), None);
+        assert_eq!(record_id(&key(42, "stable"), &queue, table), "stable");
+        let unordered = format!("{}catalog-x", registry_prefix(table)).into_bytes();
+        assert_eq!(
+            record_id(&unordered, &queue, table),
+            record_id(&unordered, &queue, table)
+        );
     }
 }

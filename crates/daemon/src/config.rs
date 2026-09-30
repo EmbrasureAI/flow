@@ -125,6 +125,15 @@ pub struct Limits {
     pub manifest_max_count: usize,
     pub garbage_interval_secs: u64,
     pub orphan_grace_secs: u64,
+    /// Grace for superseded catalog metadata JSON once it leaves the catalog
+    /// metadata log. Defaults to the smaller of 600 and `orphan_grace_secs`.
+    pub metadata_json_grace_secs: Option<u64>,
+}
+impl Limits {
+    pub fn metadata_json_grace_secs(&self) -> u64 {
+        self.metadata_json_grace_secs
+            .unwrap_or(self.orphan_grace_secs.min(600))
+    }
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -149,6 +158,7 @@ impl Default for Limits {
             manifest_max_count: 64,
             garbage_interval_secs: 300,
             orphan_grace_secs: 86400,
+            metadata_json_grace_secs: None,
         }
     }
 }
@@ -279,7 +289,9 @@ impl Config {
             "invalid history, checkpoint, or manifest maintenance limits"
         );
         ensure!(
-            l.garbage_interval_secs > 0 && l.orphan_grace_secs > 0,
+            l.garbage_interval_secs > 0
+                && l.orphan_grace_secs > 0
+                && l.metadata_json_grace_secs != Some(0),
             "garbage interval and orphan grace must be positive"
         );
         let mut sources = BTreeMap::new();
@@ -372,7 +384,7 @@ mod tests {
         type Case = (&'static str, Invalidate, &'static str);
 
         valid_config().validate().unwrap();
-        let cases: [Case; 5] = [
+        let cases: [Case; 6] = [
             (
                 "journal quota below one segment",
                 |limits| {
@@ -409,6 +421,13 @@ mod tests {
                 "zero orphan grace",
                 |limits| {
                     limits.orphan_grace_secs = 0;
+                },
+                "garbage interval and orphan grace must be positive",
+            ),
+            (
+                "zero metadata JSON grace",
+                |limits| {
+                    limits.metadata_json_grace_secs = Some(0);
                 },
                 "garbage interval and orphan grace must be positive",
             ),

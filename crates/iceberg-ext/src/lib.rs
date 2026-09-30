@@ -18,7 +18,10 @@ pub use identity::{content_file_id, delete_content_size, physical_file_stats};
 pub use action::{
     CommitAttempt, CommitResult, OPERATION_ID_KEY, RewriteFilesAction, RowDeltaAction,
 };
-pub use artifacts::{ArtifactSet, ArtifactTracker, NumberedArtifacts, retained_artifacts};
+pub use artifacts::{
+    ArtifactSet, ArtifactTracker, IndexProgress, NumberedArtifacts, RetainedIndex,
+    retained_artifacts,
+};
 pub use manifests::{ManifestRewritePolicy, RewriteManifestsAction};
 pub use plan::{ArtifactPlan, read_artifact_plan, write_artifact_plan};
 pub use snapshot::{ManifestCache, SnapshotView, position_delete_may_apply};

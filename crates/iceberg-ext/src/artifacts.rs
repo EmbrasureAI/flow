@@ -173,6 +173,241 @@ pub async fn retained_artifacts(
     Ok(protected)
 }
 
+const INDEX_LOAD_CONCURRENCY: usize = 16;
+// Conservative per-entry estimates, including hash-table slack.
+const INDEX_PATH_BYTES: usize = 32;
+const INDEX_ENTRY_BYTES: usize = 96;
+
+/// Fixed-key SipHash of an object path. The index uses membership only to
+/// retain objects: a collision can keep an orphan, never delete a live file.
+fn path_hash(path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+struct IndexedManifest {
+    lists: u32,
+    live: Box<[u64]>,
+}
+
+/// Progress of one [`RetainedIndex::sync`] call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexProgress {
+    pub manifest_lists_read: usize,
+    pub manifests_read: usize,
+    /// Every retained snapshot of the synchronized metadata is indexed.
+    pub complete: bool,
+    /// The index exceeded its memory budget and was cleared.
+    pub oversized: bool,
+}
+
+/// Incremental reachability of one table's retained snapshots: their manifest
+/// lists, manifests and live data/delete files, with the same semantics as
+/// [`retained_artifacts`]. Manifest lists and manifests are immutable, so each
+/// is read once while it stays retained, rather than on every collection page.
+/// Synchronization adds newly retained lists and releases expired ones by
+/// reference count, so the result tracks exactly the metadata last synced.
+/// Paths are stored as 64-bit hashes; catalog JSON is not included.
+#[derive(Default)]
+pub struct RetainedIndex {
+    table: Option<uuid::Uuid>,
+    lists: std::collections::HashMap<String, Box<[u64]>>,
+    manifests: std::collections::HashMap<u64, IndexedManifest>,
+    paths: std::collections::HashMap<u64, u32>,
+    bytes: usize,
+    complete: bool,
+}
+
+impl RetainedIndex {
+    pub fn estimated_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Whether the last synchronization indexed every retained snapshot.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Membership in the metadata last synchronized. Callers must check
+    /// [`Self::is_complete`] first: a partial index protects too little.
+    pub fn contains(&self, path: &str) -> bool {
+        self.paths.contains_key(&path_hash(path))
+    }
+
+    /// Bring the index to `table`'s retained snapshots. New manifest lists are
+    /// read in bounded concurrent batches until `deadline`; at least one batch
+    /// runs so repeated calls always progress. Reads finish before the index
+    /// changes, so an I/O error leaves the previous state intact. Exceeding
+    /// `max_bytes` clears the index and reports `oversized`.
+    pub async fn sync(
+        &mut self,
+        table: &iceberg::table::Table,
+        cache: &crate::ManifestCache,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<IndexProgress> {
+        use futures::{StreamExt, TryStreamExt, stream};
+        let uuid = table.metadata().uuid();
+        if self.table != Some(uuid) {
+            *self = Self {
+                table: Some(uuid),
+                ..Self::default()
+            };
+        }
+        let mut missing = Vec::new();
+        let mut retained = std::collections::HashSet::new();
+        for snapshot in table.metadata().snapshots() {
+            if retained.insert(snapshot.manifest_list())
+                && !self.lists.contains_key(snapshot.manifest_list())
+            {
+                missing.push(snapshot.clone());
+            }
+        }
+        // Release expired history before reading new lists.
+        let expired: Vec<_> = self
+            .lists
+            .keys()
+            .filter(|list| !retained.contains(list.as_str()))
+            .cloned()
+            .collect();
+        for list in expired {
+            self.remove_list(&list);
+        }
+        let mut progress = IndexProgress::default();
+        let mut first = true;
+        while !missing.is_empty() && (first || std::time::Instant::now() < deadline) {
+            first = false;
+            let batch: Vec<_> = missing
+                .drain(..missing.len().min(INDEX_LOAD_CONCURRENCY))
+                .collect();
+            let lists: Vec<(String, Vec<iceberg::spec::ManifestFile>)> = stream::iter(batch)
+                .map(|snapshot| async move {
+                    let list = table.manifest_list_reader(&snapshot).load().await?;
+                    Ok::<_, iceberg::Error>((
+                        snapshot.manifest_list().to_owned(),
+                        list.consume_entries().into_iter().collect(),
+                    ))
+                })
+                .buffer_unordered(INDEX_LOAD_CONCURRENCY)
+                .try_collect()
+                .await?;
+            progress.manifest_lists_read += lists.len();
+            // A manifest shared by lists in this batch is still read once.
+            let mut unknown = std::collections::HashMap::new();
+            for manifest in lists.iter().flat_map(|(_, manifests)| manifests) {
+                let hash = path_hash(&manifest.manifest_path);
+                if !self.manifests.contains_key(&hash) {
+                    unknown.entry(hash).or_insert_with(|| manifest.clone());
+                }
+            }
+            let loaded: Vec<(u64, Box<[u64]>)> = stream::iter(unknown)
+                .map(|(hash, manifest)| async move {
+                    let manifest = cache.peek_or_read(table, &manifest).await?;
+                    let mut live: Vec<_> = manifest
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.is_alive())
+                        .map(|entry| path_hash(entry.file_path()))
+                        .collect();
+                    live.sort_unstable();
+                    live.dedup();
+                    Ok::<_, iceberg::Error>((hash, live.into_boxed_slice()))
+                })
+                .buffer_unordered(INDEX_LOAD_CONCURRENCY)
+                .try_collect()
+                .await?;
+            progress.manifests_read += loaded.len();
+            for (hash, live) in loaded {
+                self.bytes += INDEX_ENTRY_BYTES + live.len() * 8;
+                self.manifests
+                    .insert(hash, IndexedManifest { lists: 0, live });
+            }
+            for (list, manifests) in lists {
+                let mut hashes: Vec<_> = manifests
+                    .iter()
+                    .map(|manifest| path_hash(&manifest.manifest_path))
+                    .collect();
+                hashes.sort_unstable();
+                hashes.dedup();
+                self.add_list(list, hashes.into_boxed_slice());
+            }
+            if self.bytes > max_bytes {
+                *self = Self::default();
+                progress.oversized = true;
+                return Ok(progress);
+            }
+        }
+        self.complete = missing.is_empty();
+        progress.complete = self.complete;
+        Ok(progress)
+    }
+
+    fn add_list(&mut self, list: String, manifests: Box<[u64]>) {
+        self.bytes += INDEX_ENTRY_BYTES + list.len() + manifests.len() * 8;
+        retain_path(&mut self.paths, &mut self.bytes, path_hash(&list));
+        for hash in &manifests {
+            let manifest = self
+                .manifests
+                .get_mut(hash)
+                .expect("list manifests are loaded before the list is added");
+            if manifest.lists == 0 {
+                retain_path(&mut self.paths, &mut self.bytes, *hash);
+                for live in &manifest.live {
+                    retain_path(&mut self.paths, &mut self.bytes, *live);
+                }
+            }
+            manifest.lists += 1;
+        }
+        self.lists.insert(list, manifests);
+    }
+
+    fn remove_list(&mut self, list: &str) {
+        let Some(manifests) = self.lists.remove(list) else {
+            return;
+        };
+        self.bytes = self
+            .bytes
+            .saturating_sub(INDEX_ENTRY_BYTES + list.len() + manifests.len() * 8);
+        release_path(&mut self.paths, &mut self.bytes, path_hash(list));
+        for hash in &manifests {
+            let Some(manifest) = self.manifests.get_mut(hash) else {
+                continue;
+            };
+            manifest.lists -= 1;
+            if manifest.lists == 0 {
+                let manifest = self.manifests.remove(hash).expect("present manifest");
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(INDEX_ENTRY_BYTES + manifest.live.len() * 8);
+                release_path(&mut self.paths, &mut self.bytes, *hash);
+                for live in &manifest.live {
+                    release_path(&mut self.paths, &mut self.bytes, *live);
+                }
+            }
+        }
+    }
+}
+
+fn retain_path(paths: &mut std::collections::HashMap<u64, u32>, bytes: &mut usize, hash: u64) {
+    let count = paths.entry(hash).or_insert_with(|| {
+        *bytes += INDEX_PATH_BYTES;
+        0
+    });
+    *count += 1;
+}
+
+fn release_path(paths: &mut std::collections::HashMap<u64, u32>, bytes: &mut usize, hash: u64) {
+    if let std::collections::hash_map::Entry::Occupied(mut entry) = paths.entry(hash) {
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+            *bytes = bytes.saturating_sub(INDEX_PATH_BYTES);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
