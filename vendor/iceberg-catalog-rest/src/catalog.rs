@@ -1105,6 +1105,7 @@ mod tests {
     use uuid::uuid;
 
     use super::*;
+    use crate::AuthRejected;
 
     #[tokio::test]
     async fn test_update_config() {
@@ -1389,6 +1390,155 @@ mod tests {
 
         // original token is left intact
         assert_eq!(token, Some("ey000000000000".to_string()));
+    }
+
+    async fn create_expiring_oauth_mock(
+        server: &mut ServerGuard,
+        token: &str,
+        expires_in: u64,
+    ) -> Mock {
+        server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"access_token": "{token}", "token_type": "Bearer", "expires_in": {expires_in}}}"#
+            ))
+            .expect(1)
+            .create_async()
+            .await
+    }
+
+    async fn create_namespaces_mock(
+        server: &mut ServerGuard,
+        token: &str,
+        status: usize,
+        hits: usize,
+    ) -> Mock {
+        server
+            .mock("GET", "/v1/namespaces")
+            .match_header("authorization", format!("Bearer {token}").as_str())
+            .with_status(status)
+            .with_body(r#"{"namespaces": []}"#)
+            .expect(hits)
+            .create_async()
+            .await
+    }
+
+    fn credential_catalog(server: &ServerGuard, credential: bool) -> RestCatalog {
+        let mut props = HashMap::new();
+        if credential {
+            props.insert("credential".to_string(), "client1:secret1".to_string());
+        } else {
+            props.insert("token".to_string(), "configured-token".to_string());
+        }
+        RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+        )
+    }
+
+    fn auth_rejected(error: &Error) -> bool {
+        std::error::Error::source(error).is_some_and(|source| source.is::<AuthRejected>())
+    }
+
+    #[tokio::test]
+    async fn test_oauth_token_refreshed_before_expiry() {
+        let mut server = Server::new_async().await;
+        // A zero lifetime is already due for refresh when the next request starts.
+        let expiring = create_expiring_oauth_mock(&mut server, "ey-expiring", 0).await;
+        let fresh = create_expiring_oauth_mock(&mut server, "ey-fresh", 3600).await;
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .match_header("authorization", "Bearer ey-expiring")
+            .with_status(200)
+            .with_body(r#"{"overrides": {}, "defaults": {}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let namespaces = create_namespaces_mock(&mut server, "ey-fresh", 200, 2).await;
+
+        let catalog = credential_catalog(&server, true);
+        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
+        // The replacement is not due for refresh, so no further exchange happens.
+        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
+
+        expiring.assert_async().await;
+        fresh.assert_async().await;
+        config_mock.assert_async().await;
+        namespaces.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_oauth_rejected_token_regenerated_and_request_retried() {
+        let mut server = Server::new_async().await;
+        let first = create_expiring_oauth_mock(&mut server, "ey-first", 3600).await;
+        let second = create_expiring_oauth_mock(&mut server, "ey-second", 3600).await;
+        let config_mock = create_config_mock(&mut server).await;
+        let rejected = create_namespaces_mock(&mut server, "ey-first", 401, 1).await;
+        let accepted = create_namespaces_mock(&mut server, "ey-second", 200, 2).await;
+
+        let catalog = credential_catalog(&server, true);
+        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
+        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
+
+        first.assert_async().await;
+        second.assert_async().await;
+        config_mock.assert_async().await;
+        rejected.assert_async().await;
+        accepted.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_oauth_rejection_after_regeneration_is_not_retried_again() {
+        let mut server = Server::new_async().await;
+        let first = create_expiring_oauth_mock(&mut server, "ey-first", 3600).await;
+        let second = create_expiring_oauth_mock(&mut server, "ey-second", 3600).await;
+        let config_mock = create_config_mock(&mut server).await;
+        let rejected_first = create_namespaces_mock(&mut server, "ey-first", 401, 1).await;
+        let rejected_second = create_namespaces_mock(&mut server, "ey-second", 401, 1).await;
+
+        let catalog = credential_catalog(&server, true);
+        let error = catalog.list_namespaces(None).await.unwrap_err();
+        assert!(auth_rejected(&error), "{error:?}");
+        assert!(!error.retryable());
+
+        first.assert_async().await;
+        second.assert_async().await;
+        config_mock.assert_async().await;
+        rejected_first.assert_async().await;
+        rejected_second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_configured_token_rejection_is_marked_and_not_retried() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let rejected = create_namespaces_mock(&mut server, "configured-token", 401, 1).await;
+
+        let catalog = credential_catalog(&server, false);
+        let error = catalog.list_namespaces(None).await.unwrap_err();
+        assert!(auth_rejected(&error), "{error:?}");
+
+        config_mock.assert_async().await;
+        rejected.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_rejected_oauth_credentials_are_marked() {
+        let mut server = Server::new_async().await;
+        let oauth_mock =
+            create_oauth_mock_with_path(&mut server, "/v1/oauth/tokens", "unused", 401).await;
+
+        let catalog = credential_catalog(&server, true);
+        let error = catalog.list_namespaces(None).await.unwrap_err();
+        assert!(auth_rejected(&error), "{error:?}");
+        assert!(!error.retryable());
+
+        oauth_mock.assert_async().await;
     }
 
     #[tokio::test]

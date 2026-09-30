@@ -1,4 +1,17 @@
 pub mod iceberg_catalog_rest
+pub struct iceberg_catalog_rest::AuthRejected
+impl core::clone::Clone for iceberg_catalog_rest::AuthRejected
+pub fn iceberg_catalog_rest::AuthRejected::clone(&self) -> iceberg_catalog_rest::AuthRejected
+impl core::cmp::Eq for iceberg_catalog_rest::AuthRejected
+impl core::cmp::PartialEq for iceberg_catalog_rest::AuthRejected
+pub fn iceberg_catalog_rest::AuthRejected::eq(&self, other: &iceberg_catalog_rest::AuthRejected) -> bool
+impl core::error::Error for iceberg_catalog_rest::AuthRejected
+impl core::fmt::Debug for iceberg_catalog_rest::AuthRejected
+pub fn iceberg_catalog_rest::AuthRejected::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for iceberg_catalog_rest::AuthRejected
+pub fn iceberg_catalog_rest::AuthRejected::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for iceberg_catalog_rest::AuthRejected
+impl core::marker::StructuralPartialEq for iceberg_catalog_rest::AuthRejected
 pub struct iceberg_catalog_rest::CommitTableRequest
 pub iceberg_catalog_rest::CommitTableRequest::identifier: core::option::Option<iceberg::catalog::TableIdent>
 pub iceberg_catalog_rest::CommitTableRequest::requirements: alloc::vec::Vec<iceberg::catalog::TableRequirement>

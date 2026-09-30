@@ -13,6 +13,8 @@ uri = "http://localhost:8181"
 # Optional REST authentication: name a process environment variable, not a secret.
 # token_env = "FLOW_CATALOG_TOKEN"
 # credential_env = "FLOW_CATALOG_CREDENTIAL" # client_id:client_secret for OAuth
+# Additional PEM CA bundle for an https:// catalog signed by a private CA.
+# tls_ca_file = "/etc/flow/catalog-ca.pem"
 warehouse = "s3://warehouse/"
 "s3.endpoint" = "http://localhost:9000"
 "s3.region" = "us-east-1"

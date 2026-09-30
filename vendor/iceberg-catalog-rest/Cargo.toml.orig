@@ -36,11 +36,13 @@ chrono = { workspace = true }
 http = { workspace = true }
 iceberg = { workspace = true }
 itertools = { workspace = true }
-reqwest = { workspace = true }
+# Local change: HTTPS through rustls and the platform trust store.
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# Local change: token expiry uses the runtime clock.
+tokio = { workspace = true, features = ["time"] }
 typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
