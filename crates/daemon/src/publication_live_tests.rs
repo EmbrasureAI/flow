@@ -387,6 +387,74 @@ async fn streamed_transactions(sql: &Client, slot: &str) -> i64 {
     .await
 }
 
+/// A long transaction holding ACCESS EXCLUSIVE on a published table must not
+/// stall capture: the publication check backs off instead of disconnecting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_locked_table_does_not_stall_capture() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let sql = &sql;
+    let held_url = url.clone();
+    with_daemon(&url, sql, "locked", |config, name| async move {
+        until("orders publishes before the lock", || async {
+            materialized(&config, "orders") > 0
+        })
+        .await;
+        let (held, connection) = tokio_postgres::connect(&held_url, NoTls).await.unwrap();
+        let held_task = tokio::spawn(connection);
+        held.batch_execute(&format!(
+            "BEGIN; LOCK TABLE {name}.items IN ACCESS EXCLUSIVE MODE"
+        ))
+        .await
+        .unwrap();
+        // Longer than a source operation deadline and many check intervals:
+        // every change to the unlocked table still publishes. Probes are spaced
+        // out so tiny commits don't build reader debt (compaction is off here).
+        let started = Instant::now();
+        let mut id = 100;
+        while started.elapsed() < Duration::from_secs(36) {
+            let before = materialized(&config, "orders");
+            sql.batch_execute(&format!(
+                "INSERT INTO {name}.orders VALUES ({id}, 'locked')"
+            ))
+            .await
+            .unwrap();
+            id += 1;
+            until("orders keeps publishing while items is locked", || async {
+                materialized(&config, "orders") > before
+            })
+            .await;
+            let active: bool = sql
+                .query_one(
+                    "SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                    &[&name],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(active, "capture disconnected while items was locked");
+            tokio::time::sleep(Duration::from_secs(12)).await;
+        }
+        held.batch_execute("ROLLBACK").await.unwrap();
+        drop(held);
+        held_task.await.unwrap().unwrap();
+        // Reader-debt pauses are expected here (compaction is off); a lock must
+        // never latch a publication or source-schema block.
+        let blocked = status(&config)["blocked_tables"].clone();
+        assert!(
+            blocked.as_array().into_iter().flatten().all(|record| {
+                record["error_code"] != "publication_changed"
+                    && record["error_code"] != "source_schema_incompatible"
+            }),
+            "a lock must not block a table: {blocked}"
+        );
+    })
+    .await;
+    drop(sql_task);
+}
+
 /// pgoutput streams a transaction's TRUNCATE, DDL Relation and rows once it
 /// exceeds logical_decoding_work_mem, before PostgreSQL commits or aborts it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

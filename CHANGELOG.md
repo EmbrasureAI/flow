@@ -133,6 +133,10 @@ directories and configurations keep working; no resynchronization is needed.
   longer claimed or deleted and no longer fails publication.
 - A full disk no longer stops the service when writing `status.json` or
   `metrics.prom`.
+- On PostgreSQL 16–18, a long `TRUNCATE`, rewriting `ALTER`, `VACUUM FULL`
+  or `CLUSTER` on one published table no longer stalls capture for every
+  table: the publication check gives up on the table lock after one second and
+  retries later instead of blocking capture and reconnecting.
 - Compaction catch-up replans instead of stopping the daemon when an external
   rewrite removes a v3 deletion vector's target data file.
 - Iceberg v3 row-lineage rewrites of binary columns are fixed.

@@ -273,7 +273,7 @@ pub(crate) async fn capture_loop(
                     stall.connected();
                     source
                 }
-                Err(error) if retryable_connection(&error) => {
+                Err(error) if retryable_connection(&error) || lock_busy(&error) => {
                     drop(replication_connection);
                     tracing::warn!(%error, hint = retry_hint(&error), "source disconnected during replication setup");
                     stall.failed(&config, &error).await;
@@ -383,6 +383,12 @@ pub(crate) async fn capture_loop(
                                             assembler.drop_table(violation.table)?;
                                         }
                                     }
+                                    publication_checked_at = Instant::now();
+                                }
+                                // Keep streaming; the lock holder's changes still need
+                                // capture. Try again after one full interval.
+                                Err(error) if lock_busy(&error) => {
+                                    tracing::warn!(%error, "publication check deferred while a published table is locked");
                                     publication_checked_at = Instant::now();
                                 }
                                 Err(error) if retryable_connection(&error) => {
@@ -1007,6 +1013,11 @@ fn retryable_sqlstate(code: &SqlState) -> bool {
     )
 }
 
+/// A catalog read gave up waiting for a lock held by another transaction.
+fn lock_busy(error: &anyhow::Error) -> bool {
+    retry_code(error) == Some(&SqlState::LOCK_NOT_AVAILABLE)
+}
+
 fn retry_code(error: &anyhow::Error) -> Option<&SqlState> {
     error.chain().find_map(|cause| {
         cause
@@ -1023,6 +1034,9 @@ fn retry_hint(error: &anyhow::Error) -> &'static str {
         }
         Some(&SqlState::TOO_MANY_CONNECTIONS) => {
             "PostgreSQL has no free connection slots for this role, database or server; retrying"
+        }
+        Some(&SqlState::LOCK_NOT_AVAILABLE) => {
+            "another transaction holds an ACCESS EXCLUSIVE lock on a published table (a long TRUNCATE or ALTER); retrying until it ends"
         }
         _ => "retrying with backoff",
     }
@@ -1442,8 +1456,13 @@ async fn publication_facts(
     publication: &str,
     relations: &[u32],
 ) -> Result<PublicationFacts> {
+    // On PostgreSQL 16+, pg_publication_tables opens each member relation, so
+    // a long TRUNCATE or ALTER holding ACCESS EXCLUSIVE would stall the check,
+    // and with it capture. Give up quickly; callers retry later.
     client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL lock_timeout = '1s'",
+        )
         .await?;
     let facts = read_publication_facts(client, publication, relations).await;
     let end = client
