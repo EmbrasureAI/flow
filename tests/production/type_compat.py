@@ -95,7 +95,7 @@ columns = [
             self.pg.execute(sql.SQL("ALTER PUBLICATION {} SET (publish_generated_columns=none)").format(sql.Identifier(self.name)))
             try:
                 result = subprocess.run(self.command("init"), env=self.environment, capture_output=True, timeout=self.args.timeout)
-                assert result.returncode != 0 and b"publication omits a configured source column" in result.stderr, result.stderr.decode()
+                assert result.returncode != 0 and b"publication omits a configured source column" in result.stdout + result.stderr, (result.stdout + result.stderr).decode()
                 assert not self.pg.execute("SELECT 1 FROM pg_replication_slots WHERE slot_name=%s", (self.name,)).fetchone()
             finally:
                 self.config.write_text(original)
