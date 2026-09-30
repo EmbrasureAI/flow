@@ -280,3 +280,64 @@ fn logical_heartbeats_preserve_transaction_boundaries_and_reject_bad_lengths() {
         assert!(Decoder::new(1024).decode(valid.slice(..end)).is_err());
     }
 }
+
+#[test]
+fn each_spool_and_stream_limit_reports_its_own_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = SpoolConfig {
+        segment_bytes: 80,
+        quota_bytes: 100,
+        max_chunk_bytes: 64,
+        max_transactions: 2,
+        max_subtransactions: 2,
+    };
+    let mut spool = TransactionSpool::open(dir.path(), config).unwrap();
+    spool.begin(1).unwrap();
+    spool.begin(2).unwrap();
+    let error = spool.begin(3).unwrap_err();
+    assert!(
+        matches!(error, Error::SpoolTransactions { limit: 2 }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("limits.spool_transactions"));
+    // Only subtransactions that captured rows are tracked.
+    spool.append(1, 1, b"top level").unwrap();
+    spool.append(1, 10, b"a").unwrap();
+    spool.append(1, 11, b"b").unwrap();
+    spool.append(1, 11, b"same savepoint").unwrap();
+    let error = spool.append(1, 12, b"c").unwrap_err();
+    assert!(
+        matches!(error, Error::SpoolSubtransactions { xid: 1, limit: 2 }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("limits.spool_subtransactions"));
+    let error = spool.append(2, 2, &[0; 64]).unwrap_err();
+    assert!(
+        matches!(error, Error::SpoolQuota { quota: 100, .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("limits.spool_bytes"));
+    assert!(matches!(
+        spool.append(2, 2, &[0; 65]).unwrap_err(),
+        Error::Protocol(_)
+    ));
+    // The default leaves room for large savepoint-heavy transactions.
+    assert!(SpoolConfig::default().max_subtransactions >= 1 << 20);
+
+    let mut decoder = Decoder::new(1024);
+    decoder.set_max_streamed_transactions(2);
+    let start = |xid: u32| {
+        message(b'S', |b| {
+            b.put_u32(xid);
+            b.put_u8(1);
+        })
+    };
+    for xid in [1, 2] {
+        decoder.decode(start(xid)).unwrap();
+        decoder.decode(message(b'E', |_| {})).unwrap();
+    }
+    let Err(Error::Protocol(reason)) = decoder.decode(start(3)) else {
+        panic!("third concurrent stream must be refused");
+    };
+    assert!(reason.contains("limits.spool_transactions"));
+}

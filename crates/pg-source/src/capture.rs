@@ -10,6 +10,11 @@ use std::{
     time::Instant,
 };
 
+/// Bytes that wrapping a decoded mutation as `DecodedMutationV1` quarantine
+/// adds: the outer table, version, kind and format tags and the payload length.
+/// Rows reserve it so a blocked table keeps every row's complete evidence.
+pub const QUARANTINE_WRAP_BYTES: u64 = 24;
+
 struct Buffer {
     xid: u32,
     subxid: u32,
@@ -196,18 +201,33 @@ impl CaptureAssembler {
         }
         self.block_table(table)?;
         let version = self.schemas[&table].version;
-        self.append(
-            xid,
-            subxid,
-            Mutation {
-                table_id: table,
-                schema_version: version,
-                kind: MutationKind::Quarantined {
-                    format: flow_model::QuarantineFormat::PostgresEventV1,
-                    payload: bincode::serialize(&(relation, event))?,
-                },
+        let mutation = Mutation {
+            table_id: table,
+            schema_version: version,
+            kind: MutationKind::Quarantined {
+                format: flow_model::QuarantineFormat::PostgresEventV1,
+                payload: bincode::serialize(&(relation, event))?,
             },
-        )
+        };
+        // Evidence for a row that exceeded the chunk limit cannot fit either.
+        // A bounded marker still holds this transaction for the blocked table.
+        let mutation = self.fit_quarantine(mutation)?;
+        self.append(xid, subxid, mutation)
+    }
+
+    /// Replace quarantined evidence that cannot fit one chunk with a marker.
+    fn fit_quarantine(&self, mutation: Mutation) -> Result<Mutation> {
+        let bytes = bincode::serialized_size(&mutation)?;
+        if bytes + 16 <= self.chunk_bytes {
+            return Ok(mutation);
+        }
+        Ok(Mutation {
+            kind: MutationKind::Quarantined {
+                format: flow_model::QuarantineFormat::OversizedV1,
+                payload: bincode::serialize(&(mutation.table_id.0, bytes))?,
+            },
+            ..mutation
+        })
     }
 
     pub fn pending_commit_count(&self) -> usize {
@@ -404,7 +424,10 @@ impl CaptureAssembler {
             } => {
                 let (schema, metadata) = self.table(relation)?;
                 if schema.append_only {
-                    return Err(Error::Config("UPDATE on an append-only table"));
+                    return Err(Error::AppendOnly {
+                        table: relation,
+                        operation: "UPDATE",
+                    });
                 }
                 if row.iter().any(|cell| matches!(cell, Cell::UnchangedToast)) {
                     // pgoutput omits unchanged TOAST values from the new tuple,
@@ -446,7 +469,10 @@ impl CaptureAssembler {
             } => {
                 let (schema, metadata) = self.table(relation)?;
                 if schema.append_only {
-                    return Err(Error::Config("DELETE on an append-only table"));
+                    return Err(Error::AppendOnly {
+                        table: relation,
+                        operation: "DELETE",
+                    });
                 }
                 let key = decode_key(schema, metadata, &old, &self.types)?;
                 let mutation = Mutation {
@@ -525,14 +551,32 @@ impl CaptureAssembler {
                             .deserialize(&bytes[8..])?;
                         for mutation in &mut mutations {
                             if !matches!(&mutation.kind, MutationKind::Quarantined { .. }) {
-                                mutation.kind = MutationKind::Quarantined {
-                                    format: flow_model::QuarantineFormat::DecodedMutationV1,
-                                    payload: bincode::serialize(mutation)?,
-                                };
+                                *mutation = self.fit_quarantine(Mutation {
+                                    table_id: mutation.table_id,
+                                    schema_version: mutation.schema_version,
+                                    kind: MutationKind::Quarantined {
+                                        format: flow_model::QuarantineFormat::DecodedMutationV1,
+                                        payload: bincode::serialize(mutation)?,
+                                    },
+                                })?;
                             }
                             mutation.schema_version = self.schemas[&table_id].version;
                         }
-                        journal.append_chunk(xid, &bincode::serialize(&mutations)?)?;
+                        // Wrapping grows each mutation, so the spooled chunk
+                        // may no longer fit one journal frame. Split it.
+                        let mut batch: Vec<Mutation> = Vec::new();
+                        let mut batch_bytes = 16;
+                        for mutation in mutations {
+                            let bytes = bincode::serialized_size(&mutation)?;
+                            if !batch.is_empty() && batch_bytes + bytes > self.chunk_bytes {
+                                journal.append_chunk(xid, &bincode::serialize(&batch)?)?;
+                                batch.clear();
+                                batch_bytes = 16;
+                            }
+                            batch.push(mutation);
+                            batch_bytes += bytes;
+                        }
+                        journal.append_chunk(xid, &bincode::serialize(&batch)?)?;
                         entry.0 = self.schemas[&table_id].version;
                     } else {
                         journal.append_chunk(xid, &bytes[8..])?;
@@ -605,10 +649,17 @@ impl CaptureAssembler {
             return Err(Error::Protocol("mutation outside capture transaction"));
         }
         let bytes = bincode::serialized_size(&mutation)?;
-        if bytes + 16 > self.chunk_bytes {
-            return Err(Error::Config(
-                "single mutation exceeds capture chunk limit; increase row/chunk limits",
-            ));
+        let reserve = if matches!(mutation.kind, MutationKind::Quarantined { .. }) {
+            0
+        } else {
+            QUARANTINE_WRAP_BYTES
+        };
+        if bytes + 16 + reserve > self.chunk_bytes {
+            return Err(Error::RowLimit {
+                table: mutation.table_id.0,
+                bytes: bytes + 16 + reserve,
+                limit: self.chunk_bytes,
+            });
         }
         if self.buffer.as_ref().is_some_and(|b| {
             b.xid != xid

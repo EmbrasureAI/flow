@@ -104,13 +104,19 @@ Every frame has a 28-byte little-endian header:
 
 Segment rotation syncs the previous segment and directory; terminal commits sync
 the current segment before advancing `durable_lsn`. Recovery checks bounds,
-sequence, checksum, terminal references and commit order. It truncates at the
-first torn or corrupt frame and removes all later segments. Unknown versions and
-record kinds stop recovery without truncating the journal. Orphan transactions acquire
-abort markers before new capture can reuse their XIDs. The returned
-`Recovery::truncated_bytes` must be surfaced to the operator. In journaled ACK
-mode, damaged already-acknowledged storage is a critical durability failure, not
-evidence that PostgreSQL can resend the lost records.
+sequence, checksum, terminal references and commit order. Only the final segment
+can hold an unsynchronized suffix, so recovery truncates a torn or corrupt frame
+only there. Damage in any earlier segment is storage corruption: open fails with
+`SegmentCorrupt` and modifies no segment file. `Journal::open_with_floor` also
+refuses (`DurableTail`) to truncate a final-segment tail if that would lose a
+transaction at or below a durable position the caller recorded independently;
+the daemon passes the source ledger's journal durable LSN. No recovery path
+deletes a segment. Unknown versions and record kinds stop recovery without
+truncating the journal. Orphan transactions acquire abort markers before new
+capture can reuse their XIDs. The returned `Recovery::truncated_bytes` must be
+surfaced to the operator. In journaled ACK mode, damaged already-acknowledged
+storage is a critical durability failure, not evidence that PostgreSQL can
+resend the lost records.
 
 Range terminals contain first/last chunk locations, count, payload bytes and an
 ordered-reference checksum. This descriptor stays constant in size for a large
