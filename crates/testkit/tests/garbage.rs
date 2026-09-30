@@ -372,7 +372,7 @@ async fn registered_gc_preserves_readers_checkpoints_and_pending_uploads_across_
         .expire_history(
             &current,
             schema.table_id,
-            Duration::from_millis(1),
+            &flow_coordinator::HistoryPolicy::window(Duration::from_millis(1)),
             &protection.snapshots,
         )
         .await
@@ -386,7 +386,7 @@ async fn registered_gc_preserves_readers_checkpoints_and_pending_uploads_across_
         .expire_history(
             &current,
             schema.table_id,
-            Duration::from_millis(1),
+            &flow_coordinator::HistoryPolicy::window(Duration::from_millis(1)),
             &BTreeSet::new(),
         )
         .await

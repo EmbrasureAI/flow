@@ -88,6 +88,8 @@ No separate export task is created.
 | `flow_external_reconciliations_total` | External snapshots successfully verified and durably applied to the row index, labelled by table and bounded reconciliation kind |
 | `flow_artifact_{files,bytes}_written_total` | Successfully finished data/delete artifacts, including attempts later invalidated |
 | `flow_garbage_delete_requests_total` | Conservative deletion requests against registered obsolete artifacts |
+| `flow_metadata_maintenance_failures_total` | Table-scoped manifest rewrite, snapshot expiration or garbage collection failures, labelled by `task`; each is retried with backoff |
+| `flow_expiration_missing_protections_total` | Checkpoint or operation snapshots another process expired before Flow; their protection is dropped |
 
 Recovered catalog markers are counted separately and excluded from latency samples. Source-to-service times require synchronized clocks; the production benchmark records calibration uncertainty and complete per-transaction observations. Artifact counters do not include internal SDK retry traffic or catalog-owned metadata writes and must not be presented as cloud billing measurements.
 

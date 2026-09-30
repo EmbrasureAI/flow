@@ -18,6 +18,22 @@ use crate::{
 
 pub const OPERATION_ID_KEY: &str = "flow.operation-id";
 
+/// Flow owns, and garbage collection may delete, only flat children of the
+/// table's `metadata/` directory. A catalog that writes its JSON elsewhere
+/// (for example under `write.metadata.path`) keeps ownership of that JSON.
+pub fn owned_metadata_path(location: &str, path: &str) -> bool {
+    path.strip_prefix(location.trim_end_matches('/'))
+        .and_then(|rest| rest.strip_prefix("/metadata/"))
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name != "."
+                && name != ".."
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        })
+}
+
 /// A successful publication, or the prior publication found during recovery.
 #[derive(Debug)]
 pub struct CommitResult {
@@ -720,9 +736,12 @@ async fn publish(
         // The catalog writes the next JSON, but its current pointer is already
         // authoritative. Own it before superseding it, including lost responses
         // and retries. REST catalogs need not maintain a previous-metadata log.
-        artifacts
-            .paths
-            .extend(table.metadata_location().map(str::to_owned));
+        artifacts.paths.extend(
+            table
+                .metadata_location()
+                .filter(|path| owned_metadata_path(metadata.location(), path))
+                .map(str::to_owned),
+        );
         tracker.register(artifacts).await?;
     }
     let mut manifest_number = 0;
@@ -995,4 +1014,28 @@ pub(crate) async fn manifest_list_writer(
     } else {
         ManifestListWriter::v2(output, snapshot_id, parent, sequence)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owned_metadata_path;
+
+    #[test]
+    fn only_flat_children_of_the_table_metadata_directory_are_owned() {
+        let location = "s3://bucket/warehouse/db/table/";
+        assert!(owned_metadata_path(
+            location,
+            "s3://bucket/warehouse/db/table/metadata/00001-a.metadata.json"
+        ));
+        for path in [
+            "s3://bucket/custom-metadata/00001-a.metadata.json",
+            "s3://bucket/warehouse/db/table/metadata/nested/00001-a.metadata.json",
+            "s3://bucket/warehouse/db/table/metadata/",
+            "s3://bucket/warehouse/db/table/metadata/..",
+            "s3://bucket/warehouse/db/table-other/metadata/00001-a.metadata.json",
+            "s3://bucket/warehouse/db/table/data/00001-a.metadata.json",
+        ] {
+            assert!(!owned_metadata_path(location, path), "{path}");
+        }
+    }
 }

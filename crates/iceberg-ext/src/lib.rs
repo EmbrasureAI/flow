@@ -17,6 +17,7 @@ pub use identity::{content_file_id, delete_content_size, physical_file_stats};
 
 pub use action::{
     CommitAttempt, CommitResult, OPERATION_ID_KEY, RewriteFilesAction, RowDeltaAction,
+    owned_metadata_path,
 };
 pub use artifacts::{ArtifactSet, ArtifactTracker, NumberedArtifacts, retained_artifacts};
 pub use manifests::{ManifestRewritePolicy, RewriteManifestsAction};

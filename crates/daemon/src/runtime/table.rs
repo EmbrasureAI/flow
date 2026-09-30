@@ -18,7 +18,7 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 async fn discard_unowned_spool(store: StateStore, operation: OperationId) -> Result<()> {
@@ -32,16 +32,93 @@ async fn discard_unowned_spool(store: StateStore, operation: OperationId) -> Res
     Ok(())
 }
 
-fn history_due(table: &Table, retention_seconds: u64) -> Result<bool> {
-    if table.metadata().snapshots().len() < 128 {
-        return Ok(false);
+/// Wait after a table-scoped metadata maintenance failure, doubling per
+/// consecutive failure. CDC for the table and every other table continues.
+const METADATA_RETRY_MIN: Duration = Duration::from_secs(30);
+const METADATA_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+/// Mandatory work that could not get under its limit (for example, history
+/// pinned by checkpoints) is not retried with every epoch.
+const MANDATORY_METADATA_STALL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum MetadataTask {
+    Manifests,
+    History,
+    Garbage,
+}
+
+impl MetadataTask {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Manifests => "manifest_rewrite",
+            Self::History => "snapshot_expiration",
+            Self::Garbage => "garbage_collection",
+        }
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let cutoff = now.saturating_sub(u128::from(retention_seconds) * 1000);
-    Ok(table
-        .metadata()
-        .snapshots()
-        .any(|s| s.timestamp_ms() >= 0 && (s.timestamp_ms() as u128) < cutoff))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataScope {
+    /// Everything due, including garbage collection.
+    Full,
+    /// Only work past a hard limit. It reduces commit cost, so it runs with
+    /// CDC even while source pressure suppresses optional maintenance.
+    Mandatory,
+}
+
+/// Per-table retry state for metadata maintenance. Process-local: a restart
+/// retries immediately, which is harmless.
+#[derive(Default)]
+pub(super) struct MetadataBackoff {
+    failures: BTreeMap<(TableId, MetadataTask), (Instant, u32)>,
+    stalled: BTreeMap<(TableId, MetadataTask), Instant>,
+}
+
+impl MetadataBackoff {
+    fn failed_until(&self, id: TableId, task: MetadataTask, now: Instant) -> bool {
+        self.failures
+            .get(&(id, task))
+            .is_some_and(|(retry_at, _)| now < *retry_at)
+    }
+
+    fn stalled_until(&self, id: TableId, task: MetadataTask, now: Instant) -> bool {
+        self.failed_until(id, task, now)
+            || self
+                .stalled
+                .get(&(id, task))
+                .is_some_and(|until| now < *until)
+    }
+
+    fn fail(&mut self, id: TableId, task: MetadataTask, now: Instant) -> Duration {
+        let failures = self
+            .failures
+            .get(&(id, task))
+            .map_or(1, |(_, failures)| failures.saturating_add(1));
+        let delay = METADATA_RETRY_MIN
+            .saturating_mul(1 << failures.saturating_sub(1).min(8))
+            .min(METADATA_RETRY_MAX);
+        self.failures.insert((id, task), (now + delay, failures));
+        delay
+    }
+
+    fn succeed(&mut self, id: TableId, task: MetadataTask) {
+        self.failures.remove(&(id, task));
+    }
+
+    fn stall(&mut self, id: TableId, task: MetadataTask, until: Instant) {
+        self.stalled.insert((id, task), until);
+    }
+}
+
+/// Local index, journal, model and disk failures stay connection-wide, as they
+/// do for publication. Other metadata maintenance failures are table-scoped.
+fn local_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<flow_state_store::Error>()
+            || cause.is::<flow_ingress_journal::Error>()
+            || cause.is::<flow_model::ModelError>()
+    }) || error.chain().any(|cause| cause.is::<std::io::Error>())
+        && !error.chain().any(|cause| cause.is::<reqwest::Error>())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -253,6 +330,7 @@ pub(super) struct TableWork {
     pub(super) publisher: Arc<TablePublisher>,
     pub(super) maintenance: Arc<TableMaintenance>,
     pub(super) garbage_checked: Arc<Mutex<BTreeMap<TableId, Instant>>>,
+    pub(super) metadata_backoff: Arc<Mutex<MetadataBackoff>>,
     pub(super) compaction: bool,
 }
 impl TableWork {
@@ -748,7 +826,7 @@ impl TableWork {
             let inventory = self.maintenance.inventory(&current, id).await?;
             crate::observation::table_inventory(id, &inventory);
             let (_, continuation) = self
-                .maintain_metadata(current, id, inventory.manifest_count)
+                .maintain_metadata(current, id, inventory.manifest_count, MetadataScope::Full)
                 .await?;
             tracing::info!(
                 event = "periodic_maintenance_completed",
@@ -1007,8 +1085,16 @@ impl TableWork {
         if pressure == flow_compactor::PublicationPressure::Pause {
             return Err(flow_compactor::Error::MaintenanceRequired.into());
         }
-        let periodic = self.metadata_due(&current, id, inventory.manifest_count)?;
         if !optional {
+            let (current, _) = self
+                .maintain_metadata(
+                    current,
+                    id,
+                    inventory.manifest_count,
+                    MetadataScope::Mandatory,
+                )
+                .await?;
+            let periodic = self.metadata_due(&current, id, inventory.manifest_count)?;
             return Ok(MaintenanceOutcome::Complete(
                 current,
                 MaintenancePending {
@@ -1018,7 +1104,7 @@ impl TableWork {
             ));
         }
         let (current, continuation) = self
-            .maintain_metadata(current, id, inventory.manifest_count)
+            .maintain_metadata(current, id, inventory.manifest_count, MetadataScope::Full)
             .await?;
         Ok(MaintenanceOutcome::Complete(
             current,
@@ -1029,7 +1115,19 @@ impl TableWork {
         ))
     }
 
+    fn backoff(&self) -> Result<std::sync::MutexGuard<'_, MetadataBackoff>> {
+        self.metadata_backoff
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance backoff lock poisoned"))
+    }
+
     fn garbage_due(&self, id: TableId) -> Result<bool> {
+        if self
+            .backoff()?
+            .failed_until(id, MetadataTask::Garbage, Instant::now())
+        {
+            return Ok(false);
+        }
         Ok(self
             .garbage_checked
             .lock()
@@ -1040,11 +1138,84 @@ impl TableWork {
             }))
     }
 
+    fn manifests_due(&self, id: TableId, manifests: usize, scope: MetadataScope) -> Result<bool> {
+        let now = Instant::now();
+        let limit = self.config.limits.manifest_max_count;
+        Ok(match scope {
+            MetadataScope::Full => {
+                manifests >= limit
+                    && !self
+                        .backoff()?
+                        .failed_until(id, MetadataTask::Manifests, now)
+            }
+            // Manifest count drives the cost of every commit and scan plan.
+            MetadataScope::Mandatory => {
+                manifests >= limit.saturating_mul(2)
+                    && !self
+                        .backoff()?
+                        .stalled_until(id, MetadataTask::Manifests, now)
+            }
+        })
+    }
+
+    fn history_due(&self, table: &Table, id: TableId, scope: MetadataScope) -> Result<bool> {
+        if !self.config.limits.snapshot_expiration {
+            return Ok(false);
+        }
+        let policy = self.config.limits.history_policy();
+        let now = Instant::now();
+        Ok(match scope {
+            MetadataScope::Full => {
+                policy.due(table.metadata())?
+                    && !self.backoff()?.failed_until(id, MetadataTask::History, now)
+            }
+            MetadataScope::Mandatory => {
+                policy.over_limit(table.metadata())?
+                    && !self
+                        .backoff()?
+                        .stalled_until(id, MetadataTask::History, now)
+            }
+        })
+    }
+
     fn metadata_due(&self, table: &Table, id: TableId, manifests: usize) -> Result<bool> {
-        Ok(manifests >= self.config.limits.manifest_max_count
-            || self.config.limits.snapshot_expiration
-                && history_due(table, self.config.limits.snapshot_retention_secs)?
+        Ok(self.manifests_due(id, manifests, MetadataScope::Full)?
+            || self.history_due(table, id, MetadataScope::Full)?
             || self.garbage_due(id)?)
+    }
+
+    /// Record the outcome of one metadata maintenance task. A table-scoped
+    /// failure is logged, counted and retried later; `None` is returned and
+    /// publication continues. Local failures and replans keep their existing
+    /// handling. A failure that left an operation for recovery blocks only
+    /// this table until the operation is resolved.
+    fn settle<T>(&self, id: TableId, task: MetadataTask, result: Result<T>) -> Result<Option<T>> {
+        let error = match result {
+            Ok(value) => {
+                self.backoff()?.succeed(id, task);
+                return Ok(Some(value));
+            }
+            Err(error) => error,
+        };
+        if local_failure(&error) || error.downcast_ref::<ReplanRequired>().is_some() {
+            return Err(error);
+        }
+        let delay = self.backoff()?.fail(id, task, Instant::now());
+        metrics::counter!("flow_metadata_maintenance_failures_total",
+            "table_id" => id.0.to_string(), "task" => task.name())
+        .increment(1);
+        tracing::warn!(
+            event = "metadata_maintenance_failed",
+            table_id = id.0,
+            task = task.name(),
+            retry_in_secs = delay.as_secs(),
+            %error,
+            "table metadata maintenance failed; retrying later without stopping CDC"
+        );
+        if self.store.table_state(&id)?.pending_operation.is_some() {
+            return Err(error.context(flow_compactor::Error::MaintenanceRequired));
+        }
+        Ok(None)
     }
 
     /// Run on the table actor independently of soft data debt. Garbage collection
@@ -1054,13 +1225,14 @@ impl TableWork {
         mut current: Table,
         id: TableId,
         manifests: usize,
+        scope: MetadataScope,
     ) -> Result<(Table, bool)> {
-        let manifests_due = manifests >= self.config.limits.manifest_max_count;
-        let history_due = self.config.limits.snapshot_expiration
-            && history_due(&current, self.config.limits.snapshot_retention_secs)?;
-        let garbage_due = self.garbage_due(id)?;
+        let manifests_due = self.manifests_due(id, manifests, scope)?;
+        let history_due = self.history_due(&current, id, scope)?;
+        let garbage_due = scope == MetadataScope::Full && self.garbage_due(id)?;
         if manifests_due {
-            self.maintenance
+            let result = self
+                .maintenance
                 .rewrite_manifests(
                     &current,
                     id,
@@ -1069,7 +1241,15 @@ impl TableWork {
                         ..Default::default()
                     },
                 )
-                .await?;
+                .await;
+            let rewritten = self.settle(id, MetadataTask::Manifests, result)?;
+            if scope == MetadataScope::Mandatory && matches!(rewritten, Some(None)) {
+                self.backoff()?.stall(
+                    id,
+                    MetadataTask::Manifests,
+                    Instant::now() + MANDATORY_METADATA_STALL,
+                );
+            }
             current = self.catalog.load_table(current.identifier()).await?;
         }
         if history_due {
@@ -1083,15 +1263,30 @@ impl TableWork {
             if !unresolved_initial {
                 let protected =
                     flow_coordinator::GarbageProtection::from_checkpoints(id, &checkpoints);
-                self.maintenance
-                    .expire_history(
-                        &current,
-                        id,
-                        Duration::from_secs(self.config.limits.snapshot_retention_secs),
-                        &protected.snapshots,
-                    )
-                    .await?;
+                let policy = self.config.limits.history_policy();
+                let result = self
+                    .maintenance
+                    .expire_history(&current, id, &policy, &protected.snapshots)
+                    .await;
+                let expired = self.settle(id, MetadataTask::History, result)?;
                 current = self.catalog.load_table(current.identifier()).await?;
+                if scope == MetadataScope::Mandatory
+                    && expired.is_some()
+                    && policy.over_limit(current.metadata())?
+                {
+                    tracing::warn!(
+                        event = "snapshot_limit_unreachable",
+                        table_id = id.0,
+                        snapshots = current.metadata().snapshots().len(),
+                        limit = policy.max_snapshots,
+                        "protected snapshots keep the table above its snapshot limit"
+                    );
+                    self.backoff()?.stall(
+                        id,
+                        MetadataTask::History,
+                        Instant::now() + MANDATORY_METADATA_STALL,
+                    );
+                }
             }
         }
         let mut garbage_pending = false;
@@ -1101,7 +1296,7 @@ impl TableWork {
                 &self.control.checkpoints()?,
             );
             let started = Instant::now();
-            let report = self
+            let result = self
                 .maintenance
                 .collect_garbage(
                     &current,
@@ -1112,20 +1307,22 @@ impl TableWork {
                     },
                     &protection,
                 )
-                .await?;
-            garbage_pending = report.continuation_required;
-            if !garbage_pending {
-                self.garbage_checked
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("maintenance clock lock poisoned"))?
-                    .insert(id, Instant::now());
+                .await;
+            if let Some(report) = self.settle(id, MetadataTask::Garbage, result)? {
+                garbage_pending = report.continuation_required;
+                if !garbage_pending {
+                    self.garbage_checked
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("maintenance clock lock poisoned"))?
+                        .insert(id, Instant::now());
+                }
+                metrics::counter!("flow_garbage_delete_requests_total", "table_id" => id.0.to_string())
+                    .increment(report.delete_requests as u64);
+                metrics::counter!("flow_garbage_metadata_json_delete_requests_total", "table_id" => id.0.to_string())
+                    .increment(report.metadata_json_delete_requests as u64);
+                metrics::histogram!("flow_garbage_collection_seconds", "table_id" => id.0.to_string())
+                    .record(started.elapsed().as_secs_f64());
             }
-            metrics::counter!("flow_garbage_delete_requests_total", "table_id" => id.0.to_string())
-                .increment(report.delete_requests as u64);
-            metrics::counter!("flow_garbage_metadata_json_delete_requests_total", "table_id" => id.0.to_string())
-                .increment(report.metadata_json_delete_requests as u64);
-            metrics::histogram!("flow_garbage_collection_seconds", "table_id" => id.0.to_string())
-                .record(started.elapsed().as_secs_f64());
         }
         Ok((current, garbage_pending))
     }
@@ -1354,6 +1551,7 @@ mod publication_retry_tests {
                 .unwrap(),
             ),
             garbage_checked: Arc::default(),
+            metadata_backoff: Arc::default(),
             compaction: false,
         };
 
@@ -1452,5 +1650,416 @@ mod publication_retry_tests {
         settle_unfinished_operation(Target::Present).await;
         settle_unfinished_operation(Target::Dropped).await;
         settle_unfinished_operation(Target::Replaced).await;
+    }
+}
+
+#[cfg(test)]
+mod metadata_maintenance_tests {
+    use super::*;
+    use flow_iceberg_ext::RowDeltaAction;
+    use flow_materializer::DataWriter;
+    use flow_model::{PgLsn, Value};
+    use flow_state_store::{IndexDelta, PreparedOperation};
+    use iceberg::{
+        CatalogBuilder, NamespaceIdent, TableCreation,
+        memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
+    };
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        work: TableWork,
+        schema: TableSchema,
+        head: Table,
+    }
+
+    /// A target with `commits` Flow-indexed snapshots.
+    async fn fixture(limits: impl FnOnce(&mut crate::config::Limits), commits: u64) -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../../../examples/flow.toml")).unwrap();
+        config.state_dir = root.path().join("state");
+        limits(&mut config.limits);
+        config.validate().unwrap();
+        let schema = config.tables[0].schema(7);
+        let id = schema.table_id;
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(root.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "retention",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.into(),
+                        "memory://retention".into(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let namespace = NamespaceIdent::new("replicated".into());
+        catalog
+            .create_namespace(&namespace, std::collections::HashMap::new())
+            .await
+            .unwrap();
+        let mut head = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .schema(flow_materializer::iceberg_schema(&schema).unwrap())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        for n in 1..=commits {
+            let operation = OperationId(format!("seed-{n}"));
+            let row = vec![Value::Int64(n as i64), Value::String("kept".into())];
+            let lsn = PgLsn(n * 10);
+            let mut writer = DataWriter::new(
+                head.file_io().clone(),
+                head.metadata().location(),
+                &operation,
+                schema.clone(),
+                0,
+                flow_materializer::WriterConfig::default(),
+            )
+            .unwrap();
+            let mut locations = writer
+                .write(std::slice::from_ref(&row), lsn)
+                .await
+                .unwrap()
+                .locations;
+            let committed = RowDeltaAction::new(&head, operation.0.clone())
+                .add_data_files(writer.close().await.unwrap())
+                .commit(catalog.as_ref(), &head)
+                .await
+                .unwrap();
+            for location in &mut locations {
+                location.data_sequence_number = committed.sequence_number;
+            }
+            store
+                .prepare(
+                    PreparedOperation {
+                        id: operation.clone(),
+                        table_id: id,
+                        kind: OperationKind::Ingest,
+                        base_snapshot_id: head.metadata().current_snapshot_id(),
+                        last_lsn: lsn,
+                        schema_version: schema.version,
+                        artifacts: vec![],
+                        payload: vec![],
+                    },
+                    locations.into_iter().map(|location| IndexDelta {
+                        key: schema.encode_key(&row).unwrap(),
+                        expected: None,
+                        replacement: Some(location),
+                    }),
+                )
+                .unwrap();
+            store
+                .mark_committed(&operation, committed.snapshot_id, committed.sequence_number)
+                .unwrap();
+            store.apply_committed(&operation).unwrap();
+            store.forget_applied(&operation).unwrap();
+            head = committed.table;
+        }
+        let (journal, _) = flow_ingress_journal::Journal::open(
+            root.path().join("journal"),
+            flow_ingress_journal::JournalConfig::default(),
+        )
+        .unwrap();
+        let writer = crate::services::writer_config(&config);
+        let work = TableWork {
+            config: Arc::new(config.clone()),
+            store: store.clone(),
+            control,
+            reader: journal.reader(),
+            catalog: catalog.clone(),
+            targets: Arc::new(BTreeMap::from([(
+                id,
+                (head.identifier().clone(), head.metadata().uuid()),
+            )])),
+            publisher: Arc::new(
+                TablePublisher::new(
+                    store.clone(),
+                    catalog.clone(),
+                    writer.clone(),
+                    config.limits.batch_rows,
+                    config.limits.batch_bytes,
+                )
+                .unwrap(),
+            ),
+            maintenance: Arc::new(
+                TableMaintenance::new(store, catalog, config.compaction.clone(), writer).unwrap(),
+            ),
+            garbage_checked: Arc::default(),
+            metadata_backoff: Arc::default(),
+            compaction: false,
+        };
+        Fixture {
+            _root: root,
+            work,
+            schema,
+            head,
+        }
+    }
+
+    fn options() -> WorkOptions {
+        WorkOptions {
+            periodic_maintenance: false,
+            build_active: false,
+            build_admission: BuildAdmission::Wait,
+            actor_acquired_at: Instant::now(),
+        }
+    }
+
+    async fn snapshots(f: &Fixture) -> usize {
+        f.work
+            .catalog
+            .load_table(f.head.identifier())
+            .await
+            .unwrap()
+            .metadata()
+            .snapshots()
+            .len()
+    }
+
+    /// CDC publication does only mandatory maintenance, and it is not subject
+    /// to source-pressure admission. History far past the cap is expired
+    /// there, inside the reader window, while a small overrun waits for
+    /// periodic maintenance.
+    #[tokio::test]
+    async fn publication_path_expires_history_past_the_snapshot_cap() {
+        let f = fixture(
+            |limits| {
+                limits.snapshot_retain_last = 1;
+                limits.snapshot_max_count = 3;
+            },
+            4,
+        )
+        .await;
+        // Four snapshots are within the one-snapshot slack above a cap of three.
+        let outcome = f
+            .work
+            .maintain(
+                f.head.clone(),
+                &f.schema,
+                false,
+                options(),
+                &mut Default::default(),
+            )
+            .await
+            .unwrap();
+        let MaintenanceOutcome::Complete(head, pending) = outcome else {
+            panic!("expected completed maintenance");
+        };
+        assert_eq!(head.metadata().snapshots().len(), 4);
+        assert!(pending.periodic, "periodic maintenance trims to the cap");
+
+        let f = fixture(
+            |limits| {
+                limits.snapshot_retain_last = 1;
+                limits.snapshot_max_count = 3;
+            },
+            6,
+        )
+        .await;
+        let outcome = f
+            .work
+            .maintain(
+                f.head.clone(),
+                &f.schema,
+                false,
+                options(),
+                &mut Default::default(),
+            )
+            .await
+            .unwrap();
+        let MaintenanceOutcome::Complete(head, _) = outcome else {
+            panic!("expected completed maintenance");
+        };
+        assert_eq!(head.metadata().snapshots().len(), 3);
+        assert_eq!(snapshots(&f).await, 3);
+        assert_eq!(
+            head.metadata().current_snapshot_id(),
+            f.head.metadata().current_snapshot_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_disabled_target_is_skipped_without_error() {
+        let f = fixture(
+            |limits| {
+                limits.snapshot_retention_secs = 1;
+                limits.snapshot_retain_last = 1;
+                limits.snapshot_max_count = 1;
+            },
+            3,
+        )
+        .await;
+        let transaction = iceberg::transaction::Transaction::new(&f.head);
+        let head = {
+            use iceberg::transaction::ApplyTransactionAction;
+            transaction
+                .update_table_properties()
+                .set("gc.enabled".into(), "false".into())
+                .apply(transaction)
+                .unwrap()
+                .commit(f.work.catalog.as_ref())
+                .await
+                .unwrap()
+        };
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let id = f.schema.table_id;
+        // Past the window and the cap, but another process owns its history.
+        assert!(!f.work.history_due(&head, id, MetadataScope::Full).unwrap());
+        assert!(
+            !f.work
+                .history_due(&head, id, MetadataScope::Mandatory)
+                .unwrap()
+        );
+        let (head, _) = f
+            .work
+            .maintain_metadata(head, id, 0, MetadataScope::Full)
+            .await
+            .unwrap();
+        assert_eq!(head.metadata().snapshots().len(), 3);
+        assert!(f.work.metadata_backoff.lock().unwrap().failures.is_empty());
+    }
+
+    /// A maintenance-only failure is table-scoped: it is retried with backoff
+    /// and neither stops publication nor exits the process.
+    #[tokio::test]
+    async fn maintenance_failure_backs_off_without_stopping_publication() {
+        let f = fixture(
+            |limits| {
+                limits.snapshot_retain_last = 1;
+                limits.snapshot_max_count = 1;
+            },
+            3,
+        )
+        .await;
+        let id = f.schema.table_id;
+        // An external commit the index has not reconciled makes expiration fail.
+        let external = {
+            use iceberg::transaction::ApplyTransactionAction;
+            let transaction = iceberg::transaction::Transaction::new(&f.head);
+            transaction
+                .fast_append()
+                .set_snapshot_properties(std::collections::HashMap::from([(
+                    "external".into(),
+                    "true".into(),
+                )]))
+                .apply(transaction)
+                .unwrap()
+                .commit(f.work.catalog.as_ref())
+                .await
+                .unwrap()
+        };
+        assert_ne!(
+            external.metadata().current_snapshot_id(),
+            f.head.metadata().current_snapshot_id()
+        );
+        f.work
+            .garbage_checked
+            .lock()
+            .unwrap()
+            .insert(id, Instant::now());
+        assert!(
+            f.work
+                .history_due(&external, id, MetadataScope::Full)
+                .unwrap()
+        );
+        f.work
+            .maintain_metadata(external.clone(), id, 0, MetadataScope::Full)
+            .await
+            .unwrap();
+        assert_eq!(snapshots(&f).await, 4);
+        assert!(
+            !f.work
+                .history_due(&external, id, MetadataScope::Full)
+                .unwrap()
+        );
+        assert!(
+            !f.work
+                .history_due(&external, id, MetadataScope::Mandatory)
+                .unwrap()
+        );
+        assert!(!f.work.metadata_due(&external, id, 0).unwrap());
+        let (retry_at, failures) =
+            f.work.metadata_backoff.lock().unwrap().failures[&(id, MetadataTask::History)];
+        assert_eq!(failures, 1);
+        assert!(retry_at > Instant::now() + METADATA_RETRY_MIN / 2);
+    }
+
+    #[test]
+    fn failure_backoff_doubles_is_capped_and_clears_on_success() {
+        let mut backoff = MetadataBackoff::default();
+        let id = TableId(1);
+        let now = Instant::now();
+        let delays: Vec<_> = (0..8)
+            .map(|_| backoff.fail(id, MetadataTask::Garbage, now))
+            .collect();
+        assert_eq!(delays[0], METADATA_RETRY_MIN);
+        assert_eq!(delays[1], METADATA_RETRY_MIN * 2);
+        assert_eq!(*delays.last().unwrap(), METADATA_RETRY_MAX);
+        assert!(backoff.failed_until(id, MetadataTask::Garbage, now));
+        assert!(!backoff.failed_until(id, MetadataTask::History, now));
+        assert!(!backoff.failed_until(TableId(2), MetadataTask::Garbage, now));
+        backoff.succeed(id, MetadataTask::Garbage);
+        assert!(!backoff.failed_until(id, MetadataTask::Garbage, now));
+        backoff.stall(id, MetadataTask::History, now + MANDATORY_METADATA_STALL);
+        assert!(backoff.stalled_until(id, MetadataTask::History, now));
+        assert!(!backoff.failed_until(id, MetadataTask::History, now));
+    }
+
+    #[tokio::test]
+    async fn settle_keeps_local_failures_fatal_and_blocks_only_unresolved_operations() {
+        let f = fixture(|_| {}, 1).await;
+        let id = f.schema.table_id;
+        let remote = || {
+            Err::<(), _>(anyhow::Error::new(iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                "Cannot expire snapshots",
+            )))
+        };
+        assert!(
+            f.work
+                .settle(id, MetadataTask::History, remote())
+                .unwrap()
+                .is_none()
+        );
+        let disk = Err::<(), _>(anyhow::Error::new(std::io::Error::other("disk")));
+        assert!(f.work.settle(id, MetadataTask::History, disk).is_err());
+        let corrupt = Err::<(), _>(anyhow::Error::new(
+            flow_state_store::Error::AuthorityCorruption("bad".into()),
+        ));
+        assert!(f.work.settle(id, MetadataTask::History, corrupt).is_err());
+        let replan = Err::<(), _>(ReplanRequired.into());
+        assert!(f.work.settle(id, MetadataTask::Garbage, replan).is_err());
+
+        // A failure that left an operation must be recovered before this
+        // table publishes again; it blocks only this table and is retried.
+        f.work
+            .store
+            .begin_prepare(PreparedOperation {
+                id: OperationId("manifest-rewrite-unresolved".into()),
+                table_id: id,
+                kind: OperationKind::ManifestRewrite,
+                base_snapshot_id: f.head.metadata().current_snapshot_id(),
+                last_lsn: PgLsn(10),
+                schema_version: f.schema.version,
+                artifacts: vec![],
+                payload: vec![],
+            })
+            .unwrap();
+        let error = f
+            .work
+            .settle(id, MetadataTask::Manifests, remote())
+            .unwrap_err();
+        assert_eq!(publication_error_code(&error), Some("maintenance_pressure"));
+        assert!(retry_table_work(&error));
     }
 }

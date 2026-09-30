@@ -167,7 +167,13 @@ transition without adding another snapshot.
 History expiration uses upstream's action and reference rules, protects the
 reader window, preserves existing references, and retains the descendant
 history of pending operations and supplied worker/checkpoint bases. An unresolved
-initial operation suppresses expiration. It removes only metadata references;
+initial operation suppresses expiration. The reader window is the longer of
+Flow's retention and an explicit `history.expire.max-snapshot-age-ms`. A retain
+floor keeps the newest snapshots of `main`, and a count cap then expires the
+oldest unprotected snapshots by explicit id, regardless of age; protections and
+the floor take precedence over the cap. Tables with `gc.enabled=false` are
+skipped, as Java `RemoveSnapshots` refuses them. Protected snapshots that no
+longer exist are reported and dropped. It removes only metadata references;
 physical orphan cleanup remains a separate delayed operation.
 
 ## Physical artifact collection
@@ -178,8 +184,11 @@ ordinal reservations of 64 files; the initial reservation shares the durable
 Building barrier and the final counts share the Prepared barrier. Metadata
 attempts register one compact range before writing. Recovery after complete
 index loss registers new metadata directly in the independent control store,
-so a replay cannot bypass ownership. Catalog-created metadata JSON belongs to
-the catalog and is outside this registry.
+so a replay cannot bypass ownership. Catalog-created metadata JSON in the
+table's flat `metadata/` directory is registered before a Flow commit supersedes
+it (see [catalog JSON ownership](references-compaction.md#catalog-json-ownership)).
+JSON a catalog writes elsewhere, for example under `write.metadata.path`, is
+not registered, so it is never collected and does not fail the commit.
 
 The collector follows Iceberg's
 [retention and orphan-file guidance](https://iceberg.apache.org/docs/latest/maintenance/#delete-orphan-files):
@@ -189,7 +198,12 @@ external files are never discovered or deleted by a warehouse-wide sweep.
 All retained snapshots, including branches and tags, protect their manifest
 lists, manifests, and live data/delete files. Pending operation namespaces and
 registered checkpoint/worker snapshots add protection. A missing protected
-snapshot stops collection. Tombstones in a newer manifest do not keep expired
+snapshot stops collection for that table; like any metadata maintenance
+failure, it is retried with backoff without stopping CDC.
+
+Flow sees only table references. Catalog-level branches (for example Nessie's)
+can point at snapshots and files that expiration and collection on the branch
+Flow writes consider unreferenced; do not enable Flow expiration or GC there. Tombstones in a newer manifest do not keep expired
 physical inputs alive once every snapshot that actually used them is gone.
 
 Each pass limits registry records and object candidates, intersects candidates

@@ -115,7 +115,7 @@ async fn unfenced_build_protects_ancestry_and_uploads_through_index_loss_until_s
         .expire_history(
             &head,
             f.schema.table_id,
-            Duration::from_millis(1),
+            &flow_coordinator::HistoryPolicy::window(Duration::from_millis(1)),
             &BTreeSet::new(),
         )
         .await
