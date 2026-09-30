@@ -538,6 +538,12 @@ async fn validate_history(
                 .data_file
                 .referenced_data_file()
                 .ok_or_else(|| anyhow::anyhow!("DV lacks target"))?;
+            // A rewrite that removes the target data file also retires its DV.
+            // `dv:` file IDs sort before `s3://` data paths, so the DV comes first.
+            ensure!(
+                next.live_files.contains_key(&target),
+                CatchUpRejected("selected input or delete was removed")
+            );
             let replacements = next.applicable_deletes(&target)?;
             let after = replacements
                 .first()
