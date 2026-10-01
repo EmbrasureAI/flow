@@ -26,8 +26,8 @@ fixes; see [upgrading](docs/upgrading.md).
 
 ## Scope
 
-In scope: vulnerabilities in this repository's code and the published binaries
-and container images, including credential exposure in logs or errors, TLS
+In scope: vulnerabilities in this repository's code, its Dockerfile and
+release artifacts, including credential exposure in logs or errors, TLS
 verification, unauthorized access through the optional HTTP listener, and
 state or data corruption an attacker can trigger.
 
@@ -56,7 +56,7 @@ Deployment choices are outside Flow's control but worth knowing:
   subdirectory Flow creates, such as `/data/state`, to avoid both. Readers of
   `metrics.prom` or `status` must run as the Flow user; otherwise use the HTTP
   listener. Backups of `state_dir` contain row data.
-- **Container image.** The image runs as UID 10001 and its `/data` is `0700`.
+- **Container image.** The image built from the Dockerfile runs as UID 10001 and its `/data` is `0700`.
   Runtimes that assign an arbitrary UID (such as OpenShift) cannot use it; mount
   a volume writable by that UID and set `state_dir` inside it.
 - **PostgreSQL TLS.** Connection settings follow libpq, whose default

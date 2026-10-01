@@ -65,20 +65,6 @@ The [demo guide](demo/README.md) walks through changing source rows, checking
 service status and cleaning up. The stack uses named volumes and does not
 publish ports on the host.
 
-### Install a release
-
-Tagged [releases](https://github.com/EmbrasureAI/flow/releases) publish Linux
-binaries for x86-64 and arm64, with checksums and license notices, and a
-multi-architecture container image:
-
-```sh
-docker pull ghcr.io/embrasureai/flow:<version>
-```
-
-The image runs `embrasure-flow --config /etc/flow.toml run` as an unprivileged
-user; mount the configuration at `/etc/flow.toml` and a persistent volume at
-`/data` for `state_dir`.
-
 ### Build from source
 
 Install the [pinned Rust toolchain](rust-toolchain.toml), a C++ compiler, libclang,
@@ -92,10 +78,30 @@ cargo build --locked --release -p flow-daemon
 
 On GNU/Linux, add `--features jemalloc` to enable process-wide allocation and
 background reclamation of unused pages, including RocksDB's C++ allocations.
-For the Docker image, use `docker build --build-arg FLOW_FEATURES=jemalloc -t flow .`.
+For a container image, pass `--build-arg FLOW_FEATURES=jemalloc` to `docker build`.
 The default build uses the system allocator; the feature has no effect on other
 targets. See [allocator metrics](docs/observability.md#allocator-memory) for
 measurement details and limits.
+
+### Build a container image
+
+The [Dockerfile](Dockerfile) builds a minimal image from this checkout:
+
+```sh
+docker build -t embrasure-flow .
+docker run --rm --env-file flow.env \
+  -v "$PWD/flow.toml:/etc/flow.toml:ro" -v flow-state:/data \
+  embrasure-flow --config /etc/flow.toml init
+docker run --env-file flow.env \
+  -v "$PWD/flow.toml:/etc/flow.toml:ro" -v flow-state:/data \
+  embrasure-flow
+```
+
+The image runs `embrasure-flow --config /etc/flow.toml run` by default as an
+unprivileged user. Mount the configuration at `/etc/flow.toml`, set
+`state_dir = "/data"` in it and mount a persistent volume there, and pass the
+environment variables your configuration names for credentials (here through
+`flow.env`).
 
 ### Connect your own database
 
