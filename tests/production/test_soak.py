@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from soak import Soak, mapping_summary, process_memory, reproduction
+from soak import Soak, mapping_scan_points, mapping_summary, process_memory, reproduction
 
 GROWTH = {"rss_bytes": {"window_medians": [100.0, 130.0, 160.0], "limit": 125.0}}
 
@@ -148,6 +148,10 @@ class ProcessMemoryTests(unittest.TestCase):
             "[stack]": {"mappings": 1, "rss_bytes": 32 * 1024, "anon_huge_page_bytes": 0},
         })
         self.assertEqual(mapping_summary(43, proc), {})
+
+    def test_mapping_scans_align_with_the_growth_rules_steady_samples(self):
+        # 1800 s at 30 s: 60 samples, the first 18 are warm-up.
+        self.assertEqual(mapping_scan_points(1800, 30, 0.3), {19: "first-steady-sample", 39: "steady-midpoint"})
 
 
 if __name__ == "__main__":

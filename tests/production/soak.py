@@ -70,10 +70,12 @@ def process_memory(pid, proc=Path("/proc")):
 
 
 def mapping_summary(pid, proc=Path("/proc")):
-    """Resident and anonymous huge-page bytes per mapping class: named files
-    and pseudo-mappings by name, anonymous mappings by size class. Separates
-    allocator extents, thread stacks and file pages that RSS totals combine.
-    Empty where /proc is unavailable."""
+    """Resident and anonymous huge-page bytes per mapping class: file and
+    pseudo-mappings by name, unnamed anonymous mappings by size. These are
+    attribution leads, not a decomposition: an anonymous mapping's size does
+    not prove which component owns it, and worker-thread stacks appear as
+    unnamed anonymous mappings rather than [stack]. Empty where /proc is
+    unavailable."""
     try:
         text = (proc / str(pid) / "smaps").read_text()
     except OSError:
@@ -99,6 +101,15 @@ def mapping_summary(pid, proc=Path("/proc")):
             key = "rss_bytes" if fields[0] == "Rss:" else "anon_huge_page_bytes"
             entry[key] += int(fields[1]) * 1024
     return classes
+
+
+def mapping_scan_points(duration, sample_seconds, warmup_fraction):
+    """1-based sample numbers after which to scan mappings: the first sample
+    the growth rule keeps for the expected sample count, and the midpoint of
+    the kept samples."""
+    expected = max(1, int(duration // sample_seconds))
+    first = int(expected * warmup_fraction) + 1
+    return {first: "first-steady-sample", (first + expected) // 2: "steady-midpoint"}
 
 
 def sustained_growth(samples, warmup, tolerance):
@@ -171,9 +182,18 @@ class Soak(CrashLoop):
             pass
         self.workload = Workload(self)
         self.started = time.monotonic()
-        mappings = self.report.setdefault("mappings", {})
-        mappings["start"] = mapping_summary(self.process.pid)
+        # A few timestamped scans, aligned to samples, so the post-warm-up
+        # change can be separated from initial cache filling.
         samples = self.report.setdefault("samples", [])
+        mappings = self.report.setdefault("mappings", [])
+        scan_at = mapping_scan_points(self.args.duration, self.args.sample_seconds, self.args.warmup_fraction)
+
+        def scan(label):
+            mappings.append({"label": label, "sample": len(samples),
+                             "elapsed_seconds": round(time.monotonic() - self.started, 1),
+                             "classes": mapping_summary(self.process.pid)})
+
+        scan("start")
         checks = self.report.setdefault("row_checks", [])
         next_check = self.started + self.args.verify_every
         while time.monotonic() - self.started < self.args.duration:
@@ -184,6 +204,8 @@ class Soak(CrashLoop):
                 time.sleep(0.5)
             samples.append(self.sample())
             print(f"[sample {len(samples)}] {samples[-1]}", flush=True)
+            if len(samples) in scan_at:
+                scan(scan_at[len(samples)])
             if time.monotonic() >= next_check:
                 self.workload.pause()
                 try:
@@ -198,7 +220,7 @@ class Soak(CrashLoop):
         warmup = int(len(samples) * self.args.warmup_fraction)
         tolerance = {"rss_bytes": self.args.rss_tolerance, "state_bytes": self.args.state_tolerance,
                      "journal_bytes": self.args.state_tolerance, "metadata_bytes": self.args.metadata_tolerance}
-        mappings["end"] = mapping_summary(self.process.pid)
+        scan("end")
         # Recorded here and raised after the final differential.
         self.report["growth"] = sustained_growth(samples, warmup, tolerance)
         # The nightly artifact keeps report.json but not the state directory.
