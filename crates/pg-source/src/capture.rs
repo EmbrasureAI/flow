@@ -45,13 +45,16 @@ struct PendingTransaction {
     stream: Option<StreamEvidence>,
 }
 
-/// Bounded evidence of one streamed transaction, logged at its subtransaction
-/// aborts and its commit so a lost or surviving change can be attributed to
-/// the received stream, a rollback truncation or later stages.
+/// Bounded diagnostic evidence of one streamed transaction, logged at its
+/// subtransaction aborts, when its commit is staged and when that commit is
+/// durable, so a lost or surviving change can be attributed to the received
+/// stream, a rollback truncation or a later stage. It does not affect capture.
 #[derive(Default)]
 struct StreamEvidence {
     blocks: u32,
-    /// Changes received per (sub)transaction XID: inserts, updates, deletes.
+    /// Row changes received per (sub)transaction XID as inserts, updates and
+    /// deletes, including changes a later rollback removes. Quarantined
+    /// evidence is not counted.
     received: BTreeMap<u32, [u64; 3]>,
     /// Changes of XIDs beyond the tracked limit.
     untracked: u64,
@@ -107,6 +110,8 @@ pub struct CaptureAssembler {
     pending_commits: Vec<SourceTransaction>,
     pending_commit_bytes: u64,
     pending_commit_limit: usize,
+    /// Staged streamed commits awaiting durability, for diagnostics only.
+    streamed_staged: BTreeSet<u32>,
     blocked: BTreeSet<TableId>,
     /// Configured tables whose changes are no longer captured, as when the
     /// publication stopped covering them. They are treated as unconfigured.
@@ -147,6 +152,7 @@ impl CaptureAssembler {
             pending_commits: Vec::new(),
             pending_commit_bytes: 0,
             pending_commit_limit: 32,
+            streamed_staged: BTreeSet::new(),
         })
     }
 
@@ -392,6 +398,21 @@ impl CaptureAssembler {
     pub fn flush_commits(&mut self, journal: &mut Journal) -> Result<Vec<SourceTransaction>> {
         journal.flush_commits()?;
         for transaction in &self.pending_commits {
+            if self.streamed_staged.remove(&transaction.xid) {
+                tracing::info!(
+                    event = "streamed_transaction_durable",
+                    xid = transaction.xid,
+                    end_lsn = %transaction.end_lsn,
+                    durable = %transaction
+                        .table_mutation_counts
+                        .iter()
+                        .flatten()
+                        .map(|count| format!("{}:{}", count.table_id.0, count.mutations))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    "streamed transaction durable in the journal"
+                );
+            }
             self.spool.discard(transaction.xid)?;
         }
         self.pending_commit_bytes = 0;
@@ -808,8 +829,10 @@ impl CaptureAssembler {
                 replayed?;
                 if let Some(stream) = &self.transactions[&xid].stream {
                     let [inserts, updates, deletes] = stream.totals();
+                    // Assembled and staged, not yet durable: see
+                    // `streamed_transaction_durable` in `flush_commits`.
                     tracing::info!(
-                        event = "streamed_transaction_journaled",
+                        event = "streamed_transaction_assembled",
                         xid,
                         end_lsn = %end_lsn,
                         blocks = stream.blocks,
@@ -819,12 +842,12 @@ impl CaptureAssembler {
                         received_untracked = stream.untracked,
                         aborted_subtransactions = stream.aborted_subtransactions,
                         truncated_bytes = stream.truncated_bytes,
-                        journaled = %tables
+                        staged = %tables
                             .iter()
                             .map(|(table, (_, count))| format!("{}:{count}", table.0))
                             .collect::<Vec<_>>()
                             .join(","),
-                        "streamed transaction journaled"
+                        "streamed transaction staged for a journal commit"
                     );
                 }
                 let txn = SourceTransaction {
@@ -855,6 +878,9 @@ impl CaptureAssembler {
                     .checked_add(txn.mutation_chunks.payload_bytes)
                     .ok_or(Error::Config("pending commit payload byte count overflow"))?;
                 journal.stage_commit(txn.clone())?;
+                if self.transactions[&xid].stream.is_some() {
+                    self.streamed_staged.insert(xid);
+                }
                 self.pending_commits.push(txn);
                 self.pending_commit_bytes = pending_bytes;
                 self.transactions.remove(&xid);
