@@ -687,7 +687,7 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
                     )
                     .await
                     .unwrap();
-                    outcome.rolled_back_without_abort = rolled_back.iter().copied().collect();
+                    outcome.rolled_back_without_abort = rolled_back.clone();
                     assembler.exclude_rolled_back(xid, &rolled_back).unwrap();
                 }
             }
