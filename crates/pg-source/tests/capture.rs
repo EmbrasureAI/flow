@@ -1,7 +1,6 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use flow_model::PgLsn;
 use flow_pg_source::{Cell, Decoder, Error, SourceEvent, SpoolConfig, TransactionSpool};
-use std::collections::BTreeSet;
 
 fn message(tag: u8, body: impl FnOnce(&mut BytesMut)) -> Bytes {
     let mut b = BytesMut::new();
@@ -365,7 +364,7 @@ fn spool_frames_carry_their_subtransaction_and_exclusion_skips_only_it() {
         let owner = [7, 8, 9][(index % 3) as usize];
         spool.append(7, owner, &index.to_le_bytes()).unwrap();
     }
-    assert_eq!(spool.subtransactions(7).unwrap(), BTreeSet::from([8, 9]));
+    assert_eq!(spool.subtransactions(7).unwrap(), [8, 9]);
     let replayed = |spool: &TransactionSpool| {
         let mut kept = Vec::new();
         spool
@@ -377,14 +376,14 @@ fn spool_frames_carry_their_subtransaction_and_exclusion_skips_only_it() {
         kept
     };
     // PostgreSQL's commit log reports 8 rolled back: skip only its frames.
-    spool.exclude(7, &BTreeSet::from([8])).unwrap();
+    spool.exclude(7, &[8]).unwrap();
     assert_eq!(
         replayed(&spool),
         (0..3000).filter(|index| index % 3 != 1).collect::<Vec<_>>()
     );
     // A received rollback of 9 still truncates at its first frame.
     spool.abort(7, 9).unwrap();
-    assert_eq!(spool.subtransactions(7).unwrap(), BTreeSet::from([8]));
+    assert_eq!(spool.subtransactions(7).unwrap(), [8]);
     assert_eq!(replayed(&spool), [0]);
 }
 
@@ -401,7 +400,7 @@ fn a_damaged_spool_subtransaction_tag_fails_its_checksum() {
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[4..8].copy_from_slice(&7_u32.to_le_bytes());
     std::fs::write(&path, bytes).unwrap();
-    spool.exclude(7, &BTreeSet::from([8])).unwrap();
+    spool.exclude(7, &[8]).unwrap();
     let error = spool.replay(7, |_| Ok(())).unwrap_err();
     assert!(
         matches!(&error, Error::Protocol(message) if message.contains("checksum")),

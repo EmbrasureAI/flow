@@ -11,7 +11,6 @@ use flow_pg_source::{
     CaptureAssembler, Cell, Column as PgColumn, Error, Relation, SourceEvent, SpoolConfig,
     TransactionSpool,
 };
-use std::collections::BTreeSet;
 use tempfile::TempDir;
 
 const TABLE: u32 = 11;
@@ -377,14 +376,8 @@ fn rollback_excluded_at_commit_keeps_its_provisional_decision() {
     capture.change(insert(42, 42, "1"));
     capture.truncate(42, 43);
     capture.push(SourceEvent::StreamStop);
-    assert_eq!(
-        capture.assembler.subtransactions(42).unwrap(),
-        BTreeSet::from([43])
-    );
-    capture
-        .assembler
-        .exclude_rolled_back(42, &BTreeSet::from([43]))
-        .unwrap();
+    assert_eq!(capture.assembler.subtransactions(42).unwrap(), [43]);
+    capture.assembler.exclude_rolled_back(42, &[43]).unwrap();
     assert_eq!(
         capture.assembler.provisional_blocks(42),
         [(TableId(TABLE), TRUNCATED.to_owned())]

@@ -48,9 +48,10 @@ Unknown formats, truncated records and invalid proofs fail closed.
   subtransaction changes, capture reads their status from PostgreSQL's
   commit log (`pg_xact_status`) and drops the changes of those that rolled
   back. PostgreSQL flushes a commit record before its commit log records it,
-  so an in-progress status is retried for up to 10 seconds; a status still
-  in progress, or one PostgreSQL no longer keeps, stops capture instead of
-  guessing. Provisional quarantine decisions of excluded subtransactions are
+  so an in-progress status is re-read, 1024 subtransactions per query, within
+  one 10-second deadline that also bounds each query; a status still in
+  progress, one PostgreSQL no longer keeps, or a query that does not finish
+  in time stops capture instead of guessing. Provisional quarantine decisions of excluded subtransactions are
   kept, which can block a table a received rollback would have left
   publishing.
 * [Logical decoding and exported snapshots](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html):

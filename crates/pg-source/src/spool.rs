@@ -4,7 +4,7 @@
 use crate::{Error, Result};
 use fs2::FileExt;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -69,8 +69,9 @@ struct Transaction {
     bytes: u64,
     savepoints: Vec<Savepoint>,
     subtransactions: HashMap<u32, usize>,
-    /// Subtransactions whose chunks replay skips; see [`TransactionSpool::exclude`].
-    excluded: BTreeSet<u32>,
+    /// Sorted subtransactions whose chunks replay skips; see
+    /// [`TransactionSpool::exclude`].
+    excluded: Vec<u32>,
 }
 
 pub struct TransactionSpool {
@@ -148,7 +149,7 @@ impl TransactionSpool {
                 bytes: 0,
                 savepoints: Vec::new(),
                 subtransactions: HashMap::new(),
-                excluded: BTreeSet::new(),
+                excluded: Vec::new(),
             },
         );
         Ok(())
@@ -294,7 +295,7 @@ impl TransactionSpool {
                 {
                     return Err(Error::Protocol("transaction spool checksum mismatch"));
                 }
-                if !txn.excluded.contains(&subxid) {
+                if txn.excluded.binary_search(&subxid).is_err() {
                     consume(&buffer)?;
                 }
                 offset += HEADER + u64::from(len);
@@ -306,23 +307,27 @@ impl TransactionSpool {
     /// Subtransactions, other than `xid` itself, with surviving chunks: those
     /// that spooled a chunk and were not truncated by a received rollback.
     /// Bounded by `max_subtransactions`, like the savepoints that track them.
-    pub fn subtransactions(&self, xid: u32) -> Result<BTreeSet<u32>> {
+    pub fn subtransactions(&self, xid: u32) -> Result<Vec<u32>> {
         let txn = self.transactions.get(&xid).ok_or(Error::Protocol(
             "subtransactions of unknown spool transaction",
         ))?;
-        Ok(txn.subtransactions.keys().copied().collect())
+        let mut subxids: Vec<u32> = txn.subtransactions.keys().copied().collect();
+        subxids.sort_unstable();
+        Ok(subxids)
     }
 
     /// Skip these subtransactions' chunks on replay. Unlike [`Self::abort`],
     /// which truncates at a rollback as it arrives in the stream, this keeps
     /// the changes of other (sub)transactions made after theirs.
-    pub fn exclude(&mut self, xid: u32, subxids: &BTreeSet<u32>) -> Result<()> {
+    pub fn exclude(&mut self, xid: u32, subxids: &[u32]) -> Result<()> {
         let txn = self
             .transactions
             .get_mut(&xid)
             .ok_or(Error::Protocol("exclusion in unknown spool transaction"))?;
         txn.excluded
-            .extend(subxids.iter().filter(|&&subxid| subxid != xid));
+            .extend(subxids.iter().copied().filter(|&subxid| subxid != xid));
+        txn.excluded.sort_unstable();
+        txn.excluded.dedup();
         Ok(())
     }
 

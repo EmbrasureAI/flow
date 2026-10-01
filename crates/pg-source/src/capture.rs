@@ -466,7 +466,7 @@ impl CaptureAssembler {
     /// only if changes remain in memory afterwards. Before the commit, the
     /// caller asks PostgreSQL which of these rolled back and passes them to
     /// [`Self::exclude_rolled_back`].
-    pub fn subtransactions(&mut self, xid: u32) -> Result<BTreeSet<u32>> {
+    pub fn subtransactions(&mut self, xid: u32) -> Result<Vec<u32>> {
         self.flush()?;
         self.spool.subtransactions(xid)
     }
@@ -476,7 +476,7 @@ impl CaptureAssembler {
     /// keeps the provisional quarantine decisions they made: a table may be
     /// blocked by a rolled-back decision (an availability limit), but no change
     /// that decision stops is published.
-    pub fn exclude_rolled_back(&mut self, xid: u32, subxids: &BTreeSet<u32>) -> Result<()> {
+    pub fn exclude_rolled_back(&mut self, xid: u32, subxids: &[u32]) -> Result<()> {
         if subxids.is_empty() {
             return Ok(());
         }

@@ -22,7 +22,6 @@ use flow_model::{
     Value,
 };
 use flow_pg_source::{CaptureAssembler, Decoder, SpoolConfig, TransactionSpool};
-use std::collections::BTreeSet;
 
 const TABLE: u32 = 11;
 const XID: u32 = 500;
@@ -205,13 +204,11 @@ fn journaled(savepoint_blocks: &[i64], abort: bool) -> (SourceTransaction, Vec<M
     let subtransactions = assembler.subtransactions(XID).unwrap();
     if abort {
         // The received abort already truncated the savepoint's changes.
-        assert_eq!(subtransactions, BTreeSet::from([RELEASED]));
+        assert_eq!(subtransactions, [RELEASED]);
     } else {
-        assert_eq!(subtransactions, BTreeSet::from([SAVEPOINT, RELEASED]));
+        assert_eq!(subtransactions, [SAVEPOINT, RELEASED]);
         // As PostgreSQL's commit log reports: only the savepoint rolled back.
-        assembler
-            .exclude_rolled_back(XID, &BTreeSet::from([SAVEPOINT]))
-            .unwrap();
+        assembler.exclude_rolled_back(XID, &[SAVEPOINT]).unwrap();
     }
     let txn = assembler
         .push(commit, &mut journal)
