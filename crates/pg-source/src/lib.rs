@@ -239,10 +239,14 @@ pub fn widen_xid(reference: u64, xid: u32) -> Option<u64> {
     u64::try_from(full).ok().filter(|&full| full >= 3)
 }
 
+/// Subtransaction statuses read per query, bounding each query's parameter,
+/// response and duration however many subtransactions a transaction has.
+const STATUS_BATCH: usize = 1024;
+
 /// Of these subtransaction XIDs of a transaction whose commit has been
 /// received, those PostgreSQL rolled back, from its commit log. The commit
 /// record is flushed before the commit log and process array record it, so a
-/// status may still read as in progress briefly; it is retried until
+/// status may still read as in progress briefly; only those are re-read, until
 /// `deadline`. A status PostgreSQL no longer keeps, or one still in progress
 /// at the deadline, is an error: changes are never published on a guess.
 pub async fn rolled_back_subtransactions(
@@ -252,9 +256,11 @@ pub async fn rolled_back_subtransactions(
 ) -> Result<std::collections::BTreeSet<u32>> {
     let started = std::time::Instant::now();
     let mut delay = std::time::Duration::from_millis(10);
+    let mut rolled_back = std::collections::BTreeSet::new();
+    let mut pending: Vec<u32> = xids.iter().copied().collect();
     loop {
-        // One past the latest completed XID: at most a few XIDs behind any
-        // assigned XID of a transaction whose commit is being recorded.
+        // One past the latest completed XID. Every XID of the transaction
+        // lies within 2^31 of it, which is all widening needs.
         let next = client
             .query_one(
                 "SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())::text",
@@ -264,52 +270,49 @@ pub async fn rolled_back_subtransactions(
             .get::<_, String>(0)
             .parse::<u64>()
             .map_err(|_| Error::Protocol("unparseable snapshot xmax"))?;
-        let full = xids
-            .iter()
-            .map(|&xid| {
-                widen_xid(next, xid)
-                    .map(|full| (full, xid))
-                    .ok_or(Error::Protocol(
-                        "subtransaction XID precedes the first normal XID",
-                    ))
-            })
-            .collect::<Result<std::collections::BTreeMap<u64, u32>>>()?;
-        let keys = full
-            .keys()
-            .map(|&full| {
-                i64::try_from(full).map_err(|_| Error::Protocol("subtransaction XID out of range"))
-            })
-            .collect::<Result<Vec<i64>>>()?;
-        let rows = client
-            .query(
-                "SELECT x, pg_catalog.pg_xact_status(x::text::pg_catalog.xid8)
-                 FROM unnest($1::bigint[]) AS x",
-                &[&keys],
-            )
-            .await?;
-        let mut rolled_back = std::collections::BTreeSet::new();
-        let mut in_progress = false;
-        for row in rows {
-            let key: i64 = row.get(0);
-            let xid = u64::try_from(key)
-                .ok()
-                .and_then(|key| full.get(&key))
-                .copied()
-                .ok_or(Error::Protocol("unexpected subtransaction status row"))?;
-            match row.get::<_, Option<String>>(1).as_deref() {
-                Some("committed") => {}
-                Some("aborted") => {
-                    rolled_back.insert(xid);
-                }
-                Some(_) => in_progress = true,
-                None => {
-                    return Err(Error::Protocol(
-                        "subtransaction status is no longer available",
-                    ));
+        let mut in_progress = Vec::new();
+        for batch in pending.chunks(STATUS_BATCH) {
+            let mut full = std::collections::BTreeMap::new();
+            for &xid in batch {
+                let widened = widen_xid(next, xid).ok_or(Error::Protocol(
+                    "subtransaction XID precedes the first normal XID",
+                ))?;
+                full.insert(
+                    i64::try_from(widened)
+                        .map_err(|_| Error::Protocol("subtransaction XID out of range"))?,
+                    xid,
+                );
+            }
+            let keys: Vec<i64> = full.keys().copied().collect();
+            let rows = client
+                .query(
+                    "SELECT x, pg_catalog.pg_xact_status(x::text::pg_catalog.xid8)
+                     FROM unnest($1::bigint[]) AS x",
+                    &[&keys],
+                )
+                .await?;
+            if rows.len() != keys.len() {
+                return Err(Error::Protocol("missing subtransaction status rows"));
+            }
+            for row in rows {
+                let xid = *full
+                    .get(&row.get::<_, i64>(0))
+                    .ok_or(Error::Protocol("unexpected subtransaction status row"))?;
+                match row.get::<_, Option<String>>(1).as_deref() {
+                    Some("committed") => {}
+                    Some("aborted") => {
+                        rolled_back.insert(xid);
+                    }
+                    Some(_) => in_progress.push(xid),
+                    None => {
+                        return Err(Error::Protocol(
+                            "subtransaction status is no longer available",
+                        ));
+                    }
                 }
             }
         }
-        if !in_progress {
+        if in_progress.is_empty() {
             return Ok(rolled_back);
         }
         if started.elapsed() >= deadline {
@@ -317,6 +320,7 @@ pub async fn rolled_back_subtransactions(
                 "subtransaction of a received commit is still in progress",
             ));
         }
+        pending = in_progress;
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(std::time::Duration::from_millis(500));
     }

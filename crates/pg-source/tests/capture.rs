@@ -1,6 +1,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use flow_model::PgLsn;
 use flow_pg_source::{Cell, Decoder, Error, SourceEvent, SpoolConfig, TransactionSpool};
+use std::collections::BTreeSet;
 
 fn message(tag: u8, body: impl FnOnce(&mut BytesMut)) -> Bytes {
     let mut b = BytesMut::new();
@@ -340,4 +341,70 @@ fn each_spool_and_stream_limit_reports_its_own_setting() {
         panic!("third concurrent stream must be refused");
     };
     assert!(reason.contains("limits.spool_transactions"));
+}
+
+#[test]
+fn spool_frames_carry_their_subtransaction_and_exclusion_skips_only_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = TransactionSpool::open(
+        dir.path(),
+        SpoolConfig {
+            segment_bytes: 256,
+            quota_bytes: 1 << 20,
+            max_chunk_bytes: 16,
+            max_transactions: 4,
+            max_subtransactions: 8,
+        },
+    )
+    .unwrap();
+    spool.begin(7).unwrap();
+    // Many tiny frames switching between the transaction and two
+    // subtransactions, across many segments. Only the distinct
+    // subtransactions are tracked in memory; each frame's owner is on disk.
+    for index in 0..3000_u32 {
+        let owner = [7, 8, 9][(index % 3) as usize];
+        spool.append(7, owner, &index.to_le_bytes()).unwrap();
+    }
+    assert_eq!(spool.subtransactions(7).unwrap(), BTreeSet::from([8, 9]));
+    let replayed = |spool: &TransactionSpool| {
+        let mut kept = Vec::new();
+        spool
+            .replay(7, |bytes| {
+                kept.push(u32::from_le_bytes(bytes.try_into().unwrap()));
+                Ok(())
+            })
+            .unwrap();
+        kept
+    };
+    // PostgreSQL's commit log reports 8 rolled back: skip only its frames.
+    spool.exclude(7, &BTreeSet::from([8])).unwrap();
+    assert_eq!(
+        replayed(&spool),
+        (0..3000).filter(|index| index % 3 != 1).collect::<Vec<_>>()
+    );
+    // A received rollback of 9 still truncates at its first frame.
+    spool.abort(7, 9).unwrap();
+    assert_eq!(spool.subtransactions(7).unwrap(), BTreeSet::from([8]));
+    assert_eq!(replayed(&spool), [0]);
+}
+
+#[test]
+fn a_damaged_spool_subtransaction_tag_fails_its_checksum() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = TransactionSpool::open(dir.path(), SpoolConfig::default()).unwrap();
+    spool.begin(7).unwrap();
+    spool.append(7, 8, b"rolled back").unwrap();
+    spool.append(7, 7, b"kept").unwrap();
+    // Retag the first frame as the transaction's own: excluding 8 must not
+    // then silently keep it.
+    let path = dir.path().join("txn-7/0");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[4..8].copy_from_slice(&7_u32.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    spool.exclude(7, &BTreeSet::from([8])).unwrap();
+    let error = spool.replay(7, |_| Ok(())).unwrap_err();
+    assert!(
+        matches!(&error, Error::Protocol(message) if message.contains("checksum")),
+        "{error}"
+    );
 }
