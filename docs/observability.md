@@ -539,21 +539,27 @@ gauges until a later sample succeeds; absence does not mean zero memory.
 Background reclamation does not cap live allocations or replace worker, batch,
 cache and container limits. Default and non-GNU/Linux builds omit these gauges.
 
-Every build also exports the current usage of the process-wide memory budgets,
-refreshed with the periodic health observation:
+Every build also exports the current usage of the process-wide memory budgets.
+A blocking thread samples them with the periodic health observation, at most
+one sample at a time, so the row index's property reads never delay
+publication:
 
 | Gauge | Meaning |
 | --- | --- |
 | `flow_memory_index_block_cache_bytes` | Row-index RocksDB block cache usage, including index and filter blocks |
-| `flow_memory_index_block_cache_pinned_bytes` | Block cache entries pinned by open readers |
+| `flow_memory_index_block_cache_pinned_bytes` | Part of the block cache usage pinned by open readers |
 | `flow_memory_index_memtable_bytes` | Active, unflushed and pinned memtables across the row index's column families |
 | `flow_memory_index_table_reader_bytes` | Table-reader memory outside the block cache |
 | `flow_memory_manifest_cache_bytes{cache}` | Estimated bytes of parsed manifests in the shared `publication` or `maintenance` cache |
 | `flow_memory_manifest_cache_entries{cache}` | Parsed manifests in that cache |
-| `flow_memory_retained_index_bytes` | Estimated bytes of the garbage-collection reachability indexes |
+| `flow_memory_retained_index_bytes` | Estimated bytes last accounted by the garbage-collection reachability indexes |
 
-Cache bytes are the estimates each cache evicts against, not allocator
-measurements. Temporary row indexes opened by compaction and reconciliation
-jobs are not included. These reads never stop ingestion: a failed read keeps
-the gauge's previous value and logs `memory_observation_failed` at most every
-ten minutes.
+These gauges overlap one another and the allocator gauges; they are not a
+decomposition of RSS. Pinned bytes are part of the block cache bytes. Cache
+bytes are the estimates each cache evicts against, not allocator measurements.
+The reachability estimate is recorded when a collection page completes, so it
+omits growth since then and indexes evicted while a collection still holds
+them. Temporary row indexes opened by compaction and reconciliation jobs are
+not included. These reads never stop ingestion: a failed read keeps the
+gauge's previous value and logs `memory_observation_failed` at most every ten
+minutes.

@@ -558,7 +558,8 @@ def reproduction(args):
                  "--duration", f"{args.duration:g}", "--writers", str(args.writers),
                  "--min-kill", f"{args.min_kill:g}", "--max-kill", f"{args.max_kill:g}",
                  "--large-rows", str(args.large_rows), "--large-interval", f"{args.large_interval:g}",
-                 "--format-version", str(args.format_version)]
+                 "--format-version", str(args.format_version), "--binary", str(args.binary),
+                 "--timeout", f"{args.timeout:g}"]
     if args.cycles is not None:
         arguments += ["--cycles", str(args.cycles)]
     return shlex.join(arguments) + " --catalog-uri ... --s3-endpoint ... --artifacts NEW_DIRECTORY"

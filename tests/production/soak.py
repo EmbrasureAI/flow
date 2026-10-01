@@ -88,7 +88,8 @@ def reproduction(args):
     arguments = ["uv", "run", "tests/production/soak.py", "--seed", str(args.seed),
                  "--duration", f"{args.duration:g}", "--writers", str(args.writers),
                  "--large-rows", str(args.large_rows), "--large-interval", f"{args.large_interval:g}",
-                 "--format-version", str(args.format_version), "--sample-seconds", f"{args.sample_seconds:g}",
+                 "--format-version", str(args.format_version), "--binary", str(args.binary),
+                 "--timeout", f"{args.timeout:g}", "--sample-seconds", f"{args.sample_seconds:g}",
                  "--verify-every", f"{args.verify_every:g}", "--retention-secs", str(args.retention_secs),
                  "--warmup-fraction", f"{args.warmup_fraction:g}", "--rss-tolerance", f"{args.rss_tolerance:g}",
                  "--state-tolerance", f"{args.state_tolerance:g}",
@@ -160,12 +161,15 @@ class Soak(CrashLoop):
         # Recorded here and raised after the final differential.
         self.report["growth"] = sustained_growth(samples, warmup, tolerance)
         # The nightly artifact keeps report.json but not the state directory.
-        self.report["final_metrics"] = self.metrics()
+        self.report["soak_end_metrics"] = self.metrics()
         return {"samples": len(samples), "warmup_samples": warmup, "row_checks": len(checks),
                 "growing": sorted(self.report["growth"]), "workload": dict(self.workload.counts)}
 
     def final_check(self):
         self.wait_materialized(0)
+        # After the drain, before the comparison can fail.
+        self.report["final_metrics"] = self.metrics()
+        self.report["final_process"] = process_memory(self.process.pid)
         result = self.compare("final")
         self.published()
         return result

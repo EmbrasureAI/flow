@@ -80,16 +80,36 @@ class SoakExecutionTests(unittest.TestCase):
         self.assertTrue(self.written(soak)["passed"])
 
 
+class FinalCheckTests(unittest.TestCase):
+    def test_final_metrics_follow_the_drain_and_survive_a_failed_comparison(self):
+        soak = Soak.__new__(Soak)
+        soak.report, events = {}, []
+        soak.process = argparse.Namespace(pid=0)
+        soak.wait_materialized = lambda barrier: events.append("drained")
+        soak.metrics = lambda: events.append("metrics") or {"flow_materialized_lsn": 9}
+
+        def compare(phase):
+            raise AssertionError(f"{phase}: orders differs")
+
+        soak.compare = compare
+        with self.assertRaisesRegex(AssertionError, "final: orders differs"):
+            soak.final_check()
+        self.assertEqual(events, ["drained", "metrics"])
+        self.assertEqual(soak.report["final_metrics"], {"flow_materialized_lsn": 9})
+
+
 class ReproductionTests(unittest.TestCase):
     def test_command_replays_the_soak_with_its_detector_settings(self):
         args = argparse.Namespace(seed=2245799672, duration=1800, writers=3, large_rows=12000, large_interval=15,
-                                  format_version=2, sample_seconds=30, verify_every=600, retention_secs=120,
+                                  format_version=2, binary=Path("target/debug/embrasure-flow"), timeout=600,
+                                  sample_seconds=30, verify_every=600, retention_secs=120,
                                   warmup_fraction=0.5, rss_tolerance=0.4, state_tolerance=0.5,
                                   metadata_tolerance=0.25)
         command = reproduction(args)
         self.assertTrue(command.startswith("uv run tests/production/soak.py --seed 2245799672 "))
         for option in ("--duration 1800", "--warmup-fraction 0.5", "--rss-tolerance 0.4",
-                       "--state-tolerance 0.5", "--metadata-tolerance 0.25", "--retention-secs 120"):
+                       "--state-tolerance 0.5", "--metadata-tolerance 0.25", "--retention-secs 120",
+                       "--binary target/debug/embrasure-flow", "--timeout 600"):
             self.assertIn(option, command)
 
 
