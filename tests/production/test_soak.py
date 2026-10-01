@@ -119,10 +119,12 @@ class ProcessMemoryTests(unittest.TestCase):
         (proc / "42").mkdir()
         (proc / "42" / "status").write_text("Name:\tembrasure-flow\nVmRSS:\t   3072 kB\nRssAnon:\t   2048 kB\n"
                                             "RssFile:\t    1000 kB\nRssShmem:\t      24 kB\nThreads:\t37\n")
-        (proc / "42" / "smaps_rollup").write_text("Rss:                3072 kB\nLazyFree:             8 kB\n")
+        (proc / "42" / "smaps_rollup").write_text("Rss:                3072 kB\nLazyFree:             8 kB\n"
+                                                  "AnonHugePages:     2048 kB\n")
         self.assertEqual(process_memory(42, proc), {"rss_anon_bytes": 2048 * 1024, "rss_file_bytes": 1000 * 1024,
                                                     "rss_shmem_bytes": 24 * 1024, "threads": 37,
-                                                    "lazy_free_bytes": 8 * 1024})
+                                                    "lazy_free_bytes": 8 * 1024,
+                                                    "anon_huge_page_bytes": 2048 * 1024})
         self.assertEqual(process_memory(43, proc), {})
 
 

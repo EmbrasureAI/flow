@@ -50,10 +50,11 @@ def directory_bytes(path):
 
 def process_memory(pid, proc=Path("/proc")):
     """Linux RSS components in bytes: anonymous, file-backed and shared pages,
-    lazily freed pages still counted in RSS, and the thread count. Empty
-    where /proc is unavailable."""
+    lazily freed pages still counted in RSS, anonymous transparent huge pages
+    (resident in 2 MiB units, unlike allocator page accounting) and the thread
+    count. Empty where /proc is unavailable."""
     fields = {"RssAnon": "rss_anon_bytes", "RssFile": "rss_file_bytes", "RssShmem": "rss_shmem_bytes",
-              "LazyFree": "lazy_free_bytes", "Threads": "threads"}
+              "LazyFree": "lazy_free_bytes", "AnonHugePages": "anon_huge_page_bytes", "Threads": "threads"}
     memory = {}
     for name in ("status", "smaps_rollup"):
         try:
@@ -131,6 +132,11 @@ class Soak(CrashLoop):
                 "process": process_memory(self.process.pid)}
 
     def soak(self):
+        try:
+            self.report["transparent_hugepage"] = Path(
+                "/sys/kernel/mm/transparent_hugepage/enabled").read_text().strip()
+        except OSError:
+            pass
         self.workload = Workload(self)
         self.started = time.monotonic()
         samples = self.report.setdefault("samples", [])
