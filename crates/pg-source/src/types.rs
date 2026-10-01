@@ -343,13 +343,17 @@ fn time_string(bytes: &[u8], binary: bool) -> Result<String> {
     if !(0..=DAY_MICROS).contains(&micros) {
         return Err(Error::Config("PostgreSQL time outside 00:00:00..24:00:00"));
     }
-    Ok(format!(
+    Ok(format_time(micros))
+}
+
+fn format_time(micros: i64) -> String {
+    format!(
         "{:02}:{:02}:{:02}.{:06}",
         micros / 3_600_000_000,
         micros / 60_000_000 % 60,
         micros / 1_000_000 % 60,
         micros % 1_000_000
-    ))
+    )
 }
 
 fn vector_json(bytes: &[u8], binary: bool) -> Result<serde_json::Value> {
@@ -415,22 +419,15 @@ fn json_value(value: Value, oid: u32) -> Result<serde_json::Value> {
             J::String(base64::engine::general_purpose::STANDARD.encode(v))
         }
         Value::Uuid(v) => J::String(uuid::Uuid::from_bytes(v).to_string()),
-        Value::Date(v) => J::String(
-            chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
-                .unwrap()
-                .checked_add_signed(chrono::Duration::days(i64::from(v)))
-                .ok_or(Error::Config("array date outside supported calendar range"))?
-                .to_string(),
-        ),
+        Value::Date(v) => J::String(crate::capture::date_string(v)),
         Value::TimestampMicros(v) | Value::TimestampTzMicros(v) => {
-            let dt = chrono::DateTime::from_timestamp_micros(v).ok_or(Error::Config(
-                "array timestamp outside supported calendar range",
-            ))?;
-            J::String(if oid == 1184 {
-                dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-            } else {
-                dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
-            })
+            const DAY_MICROS: i64 = 86_400_000_000;
+            // Even i64 microsecond extremes fit in i32 days. Euclidean division
+            // keeps the time of day positive for timestamps before the Unix epoch.
+            let date = crate::capture::date_string(v.div_euclid(DAY_MICROS) as i32);
+            let time = format_time(v.rem_euclid(DAY_MICROS));
+            let zone = if oid == 1184 { "Z" } else { "" };
+            J::String(format!("{date}T{time}{zone}"))
         }
         Value::Decimal { unscaled, scale } => serde_json::from_str(
             &bigdecimal::BigDecimal::new(unscaled.into(), i64::from(scale)).to_string(),
@@ -669,6 +666,196 @@ mod tests {
             numeric_binary(&[0, 0, 0, 0, 0xd0, 0, 0, 0]).unwrap(),
             "Infinity"
         );
+    }
+
+    #[test]
+    fn date_arrays_support_wide_scalar_dates() {
+        let types = TypeRegistry::default();
+        // PostgreSQL date_send encodes days since 2000-01-01.
+        for (source, days, json) in [
+            ("300000-01-01", 108_842_265i32, "+300000-01-01"),
+            ("300000-02-29", 108_842_324, "+300000-02-29"),
+            ("300000-03-01", 108_842_325, "+300000-03-01"),
+            ("4714-11-24 BC", -2_451_545, "-4713-11-24"),
+            ("5874897-12-31", 2_145_031_948, "+5874897-12-31"),
+        ] {
+            let raw = days.to_be_bytes();
+            let expected = Value::Date(days + 10_957);
+            assert_eq!(
+                types
+                    .decode(&ColumnType::Date, 1082, source.as_bytes(), false)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                types.decode(&ColumnType::Date, 1082, &raw, true).unwrap(),
+                expected
+            );
+            assert_eq!(
+                types
+                    .decode(
+                        &ColumnType::String,
+                        1182,
+                        &array(1082, &[(2, 1)], &[Some(&raw), None]),
+                        true
+                    )
+                    .unwrap(),
+                Value::String(format!(r#"["{json}",null]"#))
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_arrays_support_wide_scalar_timestamps() {
+        wide_timestamp_array(ColumnType::TimestampMicros, 1114, 1115, "", "");
+    }
+
+    #[test]
+    fn timestamptz_arrays_support_wide_scalar_timestamps() {
+        wide_timestamp_array(ColumnType::TimestampTzMicros, 1184, 1185, "+00", "Z");
+    }
+
+    fn wide_timestamp_array(kind: ColumnType, oid: u32, array_oid: u32, zone: &str, suffix: &str) {
+        let types = TypeRegistry::default();
+        let micros = 101_537_415i64 * 86_400_000_000;
+        let raw = micros.to_be_bytes();
+        let expected = if kind == ColumnType::TimestampTzMicros {
+            Value::TimestampTzMicros(micros + 946_684_800_000_000)
+        } else {
+            Value::TimestampMicros(micros + 946_684_800_000_000)
+        };
+        let source = format!("280000-01-01 00:00:00{zone}");
+        assert_eq!(
+            types.decode(&kind, oid, source.as_bytes(), false).unwrap(),
+            expected
+        );
+        assert_eq!(types.decode(&kind, oid, &raw, true).unwrap(), expected);
+        assert_eq!(
+            types
+                .decode(
+                    &ColumnType::String,
+                    array_oid,
+                    &array(oid, &[(2, 1)], &[Some(&raw), None]),
+                    true
+                )
+                .unwrap(),
+            Value::String(format!(r#"["+280000-01-01T00:00:00.000000{suffix}",null]"#))
+        );
+    }
+
+    #[test]
+    fn temporal_arrays_preserve_existing_json_format() {
+        let types = TypeRegistry::default();
+        let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        for (year, month, day) in [
+            (-4713, 11, 24),
+            (-1, 12, 31),
+            (0, 2, 29),
+            (1, 1, 1),
+            (1900, 3, 1),
+            (1969, 12, 31),
+            (1970, 1, 1),
+            (2000, 2, 29),
+            (9999, 12, 31),
+            (10000, 1, 1),
+            (262142, 12, 31),
+        ] {
+            let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+            let days = i32::try_from((date - epoch).num_days()).unwrap();
+            assert_eq!(
+                types
+                    .decode(
+                        &ColumnType::String,
+                        1182,
+                        &array(1082, &[(1, 1)], &[Some(&days.to_be_bytes())]),
+                        true
+                    )
+                    .unwrap(),
+                Value::String(serde_json::json!([date.to_string()]).to_string())
+            );
+            for time in [0, 45_296_123_456, 86_399_999_999] {
+                let micros = i64::from(days) * 86_400_000_000 + time;
+                let dt =
+                    chrono::DateTime::from_timestamp_micros(micros + 946_684_800_000_000).unwrap();
+                for (oid, array_oid, expected) in [
+                    (
+                        1114,
+                        1115,
+                        dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.6f").to_string(),
+                    ),
+                    (
+                        1184,
+                        1185,
+                        dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    ),
+                ] {
+                    assert_eq!(
+                        types
+                            .decode(
+                                &ColumnType::String,
+                                array_oid,
+                                &array(oid, &[(1, 1)], &[Some(&micros.to_be_bytes())]),
+                                true
+                            )
+                            .unwrap(),
+                        Value::String(serde_json::json!([expected]).to_string())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_arrays_preserve_scalar_rejections() {
+        let types = TypeRegistry::default();
+        for (source, days) in [
+            ("-infinity", i32::MIN),
+            ("infinity", i32::MAX),
+            ("4714-11-23 BC", -2_451_546),
+            ("5874898-01-01", 2_145_031_949),
+        ] {
+            let raw = days.to_be_bytes();
+            assert!(
+                types
+                    .decode(&ColumnType::Date, 1082, source.as_bytes(), false)
+                    .is_err()
+            );
+            let scalar = types
+                .decode(&ColumnType::Date, 1082, &raw, true)
+                .unwrap_err();
+            let array = types
+                .decode(
+                    &ColumnType::String,
+                    1182,
+                    &array(1082, &[(1, 1)], &[Some(&raw)]),
+                    true,
+                )
+                .unwrap_err();
+            assert_eq!(array.to_string(), scalar.to_string());
+        }
+        for (kind, oid, array_oid) in [
+            (ColumnType::TimestampMicros, 1114, 1115),
+            (ColumnType::TimestampTzMicros, 1184, 1185),
+        ] {
+            for micros in [
+                i64::MIN,
+                i64::MAX,
+                -211_813_488_000_000_001,
+                9_223_371_331_199_999_999,
+            ] {
+                let raw = micros.to_be_bytes();
+                let scalar = types.decode(&kind, oid, &raw, true).unwrap_err();
+                let array = types
+                    .decode(
+                        &ColumnType::String,
+                        array_oid,
+                        &array(oid, &[(1, 1)], &[Some(&raw)]),
+                        true,
+                    )
+                    .unwrap_err();
+                assert_eq!(array.to_string(), scalar.to_string());
+            }
+        }
     }
 
     #[test]

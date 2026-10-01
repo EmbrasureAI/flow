@@ -13,6 +13,12 @@ No release has been tagged yet; the first will be `0.1.0`.
 
 This will be the initial public release, `0.1.0`.
 
+### Fixed
+
+- PostgreSQL date and timestamp arrays accept finite values beyond Chrono's
+  calendar range whenever scalar decoding supports them, preserving the existing
+  JSON string representation and rejection of infinite dates and timestamps.
+
 ### Added
 
 **Capture and publication**
