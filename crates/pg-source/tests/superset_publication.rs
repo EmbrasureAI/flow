@@ -526,12 +526,14 @@ impl RollbackProbe {
     }
 }
 
-/// Delete `deleted` rows in savepoint `s1` of an open transaction. With
-/// `spill`, advance the slot past those deletes before replication starts, so
-/// PostgreSQL re-decodes them before its confirmed position, where it may not
-/// stream and spills the transaction to disk instead. Then make every later
-/// change in a child savepoint `s2`, roll back to `s1` and commit, and replay
-/// the slot through Flow's pgoutput source and capture.
+/// Delete `deleted` rows in savepoint `s1` of a transaction that stays open,
+/// then make every later change in a child savepoint `s2`. With `spill`, the
+/// slot is first advanced past the deletes, so PostgreSQL re-decodes them
+/// before its confirmed position, where it may not stream and spills the
+/// transaction instead; `s2`'s changes then stream it from the spill. Only
+/// after Flow's pgoutput source has received all of `s1`'s deletes in a
+/// streamed block does the transaction roll back to `s1` and commit, as when
+/// a savepoint is rolled back during live replication.
 async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
     use flow_pg_source::{
         PgOutputSource, PostgresSource,
@@ -578,6 +580,9 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
         .get::<_, String>(0)
         .parse()
         .unwrap();
+    // A committed message flushes WAL, including the open transaction's
+    // records so far, so the walsender can read them.
+    let flush = "SELECT pg_catalog.pg_logical_emit_message(true, 'flow-rollback-probe', 'flush')";
 
     let body = AssertUnwindSafe(async {
         let (holder, holder_connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
@@ -599,12 +604,7 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
             .parse::<u64>()
             .unwrap() as u32;
         if spill {
-            // Committing flushes the open transaction's WAL written so far.
-            sql.batch_execute(
-                "SELECT pg_catalog.pg_logical_emit_message(true, 'flow-rollback-probe', 'flush')",
-            )
-            .await
-            .unwrap();
+            sql.batch_execute(flush).await.unwrap();
             sql.execute(
                 "SELECT pg_catalog.pg_replication_slot_advance($1, pg_catalog.pg_current_wal_lsn())",
                 &[&name],
@@ -616,15 +616,11 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
             .batch_execute(&format!(
                 "SAVEPOINT s2;
                  INSERT INTO {name}.probe
-                   SELECT 100000 + i, repeat('x', 200) FROM generate_series(1, 2000) i;
-                 ROLLBACK TO SAVEPOINT s1;
-                 INSERT INTO {name}.probe VALUES (-2, 'after the rollback');
-                 COMMIT"
+                   SELECT 100000 + i, repeat('x', 200) FROM generate_series(1, 2000) i"
             ))
             .await
             .unwrap();
-        drop(holder);
-        holder_task.await.unwrap().unwrap();
+        sql.batch_execute(flush).await.unwrap();
 
         let mut config: tokio_postgres::Config = url.parse().unwrap();
         config
@@ -644,10 +640,11 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
             CaptureAssembler::new(SourceId("source".into()), spool, [schema(probe)], 1 << 16)
                 .unwrap();
         let mut outcome = RollbackProbe::default();
+        let mut rolled_back = false;
         let transaction = loop {
             let event = tokio::time::timeout(Duration::from_secs(60), source.next())
                 .await
-                .expect("pgoutput event")
+                .unwrap_or_else(|_| panic!("no pgoutput event within 60s: {outcome:?}"))
                 .unwrap()
                 .expect("replication stream ended");
             match &event {
@@ -665,12 +662,32 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
                 }
                 _ => {}
             }
+            // Barrier: roll back only once every delete of the still-open
+            // savepoint has been streamed, and only at a block boundary.
+            let block_ended = matches!(event, SourceEvent::StreamStop);
             if let Some(transaction) = assembler.push(event, &mut journal).unwrap()
                 && transaction.xid == xid
             {
                 break transaction;
             }
+            if !rolled_back
+                && block_ended
+                && outcome.savepoint_deletes_received >= u64::from(deleted.unsigned_abs())
+            {
+                rolled_back = true;
+                holder
+                    .batch_execute(&format!(
+                        "ROLLBACK TO SAVEPOINT s1;
+                         INSERT INTO {name}.probe VALUES (-2, 'after the rollback');
+                         COMMIT"
+                    ))
+                    .await
+                    .unwrap();
+            }
         };
+        assert!(rolled_back, "committed before the barrier: {outcome:?}");
+        drop(holder);
+        holder_task.await.unwrap().unwrap();
         outcome.journaled_deletes = journal
             .chunks(&transaction.mutation_chunks)
             .unwrap()
@@ -747,13 +764,15 @@ async fn live_rollback_of_a_spilled_savepoint_within_one_restore_batch_is_aborte
     assert_eq!(outcome.journaled_deletes, 0, "{outcome:?}");
 }
 
-/// Characterizes the cycle-61 hypothesis rather than desired behaviour.
-/// PostgreSQL restores a spilled transaction's changes in batches of 4096
-/// and marks a subtransaction as streamed only if changes remain in memory
-/// after streaming. A spilled savepoint with more changes than that is
-/// streamed but not marked, so its rollback sends no abort, and the
-/// rolled-back deletes reach Flow's journal. Change the journal assertion
-/// once capture handles that rollback.
+/// Diagnostic evidence for the cycle-61 hypothesis, NOT desired behaviour.
+/// Reading PostgreSQL's source, it restores a spilled transaction's changes
+/// in batches of 4096 and marks a subtransaction as streamed only if changes
+/// remain in memory afterwards, so a spilled savepoint with more changes
+/// would be streamed but its rollback would send no abort. This asserts that
+/// prediction, including the resulting wrong journal output, so CI shows
+/// whether the mechanism actually occurs on each PostgreSQL version. It does
+/// not accept that output: replace it with a correctness assertion once
+/// capture handles the rollback.
 #[tokio::test]
 #[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
 async fn live_rollback_of_a_spilled_savepoint_over_one_restore_batch_sends_no_abort() {
