@@ -11,14 +11,21 @@ fails when its window medians strictly increase and the last window exceeds
 the first by more than the tolerance. Retention and garbage collection are
 shortened so that metadata and owned-artifact bookkeeping reach steady state
 within the run; this checks for leaks, not for the default retention cost.
+
+Each sample also keeps the daemon's allocator and memory-budget gauges, so a
+growth failure shows whether live allocations, allocator retention or bounded
+caches account for the RSS. A growth failure is raised only after the final
+row differential, so both are checked on every run.
 """
 
 import os
 from pathlib import Path
+import shlex
 from statistics import median
 import subprocess
 import sys
 import time
+import traceback
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,6 +33,8 @@ from crash_loop import CrashLoop, TABLES, Workload, parser
 from run import dump
 
 RESOURCES = ("rss_bytes", "state_bytes", "journal_bytes", "metadata_bytes")
+# Diagnostic gauges kept with each sample; absent without the jemalloc feature.
+MEMORY_GAUGES = ("flow_allocator_", "flow_memory_")
 
 
 def directory_bytes(path):
@@ -55,7 +64,21 @@ def sustained_growth(samples, warmup, tolerance):
     return growing
 
 
+def reproduction(args):
+    arguments = ["uv", "run", "tests/production/soak.py", "--seed", str(args.seed),
+                 "--duration", f"{args.duration:g}", "--writers", str(args.writers),
+                 "--large-rows", str(args.large_rows), "--large-interval", f"{args.large_interval:g}",
+                 "--format-version", str(args.format_version), "--sample-seconds", f"{args.sample_seconds:g}",
+                 "--verify-every", f"{args.verify_every:g}", "--retention-secs", str(args.retention_secs)]
+    return shlex.join(arguments) + " --catalog-uri ... --s3-endpoint ... --artifacts NEW_DIRECTORY"
+
+
 class Soak(CrashLoop):
+    def __init__(self, args):
+        super().__init__(args)
+        # The inherited command would replay a crash loop, not this soak.
+        self.report["reproduce"] = reproduction(args)
+
     def configure(self):
         super().configure()
         text = self.config.read_text().replace(
@@ -79,13 +102,14 @@ class Soak(CrashLoop):
         return {"elapsed_seconds": round(time.monotonic() - self.started, 1), "rss_bytes": int(rss) * 1024,
                 "state_bytes": directory_bytes(state), "journal_bytes": directory_bytes(state / "journal"),
                 "metadata_bytes": metadata, "snapshots": snapshots,
-                "source_lag_bytes": metrics.get("flow_source_received_lsn", 0) - metrics.get("flow_materialized_lsn", 0)}
+                "source_lag_bytes": metrics.get("flow_source_received_lsn", 0) - metrics.get("flow_materialized_lsn", 0),
+                "memory": {name: value for name, value in metrics.items() if name.startswith(MEMORY_GAUGES)}}
 
     def soak(self):
         self.workload = Workload(self)
         self.started = time.monotonic()
         samples = self.report.setdefault("samples", [])
-        checks = []
+        checks = self.report.setdefault("row_checks", [])
         next_check = self.started + self.args.verify_every
         while time.monotonic() - self.started < self.args.duration:
             deadline = time.monotonic() + self.args.sample_seconds
@@ -109,11 +133,12 @@ class Soak(CrashLoop):
         warmup = int(len(samples) * self.args.warmup_fraction)
         tolerance = {"rss_bytes": self.args.rss_tolerance, "state_bytes": self.args.state_tolerance,
                      "journal_bytes": self.args.state_tolerance, "metadata_bytes": self.args.metadata_tolerance}
-        growing = sustained_growth(samples, warmup, tolerance)
-        self.report["growth"] = growing
-        assert not growing, f"sustained resource growth: {growing}"
+        # Recorded here and raised after the final differential.
+        self.report["growth"] = sustained_growth(samples, warmup, tolerance)
+        # The nightly artifact keeps report.json but not the state directory.
+        self.report["final_metrics"] = self.metrics()
         return {"samples": len(samples), "warmup_samples": warmup, "row_checks": len(checks),
-                "workload": dict(self.workload.counts)}
+                "growing": sorted(self.report["growth"]), "workload": dict(self.workload.counts)}
 
     def final_check(self):
         self.wait_materialized(0)
@@ -132,9 +157,15 @@ class Soak(CrashLoop):
             self.phase("final-differential", self.final_check)
             self.stop()
             self.check_worker_panics()
+            growing = self.report["growth"]
+            assert not growing, f"sustained resource growth: {growing}"
             self.report["passed"] = True
         except BaseException as error:
             self.report["failure"] = str(error)
+            self.report["traceback"] = traceback.format_exc()
+            # A correctness failure must not hide recorded growth, or the reverse.
+            if self.report.get("growth") and "sustained resource growth" not in str(error):
+                print(f"also: sustained resource growth: {self.report['growth']}", file=sys.stderr, flush=True)
             raise
         finally:
             if self.workload is not None and not self.workload.stopping:
