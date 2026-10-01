@@ -14,9 +14,17 @@ use uuid::Uuid;
 
 use crate::{content_file_id, invalid};
 
+/// Manifests unread for this long leave the cache. Publication and inventory
+/// read every manifest of a table's current snapshot, so those stay cached;
+/// manifests that commits, compaction or manifest rewrites superseded are not
+/// read again. Without this, superseded manifests outnumber current ones by
+/// orders of magnitude and keep the process at the full budget. Twice the
+/// default garbage interval keeps quiet tables' periodic maintenance warm.
+const MANIFEST_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Bounded, shared cache of immutable parsed manifests. A table coordinator can
 /// reuse this across actions so publication reads only new manifest objects.
-/// The budget is a conservative decoded-size estimate, not an allocator quota.
+/// The budget is a decoded-size estimate, not an allocator quota.
 #[derive(Debug, Clone)]
 pub struct ManifestCache {
     entries: Cache<ManifestCacheKey, Arc<Manifest>>,
@@ -58,9 +66,14 @@ fn data_file_weight(file: &iceberg::spec::DataFile) -> usize {
 
 impl ManifestCache {
     pub fn new(estimated_bytes: u64) -> Self {
+        Self::with_idle(estimated_bytes, MANIFEST_IDLE)
+    }
+
+    fn with_idle(estimated_bytes: u64, idle: std::time::Duration) -> Self {
         Self {
             entries: Cache::builder()
                 .max_capacity(estimated_bytes)
+                .time_to_idle(idle)
                 .weigher(|_, manifest: &Arc<Manifest>| {
                     let bytes = manifest.entries().iter().fold(4096_usize, |bytes, entry| {
                         bytes.saturating_add(data_file_weight(entry.data_file()))
@@ -355,6 +368,44 @@ mod tests {
             .equality_ids(Some(vec![1; size]))
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cache_releases_manifests_that_are_no_longer_read() {
+        let manifest = Arc::new(Manifest::new(
+            ManifestMetadata {
+                schema: Arc::new(
+                    Schema::builder()
+                        .with_fields(vec![Arc::new(NestedField::required(
+                            1,
+                            "value",
+                            Type::Primitive(PrimitiveType::String),
+                        ))])
+                        .build()
+                        .unwrap(),
+                ),
+                schema_id: 0,
+                partition_spec: PartitionSpec::unpartition_spec(),
+                format_version: FormatVersion::V2,
+                content: ManifestContentType::Data,
+            },
+            Vec::new(),
+        ));
+        let cache = ManifestCache::with_idle(1 << 20, std::time::Duration::from_secs(1));
+        let current = (Uuid::nil(), "current".into(), 1, 1, None);
+        let superseded = (Uuid::nil(), "superseded".into(), 1, 1, None);
+        cache
+            .entries
+            .insert(current.clone(), manifest.clone())
+            .await;
+        cache.entries.insert(superseded.clone(), manifest).await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(cache.entries.get(&current).await.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        cache.entries.run_pending_tasks().await;
+        assert!(cache.entries.get(&current).await.is_some());
+        assert!(cache.entries.get(&superseded).await.is_none());
+        assert_eq!(cache.entry_count(), 1);
     }
 
     #[tokio::test]

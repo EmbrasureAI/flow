@@ -114,6 +114,9 @@ This will be the initial public release, `0.1.0`.
   `flow_memory_index_memtable_bytes`, `flow_memory_manifest_cache_bytes`,
   `flow_memory_retained_index_bytes`, …) that attribute resident memory to the
   row index, manifest caches and garbage reachability indexes.
+- The shared parsed-manifest caches release manifests unread for ten minutes.
+  Manifests superseded by commits, compaction and manifest rewrites no longer
+  accumulate until each cache reaches its 64 MiB budget.
 - A Dockerfile that builds a minimal image running as an unprivileged user.
 - Operations guidance for systemd and Kubernetes, and disk sizing.
 
