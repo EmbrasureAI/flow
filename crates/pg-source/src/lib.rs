@@ -322,6 +322,13 @@ pub async fn rolled_back_subtransactions(
     }
 }
 
+pub(crate) fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+pub(crate) fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod xid_tests {
     use super::widen_xid;
@@ -342,11 +349,4 @@ mod xid_tests {
         assert_eq!(widen_xid(100, 2), None);
         assert_eq!(widen_xid(100, 3), Some(3));
     }
-}
-
-pub(crate) fn quote_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-pub(crate) fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
