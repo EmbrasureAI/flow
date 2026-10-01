@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from soak import Soak, process_memory, reproduction
+from soak import Soak, mapping_summary, process_memory, reproduction
 
 GROWTH = {"rss_bytes": {"window_medians": [100.0, 130.0, 160.0], "limit": 125.0}}
 
@@ -126,6 +126,28 @@ class ProcessMemoryTests(unittest.TestCase):
                                                     "lazy_free_bytes": 8 * 1024,
                                                     "anon_huge_page_bytes": 2048 * 1024})
         self.assertEqual(process_memory(43, proc), {})
+
+    def test_mappings_are_summarized_by_name_and_anonymous_size(self):
+        proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (proc / "42").mkdir()
+        (proc / "42" / "smaps").write_text(
+            "55d0a0000000-55d0a8000000 r-xp 00000000 08:01 1234 /runner/target/debug/embrasure-flow\n"
+            "Rss:                1024 kB\nAnonHugePages:         0 kB\n"
+            "7f0000000000-7f0000400000 rw-p 00000000 00:00 0 \n"
+            "Rss:                4096 kB\nAnonHugePages:      2048 kB\n"
+            "7f1000000000-7f1000800000 rw-p 00000000 00:00 0 \n"
+            "Rss:                2048 kB\nAnonHugePages:      2048 kB\n"
+            "7f2000000000-7f2000100000 rw-p 00000000 00:00 0 \n"
+            "Rss:                  64 kB\nAnonHugePages:         0 kB\n"
+            "7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]\n"
+            "Rss:                  32 kB\nAnonHugePages:         0 kB\n")
+        self.assertEqual(mapping_summary(42, proc), {
+            "embrasure-flow": {"mappings": 1, "rss_bytes": 1024 * 1024, "anon_huge_page_bytes": 0},
+            "anon<64MiB": {"mappings": 2, "rss_bytes": 6144 * 1024, "anon_huge_page_bytes": 4096 * 1024},
+            "anon<2MiB": {"mappings": 1, "rss_bytes": 64 * 1024, "anon_huge_page_bytes": 0},
+            "[stack]": {"mappings": 1, "rss_bytes": 32 * 1024, "anon_huge_page_bytes": 0},
+        })
+        self.assertEqual(mapping_summary(43, proc), {})
 
 
 if __name__ == "__main__":

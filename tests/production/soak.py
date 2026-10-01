@@ -69,6 +69,38 @@ def process_memory(pid, proc=Path("/proc")):
     return memory
 
 
+def mapping_summary(pid, proc=Path("/proc")):
+    """Resident and anonymous huge-page bytes per mapping class: named files
+    and pseudo-mappings by name, anonymous mappings by size class. Separates
+    allocator extents, thread stacks and file pages that RSS totals combine.
+    Empty where /proc is unavailable."""
+    try:
+        text = (proc / str(pid) / "smaps").read_text()
+    except OSError:
+        return {}
+    classes = {}
+    entry = None
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and "-" in fields[0] and not fields[0].endswith(":"):
+            start, end = (int(bound, 16) for bound in fields[0].split("-"))
+            size = end - start
+            if len(fields) > 5:
+                name = fields[5] if fields[5].startswith("[") else Path(fields[5]).name
+            elif size < 1 << 21:
+                name = "anon<2MiB"
+            elif size < 1 << 26:
+                name = "anon<64MiB"
+            else:
+                name = "anon>=64MiB"
+            entry = classes.setdefault(name, {"mappings": 0, "rss_bytes": 0, "anon_huge_page_bytes": 0})
+            entry["mappings"] += 1
+        elif entry is not None and fields[:1] in (["Rss:"], ["AnonHugePages:"]):
+            key = "rss_bytes" if fields[0] == "Rss:" else "anon_huge_page_bytes"
+            entry[key] += int(fields[1]) * 1024
+    return classes
+
+
 def sustained_growth(samples, warmup, tolerance):
     """Return {resource: evidence} for resources growing across the whole run."""
     steady = samples[warmup:]
@@ -139,6 +171,8 @@ class Soak(CrashLoop):
             pass
         self.workload = Workload(self)
         self.started = time.monotonic()
+        mappings = self.report.setdefault("mappings", {})
+        mappings["start"] = mapping_summary(self.process.pid)
         samples = self.report.setdefault("samples", [])
         checks = self.report.setdefault("row_checks", [])
         next_check = self.started + self.args.verify_every
@@ -164,6 +198,7 @@ class Soak(CrashLoop):
         warmup = int(len(samples) * self.args.warmup_fraction)
         tolerance = {"rss_bytes": self.args.rss_tolerance, "state_bytes": self.args.state_tolerance,
                      "journal_bytes": self.args.state_tolerance, "metadata_bytes": self.args.metadata_tolerance}
+        mappings["end"] = mapping_summary(self.process.pid)
         # Recorded here and raised after the final differential.
         self.report["growth"] = sustained_growth(samples, warmup, tolerance)
         # The nightly artifact keeps report.json but not the state directory.
