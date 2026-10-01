@@ -27,12 +27,14 @@ use std::collections::BTreeSet;
 const TABLE: u32 = 11;
 const XID: u32 = 500;
 const SAVEPOINT: u32 = 501;
+/// A savepoint released after the rollback: a committed child.
+const RELEASED: u32 = 502;
 const START: i64 = 11_000_000;
 const ROWS: i64 = 12_000;
 /// Rows the rolled-back savepoint deletes: `start ..= start + rows / 2`.
 const SAVEPOINT_ROWS: i64 = ROWS / 2 + 1;
 /// Rows updated before the savepoint (`start ..= start + rows / 10`) plus one
-/// update after its rollback.
+/// update by a child savepoint released after the rollback.
 const UPDATES: i64 = ROWS / 10 + 2;
 /// The crash loop's `limits.chunk_bytes`.
 const CHUNK_BYTES: u32 = 65_536;
@@ -107,8 +109,12 @@ fn insert(id: i64) -> Bytes {
 }
 
 fn update(id: i64, payload: &str) -> Bytes {
+    update_in(XID, id, payload)
+}
+
+fn update_in(xid: u32, id: i64, payload: &str) -> Bytes {
     message(b'U', |b| {
-        b.put_u32(XID);
+        b.put_u32(xid);
         b.put_u32(TABLE);
         b.put_u8(b'O');
         tuple(b, id, "new");
@@ -185,7 +191,7 @@ fn journaled(savepoint_blocks: &[i64], abort: bool) -> (SourceTransaction, Vec<M
         }));
     }
     feed(stream_start(false));
-    feed(update(START + ROWS - 1, "after rollback"));
+    feed(update_in(RELEASED, START + ROWS - 1, "released child"));
     feed(stream_stop());
     let commit = decoder
         .decode(message(b'c', |b| {
@@ -199,11 +205,12 @@ fn journaled(savepoint_blocks: &[i64], abort: bool) -> (SourceTransaction, Vec<M
     let subtransactions = assembler.subtransactions(XID).unwrap();
     if abort {
         // The received abort already truncated the savepoint's changes.
-        assert!(subtransactions.is_empty(), "{subtransactions:?}");
+        assert_eq!(subtransactions, BTreeSet::from([RELEASED]));
     } else {
-        assert_eq!(subtransactions, BTreeSet::from([SAVEPOINT]));
+        assert_eq!(subtransactions, BTreeSet::from([SAVEPOINT, RELEASED]));
+        // As PostgreSQL's commit log reports: only the savepoint rolled back.
         assembler
-            .exclude_rolled_back(XID, &subtransactions)
+            .exclude_rolled_back(XID, &BTreeSet::from([SAVEPOINT]))
             .unwrap();
     }
     let txn = assembler

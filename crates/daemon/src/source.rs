@@ -31,6 +31,10 @@ const PUBLICATION_CHECK_INTERVAL: Duration = if cfg!(test) {
     Duration::from_secs(60)
 };
 
+/// How long a subtransaction of a decoded commit may still read as in
+/// progress, before capture stops instead of publishing on an unknown status.
+const SUBTRANSACTION_STATUS_WAIT: Duration = Duration::from_secs(10);
+
 async fn source_deadline<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     tokio::time::timeout(SOURCE_SQL_TIMEOUT, operation)
         .await
@@ -483,7 +487,7 @@ pub(crate) async fn capture_loop(
                                     let subtransactions = assembler.subtransactions(*xid)?;
                                     if !subtransactions.is_empty() {
                                         let rolled_back = source_deadline(async {
-                                            Ok::<_, anyhow::Error>(flow_pg_source::rolled_back_subtransactions(&sql, &subtransactions).await?)
+                                            Ok::<_, anyhow::Error>(flow_pg_source::rolled_back_subtransactions(&sql, &subtransactions, SUBTRANSACTION_STATUS_WAIT).await?)
                                         }).await;
                                         match rolled_back {
                                             Ok(rolled_back) => assembler.exclude_rolled_back(*xid, &rolled_back)?,

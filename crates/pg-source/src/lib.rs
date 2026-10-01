@@ -228,49 +228,120 @@ impl PostgresSource for PgOutputSource {
     }
 }
 
+/// Widen a 32-bit XID to a full XID near `reference`, a full XID that
+/// PostgreSQL has assigned or is about to assign. An XID still in use lies
+/// within 2^31 of every other, so the nearest full XID with these low 32 bits
+/// is the one PostgreSQL assigned, even when `reference` is in the next or
+/// previous epoch. `None` if that would precede the first normal XID.
+pub fn widen_xid(reference: u64, xid: u32) -> Option<u64> {
+    let distance = i64::from(xid.wrapping_sub(reference as u32) as i32);
+    let full = i64::try_from(reference).ok()?.checked_add(distance)?;
+    u64::try_from(full).ok().filter(|&full| full >= 3)
+}
+
 /// Of these subtransaction XIDs of a transaction whose commit has been
-/// received, those PostgreSQL rolled back, from its commit log. Every status
-/// is final once the commit is decoded. 32-bit XIDs are widened with the
-/// epoch of the next XID, which is correct for any XID PostgreSQL still
-/// tracks. A status that is no longer known is an error, never assumed.
+/// received, those PostgreSQL rolled back, from its commit log. The commit
+/// record is flushed before the commit log and process array record it, so a
+/// status may still read as in progress briefly; it is retried until
+/// `deadline`. A status PostgreSQL no longer keeps, or one still in progress
+/// at the deadline, is an error: changes are never published on a guess.
 pub async fn rolled_back_subtransactions(
     client: &Client,
     xids: &std::collections::BTreeSet<u32>,
+    deadline: std::time::Duration,
 ) -> Result<std::collections::BTreeSet<u32>> {
-    let xids: Vec<i64> = xids.iter().map(|&xid| i64::from(xid)).collect();
-    let rows = client
-        .query(
-            "SELECT x, pg_catalog.pg_xact_status((CASE WHEN x <= n & 4294967295
-                    THEN ((n >> 32) << 32) | x ELSE (((n >> 32) - 1) << 32) | x END)::text::pg_catalog.xid8)
-             FROM (SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())::text::bigint AS n) AS next,
-                  unnest($1::bigint[]) AS x",
-            &[&xids],
-        )
-        .await?;
-    let mut rolled_back = std::collections::BTreeSet::new();
-    for row in rows {
-        let xid: i64 = row.get(0);
-        match row.get::<_, Option<String>>(1).as_deref() {
-            Some("committed") => {}
-            Some("aborted") => {
-                rolled_back.insert(
-                    u32::try_from(xid)
-                        .map_err(|_| Error::Protocol("subtransaction XID out of range"))?,
-                );
-            }
-            Some(_) => {
-                return Err(Error::Protocol(
-                    "subtransaction of a received commit is still in progress",
-                ));
-            }
-            None => {
-                return Err(Error::Protocol(
-                    "subtransaction status is no longer available",
-                ));
+    let started = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(10);
+    loop {
+        // One past the latest completed XID: at most a few XIDs behind any
+        // assigned XID of a transaction whose commit is being recorded.
+        let next = client
+            .query_one(
+                "SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())::text",
+                &[],
+            )
+            .await?
+            .get::<_, String>(0)
+            .parse::<u64>()
+            .map_err(|_| Error::Protocol("unparseable snapshot xmax"))?;
+        let full = xids
+            .iter()
+            .map(|&xid| {
+                widen_xid(next, xid)
+                    .map(|full| (full, xid))
+                    .ok_or(Error::Protocol(
+                        "subtransaction XID precedes the first normal XID",
+                    ))
+            })
+            .collect::<Result<std::collections::BTreeMap<u64, u32>>>()?;
+        let keys = full
+            .keys()
+            .map(|&full| {
+                i64::try_from(full).map_err(|_| Error::Protocol("subtransaction XID out of range"))
+            })
+            .collect::<Result<Vec<i64>>>()?;
+        let rows = client
+            .query(
+                "SELECT x, pg_catalog.pg_xact_status(x::text::pg_catalog.xid8)
+                 FROM unnest($1::bigint[]) AS x",
+                &[&keys],
+            )
+            .await?;
+        let mut rolled_back = std::collections::BTreeSet::new();
+        let mut in_progress = false;
+        for row in rows {
+            let key: i64 = row.get(0);
+            let xid = u64::try_from(key)
+                .ok()
+                .and_then(|key| full.get(&key))
+                .copied()
+                .ok_or(Error::Protocol("unexpected subtransaction status row"))?;
+            match row.get::<_, Option<String>>(1).as_deref() {
+                Some("committed") => {}
+                Some("aborted") => {
+                    rolled_back.insert(xid);
+                }
+                Some(_) => in_progress = true,
+                None => {
+                    return Err(Error::Protocol(
+                        "subtransaction status is no longer available",
+                    ));
+                }
             }
         }
+        if !in_progress {
+            return Ok(rolled_back);
+        }
+        if started.elapsed() >= deadline {
+            return Err(Error::Protocol(
+                "subtransaction of a received commit is still in progress",
+            ));
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_millis(500));
     }
-    Ok(rolled_back)
+}
+
+#[cfg(test)]
+mod xid_tests {
+    use super::widen_xid;
+
+    #[test]
+    fn widening_picks_the_nearest_epoch_across_a_wrap() {
+        const EPOCH: u64 = 1 << 32;
+        // Same epoch, behind and slightly ahead of the reference: a commit
+        // can be decoded before its XIDs count as completed.
+        assert_eq!(widen_xid(EPOCH + 1000, 900), Some(EPOCH + 900));
+        assert_eq!(widen_xid(EPOCH + 1000, 1005), Some(EPOCH + 1005));
+        // The reference has wrapped into the next epoch; the XID has not.
+        assert_eq!(widen_xid(EPOCH + 5, u32::MAX - 10), Some(EPOCH - 11));
+        // The XID has wrapped; the reference, just behind it, has not.
+        assert_eq!(widen_xid(2 * EPOCH - 3, 4), Some(2 * EPOCH + 4));
+        // Nothing precedes the first epoch, nor the first normal XID.
+        assert_eq!(widen_xid(100, u32::MAX - 10), None);
+        assert_eq!(widen_xid(100, 2), None);
+        assert_eq!(widen_xid(100, 3), Some(3));
+    }
 }
 
 pub(crate) fn quote_identifier(value: &str) -> String {

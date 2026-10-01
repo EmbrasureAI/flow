@@ -523,8 +523,12 @@ struct RollbackProbe {
     /// Subtransactions PostgreSQL's commit log reported rolled back at the
     /// commit although no abort was received; capture excluded them.
     rolled_back_without_abort: Vec<u32>,
-    /// Deletes in the journaled transaction; PostgreSQL committed none.
+    /// The durable journaled transaction, after reopening the journal:
+    /// inserted ids, deletes and other mutations. PostgreSQL committed only
+    /// the inserts -1 and -2 of the root and -3 of a released child.
+    journaled_inserts: Vec<i32>,
     journaled_deletes: u64,
+    journaled_other: u64,
 }
 
 impl RollbackProbe {
@@ -676,10 +680,13 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
             if matches!(event, SourceEvent::Commit { xid: committed, .. } if committed == xid) {
                 let subtransactions = assembler.subtransactions(xid).unwrap();
                 if !subtransactions.is_empty() {
-                    let rolled_back =
-                        flow_pg_source::rolled_back_subtransactions(&sql, &subtransactions)
-                            .await
-                            .unwrap();
+                    let rolled_back = flow_pg_source::rolled_back_subtransactions(
+                        &sql,
+                        &subtransactions,
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap();
                     outcome.rolled_back_without_abort = rolled_back.iter().copied().collect();
                     assembler.exclude_rolled_back(xid, &rolled_back).unwrap();
                 }
@@ -701,6 +708,9 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
                     .batch_execute(&format!(
                         "ROLLBACK TO SAVEPOINT s1;
                          INSERT INTO {name}.probe VALUES (-2, 'after the rollback');
+                         SAVEPOINT s3;
+                         INSERT INTO {name}.probe VALUES (-3, 'released child');
+                         RELEASE SAVEPOINT s3;
                          COMMIT"
                     ))
                     .await
@@ -710,12 +720,36 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
         assert!(rolled_back, "committed before the barrier: {outcome:?}");
         drop(holder);
         holder_task.await.unwrap().unwrap();
-        outcome.journaled_deletes = journal
-            .chunks(&transaction.mutation_chunks)
+        // Read the outcome back from the durable journal.
+        assembler.flush_commits(&mut journal).unwrap();
+        drop(journal);
+        let (journal, recovered) =
+            Journal::open(root.path().join("journal"), JournalConfig::default()).unwrap();
+        let durable = recovered
+            .transactions
+            .iter()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .find(|durable| durable.xid == xid)
+            .expect("durable transaction");
+        assert_eq!(durable, transaction);
+        for mutation in journal
+            .chunks(&durable.mutation_chunks)
             .unwrap()
             .flat_map(|bytes| bincode::deserialize::<Vec<Mutation>>(&bytes.unwrap()).unwrap())
-            .filter(|mutation| matches!(mutation.kind, MutationKind::Delete { .. }))
-            .count() as u64;
+        {
+            match &mutation.kind {
+                MutationKind::Insert { row } => match row.first() {
+                    Some(Value::Int32(id)) => outcome.journaled_inserts.push(*id),
+                    _ => outcome.journaled_other += 1,
+                },
+                MutationKind::Delete { .. } => outcome.journaled_deletes += 1,
+                _ => outcome.journaled_other += 1,
+            }
+        }
+        outcome.journaled_inserts.sort_unstable();
         drop(source);
         drop(replication);
         replication_task.abort();
@@ -763,6 +797,13 @@ async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
     }
 }
 
+/// The durable journal holds exactly the changes PostgreSQL committed.
+fn assert_committed_changes_only(outcome: &RollbackProbe) {
+    assert_eq!(outcome.journaled_inserts, [-3, -2, -1], "{outcome:?}");
+    assert_eq!(outcome.journaled_deletes, 0, "{outcome:?}");
+    assert_eq!(outcome.journaled_other, 0, "{outcome:?}");
+}
+
 /// Control: streamed from memory, the rolled-back savepoint is aborted.
 #[tokio::test]
 #[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
@@ -772,7 +813,7 @@ async fn live_rollback_of_a_savepoint_streamed_from_memory_is_aborted() {
     assert_eq!(outcome.savepoint_deletes_received, 5039, "{outcome:?}");
     assert!(outcome.savepoint_aborted(), "{outcome:?}");
     assert!(outcome.rolled_back_without_abort.is_empty(), "{outcome:?}");
-    assert_eq!(outcome.journaled_deletes, 0, "{outcome:?}");
+    assert_committed_changes_only(&outcome);
 }
 
 /// Control: spilled with fewer changes than PostgreSQL restores at once, the
@@ -785,7 +826,7 @@ async fn live_rollback_of_a_spilled_savepoint_within_one_restore_batch_is_aborte
     assert_eq!(outcome.savepoint_deletes_received, 1000, "{outcome:?}");
     assert!(outcome.savepoint_aborted(), "{outcome:?}");
     assert!(outcome.rolled_back_without_abort.is_empty(), "{outcome:?}");
-    assert_eq!(outcome.journaled_deletes, 0, "{outcome:?}");
+    assert_committed_changes_only(&outcome);
 }
 
 /// PostgreSQL restores a spilled transaction's changes in batches of 4096
@@ -807,5 +848,5 @@ async fn live_rollback_of_a_spilled_savepoint_over_one_restore_batch_is_excluded
         outcome.savepoint.into_iter().collect::<Vec<_>>(),
         "{outcome:?}"
     );
-    assert_eq!(outcome.journaled_deletes, 0, "{outcome:?}");
+    assert_committed_changes_only(&outcome);
 }

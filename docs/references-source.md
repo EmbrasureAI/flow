@@ -45,9 +45,14 @@ Unknown formats, truncated records and invalid proofs fail closed.
   A spilled transaction's changes are restored in batches of 4096, so a
   spilled savepoint with more changes can be streamed and later rolled back
   with no abort message. At each commit of a transaction with surviving
-  subtransaction changes, capture reads their final status from
-  PostgreSQL's commit log (`pg_xact_status`) and drops the changes of those
-  that rolled back. An unknown status stops capture instead of guessing.
+  subtransaction changes, capture reads their status from PostgreSQL's
+  commit log (`pg_xact_status`) and drops the changes of those that rolled
+  back. PostgreSQL flushes a commit record before its commit log records it,
+  so an in-progress status is retried for up to 10 seconds; a status still
+  in progress, or one PostgreSQL no longer keeps, stops capture instead of
+  guessing. Provisional quarantine decisions of excluded subtransactions are
+  kept, which can block a table a received rollback would have left
+  publishing.
 * [Logical decoding and exported snapshots](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html):
   a slot may resend transactions after server recovery. A new slot's exported
   snapshot and consistent point establish one source-wide initial-copy boundary.

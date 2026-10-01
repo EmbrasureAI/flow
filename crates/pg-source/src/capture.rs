@@ -472,8 +472,10 @@ impl CaptureAssembler {
     }
 
     /// Drop the changes of subtransactions PostgreSQL rolled back, keeping
-    /// those of every other (sub)transaction. Provisional quarantine decisions
-    /// are kept: blocking a table is safe, publishing its changes might not be.
+    /// those of every other (sub)transaction. Unlike a received rollback, this
+    /// keeps the provisional quarantine decisions they made: a table may be
+    /// blocked by a rolled-back decision (an availability limit), but no change
+    /// that decision stops is published.
     pub fn exclude_rolled_back(&mut self, xid: u32, subxids: &BTreeSet<u32>) -> Result<()> {
         if subxids.is_empty() {
             return Ok(());
