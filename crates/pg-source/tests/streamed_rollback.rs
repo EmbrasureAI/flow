@@ -6,7 +6,7 @@
 //! block, capture chunk or spool segment boundaries fall inside it.
 
 use bytes::Bytes;
-use flow_ingress_journal::{Journal, JournalConfig};
+use flow_ingress_journal::{ChunkReader, Journal, JournalConfig};
 use flow_model::{
     Column, ColumnType, Mutation, MutationKind, PgLsn, SourceId, TableId, TableSchema, Value,
 };

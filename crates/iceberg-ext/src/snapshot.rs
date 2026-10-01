@@ -14,11 +14,11 @@ use uuid::Uuid;
 
 use crate::{content_file_id, invalid};
 
-/// Manifests unread for this long leave the cache. Publication and inventory
-/// read every manifest of a table's current snapshot, so those stay cached;
-/// manifests that commits, compaction or manifest rewrites superseded are not
-/// read again. Without this, superseded manifests outnumber current ones by
-/// orders of magnitude and keep the process at the full budget. Twice the
+/// Manifests unread for this long leave the cache; a later read reloads them.
+/// Publication and inventory read every manifest of a table's current
+/// snapshot, so those stay cached. Manifests superseded by commits, compaction
+/// or manifest rewrites are read only by work on retained snapshots, if at
+/// all; without expiry they accumulate until the budget is full. Twice the
 /// default garbage interval keeps quiet tables' periodic maintenance warm.
 const MANIFEST_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 
