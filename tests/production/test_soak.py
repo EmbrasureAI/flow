@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from soak import Soak, reproduction
+from soak import Soak, process_memory, reproduction
 
 GROWTH = {"rss_bytes": {"window_medians": [100.0, 130.0, 160.0], "limit": 125.0}}
 
@@ -91,6 +91,19 @@ class ReproductionTests(unittest.TestCase):
         for option in ("--duration 1800", "--warmup-fraction 0.5", "--rss-tolerance 0.4",
                        "--state-tolerance 0.5", "--metadata-tolerance 0.25", "--retention-secs 120"):
             self.assertIn(option, command)
+
+
+class ProcessMemoryTests(unittest.TestCase):
+    def test_linux_rss_components_are_parsed(self):
+        proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (proc / "42").mkdir()
+        (proc / "42" / "status").write_text("Name:\tembrasure-flow\nVmRSS:\t   3072 kB\nRssAnon:\t   2048 kB\n"
+                                            "RssFile:\t    1000 kB\nRssShmem:\t      24 kB\nThreads:\t37\n")
+        (proc / "42" / "smaps_rollup").write_text("Rss:                3072 kB\nLazyFree:             8 kB\n")
+        self.assertEqual(process_memory(42, proc), {"rss_anon_bytes": 2048 * 1024, "rss_file_bytes": 1000 * 1024,
+                                                    "rss_shmem_bytes": 24 * 1024, "threads": 37,
+                                                    "lazy_free_bytes": 8 * 1024})
+        self.assertEqual(process_memory(43, proc), {})
 
 
 if __name__ == "__main__":

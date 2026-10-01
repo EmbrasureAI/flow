@@ -48,6 +48,26 @@ def directory_bytes(path):
     return total
 
 
+def process_memory(pid, proc=Path("/proc")):
+    """Linux RSS components in bytes: anonymous, file-backed and shared pages,
+    lazily freed pages still counted in RSS, and the thread count. Empty
+    where /proc is unavailable."""
+    fields = {"RssAnon": "rss_anon_bytes", "RssFile": "rss_file_bytes", "RssShmem": "rss_shmem_bytes",
+              "LazyFree": "lazy_free_bytes", "Threads": "threads"}
+    memory = {}
+    for name in ("status", "smaps_rollup"):
+        try:
+            text = (proc / str(pid) / name).read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            key, _, value = line.partition(":")
+            if key in fields:
+                number, *unit = value.split()
+                memory[fields[key]] = int(number) * (1024 if unit == ["kB"] else 1)
+    return memory
+
+
 def sustained_growth(samples, warmup, tolerance):
     """Return {resource: evidence} for resources growing across the whole run."""
     steady = samples[warmup:]
@@ -106,7 +126,8 @@ class Soak(CrashLoop):
                 "state_bytes": directory_bytes(state), "journal_bytes": directory_bytes(state / "journal"),
                 "metadata_bytes": metadata, "snapshots": snapshots,
                 "source_lag_bytes": metrics.get("flow_source_received_lsn", 0) - metrics.get("flow_materialized_lsn", 0),
-                "memory": {name: value for name, value in metrics.items() if name.startswith(MEMORY_GAUGES)}}
+                "memory": {name: value for name, value in metrics.items() if name.startswith(MEMORY_GAUGES)},
+                "process": process_memory(self.process.pid)}
 
     def soak(self):
         self.workload = Workload(self)
