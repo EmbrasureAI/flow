@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from soak import Soak
+from soak import Soak, reproduction
 
 GROWTH = {"rss_bytes": {"window_medians": [100.0, 130.0, 160.0], "limit": 125.0}}
 
@@ -78,6 +78,19 @@ class SoakExecutionTests(unittest.TestCase):
         soak.execute()
         self.assertEqual(soak.calls, ["seed", "initialize", "handoff", "soak", "final", "panics"])
         self.assertTrue(self.written(soak)["passed"])
+
+
+class ReproductionTests(unittest.TestCase):
+    def test_command_replays_the_soak_with_its_detector_settings(self):
+        args = argparse.Namespace(seed=2245799672, duration=1800, writers=3, large_rows=12000, large_interval=15,
+                                  format_version=2, sample_seconds=30, verify_every=600, retention_secs=120,
+                                  warmup_fraction=0.5, rss_tolerance=0.4, state_tolerance=0.5,
+                                  metadata_tolerance=0.25)
+        command = reproduction(args)
+        self.assertTrue(command.startswith("uv run tests/production/soak.py --seed 2245799672 "))
+        for option in ("--duration 1800", "--warmup-fraction 0.5", "--rss-tolerance 0.4",
+                       "--state-tolerance 0.5", "--metadata-tolerance 0.25", "--retention-secs 120"):
+            self.assertIn(option, command)
 
 
 if __name__ == "__main__":

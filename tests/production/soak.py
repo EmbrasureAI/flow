@@ -69,7 +69,10 @@ def reproduction(args):
                  "--duration", f"{args.duration:g}", "--writers", str(args.writers),
                  "--large-rows", str(args.large_rows), "--large-interval", f"{args.large_interval:g}",
                  "--format-version", str(args.format_version), "--sample-seconds", f"{args.sample_seconds:g}",
-                 "--verify-every", f"{args.verify_every:g}", "--retention-secs", str(args.retention_secs)]
+                 "--verify-every", f"{args.verify_every:g}", "--retention-secs", str(args.retention_secs),
+                 "--warmup-fraction", f"{args.warmup_fraction:g}", "--rss-tolerance", f"{args.rss_tolerance:g}",
+                 "--state-tolerance", f"{args.state_tolerance:g}",
+                 "--metadata-tolerance", f"{args.metadata_tolerance:g}"]
     return shlex.join(arguments) + " --catalog-uri ... --s3-endpoint ... --artifacts NEW_DIRECTORY"
 
 
