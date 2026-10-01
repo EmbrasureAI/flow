@@ -538,3 +538,20 @@ when distinguishing live objects from retained pages. Failed samples omit the
 gauges until a later sample succeeds; absence does not mean zero memory.
 Background reclamation does not cap live allocations or replace worker, batch,
 cache and container limits. Default and non-GNU/Linux builds omit these gauges.
+
+Every build also exports the current usage of the process-wide memory budgets,
+refreshed with the periodic health observation:
+
+| Gauge | Meaning |
+| --- | --- |
+| `flow_memory_index_block_cache_bytes` | Row-index RocksDB block cache usage, including index and filter blocks |
+| `flow_memory_index_block_cache_pinned_bytes` | Block cache entries pinned by open readers |
+| `flow_memory_index_memtable_bytes` | Active, unflushed and pinned memtables across the row index's column families |
+| `flow_memory_index_table_reader_bytes` | Table-reader memory outside the block cache |
+| `flow_memory_manifest_cache_bytes{cache}` | Estimated bytes of parsed manifests in the shared `publication` or `maintenance` cache |
+| `flow_memory_manifest_cache_entries{cache}` | Parsed manifests in that cache |
+| `flow_memory_retained_index_bytes` | Estimated bytes of the garbage-collection reachability indexes |
+
+Cache bytes are the estimates each cache evicts against, not allocator
+measurements. Temporary row indexes opened by compaction and reconciliation
+jobs are not included.

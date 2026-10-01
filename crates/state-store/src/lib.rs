@@ -251,8 +251,21 @@ impl WriteObservation {
     }
 }
 
+/// Memory RocksDB currently holds against the store's configured budgets.
+/// Fields overlap with allocator statistics and are not process RSS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexMemory {
+    pub block_cache_bytes: u64,
+    pub block_cache_pinned_bytes: u64,
+    /// Active, unflushed and pinned memtables of every column family.
+    pub memtable_bytes: u64,
+    /// Table-reader memory outside the block cache.
+    pub table_reader_bytes: u64,
+}
+
 struct Inner {
     db: DB,
+    cache: Cache,
     writer: Mutex<()>,
     batch_rows: usize,
     lookup_rows: usize,
@@ -356,6 +369,7 @@ impl StateStore {
         validate_operation_records(&db, !authority_import)?;
         Ok(Self(Arc::new(Inner {
             db,
+            cache,
             writer: Mutex::new(()),
             batch_rows: config.apply_batch_rows,
             lookup_rows: config.apply_lookup_rows,
@@ -369,6 +383,32 @@ impl StateStore {
         let guard = self.0.writer.lock().map_err(|_| Error::Poisoned)?;
         self.ensure_writable()?;
         Ok(guard)
+    }
+
+    /// Current RocksDB memory, for observation. Properties are read from
+    /// in-memory counters and do not touch table files.
+    pub fn memory_usage(&self) -> Result<IndexMemory> {
+        let db = &self.0.db;
+        let mut memory = IndexMemory {
+            block_cache_bytes: self.0.cache.get_usage() as u64,
+            block_cache_pinned_bytes: self.0.cache.get_pinned_usage() as u64,
+            memtable_bytes: db
+                .property_int_value("rocksdb.size-all-mem-tables")?
+                .unwrap_or(0),
+            table_reader_bytes: db
+                .property_int_value("rocksdb.estimate-table-readers-mem")?
+                .unwrap_or(0),
+        };
+        for name in STATE_COLUMN_FAMILIES {
+            let cf = db.cf_handle(name).expect("opened column family");
+            memory.memtable_bytes += db
+                .property_int_value_cf(&cf, "rocksdb.size-all-mem-tables")?
+                .unwrap_or(0);
+            memory.table_reader_bytes += db
+                .property_int_value_cf(&cf, "rocksdb.estimate-table-readers-mem")?
+                .unwrap_or(0);
+        }
+        Ok(memory)
     }
 
     /// Whether a durable transition failed in this process. The generation is
@@ -1483,6 +1523,21 @@ mod tests {
             };
             drop(StateStore::open(directory.path(), options).unwrap());
         }
+    }
+
+    #[test]
+    fn memory_usage_reports_memtables_and_the_shared_block_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let before = store.memory_usage().unwrap();
+        for index in 0..256_u32 {
+            store
+                .put_source_transaction(&index.to_be_bytes(), &[7; 1024])
+                .unwrap();
+        }
+        let after = store.memory_usage().unwrap();
+        assert!(after.memtable_bytes >= before.memtable_bytes + 256 * 1024);
+        assert!(after.block_cache_bytes <= 128 << 20);
     }
 
     #[test]

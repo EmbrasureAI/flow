@@ -71,6 +71,16 @@ impl ManifestCache {
         }
     }
 
+    /// Estimated bytes charged against the budget. Maintenance runs lazily,
+    /// so recent insertions and evictions may not be reflected yet.
+    pub fn weighted_bytes(&self) -> u64 {
+        self.entries.weighted_size()
+    }
+
+    pub fn entry_count(&self) -> u64 {
+        self.entries.entry_count()
+    }
+
     pub(crate) async fn load(
         &self,
         table: &Table,

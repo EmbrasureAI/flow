@@ -1345,6 +1345,7 @@ impl PublishRuntime {
                     }
                     // Keep durability visible while a catalog publication is stalled.
                     observation.table_states(store, ledger, &blocked, schemas.keys().copied())?;
+                    crate::observation::memory_budgets(store, &work.publisher, &work.maintenance)?;
                     observation.write(config, ledger, capture_goal, true)?;
                     if checkpoints.is_empty()
                         && checkpoint_at.elapsed() >= Duration::from_secs(config.limits.checkpoint_interval_secs)
