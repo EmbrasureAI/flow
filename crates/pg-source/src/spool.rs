@@ -4,7 +4,7 @@
 use crate::{Error, Result};
 use fs2::FileExt;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -67,6 +67,10 @@ struct Transaction {
     bytes: u64,
     savepoints: Vec<Savepoint>,
     subtransactions: HashMap<u32, usize>,
+    /// Spool position and (sub)transaction XID of each surviving chunk.
+    chunks: Vec<(u64, u32)>,
+    /// Subtransactions whose chunks replay skips; see [`TransactionSpool::exclude`].
+    excluded: BTreeSet<u32>,
 }
 
 pub struct TransactionSpool {
@@ -144,6 +148,8 @@ impl TransactionSpool {
                 bytes: 0,
                 savepoints: Vec::new(),
                 subtransactions: HashMap::new(),
+                chunks: Vec::new(),
+                excluded: BTreeSet::new(),
             },
         );
         Ok(())
@@ -199,6 +205,7 @@ impl TransactionSpool {
                 .open(self.root.join(format!("txn-{xid}/{}", txn.segment)))?;
             txn.offset = 0;
         }
+        txn.chunks.push((txn.bytes, subxid));
         let mut header = [0; HEADER as usize];
         header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         header[4..].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
@@ -253,6 +260,7 @@ impl TransactionSpool {
         txn.offset = start.offset;
         self.bytes -= txn.bytes - start.bytes;
         txn.bytes = start.bytes;
+        txn.chunks.retain(|&(position, _)| position < start.bytes);
         for savepoint in txn.savepoints.drain(index..) {
             txn.subtransactions.remove(&savepoint.xid);
         }
@@ -267,6 +275,7 @@ impl TransactionSpool {
             .get(&xid)
             .ok_or(Error::Protocol("replay of unknown spool transaction"))?;
         let mut buffer = Vec::new();
+        let mut chunks = txn.chunks.iter();
         for segment in 0..=txn.segment {
             let mut file = File::open(self.root.join(format!("txn-{xid}/{segment}")))?;
             let size = file.metadata()?.len();
@@ -283,10 +292,41 @@ impl TransactionSpool {
                 if crc32fast::hash(&buffer) != u32::from_le_bytes(header[4..].try_into().unwrap()) {
                     return Err(Error::Protocol("transaction spool checksum mismatch"));
                 }
-                consume(&buffer)?;
+                let &(_, subxid) = chunks
+                    .next()
+                    .ok_or(Error::Protocol("spool frame without a chunk record"))?;
+                if !txn.excluded.contains(&subxid) {
+                    consume(&buffer)?;
+                }
                 offset += HEADER + u64::from(len);
             }
         }
+        Ok(())
+    }
+
+    /// Subtransactions, other than `xid` itself, with surviving chunks.
+    pub fn subtransactions(&self, xid: u32) -> Result<BTreeSet<u32>> {
+        let txn = self.transactions.get(&xid).ok_or(Error::Protocol(
+            "subtransactions of unknown spool transaction",
+        ))?;
+        Ok(txn
+            .chunks
+            .iter()
+            .map(|&(_, subxid)| subxid)
+            .filter(|&subxid| subxid != xid)
+            .collect())
+    }
+
+    /// Skip these subtransactions' chunks on replay. Unlike [`Self::abort`],
+    /// which truncates at a rollback as it arrives in the stream, this keeps
+    /// the changes of other (sub)transactions made after theirs.
+    pub fn exclude(&mut self, xid: u32, subxids: &BTreeSet<u32>) -> Result<()> {
+        let txn = self
+            .transactions
+            .get_mut(&xid)
+            .ok_or(Error::Protocol("exclusion in unknown spool transaction"))?;
+        txn.excluded
+            .extend(subxids.iter().filter(|&&subxid| subxid != xid));
         Ok(())
     }
 

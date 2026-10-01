@@ -228,6 +228,51 @@ impl PostgresSource for PgOutputSource {
     }
 }
 
+/// Of these subtransaction XIDs of a transaction whose commit has been
+/// received, those PostgreSQL rolled back, from its commit log. Every status
+/// is final once the commit is decoded. 32-bit XIDs are widened with the
+/// epoch of the next XID, which is correct for any XID PostgreSQL still
+/// tracks. A status that is no longer known is an error, never assumed.
+pub async fn rolled_back_subtransactions(
+    client: &Client,
+    xids: &std::collections::BTreeSet<u32>,
+) -> Result<std::collections::BTreeSet<u32>> {
+    let xids: Vec<i64> = xids.iter().map(|&xid| i64::from(xid)).collect();
+    let rows = client
+        .query(
+            "SELECT x, pg_catalog.pg_xact_status((CASE WHEN x <= n & 4294967295
+                    THEN ((n >> 32) << 32) | x ELSE (((n >> 32) - 1) << 32) | x END)::text::pg_catalog.xid8)
+             FROM (SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())::text::bigint AS n) AS next,
+                  unnest($1::bigint[]) AS x",
+            &[&xids],
+        )
+        .await?;
+    let mut rolled_back = std::collections::BTreeSet::new();
+    for row in rows {
+        let xid: i64 = row.get(0);
+        match row.get::<_, Option<String>>(1).as_deref() {
+            Some("committed") => {}
+            Some("aborted") => {
+                rolled_back.insert(
+                    u32::try_from(xid)
+                        .map_err(|_| Error::Protocol("subtransaction XID out of range"))?,
+                );
+            }
+            Some(_) => {
+                return Err(Error::Protocol(
+                    "subtransaction of a received commit is still in progress",
+                ));
+            }
+            None => {
+                return Err(Error::Protocol(
+                    "subtransaction status is no longer available",
+                ));
+            }
+        }
+    }
+    Ok(rolled_back)
+}
+
 pub(crate) fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }

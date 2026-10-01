@@ -39,6 +39,15 @@ Unknown formats, truncated records and invalid proofs fail closed.
   descendant changes too. Filtering only matching XIDs would be incorrect.
   Our implementation uses bounded savepoint metadata and sequential segment
   truncation; no PostgreSQL implementation text is copied.
+* [PostgreSQL's reorder buffer](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/replication/logical/reorderbuffer.c):
+  a subtransaction's abort is streamed only if it was marked as streamed, and
+  a subtransaction is marked only if changes remain in memory after streaming.
+  A spilled transaction's changes are restored in batches of 4096, so a
+  spilled savepoint with more changes can be streamed and later rolled back
+  with no abort message. At each commit of a transaction with surviving
+  subtransaction changes, capture reads their final status from
+  PostgreSQL's commit log (`pg_xact_status`) and drops the changes of those
+  that rolled back. An unknown status stops capture instead of guessing.
 * [Logical decoding and exported snapshots](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html):
   a slot may resend transactions after server recovery. A new slot's exported
   snapshot and consistent point establish one source-wide initial-copy boundary.
@@ -62,6 +71,7 @@ Unknown formats, truncated records and invalid proofs fail closed.
 | Primary-key changes | FULL before row supplies old canonical key; new row supplies replacement; real update/delete/key-move workloads across PostgreSQL 14.24–18.6 | Longer production-shaped qualification |
 | Large streamed transactions | One bounded active buffer, disk spool, bounded XID/savepoint counts, terminal-only journal commit | Sustained throughput and source memory measurements |
 | Nested stream abort | Real disk suffix truncation removes aborted parent and child changes | PostgreSQL nested-savepoint workloads |
+| Rollback without a stream abort | Commit-time commit-log status excludes rolled-back subtransactions; live probe of a spilled savepoint over one restore batch in the PostgreSQL compatibility suite | Rate of PostgreSQL spilling in production workloads |
 | TOAST | Validated FULL old tuples resolve unchanged fields; unresolved values block the table instead of publishing. Real 18.6 updates, key moves and deletes preserve 16 KiB text and 8 KiB binary values | PostgreSQL version matrix and larger configured row limits |
 | Reconnect | Real pinned transport against a local scripted wire peer; interrupted uncommitted stream reconnects; journal deduplicates committed LSNs | Real failover and PostgreSQL slot rollback |
 | Initial snapshot | Permanent slot export, imported snapshot with parallel binary COPY and concurrent CDC; real crashes before/after staging, nullable DDL between copy attempts, retained completed tables and index-loss recovery across PostgreSQL 14.24–18.6 | Larger copy and multi-hour recovery workloads |

@@ -460,6 +460,35 @@ impl CaptureAssembler {
 
     /// Resolve versions after streamed subtransaction rollback. The ordinary
     /// row path does not pay for this extra spool read.
+    /// Subtransactions whose changes `xid` still holds. PostgreSQL can roll
+    /// one back without streaming its abort: its source restores a spilled
+    /// transaction's changes in batches and marks a subtransaction as streamed
+    /// only if changes remain in memory afterwards. Before the commit, the
+    /// caller asks PostgreSQL which of these rolled back and passes them to
+    /// [`Self::exclude_rolled_back`].
+    pub fn subtransactions(&mut self, xid: u32) -> Result<BTreeSet<u32>> {
+        self.flush()?;
+        self.spool.subtransactions(xid)
+    }
+
+    /// Drop the changes of subtransactions PostgreSQL rolled back, keeping
+    /// those of every other (sub)transaction. Provisional quarantine decisions
+    /// are kept: blocking a table is safe, publishing its changes might not be.
+    pub fn exclude_rolled_back(&mut self, xid: u32, subxids: &BTreeSet<u32>) -> Result<()> {
+        if subxids.is_empty() {
+            return Ok(());
+        }
+        self.flush()?;
+        self.spool.exclude(xid, subxids)?;
+        tracing::warn!(
+            event = "streamed_rollback_without_abort",
+            xid,
+            subtransactions = ?subxids,
+            "PostgreSQL rolled back streamed subtransactions without an abort; their changes are dropped"
+        );
+        Ok(())
+    }
+
     pub fn surviving_schema_versions(&mut self, xid: u32) -> Result<Vec<TableSchemaVersion>> {
         self.flush()?;
         let mut versions = BTreeMap::<TableId, BTreeSet<u32>>::new();

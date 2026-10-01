@@ -8,6 +8,10 @@
 //! savepoint may be journaled, wherever stream block, capture chunk or spool
 //! segment boundaries fall inside it.
 //!
+//! PostgreSQL can also roll back a streamed savepoint without sending its
+//! abort; capture then excludes it at the commit once PostgreSQL's commit log
+//! reports it rolled back. Both cases are covered.
+//!
 //! This covers only the stream shapes supplied here, not reconnect, recovery
 //! or what PostgreSQL sends in a particular run.
 
@@ -18,6 +22,7 @@ use flow_model::{
     Value,
 };
 use flow_pg_source::{CaptureAssembler, Decoder, SpoolConfig, TransactionSpool};
+use std::collections::BTreeSet;
 
 const TABLE: u32 = 11;
 const XID: u32 = 500;
@@ -113,8 +118,11 @@ fn update(id: i64, payload: &str) -> Bytes {
 }
 
 /// Decode and capture the transaction, sending the savepoint's deletes in
-/// stream blocks of the given sizes before its rollback.
-fn journaled(savepoint_blocks: &[i64]) -> (SourceTransaction, Vec<Mutation>) {
+/// stream blocks of the given sizes before its rollback. Without `abort`,
+/// PostgreSQL sends no abort for the rolled-back savepoint, and capture
+/// excludes it as the daemon does when PostgreSQL's commit log reports it
+/// rolled back.
+fn journaled(savepoint_blocks: &[i64], abort: bool) -> (SourceTransaction, Vec<Mutation>) {
     let root = tempfile::tempdir().unwrap();
     let (mut journal, _) =
         Journal::open(root.path().join("journal"), JournalConfig::default()).unwrap();
@@ -170,21 +178,38 @@ fn journaled(savepoint_blocks: &[i64]) -> (SourceTransaction, Vec<Mutation>) {
         feed(stream_stop());
     }
     assert!(next - START <= SAVEPOINT_ROWS);
-    feed(message(b'A', |b| {
-        b.put_u32(XID);
-        b.put_u32(SAVEPOINT);
-    }));
+    if abort {
+        feed(message(b'A', |b| {
+            b.put_u32(XID);
+            b.put_u32(SAVEPOINT);
+        }));
+    }
     feed(stream_start(false));
     feed(update(START + ROWS - 1, "after rollback"));
     feed(stream_stop());
-    let txn = feed(message(b'c', |b| {
-        b.put_u32(XID);
-        b.put_u8(0);
-        b.put_u64(100);
-        b.put_u64(108);
-        b.put_i64(0);
-    }))
-    .expect("staged commit");
+    let commit = decoder
+        .decode(message(b'c', |b| {
+            b.put_u32(XID);
+            b.put_u8(0);
+            b.put_u64(100);
+            b.put_u64(108);
+            b.put_i64(0);
+        }))
+        .unwrap();
+    let subtransactions = assembler.subtransactions(XID).unwrap();
+    if abort {
+        // The received abort already truncated the savepoint's changes.
+        assert!(subtransactions.is_empty(), "{subtransactions:?}");
+    } else {
+        assert_eq!(subtransactions, BTreeSet::from([SAVEPOINT]));
+        assembler
+            .exclude_rolled_back(XID, &subtransactions)
+            .unwrap();
+    }
+    let txn = assembler
+        .push(commit, &mut journal)
+        .unwrap()
+        .expect("staged commit");
     let mutations = journal
         .chunks(&txn.mutation_chunks)
         .unwrap()
@@ -239,45 +264,53 @@ fn no_streamed_change_of_a_rolled_back_savepoint_is_journaled() {
         &[3000, 3001],
     ];
     for &blocks in cases {
-        let (txn, mutations) = journaled(blocks);
-        let count = |pick: fn(&MutationKind) -> bool| {
-            mutations
+        for abort in [true, false] {
+            let (txn, mutations) = journaled(blocks, abort);
+            let count = |pick: fn(&MutationKind) -> bool| {
+                mutations
+                    .iter()
+                    .filter(|mutation| pick(&mutation.kind))
+                    .count() as i64
+            };
+            // 12,000 deletes and 12,000 inserts of the replaced range, 1,202 updates.
+            assert_eq!(
+                mutations.len() as i64,
+                2 * ROWS + UPDATES,
+                "{blocks:?} abort {abort}"
+            );
+            assert_eq!(mutations.len(), 25_202, "{blocks:?} abort {abort}");
+            assert_eq!(
+                txn.mutation_count(TableId(TABLE)),
+                Some(25_202),
+                "{blocks:?} abort {abort}"
+            );
+            assert_eq!(
+                count(|kind| matches!(kind, MutationKind::Delete { .. })),
+                ROWS,
+                "{blocks:?} abort {abort}"
+            );
+            assert_eq!(
+                count(|kind| matches!(kind, MutationKind::Insert { .. })),
+                ROWS
+            );
+            assert_eq!(
+                count(|kind| matches!(kind, MutationKind::Update { .. })),
+                UPDATES
+            );
+            // Every delete precedes the inserts: none is the savepoint's.
+            let first_insert = mutations
                 .iter()
-                .filter(|mutation| pick(&mutation.kind))
-                .count() as i64
-        };
-        // 12,000 deletes and 12,000 inserts of the replaced range, 1,202 updates.
-        assert_eq!(mutations.len() as i64, 2 * ROWS + UPDATES, "{blocks:?}");
-        assert_eq!(mutations.len(), 25_202, "{blocks:?}");
-        assert_eq!(
-            txn.mutation_count(TableId(TABLE)),
-            Some(25_202),
-            "{blocks:?}"
-        );
-        assert_eq!(
-            count(|kind| matches!(kind, MutationKind::Delete { .. })),
-            ROWS,
-            "{blocks:?}"
-        );
-        assert_eq!(
-            count(|kind| matches!(kind, MutationKind::Insert { .. })),
-            ROWS
-        );
-        assert_eq!(
-            count(|kind| matches!(kind, MutationKind::Update { .. })),
-            UPDATES
-        );
-        // Every delete precedes the inserts: none is the savepoint's.
-        let first_insert = mutations
-            .iter()
-            .position(|mutation| matches!(mutation.kind, MutationKind::Insert { .. }))
-            .unwrap();
-        assert!(
-            mutations[first_insert..]
-                .iter()
-                .all(|mutation| !matches!(mutation.kind, MutationKind::Delete { .. })),
-            "{blocks:?}"
-        );
-        assert!(matches!(&mutations[0].kind, MutationKind::Delete { key } if *key == start_key));
+                .position(|mutation| matches!(mutation.kind, MutationKind::Insert { .. }))
+                .unwrap();
+            assert!(
+                mutations[first_insert..]
+                    .iter()
+                    .all(|mutation| !matches!(mutation.kind, MutationKind::Delete { .. })),
+                "{blocks:?} abort {abort}"
+            );
+            assert!(
+                matches!(&mutations[0].kind, MutationKind::Delete { key } if *key == start_key)
+            );
+        }
     }
 }

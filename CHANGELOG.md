@@ -128,6 +128,15 @@ This will be the initial public release, `0.1.0`.
   (for example a long `TRUNCATE`, rewriting `ALTER`, `VACUUM FULL` or
   `CLUSTER`). Capture that is already streaming continues.
 
+### Fixed
+
+- A streamed transaction could publish the changes of a savepoint it had
+  rolled back. When PostgreSQL spills a transaction and later streams a
+  savepoint with more than 4096 changes from the spill, it sends no abort for
+  that savepoint's rollback. Capture now checks the status of each
+  subtransaction with surviving changes in PostgreSQL's commit log at the
+  commit and drops those that rolled back.
+
 ### Security
 
 - Credentials are kept out of catalog and configuration errors, and catalog

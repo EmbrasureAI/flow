@@ -476,6 +476,25 @@ pub(crate) async fn capture_loop(
                                         continue;
                                     }
                                 }
+                                if let SourceEvent::Commit { xid, end_lsn, .. } = &event
+                                    && *end_lsn > journal.staged_lsn() {
+                                    // PostgreSQL can roll back a streamed subtransaction
+                                    // without sending its abort. Its commit log decides.
+                                    let subtransactions = assembler.subtransactions(*xid)?;
+                                    if !subtransactions.is_empty() {
+                                        let rolled_back = source_deadline(async {
+                                            Ok::<_, anyhow::Error>(flow_pg_source::rolled_back_subtransactions(&sql, &subtransactions).await?)
+                                        }).await;
+                                        match rolled_back {
+                                            Ok(rolled_back) => assembler.exclude_rolled_back(*xid, &rolled_back)?,
+                                            Err(error) if retryable_connection(&error) => {
+                                                tracing::warn!(%error, "subtransaction status check interrupted; replaying before journal commit");
+                                                break;
+                                            }
+                                            Err(error) => return Err(error),
+                                        }
+                                    }
+                                }
                                 if let SourceEvent::Commit { xid, .. } = &event {
                                     registry.commit_provisional(*xid, &mut assembler)?;
                                 }
