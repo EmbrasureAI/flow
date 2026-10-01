@@ -931,7 +931,10 @@ async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history(
     // Drive the persisted clock through both sides of expiry without relying
     // on a RocksDB reopen or an async task completing within the 300 ms grace.
     store
-        .put_source_transaction(marker_key.as_bytes(), &bincode::serialize(&u64::MAX).unwrap())
+        .put_source_transaction(
+            marker_key.as_bytes(),
+            &bincode::serialize(&u64::MAX).unwrap(),
+        )
         .unwrap();
     make_due(&store);
     let report = collect_phase(&maintenance, &current, &grace).await;
