@@ -110,6 +110,10 @@ This will be the initial public release, `0.1.0`.
   `flow_table_maintenance_failing`, …), process gauges and example alert
   rules; `status.json` reports `state` and `last_error`.
 - Optional jemalloc allocator on GNU/Linux (`--features jemalloc`).
+- Memory-budget gauges (`flow_memory_index_block_cache_bytes`,
+  `flow_memory_index_memtable_bytes`, `flow_memory_manifest_cache_bytes`,
+  `flow_memory_retained_index_bytes`, …) that attribute resident memory to the
+  row index, manifest caches and garbage reachability indexes.
 - A Dockerfile that builds a minimal image running as an unprivileged user.
 - Operations guidance for systemd and Kubernetes, and disk sizing.
 
