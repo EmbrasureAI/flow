@@ -179,10 +179,15 @@ fn a_delete_mutation_of_the_crash_loop_key_encodes_in_thirty_bytes() {
         schema_version: 1,
         kind: MutationKind::Delete { key },
     };
-    // A 64 KiB chunk with its 16-byte header holds 2183 such deletes, so a
-    // savepoint's deletes reach chunk boundaries after 2183 and 4366 rows.
+    // Capture flushes a chunk only when the next mutation would take its
+    // estimate (a 16-byte header plus the mutations) past the limit, so a
+    // 64 KiB chunk holds 2184 such deletes. A savepoint's deletes start a new
+    // chunk and reach chunk boundaries after 2184 and 4368 rows.
     assert_eq!(bincode::serialized_size(&delete).unwrap(), 30);
-    assert_eq!((u64::from(CHUNK_BYTES) - 16) / 30, 2183);
+    let per_chunk = (u64::from(CHUNK_BYTES) - 16) / 30;
+    assert_eq!(per_chunk, 2184);
+    assert!(16 + 30 * per_chunk <= u64::from(CHUNK_BYTES));
+    assert!(16 + 30 * (per_chunk + 1) > u64::from(CHUNK_BYTES));
 }
 
 #[test]
@@ -194,7 +199,7 @@ fn no_streamed_change_of_a_rolled_back_savepoint_is_journaled() {
     };
     // Stream boundaries inside, at and after the chunk boundaries, and at the
     // nightly failure's 5039 surviving deletes.
-    for streamed in [1, 2183, 2184, 4366, 5039, SAVEPOINT_ROWS] {
+    for streamed in [1, 2184, 2185, 4368, 4369, 5039, SAVEPOINT_ROWS] {
         let mutations = journaled(streamed);
         let count = |pick: fn(&MutationKind) -> bool| {
             mutations
