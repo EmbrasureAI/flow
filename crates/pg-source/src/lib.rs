@@ -275,7 +275,7 @@ pub async fn rolled_back_subtransactions(
                 client
                     .query(
                         "SELECT x, pg_catalog.pg_xact_status(x::text::pg_catalog.xid8)
-                     FROM unnest($1::bigint[]) AS x",
+                     FROM pg_catalog.unnest($1::bigint[]) AS x",
                         &[&keys],
                     )
                     .await?
@@ -330,9 +330,11 @@ where
                 return Err(Error::Protocol("missing subtransaction status rows"));
             }
             for (key, state) in rows {
-                let xid = *full
-                    .get(&key)
-                    .ok_or(Error::Protocol("unexpected subtransaction status row"))?;
+                // Consume each expected key once: equal row counts alone
+                // do not rule out a duplicate hiding an omitted status.
+                let xid = full.remove(&key).ok_or(Error::Protocol(
+                    "unexpected or duplicate subtransaction status row",
+                ))?;
                 match state.as_deref() {
                     Some("committed") => {}
                     Some("aborted") => rolled_back.push(xid),
@@ -474,6 +476,25 @@ mod xid_tests {
                 reads == (if (key - EPOCH as i64) % 7 == 0 { 3 } else { 1 })
             })
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_status_rows_cannot_hide_a_missing_subtransaction() {
+        let result = resolve_statuses(
+            &[7, 8],
+            Duration::from_secs(10),
+            || async { Ok::<u64, Error>(EPOCH + 10_000) },
+            |keys: Vec<i64>| async move {
+                // A same-length response repeats the committed child and
+                // omits the other child, whose status is unknown.
+                Ok::<Vec<(i64, Option<String>)>, Error>(vec![
+                    (keys[0], Some("committed".to_owned())),
+                    (keys[0], Some("committed".to_owned())),
+                ])
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Protocol(message)) if message.contains("duplicate")));
     }
 
     #[tokio::test]
