@@ -24,6 +24,7 @@ pub(crate) struct Observation {
     table_progress: Vec<TableProgress>,
     table_sources: std::collections::BTreeMap<TableId, (String, String)>,
     started_at: SystemTime,
+    memory_warned_at: Option<Instant>,
     #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
     allocator_sample: Option<(Instant, Option<crate::allocator::MemoryUsage>)>,
 }
@@ -60,6 +61,7 @@ impl Observation {
             table_progress: Vec::new(),
             table_sources: Default::default(),
             started_at: SystemTime::now(),
+            memory_warned_at: None,
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         })
@@ -124,6 +126,68 @@ impl Observation {
         }
         self.blocked_tables = blocked.records().cloned().collect();
         Ok(())
+    }
+
+    /// Usage of the process-wide memory budgets: the row index's RocksDB block
+    /// cache and memtables, the shared publication and maintenance manifest
+    /// caches, and the garbage reachability indexes. Cache bytes are the
+    /// estimates the caches evict against; compare them with the allocator
+    /// gauges. Diagnostics must not stop ingestion: a failed read keeps that
+    /// gauge's previous value and is logged at most every ten minutes.
+    pub(crate) fn memory_budgets(
+        &mut self,
+        store: &StateStore,
+        publisher: &flow_coordinator::TablePublisher,
+        maintenance: &flow_coordinator::TableMaintenance,
+    ) {
+        let mut failures = Vec::new();
+        match store.memory_usage() {
+            Ok(index) => {
+                for (name, value) in [
+                    (
+                        "flow_memory_index_block_cache_bytes",
+                        index.block_cache_bytes,
+                    ),
+                    (
+                        "flow_memory_index_block_cache_pinned_bytes",
+                        index.block_cache_pinned_bytes,
+                    ),
+                    ("flow_memory_index_memtable_bytes", index.memtable_bytes),
+                    (
+                        "flow_memory_index_table_reader_bytes",
+                        index.table_reader_bytes,
+                    ),
+                ] {
+                    metrics::gauge!(name).set(value as f64);
+                }
+            }
+            Err(error) => failures.push(format!("row index: {error}")),
+        }
+        match maintenance.retained_index_bytes() {
+            Ok(bytes) => metrics::gauge!("flow_memory_retained_index_bytes").set(bytes as f64),
+            Err(error) => failures.push(format!("retained indexes: {error}")),
+        }
+        for (cache, manifests) in [
+            ("publication", publisher.manifest_cache()),
+            ("maintenance", maintenance.manifest_cache()),
+        ] {
+            metrics::gauge!("flow_memory_manifest_cache_bytes", "cache" => cache)
+                .set(manifests.weighted_bytes() as f64);
+            metrics::gauge!("flow_memory_manifest_cache_entries", "cache" => cache)
+                .set(manifests.entry_count() as f64);
+        }
+        if !failures.is_empty()
+            && self
+                .memory_warned_at
+                .is_none_or(|warned| warned.elapsed() >= Duration::from_secs(600))
+        {
+            self.memory_warned_at = Some(Instant::now());
+            tracing::warn!(
+                event = "memory_observation_failed",
+                failures = failures.join("; "),
+                "memory budget gauges are stale"
+            );
+        }
     }
 
     /// Flush process counters even when initialization failed before a source
@@ -332,49 +396,6 @@ fn table_lag_seconds(table: &TableProgress, now_micros: i64) -> f64 {
         })
 }
 
-/// Usage of the process-wide memory budgets: the row index's RocksDB block cache
-/// and memtables, the shared publication and maintenance manifest caches, and
-/// the garbage reachability indexes. Cache bytes are the budget estimates the
-/// caches evict against; compare them with the allocator gauges.
-pub(crate) fn memory_budgets(
-    store: &StateStore,
-    publisher: &flow_coordinator::TablePublisher,
-    maintenance: &flow_coordinator::TableMaintenance,
-) -> Result<()> {
-    let index = store.memory_usage()?;
-    for (name, value) in [
-        (
-            "flow_memory_index_block_cache_bytes",
-            index.block_cache_bytes,
-        ),
-        (
-            "flow_memory_index_block_cache_pinned_bytes",
-            index.block_cache_pinned_bytes,
-        ),
-        ("flow_memory_index_memtable_bytes", index.memtable_bytes),
-        (
-            "flow_memory_index_table_reader_bytes",
-            index.table_reader_bytes,
-        ),
-        (
-            "flow_memory_retained_index_bytes",
-            maintenance.retained_index_bytes()? as u64,
-        ),
-    ] {
-        metrics::gauge!(name).set(value as f64);
-    }
-    for (cache, manifests) in [
-        ("publication", publisher.manifest_cache()),
-        ("maintenance", maintenance.manifest_cache()),
-    ] {
-        metrics::gauge!("flow_memory_manifest_cache_bytes", "cache" => cache)
-            .set(manifests.weighted_bytes() as f64);
-        metrics::gauge!("flow_memory_manifest_cache_entries", "cache" => cache)
-            .set(manifests.entry_count() as f64);
-    }
-    Ok(())
-}
-
 pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
     let table = table.0.to_string();
     let debt = &inventory.debt;
@@ -555,6 +576,7 @@ mod tests {
             table_progress: Vec::new(),
             table_sources: Default::default(),
             started_at: SystemTime::now(),
+            memory_warned_at: None,
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         };

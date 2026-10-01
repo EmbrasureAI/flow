@@ -554,4 +554,6 @@ refreshed with the periodic health observation:
 
 Cache bytes are the estimates each cache evicts against, not allocator
 measurements. Temporary row indexes opened by compaction and reconciliation
-jobs are not included.
+jobs are not included. These reads never stop ingestion: a failed read keeps
+the gauge's previous value and logs `memory_observation_failed` at most every
+ten minutes.
