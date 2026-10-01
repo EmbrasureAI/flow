@@ -44,6 +44,37 @@ EXPECTED_ABORTS = (psycopg.errors.DeadlockDetected, psycopg.errors.UniqueViolati
                    psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled)
 
 
+def row_difference(actual, expected, limit=50):
+    """Bounded key-level difference of rows whose first value is the key: counts,
+    contiguous key ranges and a few raw rows with long values shortened."""
+    actual_rows = {row[0]: row for row in actual}
+    expected_rows = {row[0]: row for row in expected}
+    missing = sorted(expected_rows.keys() - actual_rows.keys())
+    extra = sorted(actual_rows.keys() - expected_rows.keys())
+    changed = sorted(key for key in expected_rows.keys() & actual_rows.keys() if actual_rows[key] != expected_rows[key])
+
+    def ranges(keys):
+        spans = []
+        for key in keys:
+            if spans and isinstance(key, int) and key == spans[-1][1] + 1:
+                spans[-1][1] = key
+                spans[-1][2] += 1
+            else:
+                spans.append([key, key, 1])
+        return spans[:limit]
+
+    def shorten(row):
+        return None if row is None else [value if len(repr(value)) <= 80 else repr(value)[:77] + "..."
+                                         for value in row]
+
+    sampled = missing[:5] + extra[:5] + changed[:10]
+    return {"iceberg_rows": len(actual), "postgres_rows": len(expected), "missing": len(missing),
+            "extra": len(extra), "changed": len(changed), "missing_ranges": ranges(missing),
+            "extra_ranges": ranges(extra), "changed_keys": changed[:limit],
+            "rows": [{"key": key, "iceberg": shorten(actual_rows.get(key)),
+                      "postgres": shorten(expected_rows.get(key))} for key in sampled]}
+
+
 class TransactionLog:
     """Committed transactions with WAL positions bracketing their commit record.
 
@@ -366,6 +397,7 @@ class CrashLoop(Run):
             if actual != expected:
                 mismatch = next(((i, a, b) for i, (a, b) in enumerate(zip(actual, expected)) if a != b), None)
                 dump(self.directory / f"{phase}-{name}-metadata.json", metadata)
+                self.report.setdefault("row_differences", {})[f"{phase}-{name}"] = row_difference(actual, expected)
                 raise AssertionError(f"{phase}: {name} differs: Iceberg={len(actual)} PostgreSQL={len(expected)} "
                                      f"first={mismatch}; reproduce with --seed {self.args.seed}")
             result[name] = {"rows": len(actual), "columns": len(columns),
@@ -451,6 +483,17 @@ class CrashLoop(Run):
         window = self.rng.uniform(self.args.min_kill, self.args.max_kill)
         fault = self.rng.choice(FAULTS)
         details = {"cycle": number, "window_seconds": round(window, 3), **self.arm(fault, window)}
+        # Wall-clock milliseconds, comparable with daemon and catalog-proxy logs.
+        details["at_ms"] = {"armed": wall_ms()}
+        try:
+            return self.run_cycle(number, window, fault, details)
+        except BaseException:
+            # A failed cycle is otherwise lost: only successful cycles are kept.
+            self.report["failed_cycle"] = {**details, "traceback": traceback.format_exc()}
+            raise
+
+    def run_cycle(self, number, window, fault, details):
+        at = details["at_ms"]
         ddl_at = (self.rng.uniform(0, window)
                   if self.added_columns < self.args.max_added_columns and self.rng.random() < self.args.ddl_probability
                   else None)
@@ -463,13 +506,17 @@ class CrashLoop(Run):
             if ddl_at is not None and elapsed >= ddl_at:
                 details["added_column"] = self.add_column()
                 ddl_at = None
-            if fault == "reject" and elapsed >= details["reject_for"]:
+            if fault == "reject" and elapsed >= details["reject_for"] and self.proxy.reject:
                 self.proxy.reject = False
-            if fault == "hold" and elapsed >= details["release_after"]:
+                at["reject_ended"] = wall_ms()
+            if fault == "hold" and elapsed >= details["release_after"] and not self.proxy.release_commits.is_set():
                 self.proxy.release_commits.set()
+                at["released"] = wall_ms()
             time.sleep(0.05)
         process = self.process
+        at["kill"] = wall_ms()
         self.stop(crash=True)
+        at["killed"] = wall_ms()
         assert process.returncode == -9, f"daemon exited {process.returncode} before SIGKILL"
         details["ack"] = self.check_ack()
         self.disarm()
@@ -478,9 +525,13 @@ class CrashLoop(Run):
                                               if event.get("fault"))
         recovered = time.monotonic()
         self.start()
+        at["restarted"] = wall_ms()
+        details["generation"] = self.generation
         self.workload.pause()
         try:
+            at["writers_paused"] = wall_ms()
             details["materialized"] = self.wait_materialized(0)["flow_materialized_lsn"]
+            at["materialized"] = wall_ms()
             details["recovery_seconds"] = round(time.monotonic() - recovered, 3)
             details["rows"] = self.compare(f"cycle-{number}")
             self.published()
@@ -551,6 +602,10 @@ class CrashLoop(Run):
             dump(self.directory / "report.json", self.report)
             self.pg.close()
             self.duck.close()
+
+
+def wall_ms():
+    return int(time.time() * 1000)
 
 
 def reproduction(args):
