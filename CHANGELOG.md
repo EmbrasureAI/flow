@@ -110,8 +110,7 @@ This will be the initial public release, `0.1.0`.
   `flow_table_maintenance_failing`, …), process gauges and example alert
   rules; `status.json` reports `state` and `last_error`.
 - Optional jemalloc allocator on GNU/Linux (`--features jemalloc`).
-- Release workflow publishing Linux x86-64 and arm64 binaries and a
-  multi-architecture image at `ghcr.io/embrasureai/flow`.
+- A Dockerfile that builds a minimal image running as an unprivileged user.
 - Operations guidance for systemd and Kubernetes, and disk sizing.
 
 **Known limitations**
@@ -135,7 +134,5 @@ This will be the initial public release, `0.1.0`.
   `[http]`; on shared volumes, put `state_dir` in a subdirectory.
 - A scheduled dependency audit and Dependabot run in CI, and workflow actions
   are pinned by commit.
-- Release re-runs do not overwrite published images or assets unless
-  `replace_assets` is set.
 
 [Unreleased]: https://github.com/EmbrasureAI/flow/commits/main

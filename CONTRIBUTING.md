@@ -76,7 +76,7 @@ Maintainers release from `main`:
 
 The [release workflow](.github/workflows/release.yml) checks that the tag,
 workspace version and changelog agree, then publishes Linux x86-64 and arm64
-archives with checksums and license notices, a multi-architecture image at
-`ghcr.io/embrasureai/flow`, and a GitHub release with the changelog entry.
+archives with checksums and license notices, a multi-architecture container
+image, and a GitHub release with the changelog entry.
 Tags with a hyphen (for example `v0.2.0-rc.1`) are prereleases and do not move
 the image's `latest` tag.

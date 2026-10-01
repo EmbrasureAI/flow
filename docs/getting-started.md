@@ -15,9 +15,9 @@ cargo build --locked --release -p flow-daemon
 cargo run --locked -p flow-daemon -- --config examples/flow.toml check
 ```
 
-Tagged releases also publish Linux binaries for x86-64 and arm64 and a
-container image, `ghcr.io/embrasureai/flow`; see the
-[releases page](https://github.com/EmbrasureAI/flow/releases).
+To run Flow in a container, build the image from the repository's
+[Dockerfile](../Dockerfile) as described in the
+[README](../README.md#build-a-container-image).
 
 ## Prepare PostgreSQL
 
