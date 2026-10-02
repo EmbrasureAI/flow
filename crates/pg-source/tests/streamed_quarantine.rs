@@ -362,3 +362,28 @@ fn undecodable_relation_is_scoped_to_its_streamed_transaction() {
     });
     assert!(!capture.assembler.is_blocked(TableId(TABLE)));
 }
+
+/// PostgreSQL can roll back a streamed subtransaction without sending its
+/// abort; capture then excludes it at the commit once PostgreSQL's commit log
+/// reports the rollback. Its changes go, but a provisional decision it made is
+/// kept, so the table is blocked although the rolled-back TRUNCATE never
+/// committed. That is a conservative availability limit, not the semantics of
+/// a received rollback: the decision never lets through a change it stops.
+#[test]
+fn rollback_excluded_at_commit_keeps_its_provisional_decision() {
+    let mut capture = Capture::new();
+    capture.push(start(42, true));
+    capture.change(insert(42, 42, "1"));
+    capture.truncate(42, 43);
+    capture.push(SourceEvent::StreamStop);
+    assert_eq!(capture.assembler.subtransactions(42).unwrap(), [43]);
+    capture.assembler.exclude_rolled_back(42, &[43]).unwrap();
+    assert_eq!(
+        capture.assembler.provisional_blocks(42),
+        [(TableId(TABLE), TRUNCATED.to_owned())]
+    );
+    assert_eq!(
+        capture.assembler.provisional_block(42, TableId(TABLE)),
+        Some(TRUNCATED)
+    );
+}

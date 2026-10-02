@@ -13,6 +13,10 @@ use flow_pg_source::{
 use tempfile::TempDir;
 
 const CAPTURED: u32 = 11;
+
+/// Live tests share one database. Logical messages and, on PostgreSQL 14,
+/// empty transactions reach every slot, so they run one at a time.
+static LIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const OTHER: u32 = 99;
 
 fn schema(id: u32) -> TableSchema {
@@ -323,6 +327,7 @@ fn streamed_transactions_skip_interleaved_changes_to_other_tables() {
 #[tokio::test]
 #[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
 async fn live_superset_publication_captures_only_configured_tables() {
+    let _live = LIVE.lock().await;
     use flow_pg_source::{
         PgOutputSource, PostgresSource,
         tokio_postgres::{self, NoTls, config::ReplicationMode},
@@ -501,4 +506,347 @@ async fn live_superset_publication_captures_only_configured_tables() {
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+// The compatibility suite runs this binary's live tests against every
+// supported PostgreSQL version, so the streamed-rollback probe below lives
+// here although it concerns rollback rather than publication membership.
+
+/// What Flow observed of one savepoint rollback in a streamed transaction.
+#[derive(Debug, Default)]
+struct RollbackProbe {
+    streamed: bool,
+    /// The rolled-back savepoint's XID, as carried by its streamed deletes.
+    savepoint: Option<u32>,
+    savepoint_deletes_received: u64,
+    aborted_subtransactions: Vec<u32>,
+    /// Subtransactions PostgreSQL's commit log reported rolled back at the
+    /// commit although no abort was received; capture excluded them.
+    rolled_back_without_abort: Vec<u32>,
+    /// The durable journaled transaction, after reopening the journal:
+    /// inserted ids, deletes and other mutations. PostgreSQL committed only
+    /// the inserts -1 and -2 of the root and -3 of a released child.
+    journaled_inserts: Vec<i32>,
+    journaled_deletes: u64,
+    journaled_other: u64,
+}
+
+impl RollbackProbe {
+    fn savepoint_aborted(&self) -> bool {
+        self.savepoint
+            .is_some_and(|savepoint| self.aborted_subtransactions.contains(&savepoint))
+    }
+}
+
+/// Delete `deleted` rows in savepoint `s1` of a transaction that stays open,
+/// then make every later change in a child savepoint `s2`. With `spill`, the
+/// slot is first advanced past the deletes, so PostgreSQL re-decodes them
+/// before its confirmed position, where it may not stream and spills the
+/// transaction instead; `s2`'s changes then stream it from the spill. Only
+/// after Flow's pgoutput source has received all of `s1`'s deletes in a
+/// streamed block does the transaction roll back to `s1` and commit, as when
+/// a savepoint is rolled back during live replication.
+async fn rollback_probe(deleted: i32, spill: bool) -> RollbackProbe {
+    let _live = LIVE.lock().await;
+    use flow_pg_source::{
+        PgOutputSource, PostgresSource,
+        tokio_postgres::{self, NoTls, config::ReplicationMode},
+    };
+    use futures::FutureExt;
+    use std::{
+        panic::AssertUnwindSafe,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let name = format!(
+        "flow_rollback_{deleted}_{}_{}",
+        u8::from(spill),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    sql.batch_execute(&format!(
+        "CREATE SCHEMA {name};
+         CREATE TABLE {name}.probe (id integer PRIMARY KEY, body text NOT NULL);
+         ALTER TABLE {name}.probe REPLICA IDENTITY FULL;
+         INSERT INTO {name}.probe SELECT i, 'row ' || i FROM generate_series(1, {deleted}) i;
+         CREATE PUBLICATION {name} FOR TABLE {name}.probe;"
+    ))
+    .await
+    .unwrap();
+    let probe: u32 = sql
+        .query_one("SELECT to_regclass($1)::oid", &[&format!("{name}.probe")])
+        .await
+        .unwrap()
+        .get(0);
+    let start: PgLsn = sql
+        .query_one(
+            "SELECT lsn::text FROM pg_catalog.pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0)
+        .parse()
+        .unwrap();
+    // A committed message flushes WAL, including the open transaction's
+    // records so far, so the walsender can read them.
+    let flush = "SELECT pg_catalog.pg_logical_emit_message(true, 'flow-rollback-probe', 'flush')";
+
+    let body = AssertUnwindSafe(async {
+        let (holder, holder_connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        let holder_task = tokio::spawn(holder_connection);
+        holder
+            .batch_execute(&format!(
+                "BEGIN;
+                 INSERT INTO {name}.probe VALUES (-1, 'before the savepoint');
+                 SAVEPOINT s1;
+                 DELETE FROM {name}.probe WHERE id BETWEEN 1 AND {deleted}"
+            ))
+            .await
+            .unwrap();
+        let xid = holder
+            .query_one("SELECT txid_current()::text", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
+            .parse::<u64>()
+            .unwrap() as u32;
+        if spill {
+            sql.batch_execute(flush).await.unwrap();
+            sql.execute(
+                "SELECT pg_catalog.pg_replication_slot_advance($1, pg_catalog.pg_current_wal_lsn())",
+                &[&name],
+            )
+            .await
+            .unwrap();
+        }
+        holder
+            .batch_execute(&format!(
+                "SAVEPOINT s2;
+                 INSERT INTO {name}.probe
+                   SELECT 100000 + i, repeat('x', 200) FROM generate_series(1, 2000) i"
+            ))
+            .await
+            .unwrap();
+        sql.batch_execute(flush).await.unwrap();
+
+        let mut config: tokio_postgres::Config = url.parse().unwrap();
+        config
+            .replication_mode(ReplicationMode::Logical)
+            .options("-c logical_decoding_work_mem=64kB");
+        let (replication, connection) = config.connect(NoTls).await.unwrap();
+        let replication_task = tokio::spawn(connection);
+        let mut source = PgOutputSource::start(&replication, &name, &name, start, 1 << 20)
+            .await
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (mut journal, _) =
+            Journal::open(root.path().join("journal"), JournalConfig::default()).unwrap();
+        let spool =
+            TransactionSpool::open(root.path().join("spool"), SpoolConfig::default()).unwrap();
+        let mut assembler =
+            CaptureAssembler::new(SourceId("source".into()), spool, [schema(probe)], 1 << 16)
+                .unwrap();
+        let mut outcome = RollbackProbe::default();
+        let mut rolled_back = false;
+        let transaction = loop {
+            let event = tokio::time::timeout(Duration::from_secs(60), source.next())
+                .await
+                .unwrap_or_else(|_| panic!("no pgoutput event within 60s: {outcome:?}"))
+                .unwrap()
+                .expect("replication stream ended");
+            match &event {
+                SourceEvent::StreamStart { xid: top, .. } if *top == xid => {
+                    outcome.streamed = true;
+                }
+                SourceEvent::Delete {
+                    xid: top, subxid, ..
+                } if *top == xid && *subxid != xid => {
+                    outcome.savepoint = Some(*subxid);
+                    outcome.savepoint_deletes_received += 1;
+                }
+                SourceEvent::Abort { xid: top, subxid } if *top == xid && *subxid != xid => {
+                    outcome.aborted_subtransactions.push(*subxid);
+                }
+                _ => {}
+            }
+            // As the daemon does before a commit: PostgreSQL's commit log
+            // decides which subtransactions with changes rolled back.
+            if matches!(event, SourceEvent::Commit { xid: committed, .. } if committed == xid) {
+                let subtransactions = assembler.subtransactions(xid).unwrap();
+                if !subtransactions.is_empty() {
+                    let rolled_back = flow_pg_source::rolled_back_subtransactions(
+                        &sql,
+                        &subtransactions,
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap();
+                    outcome.rolled_back_without_abort = rolled_back.clone();
+                    assembler.exclude_rolled_back(xid, &rolled_back).unwrap();
+                }
+            }
+            // Barrier: roll back only once every delete of the still-open
+            // savepoint has been streamed, and only at a block boundary.
+            let block_ended = matches!(event, SourceEvent::StreamStop);
+            if let Some(transaction) = assembler.push(event, &mut journal).unwrap()
+                && transaction.xid == xid
+            {
+                break transaction;
+            }
+            if !rolled_back
+                && block_ended
+                && outcome.savepoint_deletes_received >= u64::from(deleted.unsigned_abs())
+            {
+                rolled_back = true;
+                holder
+                    .batch_execute(&format!(
+                        "ROLLBACK TO SAVEPOINT s1;
+                         INSERT INTO {name}.probe VALUES (-2, 'after the rollback');
+                         SAVEPOINT s3;
+                         INSERT INTO {name}.probe VALUES (-3, 'released child');
+                         RELEASE SAVEPOINT s3;
+                         COMMIT"
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        assert!(rolled_back, "committed before the barrier: {outcome:?}");
+        drop(holder);
+        holder_task.await.unwrap().unwrap();
+        // Read the outcome back from the durable journal.
+        assembler.flush_commits(&mut journal).unwrap();
+        drop(journal);
+        let (journal, recovered) =
+            Journal::open(root.path().join("journal"), JournalConfig::default()).unwrap();
+        let durable = recovered
+            .transactions
+            .iter()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .find(|durable| durable.xid == xid)
+            .expect("durable transaction");
+        assert_eq!(durable, transaction);
+        for mutation in journal
+            .chunks(&durable.mutation_chunks)
+            .unwrap()
+            .flat_map(|bytes| bincode::deserialize::<Vec<Mutation>>(&bytes.unwrap()).unwrap())
+        {
+            match &mutation.kind {
+                MutationKind::Insert { row } => match row.first() {
+                    Some(Value::Int32(id)) => outcome.journaled_inserts.push(*id),
+                    _ => outcome.journaled_other += 1,
+                },
+                MutationKind::Delete { .. } => outcome.journaled_deletes += 1,
+                _ => outcome.journaled_other += 1,
+            }
+        }
+        outcome.journaled_inserts.sort_unstable();
+        drop(source);
+        drop(replication);
+        replication_task.abort();
+        outcome
+    });
+    let result = body.catch_unwind().await;
+
+    // Always release the slot, including after a failed assertion.
+    for _ in 0..50 {
+        sql.execute(
+            "SELECT pg_catalog.pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1 AND active",
+            &[&name],
+        )
+        .await
+        .unwrap();
+        let dropped = sql
+            .query(
+                "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1 AND NOT active",
+                &[&name],
+            )
+            .await;
+        let remaining: i64 = sql
+            .query_one(
+                "SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if dropped.is_ok() && remaining == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    sql.batch_execute(&format!(
+        "DROP PUBLICATION {name}; DROP SCHEMA {name} CASCADE"
+    ))
+    .await
+    .unwrap();
+    drop(sql);
+    sql_task.await.unwrap().unwrap();
+    match result {
+        Ok(outcome) => outcome,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// The durable journal holds exactly the changes PostgreSQL committed.
+fn assert_committed_changes_only(outcome: &RollbackProbe) {
+    assert_eq!(outcome.journaled_inserts, [-3, -2, -1], "{outcome:?}");
+    assert_eq!(outcome.journaled_deletes, 0, "{outcome:?}");
+    assert_eq!(outcome.journaled_other, 0, "{outcome:?}");
+}
+
+/// Control: streamed from memory, the rolled-back savepoint is aborted.
+#[tokio::test]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_rollback_of_a_savepoint_streamed_from_memory_is_aborted() {
+    let outcome = rollback_probe(5039, false).await;
+    assert!(outcome.streamed, "{outcome:?}");
+    assert_eq!(outcome.savepoint_deletes_received, 5039, "{outcome:?}");
+    assert!(outcome.savepoint_aborted(), "{outcome:?}");
+    assert!(outcome.rolled_back_without_abort.is_empty(), "{outcome:?}");
+    assert_committed_changes_only(&outcome);
+}
+
+/// Control: spilled with fewer changes than PostgreSQL restores at once, the
+/// rolled-back savepoint is aborted.
+#[tokio::test]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_rollback_of_a_spilled_savepoint_within_one_restore_batch_is_aborted() {
+    let outcome = rollback_probe(1000, true).await;
+    assert!(outcome.streamed, "{outcome:?}");
+    assert_eq!(outcome.savepoint_deletes_received, 1000, "{outcome:?}");
+    assert!(outcome.savepoint_aborted(), "{outcome:?}");
+    assert!(outcome.rolled_back_without_abort.is_empty(), "{outcome:?}");
+    assert_committed_changes_only(&outcome);
+}
+
+/// PostgreSQL restores a spilled transaction's changes in batches of 4096
+/// and marks a subtransaction as streamed only if changes remain in memory
+/// afterwards, so a spilled savepoint with more changes is streamed but its
+/// rollback sends no abort. Unless capture checks PostgreSQL's commit log at
+/// the commit, the rolled-back deletes reach the journal. The missing abort
+/// is PostgreSQL's behaviour and is asserted only as evidence that this test
+/// exercises it.
+#[tokio::test]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_rollback_of_a_spilled_savepoint_over_one_restore_batch_is_excluded_at_commit() {
+    let outcome = rollback_probe(5039, true).await;
+    assert!(outcome.streamed, "{outcome:?}");
+    assert_eq!(outcome.savepoint_deletes_received, 5039, "{outcome:?}");
+    assert!(!outcome.savepoint_aborted(), "{outcome:?}");
+    assert_eq!(
+        outcome.rolled_back_without_abort,
+        outcome.savepoint.into_iter().collect::<Vec<_>>(),
+        "{outcome:?}"
+    );
+    assert_committed_changes_only(&outcome);
 }

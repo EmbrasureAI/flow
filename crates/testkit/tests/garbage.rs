@@ -785,6 +785,33 @@ async fn legacy_metadata_import_is_scoped_idempotent_and_grace_delayed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history() {
+    async fn collect_phase(
+        maintenance: &TableMaintenance,
+        table: &Table,
+        policy: &GarbagePolicy,
+    ) -> flow_coordinator::GarbageReport {
+        let mut total = flow_coordinator::GarbageReport::default();
+        for _ in 0..1000 {
+            let report = maintenance
+                .collect_garbage(
+                    table,
+                    flow_testkit::schema(1).table_id,
+                    policy,
+                    &GarbageProtection::default(),
+                )
+                .await
+                .unwrap();
+            total.examined_objects += report.examined_objects;
+            total.deferred_objects += report.deferred_objects;
+            total.delete_requests += report.delete_requests;
+            total.metadata_json_delete_requests += report.metadata_json_delete_requests;
+            if !report.continuation_required {
+                return total;
+            }
+        }
+        panic!("bounded reader-grace sweeps must terminate");
+    }
+
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     let temp = TempDir::new().unwrap();
     let catalog = Arc::new(catalog(&temp.path().join("warehouse")).await);
@@ -807,11 +834,29 @@ async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history(
             ranges: Vec::new(),
         },
     };
+    let uuid = table.metadata().uuid();
+    let owner_prefix = format!("owned-artifacts/v2/{uuid}/");
+    let owner_key = format!("{owner_prefix}old");
+    let marker_key = format!(
+        "artifact-unreferenced/v1/{uuid}/{}",
+        uuid::Uuid::new_v5(&uuid, path.as_bytes())
+    );
+    // Force this one owner through the collector instead of allowing its due
+    // queue entry to skip a phase of the test.
+    let make_due = |store: &StateStore| {
+        let mut owners: Vec<_> = store
+            .source_transactions_after(owner_prefix.as_bytes(), None)
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(owners.len(), 1);
+        let (key, value) = owners.pop().unwrap();
+        assert_ne!(key.as_ref(), owner_key.as_bytes());
+        store
+            .write_source_records([(owner_key.as_bytes(), value.as_ref())], [key.as_ref()])
+            .unwrap();
+    };
     store
-        .put_source_transaction(
-            format!("owned-artifacts/v2/{}/old", table.metadata().uuid()).as_bytes(),
-            &bincode::serialize(&record).unwrap(),
-        )
+        .put_source_transaction(owner_key.as_bytes(), &bincode::serialize(&record).unwrap())
         .unwrap();
     let maintenance = TableMaintenance::new(
         store.clone(),
@@ -823,6 +868,13 @@ async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history(
     assert_eq!(
         collect(&maintenance, &table, &GarbageProtection::default()).await,
         0
+    );
+    assert!(
+        store
+            .source_transaction(marker_key.as_bytes())
+            .unwrap()
+            .is_none(),
+        "retained JSON must not have an unreferenced clock"
     );
     let mut current = table;
     for n in 0..2 {
@@ -842,48 +894,65 @@ async fn long_lived_json_gets_a_new_reader_grace_when_it_leaves_catalog_history(
         metadata_grace: Duration::from_millis(300),
         ..Default::default()
     };
-    let report = maintenance
-        .collect_garbage(
-            &current,
-            schema.table_id,
-            &grace,
-            &GarbageProtection::default(),
-        )
-        .await
-        .unwrap();
+    make_due(&store);
+    let observed_after = now_ms();
+    let report = collect_phase(&maintenance, &current, &grace).await;
     assert_eq!(
         report.delete_requests, 0,
         "upload age must not substitute for time since unreference"
     );
+    assert_eq!(report.examined_objects, 1);
+    assert_eq!(report.deferred_objects, 1);
     assert!(Path::new(&path).exists());
+    let marker = store
+        .source_transaction(marker_key.as_bytes())
+        .unwrap()
+        .unwrap();
+    let since: u64 = bincode::deserialize(&marker).unwrap();
+    assert!(
+        (observed_after..=now_ms()).contains(&since),
+        "leaving catalog history must start a fresh reader clock"
+    );
     drop(maintenance);
     drop(store);
     let store = StateStore::open(&index, Default::default()).unwrap();
+    assert_eq!(
+        store.source_transaction(marker_key.as_bytes()).unwrap(),
+        Some(marker),
+        "restart must preserve the reader clock"
+    );
     let maintenance = TableMaintenance::new(
-        store,
+        store.clone(),
         catalog.clone(),
         Policy::default(),
         WriterConfig::default(),
     )
     .unwrap();
-    let report = maintenance
-        .collect_garbage(
-            &current,
-            schema.table_id,
-            &grace,
-            &GarbageProtection::default(),
+    // Drive the persisted clock through both sides of expiry without relying
+    // on a RocksDB reopen or an async task completing within the 300 ms grace.
+    store
+        .put_source_transaction(
+            marker_key.as_bytes(),
+            &bincode::serialize(&u64::MAX).unwrap(),
         )
-        .await
         .unwrap();
+    make_due(&store);
+    let report = collect_phase(&maintenance, &current, &grace).await;
+    assert_eq!(report.examined_objects, 1);
+    assert_eq!(report.deferred_objects, 1);
     assert_eq!(
         report.delete_requests, 0,
-        "restart must preserve the reader grace"
+        "an unexpired reader clock protects JSON"
     );
-    tokio::time::sleep(Duration::from_millis(350)).await;
-    assert_eq!(
-        collect(&maintenance, &current, &GarbageProtection::default()).await,
-        1
-    );
+    assert!(Path::new(&path).exists());
+    store
+        .put_source_transaction(marker_key.as_bytes(), &bincode::serialize(&0_u64).unwrap())
+        .unwrap();
+    make_due(&store);
+    let report = collect_phase(&maintenance, &current, &grace).await;
+    assert_eq!(report.examined_objects, 1);
+    assert_eq!(report.delete_requests, 1);
+    assert_eq!(report.metadata_json_delete_requests, 1);
     assert!(!Path::new(&path).exists());
     assert!(Path::new(current.metadata_location().unwrap()).exists());
 }

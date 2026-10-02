@@ -27,6 +27,7 @@ uuid.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 crc32fast.workspace = true
 metrics.workspace = true
+tracing.workspace = true
 fs2 = "0.4"
 tokio-postgres = { git = "https://github.com/iambriccardo/rust-postgres", rev = "c4b8de06aaa99f71800126bedcca6e623d368357", features = ["runtime"] }
 

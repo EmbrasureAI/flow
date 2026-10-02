@@ -176,6 +176,13 @@ impl RetainedIndexes {
         slot.used = Instant::now();
         Ok(slot.index.clone())
     }
+    pub(super) fn bytes(&self) -> Result<usize> {
+        let slots = self
+            .slots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("retained index lock poisoned"))?;
+        Ok(slots.tables.values().map(|slot| slot.bytes).sum())
+    }
     fn forget_builder(&self, table: uuid::Uuid) -> Result<()> {
         let mut slots = self
             .slots

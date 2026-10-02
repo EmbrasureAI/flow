@@ -11,7 +11,9 @@ use std::{
     time::Instant,
 };
 
-const HEADER: u64 = 8;
+/// Frame header: payload length, the (sub)transaction XID that made the
+/// changes, and a CRC-32 of that XID and the payload.
+const HEADER: u64 = 12;
 
 #[derive(Clone, Debug)]
 pub struct SpoolConfig {
@@ -67,6 +69,9 @@ struct Transaction {
     bytes: u64,
     savepoints: Vec<Savepoint>,
     subtransactions: HashMap<u32, usize>,
+    /// Sorted subtransactions whose chunks replay skips; see
+    /// [`TransactionSpool::exclude`].
+    excluded: Vec<u32>,
 }
 
 pub struct TransactionSpool {
@@ -144,6 +149,7 @@ impl TransactionSpool {
                 bytes: 0,
                 savepoints: Vec::new(),
                 subtransactions: HashMap::new(),
+                excluded: Vec::new(),
             },
         );
         Ok(())
@@ -201,7 +207,8 @@ impl TransactionSpool {
         }
         let mut header = [0; HEADER as usize];
         header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        header[4..].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+        header[4..8].copy_from_slice(&subxid.to_le_bytes());
+        header[8..].copy_from_slice(&frame_checksum(subxid, payload).to_le_bytes());
         txn.file.write_all(&header)?;
         txn.file.write_all(payload)?;
         txn.offset += length;
@@ -280,13 +287,47 @@ impl TransactionSpool {
                 }
                 buffer.resize(len as usize, 0);
                 file.read_exact(&mut buffer)?;
-                if crc32fast::hash(&buffer) != u32::from_le_bytes(header[4..].try_into().unwrap()) {
+                // The checksum covers the XID tag, so a damaged tag cannot
+                // silently keep or drop the wrong changes.
+                let subxid = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                if frame_checksum(subxid, &buffer)
+                    != u32::from_le_bytes(header[8..].try_into().unwrap())
+                {
                     return Err(Error::Protocol("transaction spool checksum mismatch"));
                 }
-                consume(&buffer)?;
+                if txn.excluded.binary_search(&subxid).is_err() {
+                    consume(&buffer)?;
+                }
                 offset += HEADER + u64::from(len);
             }
         }
+        Ok(())
+    }
+
+    /// Subtransactions, other than `xid` itself, with surviving chunks: those
+    /// that spooled a chunk and were not truncated by a received rollback.
+    /// Bounded by `max_subtransactions`, like the savepoints that track them.
+    pub fn subtransactions(&self, xid: u32) -> Result<Vec<u32>> {
+        let txn = self.transactions.get(&xid).ok_or(Error::Protocol(
+            "subtransactions of unknown spool transaction",
+        ))?;
+        let mut subxids: Vec<u32> = txn.subtransactions.keys().copied().collect();
+        subxids.sort_unstable();
+        Ok(subxids)
+    }
+
+    /// Skip these subtransactions' chunks on replay. Unlike [`Self::abort`],
+    /// which truncates at a rollback as it arrives in the stream, this keeps
+    /// the changes of other (sub)transactions made after theirs.
+    pub fn exclude(&mut self, xid: u32, subxids: &[u32]) -> Result<()> {
+        let txn = self
+            .transactions
+            .get_mut(&xid)
+            .ok_or(Error::Protocol("exclusion in unknown spool transaction"))?;
+        txn.excluded
+            .extend(subxids.iter().copied().filter(|&subxid| subxid != xid));
+        txn.excluded.sort_unstable();
+        txn.excluded.dedup();
         Ok(())
     }
 
@@ -307,4 +348,11 @@ impl TransactionSpool {
         self.bytes -= txn.bytes;
         Ok(())
     }
+}
+
+fn frame_checksum(subxid: u32, payload: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&subxid.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize()
 }
