@@ -61,7 +61,7 @@ typetag = "0.2"
 uuid.workspace = true
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 tempfile.workspace = true
