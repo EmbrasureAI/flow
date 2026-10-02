@@ -41,6 +41,56 @@ struct PendingTransaction {
     /// just before it. PostgreSQL re-sends the Relation at the next streamed
     /// change after catalog invalidation, which replaces this entry either way.
     undecodable: BTreeMap<TableId, String>,
+    /// Present only for streamed transactions.
+    stream: Option<StreamEvidence>,
+}
+
+/// Bounded diagnostic evidence of one streamed transaction, logged at its
+/// subtransaction aborts, when its commit is staged and when that commit is
+/// durable, so a lost or surviving change can be attributed to the received
+/// stream, a rollback truncation or a later stage. It does not affect capture.
+#[derive(Default)]
+struct StreamEvidence {
+    blocks: u32,
+    /// Row changes received per (sub)transaction XID as inserts, updates and
+    /// deletes, including changes a later rollback removes. Quarantined
+    /// evidence is not counted.
+    received: BTreeMap<u32, [u64; 3]>,
+    /// Changes of XIDs beyond the tracked limit.
+    untracked: u64,
+    aborted_subtransactions: u32,
+    truncated_bytes: u64,
+}
+
+const STREAM_EVIDENCE_XIDS: usize = 64;
+
+impl StreamEvidence {
+    fn received(&mut self, subxid: u32, kind: &MutationKind) {
+        let index = match kind {
+            MutationKind::Insert { .. } => 0,
+            MutationKind::Update { .. } => 1,
+            MutationKind::Delete { .. } => 2,
+            MutationKind::Quarantined { .. } => return,
+        };
+        if let Some(counts) = self.received.get_mut(&subxid) {
+            counts[index] += 1;
+        } else if self.received.len() < STREAM_EVIDENCE_XIDS {
+            let mut counts = [0; 3];
+            counts[index] = 1;
+            self.received.insert(subxid, counts);
+        } else {
+            self.untracked += 1;
+        }
+    }
+
+    fn totals(&self) -> [u64; 3] {
+        self.received.values().fold([0; 3], |mut totals, counts| {
+            for (total, count) in totals.iter_mut().zip(counts) {
+                *total += count;
+            }
+            totals
+        })
+    }
 }
 
 /// Bounded source-wide transaction assembly. Only one pgoutput segment is
@@ -60,6 +110,8 @@ pub struct CaptureAssembler {
     pending_commits: Vec<SourceTransaction>,
     pending_commit_bytes: u64,
     pending_commit_limit: usize,
+    /// Staged streamed commits awaiting durability, for diagnostics only.
+    streamed_staged: BTreeSet<u32>,
     blocked: BTreeSet<TableId>,
     /// Configured tables whose changes are no longer captured, as when the
     /// publication stopped covering them. They are treated as unconfigured.
@@ -100,6 +152,7 @@ impl CaptureAssembler {
             pending_commits: Vec::new(),
             pending_commit_bytes: 0,
             pending_commit_limit: 32,
+            streamed_staged: BTreeSet::new(),
         })
     }
 
@@ -345,6 +398,21 @@ impl CaptureAssembler {
     pub fn flush_commits(&mut self, journal: &mut Journal) -> Result<Vec<SourceTransaction>> {
         journal.flush_commits()?;
         for transaction in &self.pending_commits {
+            if self.streamed_staged.remove(&transaction.xid) {
+                tracing::info!(
+                    event = "streamed_transaction_durable",
+                    xid = transaction.xid,
+                    end_lsn = %transaction.end_lsn,
+                    durable = %transaction
+                        .table_mutation_counts
+                        .iter()
+                        .flatten()
+                        .map(|count| format!("{}:{}", count.table_id.0, count.mutations))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    "streamed transaction durable in the journal"
+                );
+            }
             self.spool.discard(transaction.xid)?;
         }
         self.pending_commit_bytes = 0;
@@ -392,6 +460,37 @@ impl CaptureAssembler {
 
     /// Resolve versions after streamed subtransaction rollback. The ordinary
     /// row path does not pay for this extra spool read.
+    /// Subtransactions whose changes `xid` still holds. PostgreSQL can roll
+    /// one back without streaming its abort: its source restores a spilled
+    /// transaction's changes in batches and marks a subtransaction as streamed
+    /// only if changes remain in memory afterwards. Before the commit, the
+    /// caller asks PostgreSQL which of these rolled back and passes them to
+    /// [`Self::exclude_rolled_back`].
+    pub fn subtransactions(&mut self, xid: u32) -> Result<Vec<u32>> {
+        self.flush()?;
+        self.spool.subtransactions(xid)
+    }
+
+    /// Drop the changes of subtransactions PostgreSQL rolled back, keeping
+    /// those of every other (sub)transaction. Unlike a received rollback, this
+    /// keeps the provisional quarantine decisions they made: a table may be
+    /// blocked by a rolled-back decision (an availability limit), but no change
+    /// that decision stops is published.
+    pub fn exclude_rolled_back(&mut self, xid: u32, subxids: &[u32]) -> Result<()> {
+        if subxids.is_empty() {
+            return Ok(());
+        }
+        self.flush()?;
+        self.spool.exclude(xid, subxids)?;
+        tracing::warn!(
+            event = "streamed_rollback_without_abort",
+            xid,
+            subtransactions = ?subxids,
+            "PostgreSQL rolled back streamed subtransactions without an abort; their changes are dropped"
+        );
+        Ok(())
+    }
+
     pub fn surviving_schema_versions(&mut self, xid: u32) -> Result<Vec<TableSchemaVersion>> {
         self.flush()?;
         let mut versions = BTreeMap::<TableId, BTreeSet<u32>>::new();
@@ -481,6 +580,12 @@ impl CaptureAssembler {
                         schemas: BTreeMap::new(),
                         provisional: Vec::new(),
                         undecodable: BTreeMap::new(),
+                        stream: matches!(event, SourceEvent::StreamStart { .. }).then(|| {
+                            StreamEvidence {
+                                blocks: 1,
+                                ..Default::default()
+                            }
+                        }),
                     },
                 );
                 if matches!(event, SourceEvent::StreamStart { .. }) {
@@ -489,10 +594,11 @@ impl CaptureAssembler {
             }
             SourceEvent::StreamStart { xid, first: false } => {
                 self.flush()?;
-                if !self.transactions.contains_key(&xid) {
-                    return Err(Error::Protocol(
-                        "continuation of unknown capture transaction",
-                    ));
+                let transaction = self.transactions.get_mut(&xid).ok_or(Error::Protocol(
+                    "continuation of unknown capture transaction",
+                ))?;
+                if let Some(stream) = &mut transaction.stream {
+                    stream.blocks += 1;
                 }
                 self.streaming = Some(xid);
             }
@@ -597,15 +703,46 @@ impl CaptureAssembler {
                     return Err(Error::Protocol("cannot abort a staged capture commit"));
                 }
                 self.flush()?;
+                let savepoint = self.spool.savepoint(xid, subxid);
                 // Provisional decisions roll back exactly with their spooled changes.
-                if let Some(start) = self.spool.savepoint(xid, subxid)
+                if let Some(start) = savepoint
                     && let Some(transaction) = self.transactions.get_mut(&xid)
                 {
                     transaction
                         .provisional
                         .retain(|(position, _, _)| *position < start);
                 }
+                let before = self.spool.position(xid).ok();
                 self.spool.abort(xid, subxid)?;
+                let after = self.spool.position(xid).ok();
+                if let Some(transaction) = self.transactions.get_mut(&xid)
+                    && let Some(stream) = &mut transaction.stream
+                {
+                    // A whole-transaction rollback discards the spool.
+                    let truncated = match (before, after) {
+                        (Some(before), Some(after)) => before - after,
+                        (Some(before), None) => before,
+                        _ => 0,
+                    };
+                    stream.aborted_subtransactions += 1;
+                    stream.truncated_bytes += truncated;
+                    let [inserts, updates, deletes] =
+                        stream.received.get(&subxid).copied().unwrap_or_default();
+                    tracing::info!(
+                        event = "streamed_subtransaction_aborted",
+                        xid,
+                        subxid,
+                        received_lsn = %received_lsn,
+                        blocks = stream.blocks,
+                        savepoint_bytes = ?savepoint,
+                        spool_bytes_before = ?before,
+                        truncated_bytes = truncated,
+                        received_inserts = inserts,
+                        received_updates = updates,
+                        received_deletes = deletes,
+                        "streamed subtransaction rolled back"
+                    );
+                }
                 if xid == subxid {
                     self.transactions.remove(&xid);
                 }
@@ -721,6 +858,29 @@ impl CaptureAssembler {
                 )
                 .record(started.elapsed().as_secs_f64());
                 replayed?;
+                if let Some(stream) = &self.transactions[&xid].stream {
+                    let [inserts, updates, deletes] = stream.totals();
+                    // Assembled and staged, not yet durable: see
+                    // `streamed_transaction_durable` in `flush_commits`.
+                    tracing::info!(
+                        event = "streamed_transaction_assembled",
+                        xid,
+                        end_lsn = %end_lsn,
+                        blocks = stream.blocks,
+                        received_inserts = inserts,
+                        received_updates = updates,
+                        received_deletes = deletes,
+                        received_untracked = stream.untracked,
+                        aborted_subtransactions = stream.aborted_subtransactions,
+                        truncated_bytes = stream.truncated_bytes,
+                        staged = %tables
+                            .iter()
+                            .map(|(table, (_, count))| format!("{}:{count}", table.0))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        "streamed transaction staged for a journal commit"
+                    );
+                }
                 let txn = SourceTransaction {
                     source_id: self.source.clone(),
                     xid,
@@ -749,6 +909,9 @@ impl CaptureAssembler {
                     .checked_add(txn.mutation_chunks.payload_bytes)
                     .ok_or(Error::Config("pending commit payload byte count overflow"))?;
                 journal.stage_commit(txn.clone())?;
+                if self.transactions[&xid].stream.is_some() {
+                    self.streamed_staged.insert(xid);
+                }
                 self.pending_commits.push(txn);
                 self.pending_commit_bytes = pending_bytes;
                 self.transactions.remove(&xid);
@@ -776,8 +939,12 @@ impl CaptureAssembler {
     }
 
     fn append(&mut self, xid: u32, subxid: u32, mutation: Mutation) -> Result<()> {
-        if !self.transactions.contains_key(&xid) {
-            return Err(Error::Protocol("mutation outside capture transaction"));
+        let transaction = self
+            .transactions
+            .get_mut(&xid)
+            .ok_or(Error::Protocol("mutation outside capture transaction"))?;
+        if let Some(stream) = &mut transaction.stream {
+            stream.received(subxid, &mutation.kind);
         }
         let bytes = bincode::serialized_size(&mutation)?;
         let reserve = if matches!(mutation.kind, MutationKind::Quarantined { .. }) {

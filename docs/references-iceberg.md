@@ -123,7 +123,10 @@ Append publication reuses unchanged manifests and writes separate data/delete
 manifests without merging old ones. Rewrites touch only manifests containing
 removed files. Manifest loading has bounded concurrency (16). A coordinator
 should reuse one `ManifestCache` across actions; its default estimated decoded
-budget is 64 MiB. Immutable entries use `Arc` so views and caches share file
+budget is 64 MiB. Manifests unread for ten minutes leave the cache and are
+reloaded if read again. Every publication and inventory rereads the current
+snapshot's manifests; superseded manifests are read only by work on retained
+snapshots, so without expiry they accumulate until the budget is full. Immutable entries use `Arc` so views and caches share file
 metrics instead of deep-copying them. The cache key includes table UUID and
 the manifest's inherited sequence/snapshot context.
 Exact delete targets are indexed once per view, avoiding an all-files scan per

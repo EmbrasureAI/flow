@@ -206,6 +206,11 @@ impl TablePublisher {
             manifest_cache: ManifestCache::default(),
         })
     }
+    /// Parsed manifests shared by every table's publications.
+    pub fn manifest_cache(&self) -> &ManifestCache {
+        &self.manifest_cache
+    }
+
     async fn merge_previous_deletes(
         &self,
         table: &Table,

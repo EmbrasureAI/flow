@@ -110,6 +110,14 @@ This will be the initial public release, `0.1.0`.
   `flow_table_maintenance_failing`, …), process gauges and example alert
   rules; `status.json` reports `state` and `last_error`.
 - Optional jemalloc allocator on GNU/Linux (`--features jemalloc`).
+- Memory-budget gauges (`flow_memory_index_block_cache_bytes`,
+  `flow_memory_index_memtable_bytes`, `flow_memory_manifest_cache_bytes`,
+  `flow_memory_retained_index_bytes`, …) that attribute resident memory to the
+  row index, manifest caches and garbage reachability indexes.
+- The shared parsed-manifest caches release manifests unread for ten minutes
+  and reload them if read again, so rarely read manifests superseded by
+  commits, compaction and manifest rewrites no longer accumulate until each
+  cache reaches its 64 MiB budget.
 - A Dockerfile that builds a minimal image running as an unprivileged user.
 - Operations guidance for systemd and Kubernetes, and disk sizing.
 
@@ -125,6 +133,12 @@ This will be the initial public release, `0.1.0`.
 - PostgreSQL date and timestamp arrays accept finite values beyond Chrono's
   calendar range whenever scalar decoding supports them, preserving the existing
   JSON string representation and rejection of infinite dates and timestamps.
+- A streamed transaction could publish the changes of a savepoint it had
+  rolled back. When PostgreSQL spills a transaction and later streams a
+  savepoint with more than 4096 changes from the spill, it sends no abort for
+  that savepoint's rollback. Capture now checks the status of each
+  subtransaction with surviving changes in PostgreSQL's commit log at the
+  commit and drops those that rolled back.
 
 ### Security
 

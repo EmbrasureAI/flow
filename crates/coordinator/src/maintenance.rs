@@ -289,6 +289,16 @@ impl TableMaintenance {
         })
     }
 
+    /// Parsed manifests shared by every table's maintenance.
+    pub fn manifest_cache(&self) -> &ManifestCache {
+        &self.cache
+    }
+
+    /// Estimated bytes of the per-process garbage reachability indexes.
+    pub fn retained_index_bytes(&self) -> Result<usize> {
+        self.garbage.bytes()
+    }
+
     pub fn with_read_limits(mut self, limits: flow_compactor::ReadLimits) -> Result<Self> {
         limits.validate()?;
         self.read_limits = limits;
