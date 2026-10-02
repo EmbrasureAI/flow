@@ -8,6 +8,8 @@ use tokio_postgres::{
     types::{Kind, Type},
 };
 
+const DAY_MICROS: i64 = 86_400_000_000;
+
 #[derive(Clone, Debug, Default)]
 pub struct TypeRegistry(BTreeMap<u32, SourceType>);
 #[derive(Clone, Debug)]
@@ -307,7 +309,6 @@ impl TypeRegistry {
 // Keep time at the source boundary: Iceberg TIME is not supported by Athena,
 // and PostgreSQL's valid 24:00:00 cannot be represented by chrono::NaiveTime.
 fn time_string(bytes: &[u8], binary: bool) -> Result<String> {
-    const DAY_MICROS: i64 = 86_400_000_000;
     let micros = if binary {
         i64::from_be_bytes(
             bytes
@@ -421,7 +422,6 @@ fn json_value(value: Value, oid: u32) -> Result<serde_json::Value> {
         Value::Uuid(v) => J::String(uuid::Uuid::from_bytes(v).to_string()),
         Value::Date(v) => J::String(crate::capture::date_string(v)),
         Value::TimestampMicros(v) | Value::TimestampTzMicros(v) => {
-            const DAY_MICROS: i64 = 86_400_000_000;
             // Even i64 microsecond extremes fit in i32 days. Euclidean division
             // keeps the time of day positive for timestamps before the Unix epoch.
             let date = crate::capture::date_string(v.div_euclid(DAY_MICROS) as i32);

@@ -943,12 +943,12 @@ fn postgres_era(text: &str) -> (&str, bool) {
         .map_or((text, false), |date| (date, true))
 }
 
-// PostgreSQL emits unsigned wide years and a BC suffix. Integer Gregorian
-// arithmetic covers its full finite range, beyond chrono's calendar range.
 const DAYS_PER_ERA: i64 = 146_097;
 const POSTGRES_EPOCH_DAY: i64 = 730_425;
 const UNIX_EPOCH_DAY: i64 = POSTGRES_EPOCH_DAY - 10_957;
 
+// PostgreSQL emits unsigned wide years and a BC suffix. Integer Gregorian
+// arithmetic covers its full finite range, beyond chrono's calendar range.
 fn postgres_days(date: &str, bc: bool) -> Option<i64> {
     let mut parts = date.split('-');
     let year = parts.next()?;

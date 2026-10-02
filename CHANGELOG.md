@@ -13,12 +13,6 @@ No release has been tagged yet; the first will be `0.1.0`.
 
 This will be the initial public release, `0.1.0`.
 
-### Fixed
-
-- PostgreSQL date and timestamp arrays accept finite values beyond Chrono's
-  calendar range whenever scalar decoding supports them, preserving the existing
-  JSON string representation and rejection of infinite dates and timestamps.
-
 ### Added
 
 **Capture and publication**
@@ -125,6 +119,12 @@ This will be the initial public release, `0.1.0`.
   another transaction holds an `ACCESS EXCLUSIVE` lock on a published table
   (for example a long `TRUNCATE`, rewriting `ALTER`, `VACUUM FULL` or
   `CLUSTER`). Capture that is already streaming continues.
+
+### Fixed
+
+- PostgreSQL date and timestamp arrays accept finite values beyond Chrono's
+  calendar range whenever scalar decoding supports them, preserving the existing
+  JSON string representation and rejection of infinite dates and timestamps.
 
 ### Security
 
