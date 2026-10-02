@@ -253,3 +253,96 @@ async fn copy_rejects_oversized_header_without_reading_body() {
 async fn replication_rejects_oversized_header_without_reading_body() {
     oversized_advertised_frame(true).await;
 }
+
+#[tokio::test]
+async fn snapshot_cleanup_failure_preserves_initialization_error() {
+    let listener = std::sync::Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let port = listener.local_addr().unwrap().port();
+    let replication_listener = listener.clone();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = replication_listener.accept().await.unwrap();
+        let length = socket.read_u32().await.unwrap();
+        let mut startup = vec![0; (length - 4) as usize];
+        socket.read_exact(&mut startup).await.unwrap();
+        backend(&mut socket, b'R', &0u32.to_be_bytes()).await;
+        backend(&mut socket, b'Z', b"I").await;
+        let (tag, query) = frontend(&mut socket).await;
+        assert_eq!(tag, b'Q');
+        assert_eq!(
+            query,
+            b"CREATE_REPLICATION_SLOT owned_slot LOGICAL pgoutput EXPORT_SNAPSHOT\0"
+        );
+        let columns = [
+            "slot_name",
+            "consistent_point",
+            "snapshot_name",
+            "output_plugin",
+        ];
+        let mut description = BytesMut::new();
+        description.put_i16(columns.len() as i16);
+        for column in columns {
+            description.extend_from_slice(column.as_bytes());
+            description.put_u8(0);
+            description.put_u32(0); // table OID
+            description.put_i16(0); // column number
+            description.put_u32(25); // text OID
+            description.put_i16(-1);
+            description.put_i32(-1);
+            description.put_i16(0); // text format
+        }
+        backend(&mut socket, b'T', &description).await;
+        let mut row = BytesMut::new();
+        row.put_i16(4);
+        for value in ["owned_slot", "0/1234", "snapshot", "pgoutput"] {
+            row.put_i32(value.len() as i32);
+            row.extend_from_slice(value.as_bytes());
+        }
+        backend(&mut socket, b'D', &row).await;
+        backend(&mut socket, b'C', b"CREATE_REPLICATION_SLOT\0").await;
+        backend(&mut socket, b'Z', b"I").await;
+        let (tag, query) = frontend(&mut socket).await;
+        assert_eq!(tag, b'Q');
+        assert_eq!(query, b"DROP_REPLICATION_SLOT owned_slot\0");
+        backend(&mut socket, b'E', b"SERROR\0C42501\0Mcleanup denied\0\0").await;
+        backend(&mut socket, b'Z', b"I").await;
+    });
+    let mut config = Config::new();
+    config
+        .host("127.0.0.1")
+        .port(port)
+        .user("source")
+        .ssl_mode(SslMode::Disable);
+    let (replication, connection) = config.connect(NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+
+    // A closed SQL connection fails transaction initialization deterministically.
+    // The replication connection remains usable and explicitly rejects cleanup.
+    let importer_peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let length = socket.read_u32().await.unwrap();
+        let mut startup = vec![0; (length - 4) as usize];
+        socket.read_exact(&mut startup).await.unwrap();
+        backend(&mut socket, b'R', &0u32.to_be_bytes()).await;
+        backend(&mut socket, b'Z', b"I").await;
+    });
+    let (mut importer, connection) = config.connect(NoTls).await.unwrap();
+    let _ = connection.await;
+    importer_peer.await.unwrap();
+    assert!(importer.is_closed());
+    let error = flow_pg_source::export_snapshot(&replication, &mut importer, "owned_slot")
+        .await
+        .err()
+        .unwrap();
+    let flow_pg_source::Error::Postgres(error) = error else {
+        panic!("expected original PostgreSQL initialization error");
+    };
+    assert!(
+        error.is_closed(),
+        "cleanup replaced the original error: {error:?}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+        .await
+        .expect("snapshot failure did not attempt slot cleanup")
+        .unwrap();
+    let _ = driver.await;
+}
