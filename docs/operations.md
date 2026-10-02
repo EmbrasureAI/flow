@@ -148,12 +148,41 @@ incarnation beside the old one:
 Writing to new target names keeps the old tables readable until the new
 incarnation catches up.
 
-## Add or remove tables
+## Add or re-snapshot tables
 
-The configured table set is fixed for a state directory. To add tables without
-recopying existing ones, run another Flow instance with its own state
-directory, slot and publication (or the same administrator-managed publication)
-for only the new tables. Each instance holds one more slot and WAL sender.
+### Add newly configured tables
+
+To add tables to an existing state directory without recopying existing ones:
+
+1. Ensure the new tables are added to the PostgreSQL publication.
+2. Append the new `[[tables]]` configuration blocks to `flow.toml` (or use `embrasure-flow discover >> flow.toml`).
+3. Stop the daemon if running, and execute:
+   ```sh
+   embrasure-flow --config flow.toml init --add-tables
+   # Or alternatively:
+   embrasure-flow --config flow.toml add-table
+   ```
+4. Flow validates each new table, creates its target table in the Iceberg catalog, takes a temporary exported snapshot from PostgreSQL, and streams the initial COPY into Parquet files. Existing tables and CDC are preserved without resynchronization.
+5. Resume continuous streaming:
+   ```sh
+   embrasure-flow --config flow.toml run
+   ```
+
+### Re-snapshot a single table
+
+If a single table experiences data drift, manual corruption, or requires an isolated re-synchronization without resetting the source replication slot or re-copying other tables:
+
+1. Stop the running daemon.
+2. Run the isolated re-snapshot:
+   ```sh
+   embrasure-flow --config flow.toml init --resnapshot schema.table
+   # Or alternatively:
+   embrasure-flow --config flow.toml resnapshot schema.table
+   ```
+3. Flow resets that specific table's local row index, recreates its empty Iceberg target, exports a fresh temporary snapshot from PostgreSQL, and performs a full COPY and base publication for that table only. Other tables retain their established snapshots and positions.
+4. Restart continuous streaming with `embrasure-flow --config flow.toml run`.
+
+### Remove tables
 
 To remove a table, or to merge instances, resynchronize with the new table set.
 Until then, keep the removed table in the publication: removing a configured

@@ -75,6 +75,12 @@ This will be the initial public release, `0.1.0`.
 
 **Commands and configuration**
 
+- `embrasure-flow init --add-tables` (and `embrasure-flow add-table`) dynamically
+  initializes and publishes newly added tables into an existing state directory
+  without full resynchronization or recopying existing tables.
+- `embrasure-flow init --resnapshot <schema.table>` (and `embrasure-flow resnapshot <schema.table>`)
+  allows re-snapshotting a single table without affecting other tables or resetting the
+  source replication slot.
 - `embrasure-flow discover` prints `[[tables]]` configuration for the
   publication's tables, named tables or a schema, using the same type mapping
   and validation as `init`.

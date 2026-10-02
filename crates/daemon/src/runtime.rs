@@ -45,7 +45,7 @@ use std::{
 };
 use tokio::sync::watch;
 
-pub use crate::bootstrap::initialize;
+pub use crate::bootstrap::{InitOptions, initialize, initialize_with_options};
 
 /// Print the local observation and return whether the service is ready.
 pub fn status(config: Config) -> Result<bool> {
@@ -81,7 +81,9 @@ async fn run_service(
     crate::bootstrap::validate_identity(&config, &boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len(),
-        crate::exit::config("configured tables changed; explicit resynchronization is required")
+        crate::exit::config(
+            "configured tables changed; run `embrasure-flow init --add-tables` to initialize newly added tables, or resynchronize if existing tables were removed"
+        )
     );
     for (index, configured) in config.tables.iter().enumerate() {
         ensure!(
