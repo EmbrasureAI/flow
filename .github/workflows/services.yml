@@ -36,20 +36,20 @@ jobs:
         run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
       - name: Build PostgreSQL regression tests
         run: |
-          cargo test --locked -p flow-pg-source --test snapshot_timeout --test schema_batch --test superset_publication --no-run --message-format=json > target/pg-test-build.jsonl
+          cargo test --locked -p flow-pg-source --test snapshot_timeout --test snapshot_slots --test schema_batch --test superset_publication --no-run --message-format=json > target/pg-test-build.jsonl
           cargo test --locked -p flow-daemon --bin embrasure-flow --no-run --message-format=json > target/daemon-test-build.jsonl
           python3 - <<'PYTEST'
           import json
           import shutil
           from pathlib import Path
           artifacts = [json.loads(line) for name in ("pg", "daemon") for line in Path(f"target/{name}-test-build.jsonl").read_text().splitlines()]
-          for name, output in (("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("superset_publication", "superset_publication_tests"), ("embrasure-flow", "daemon_tests")):
+          for name, output in (("snapshot_slots", "snapshot_slots_tests"), ("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("superset_publication", "superset_publication_tests"), ("embrasure-flow", "daemon_tests")):
               executable, = [item["executable"] for item in artifacts if item.get("executable") and item.get("profile", {}).get("test") and item.get("target", {}).get("name") == name]
               shutil.copy2(executable, f"target/debug/{output}")
           PYTEST
       - name: Package service binaries with executable permissions and checksums
         run: |
-          binaries=(target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/superset_publication_tests target/debug/daemon_tests)
+          binaries=(target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/snapshot_slots_tests target/debug/schema_batch_tests target/debug/superset_publication_tests target/debug/daemon_tests)
           sha256sum "${binaries[@]}" > target/service-binaries.sha256
           tar -cf "$RUNNER_TEMP/service-binaries.tar" "${binaries[@]}" target/service-binaries.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -192,9 +192,11 @@ jobs:
       - name: Superset publication captures only configured tables
         if: matrix.suite == 'compatibility'
         run: target/debug/superset_publication_tests live_ --ignored
-      - name: Snapshot COPY survives inherited statement timeouts
+      - name: Snapshot timeouts and replication slot lifecycle
         if: matrix.suite == 'compatibility'
-        run: target/debug/snapshot_timeout_tests --ignored
+        run: |
+          target/debug/snapshot_timeout_tests --ignored
+          target/debug/snapshot_slots_tests --ignored
       - name: Crash recovery and concurrent compaction
         if: matrix.suite == 'compatibility'
         run: >-

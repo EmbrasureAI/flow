@@ -130,6 +130,10 @@ This will be the initial public release, `0.1.0`.
 
 ### Fixed
 
+- Failed snapshot initialization now attempts to drop the permanent replication
+  slot created by that attempt, preserving the original error if cleanup fails.
+  Existing slots, successful initialization and temporary-slot cleanup are
+  unchanged.
 - A streamed transaction could publish the changes of a savepoint it had
   rolled back. When PostgreSQL spills a transaction and later streams a
   savepoint with more than 4096 changes from the spill, it sends no abort for
