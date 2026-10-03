@@ -163,9 +163,21 @@ fn recover_published_copy(
     remove_staging(config, table, copy)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct InitOptions {
+    pub add_tables: bool,
+    pub resnapshot: Option<String>,
+}
+
 /// Creates the permanent source incarnation once; subsequent calls resume its
 /// per-table copies without resetting that slot or its durable CDC journal.
 pub async fn initialize(config: Config) -> Result<()> {
+    initialize_with_options(config, InitOptions::default()).await
+}
+
+/// Resume or initialize source tables, with optional support for adding new
+/// tables or re-snapshotting a single table without resetting the source slot.
+pub async fn initialize_with_options(config: Config, options: InitOptions) -> Result<()> {
     // Storage metric handles bind to the recorder on first FileIO access.
     let observation = crate::observation::Observation::install()?;
     let started = std::time::Instant::now();
@@ -176,8 +188,31 @@ pub async fn initialize(config: Config) -> Result<()> {
         crate::lifecycle::state_lock_acquired();
         let mut boot = match store.source_transaction(BOOTSTRAP)? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
-            None => prepare_source(&config, &store, catalog.as_ref()).await?,
+            None => {
+                ensure!(
+                    !options.add_tables,
+                    crate::exit::config(
+                        "cannot add tables: source is not initialized yet; run init first without --add-tables"
+                    )
+                );
+                ensure!(
+                    options.resnapshot.is_none(),
+                    crate::exit::config(
+                        "cannot resnapshot: source is not initialized yet; run init first without --resnapshot"
+                    )
+                );
+                prepare_source(&config, &store, catalog.as_ref()).await?
+            }
         };
+        if let Some(table_name) = &options.resnapshot {
+            resnapshot_table(&config, &store, catalog.as_ref(), &mut boot, table_name).await?;
+        } else if options.add_tables {
+            if config.tables.len() > boot.schemas.len() {
+                add_configured_tables(&config, &store, catalog.as_ref(), &mut boot).await?;
+            } else {
+                tracing::info!("no new tables to add: all configured tables are already initialized");
+            }
+        }
         validate_config(&config, &boot)?;
         resume(&config, store, catalog, &mut boot).await
     }
@@ -230,6 +265,23 @@ async fn open_bootstrap_state(config: &Config, catalog: Arc<dyn Catalog>) -> Res
     }
 }
 
+pub(crate) fn validate_column_selection_prefix(config: &Config, boot: &Bootstrap) -> Result<()> {
+    let prefix_projections = config
+        .tables
+        .iter()
+        .take(boot.schemas.len())
+        .enumerate()
+        .filter_map(|(index, table)| table.projection().map(|_| index))
+        .collect::<Vec<_>>();
+    ensure!(
+        boot.explicit_projections == prefix_projections,
+        crate::exit::config(
+            "column selection mode differs from durable bootstrap; resynchronization is required"
+        )
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Result<()> {
     ensure!(
         boot.explicit_projections
@@ -243,6 +295,35 @@ pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Re
             "column selection mode differs from durable bootstrap; resynchronization is required"
         )
     );
+    Ok(())
+}
+
+pub(crate) fn validate_existing_prefix(config: &Config, boot: &Bootstrap) -> Result<()> {
+    validate_column_selection_prefix(config, boot)?;
+    ensure!(
+        boot.source_id == config.source.id
+            && boot.slot == config.source.slot
+            && boot.publication == config.source.publication,
+        crate::exit::config("source incarnation differs from durable bootstrap")
+    );
+    ensure!(
+        boot.schemas.len() <= config.tables.len(),
+        crate::exit::config(
+            "configured tables were removed; removing tables requires resynchronization"
+        )
+    );
+    for index in 0..boot.schemas.len() {
+        ensure!(
+            config.tables[index].schema(boot.schemas[index].table_id.0) == boot.schemas[index]
+                && (
+                    config.tables[index].target_namespace.clone(),
+                    config.tables[index].target_table.clone()
+                ) == boot.targets[index],
+            crate::exit::config(
+                "existing configured schema or target differs from durable bootstrap"
+            )
+        );
+    }
     Ok(())
 }
 
@@ -261,7 +342,9 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
     validate_identity(config, boot)?;
     ensure!(
         boot.schemas.len() == config.tables.len() && boot.targets.len() == config.tables.len(),
-        crate::exit::config("configured source tables differ from durable bootstrap")
+        crate::exit::config(
+            "configured source tables differ from durable bootstrap; run `embrasure-flow init --add-tables` to initialize newly added tables, or resynchronize if tables were removed"
+        )
     );
     for (index, configured) in config.tables.iter().enumerate() {
         ensure!(
@@ -275,6 +358,161 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
     }
     Ok(())
 }
+
+async fn add_configured_tables(
+    config: &Config,
+    store: &StateStore,
+    catalog: &dyn Catalog,
+    boot: &mut Bootstrap,
+) -> Result<()> {
+    validate_existing_prefix(config, boot)?;
+    let sql = crate::retry::startup("source connection", || connect(config, false)).await?;
+    let start_index = boot.schemas.len();
+    for index in start_index..config.tables.len() {
+        let configured = &config.tables[index];
+        let (relation, _) = fetch_relation(
+            &sql,
+            &configured.source_namespace,
+            &configured.source_table,
+            !configured.append_only,
+        )
+        .await?;
+        let schema = configured.schema(relation.id);
+        ensure!(
+            !boot.schemas.iter().any(|s| s.table_id == schema.table_id),
+            crate::exit::config(format!(
+                "table {}.{} has the same table id {} as an existing configured table",
+                configured.source_namespace,
+                configured.source_table,
+                schema.table_id.0
+            ))
+        );
+        validate_source_table(&sql, configured, &schema).await?;
+        let id = target(&configured.target_namespace, &configured.target_table)?;
+        if !catalog.namespace_exists(&id.namespace).await? {
+            catalog
+                .create_namespace(&id.namespace, HashMap::new())
+                .await?;
+        }
+        if !catalog.table_exists(&id).await? {
+            let created = catalog
+                .create_table(
+                    &id.namespace,
+                    TableCreation::builder()
+                        .name(id.name.clone())
+                        .format_version(configured.format_version)
+                        .schema(flow_materializer::iceberg_schema(&schema)?)
+                        .build(),
+                )
+                .await?;
+            ensure!(
+                created.metadata().format_version() == configured.format_version,
+                "catalog created target with format {}, requested {}",
+                created.metadata().format_version(),
+                configured.format_version,
+            );
+        }
+        let existing = catalog.load_table(&id).await?;
+        ensure!(
+            existing.metadata().current_snapshot_id().is_none()
+                && *existing.metadata().current_schema().as_ref()
+                    == flow_materializer::iceberg_schema(&schema)?,
+            "initial target must be empty and match the configured schema"
+        );
+        boot.target_uuids.push(existing.metadata().uuid());
+        store.complete_noop(&schema.table_id, PgLsn(0), schema.version)?;
+        if configured.projection().is_some() {
+            boot.explicit_projections.push(index);
+        }
+        boot.targets.push((
+            configured.target_namespace.clone(),
+            configured.target_table.clone(),
+        ));
+        boot.schemas.push(schema);
+        tracing::info!(
+            event = "table_added_to_bootstrap",
+            source = %format!("{}.{}", configured.source_namespace, configured.source_table),
+            table_id = relation.id,
+            "added new table to bootstrap"
+        );
+    }
+    validate_publication(&sql, config, &boot.schemas, true).await?;
+    boot.copied = false;
+    persist_bootstrap(store, boot)?;
+    Ok(())
+}
+
+async fn resnapshot_table(
+    config: &Config,
+    store: &StateStore,
+    catalog: &dyn Catalog,
+    boot: &mut Bootstrap,
+    table_name: &str,
+) -> Result<()> {
+    validate_config(config, boot)?;
+    let index = config
+        .tables
+        .iter()
+        .position(|t| {
+            let full_name = format!("{}.{}", t.source_namespace, t.source_table);
+            full_name == table_name
+                || t.source_table == table_name
+                || (t.source_namespace == "public" && t.source_table == table_name)
+        })
+        .ok_or_else(|| {
+            crate::exit::config(format!(
+                "table {table_name} not found in configuration tables"
+            ))
+        })?;
+    let configured = &config.tables[index];
+    let schema = &boot.schemas[index];
+    let (namespace, name) = &boot.targets[index];
+    let id = target(namespace, name)?;
+    tracing::info!(
+        event = "resnapshot_initiated",
+        table = %table_name,
+        table_id = schema.table_id.0,
+        "resetting table state and target for per-table re-snapshot"
+    );
+
+    // 1. Delete staging journal and table copy record
+    if let Some(old_copy) = TableCopy::load(store, schema.table_id)? {
+        remove_staging(config, schema.table_id, &old_copy)?;
+    }
+    store.delete_source_transaction(&TableCopy::key(schema.table_id))?;
+
+    // 2. Clear RocksDB row index and live counts for this table
+    store.clear_table_index(&schema.table_id)?;
+
+    // 3. Reset table_state in store to clean slate
+    store.complete_noop(&schema.table_id, PgLsn(0), schema.version)?;
+
+    // 4. Drop and recreate target table in Iceberg catalog so it is empty
+    if catalog.table_exists(&id).await? {
+        catalog.drop_table(&id).await?;
+    }
+    let created = catalog
+        .create_table(
+            &id.namespace,
+            TableCreation::builder()
+                .name(id.name.clone())
+                .format_version(configured.format_version)
+                .schema(flow_materializer::iceberg_schema(schema)?)
+                .build(),
+        )
+        .await?;
+    boot.target_uuids[index] = created.metadata().uuid();
+    boot.copied = false;
+    persist_bootstrap(store, boot)?;
+    tracing::info!(
+        event = "resnapshot_prepared",
+        table = %table_name,
+        table_id = schema.table_id.0,
+        "target table recreated and state cleared; ready for copy"
+    );
+    Ok(())
+}
+
 
 async fn prepare_source(
     config: &Config,
@@ -598,7 +836,7 @@ pub(crate) async fn resume(
                     &mut ledger,
                     schema.table_id,
                     &copy,
-                    initial_cut,
+                    copy.cut,
                     table_state.snapshot_id.unwrap_or(0),
                 )?;
                 continue;
@@ -713,6 +951,7 @@ pub(crate) async fn resume(
         let table = targets[&schema.table_id].clone();
         let exported = exported.clone();
         async move {
+            let cut = copy.cut;
             copy_and_publish(
                 config,
                 &store,
@@ -728,6 +967,7 @@ pub(crate) async fn resume(
                 },
             )
             .await
+            .map(|(table_id, snapshot)| (table_id, snapshot, cut))
             .with_context(|| {
                 format!(
                     "initial snapshot for {}.{}",
@@ -746,9 +986,9 @@ pub(crate) async fn resume(
             result = work.next() => {
                 let Some(result) = result else { break; };
                 match result {
-                    Ok((table, snapshot)) => {
-                        if ledger.watermarks().materialized_lsn < initial_cut
-                            && let Err(error) = ledger.table_materialized(initial_cut, table, snapshot) {
+                    Ok((table, snapshot, cut)) => {
+                        if ledger.watermarks().materialized_lsn < cut
+                            && let Err(error) = ledger.table_materialized(cut, table, snapshot) {
                             failure.get_or_insert(error);
                         }
                     }
