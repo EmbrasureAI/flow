@@ -54,16 +54,16 @@ CREATE PUBLICATION embrasure_flow FOR TABLE public.orders
 
 Mutable tables need a primary key and one of two replica identities:
 
-- `REPLICA IDENTITY FULL` works for every supported column type. PostgreSQL
-  logs the complete old row for each update and delete, so it writes more WAL.
-- `REPLICA IDENTITY DEFAULT` (PostgreSQL's default) also works when every
-  replicated column has a fixed-width type: `boolean`, `smallint`, `integer`,
-  `bigint`, `real`, `double precision`, `date`, `time`, `timestamp`,
-  `timestamptz`, `uuid`, an enum, or a domain over one of these. Such values
-  cannot be TOASTed, so every update carries the complete new row without the
-  extra old-row WAL. A table with any variable-width replicated column (`text`,
-  `numeric`, `jsonb`, arrays and so on) needs FULL; excluding such a column with
-  explicit `column_selection` does not change this.
+- `REPLICA IDENTITY DEFAULT` (PostgreSQL's default) is recommended. PostgreSQL
+  omits an out-of-line (TOAST) value from an update that does not change it.
+  Flow carries that value forward from the key's earlier image in the same
+  publication epoch, or from its row in the current Iceberg snapshot after
+  checking the row fingerprint recorded in the write-side index. It never
+  queries the source for the value and never publishes a placeholder.
+- `REPLICA IDENTITY FULL` makes PostgreSQL log the complete old row for each
+  update and delete, so it writes more WAL. Use it for tables whose primary
+  keys change: a key change that leaves a TOASTed value unchanged has no prior
+  image under DEFAULT, so that table blocks and needs a resync.
 
 `check --source` and `discover` report which identity each table needs. Tables
 without a primary key can only be replicated in append-only mode.
@@ -180,7 +180,7 @@ the pipeline. See [operations](operations.md#before-initialization).
 
 Mutable tables require a primary key and a [supported replica identity](#replica-identity). Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; they may include other tables. During streaming, a committed TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
 
-An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values block the affected table rather than publishing an incomplete row.
+An unchanged TOAST value is recovered from the complete old tuple under FULL, or carried forward from the key's previous row under DEFAULT. A value with no prior image blocks the affected table rather than publishing an incomplete row.
 
 ```sh
 export FLOW_POSTGRES_URL='postgres://user:password@host/database?sslmode=verify-full&sslrootcert=/etc/flow/postgres-ca.pem'
@@ -222,7 +222,7 @@ authentication; bind it to a private interface. See [observability](observabilit
 | Source connection environment variable is missing | Export the variable named by `source.connection_env` in the process running Flow. |
 | Publication not found or a configured table is missing | Create the named publication in the source database with every configured table and all four operation flags. It may include other tables. |
 | Publication no longer matches the capture contract | A configured table was removed or given a row filter or column list: only that table is blocked with `publication_changed` and needs a resync. A missing publication or unpublished operation stops capture; every start for that slot then fails with "requires resynchronization before capture can resume". Restoring the setting does not clear either; changes may have been skipped. |
-| Replica identity or primary-key validation fails | Set FULL replica identity, or DEFAULT when every replicated column is [fixed-width](#replica-identity), and match the complete primary key in `primary_key`; keyless tables require append-only mode. `discover` generates matching blocks. |
+| Replica identity or primary-key validation fails | Set DEFAULT or FULL [replica identity](#replica-identity) and match the complete primary key in `primary_key`; keyless tables require append-only mode. `discover` generates matching blocks. |
 | Source column name or type differs | Match column order, names and the type mappings; check `column_selection` if intentionally excluding columns. |
 | Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. `check --source` validates the PostgreSQL side; plain `check` validates none of them. Tables blocked with `catalog_auth` need new or broader catalog credentials. |
 | Catalog TLS certificate verification fails | Trust the catalog's CA through the system store, `SSL_CERT_FILE`, or `catalog.tls_ca_file`, and connect with a host name the certificate covers. |

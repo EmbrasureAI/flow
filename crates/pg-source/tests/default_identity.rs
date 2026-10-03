@@ -257,7 +257,7 @@ fn default_never_repairs_unchanged_toast_from_key_null_placeholders() {
 }
 
 #[test]
-fn default_eligibility_rejects_variable_width_and_other_identities() {
+fn default_eligibility_accepts_variable_width_and_rejects_other_identities() {
     let (mut schema, mut relation) = fixture();
     for identity in *b"ni" {
         relation.replica_identity = identity;
@@ -272,17 +272,116 @@ fn default_eligibility_rejects_variable_width_and_other_identities() {
     ] {
         relation.columns[1].type_oid = oid;
         schema.columns[1].data_type = kind;
-        let error = relation.validate_schema(&schema).unwrap_err().to_string();
-        assert!(
-            error.contains("public.items column body") && error.contains("REPLICA IDENTITY FULL"),
-            "{error}"
-        );
+        relation.validate_schema(&schema).unwrap();
     }
     relation.replica_identity = b'f';
     relation.validate_schema(&schema).unwrap();
     schema.append_only = true;
     relation.replica_identity = b'n';
     relation.validate_schema(&schema).unwrap();
+}
+
+fn text_body_capture(root: &std::path::Path) -> (TableSchema, CaptureAssembler, Journal) {
+    let (mut schema, mut relation) = fixture();
+    schema.columns[1].data_type = ColumnType::String;
+    relation.columns[1].type_oid = 25;
+    let (mut journal, _) = Journal::open(root.join("journal"), JournalConfig::default()).unwrap();
+    let spool = TransactionSpool::open(root.join("spool"), SpoolConfig::default()).unwrap();
+    let mut capture =
+        CaptureAssembler::new(SourceId("s".into()), spool, [schema.clone()], 256).unwrap();
+    capture
+        .push(SourceEvent::Relation(relation), &mut journal)
+        .unwrap();
+    capture
+        .push(
+            SourceEvent::Begin {
+                xid: 1,
+                final_lsn: PgLsn(100),
+                commit_timestamp_micros: 0,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    (schema, capture, journal)
+}
+
+/// A DEFAULT-identity update omits an unchanged out-of-line value. Capture keeps
+/// it explicitly unchanged for collapse/publication instead of blocking the table.
+#[test]
+fn default_unchanged_toast_is_captured_as_an_unchanged_value() {
+    let root = tempfile::tempdir().unwrap();
+    let (schema, mut capture, mut journal) = text_body_capture(root.path());
+    let mut row = tuple([Some(7), None, Some(1)]);
+    row[1] = Cell::UnchangedToast;
+    capture
+        .push(
+            SourceEvent::Update {
+                xid: 1,
+                subxid: 1,
+                relation: 11,
+                old: None,
+                old_is_key: false,
+                row,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    let txn = capture
+        .push(
+            SourceEvent::Commit {
+                xid: 1,
+                commit_lsn: PgLsn(100),
+                end_lsn: PgLsn(108),
+                commit_timestamp_micros: 0,
+            },
+            &mut journal,
+        )
+        .unwrap()
+        .unwrap();
+    let mutations: Vec<Mutation> = journal
+        .chunks(&txn.mutation_chunks)
+        .unwrap()
+        .flat_map(|b| bincode::deserialize::<Vec<Mutation>>(&b.unwrap()).unwrap())
+        .collect();
+    let row = vec![Value::Int32(7), Value::Unchanged, Value::Int32(1)];
+    assert_eq!(
+        mutations,
+        vec![Mutation {
+            table_id: TableId(11),
+            schema_version: 1,
+            kind: MutationKind::Update {
+                old_key: schema.encode_partial_key(&row).unwrap(),
+                row,
+            },
+        }]
+    );
+}
+
+/// A changed key has only a key-only old tuple, so the new key has no complete
+/// prior image. Key values themselves can never be unchanged.
+#[test]
+fn default_unchanged_toast_with_a_key_change_or_key_value_stays_blocked() {
+    for (old, unchanged) in [(Some(tuple([Some(7), None, Some(1)])), 1), (None, 2)] {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut capture, mut journal) = text_body_capture(root.path());
+        let mut row = tuple([Some(8), Some(5), Some(2)]);
+        row[unchanged] = Cell::UnchangedToast;
+        assert!(matches!(
+            capture.push(
+                SourceEvent::Update {
+                    xid: 1,
+                    subxid: 1,
+                    relation: 11,
+                    old_is_key: old.is_some(),
+                    old,
+                    row,
+                },
+                &mut journal,
+            ),
+            Err(Error::UnchangedToast(11))
+        ));
+        assert_eq!(journal.durable_lsn(), PgLsn(0));
+    }
 }
 
 #[test]

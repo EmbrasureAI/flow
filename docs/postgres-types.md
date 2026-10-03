@@ -61,8 +61,9 @@ change the representation of an initialized table in place.
   NULL; JSON `null` becomes the non-NULL string `null`, and JSON `"null"` retains
   its JSON quotes. Object key order and whitespace
   normalize, and the last duplicate object key wins. JSONB already has PostgreSQL's
-  normalized semantics. Large unchanged TOAST fields still use the validated FULL
-  old tuple; the decoder never queries the source per row.
+  normalized semantics. Large unchanged TOAST fields use the validated FULL
+  old tuple, or the previous row under DEFAULT; the decoder never queries the
+  source per row.
 * Arrays preserve order, dimensions as nested JSON arrays, and null elements.
   A null array and an empty array remain different. PostgreSQL lower-bound labels
   are discarded: `[0:1]={10,20}` becomes `[10,20]`. The binary decoder reuses

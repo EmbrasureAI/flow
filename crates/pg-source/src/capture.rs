@@ -645,11 +645,12 @@ impl CaptureAssembler {
                         operation: "UPDATE",
                     });
                 }
-                if row.iter().any(|cell| matches!(cell, Cell::UnchangedToast)) {
+                let mut partial = row.iter().any(|cell| matches!(cell, Cell::UnchangedToast));
+                if partial && metadata.replica_identity == b'f' {
                     // pgoutput omits unchanged TOAST values from the new tuple,
                     // even with FULL identity. Its complete old tuple supplies
                     // those values without consulting mutable source state.
-                    if metadata.replica_identity != b'f' || old_is_key {
+                    if old_is_key {
                         return Err(Error::UnchangedToast(relation));
                     }
                     let previous = old.as_ref().ok_or(Error::UnchangedToast(relation))?;
@@ -662,12 +663,25 @@ impl CaptureAssembler {
                             *cell = previous.clone();
                         }
                     }
+                    partial = false;
+                } else if partial && old.is_some() {
+                    // DEFAULT sends a key-only old tuple only when the key
+                    // changed. The new key's row has no prior image to carry.
+                    return Err(Error::UnchangedToast(relation));
                 }
-                let row = decode_row_with_types(schema, metadata, &row, &self.types)?;
+                // Under DEFAULT, the omitted values stay explicitly unchanged.
+                // Collapse and publication carry the key's previous values forward.
+                let row = if partial {
+                    decode_update_row_with_types(schema, metadata, &row, &self.types)?
+                } else {
+                    decode_row_with_types(schema, metadata, &row, &self.types)?
+                };
                 let old_key = if let Some(old) = old {
                     decode_key(schema, metadata, &old, &self.types)?
                 } else {
-                    schema.encode_key(&row)?
+                    // Without an old tuple the key is unchanged; omitted values
+                    // are never key columns.
+                    schema.encode_partial_key(&row)?
                 };
                 let mutation = Mutation {
                     table_id: schema.table_id,
@@ -1075,6 +1089,38 @@ fn decode_key(
         });
     }
     Ok(key_schema.encode_key(&values)?)
+}
+
+/// Decode an update image whose non-key unchanged TOAST values remain
+/// [`Value::Unchanged`]. Only DEFAULT-identity updates without a key change
+/// produce such images.
+fn decode_update_row_with_types(
+    schema: &TableSchema,
+    relation: &Relation,
+    tuple: &Tuple,
+    types: &crate::TypeRegistry,
+) -> Result<Row> {
+    types.validate_relation(schema, relation)?;
+    if tuple.len() != relation.columns.len() {
+        return Err(Error::Protocol("tuple column count differs from relation"));
+    }
+    let mut row = Vec::with_capacity(tuple.len());
+    for (index, ((cell, column), pg)) in tuple
+        .iter()
+        .zip(&schema.columns)
+        .zip(&relation.columns)
+        .enumerate()
+    {
+        row.push(match cell {
+            Cell::Null => Value::Null,
+            Cell::UnchangedToast if !schema.primary_key.contains(&index) => Value::Unchanged,
+            Cell::UnchangedToast => return Err(Error::UnchangedToast(relation.id)),
+            Cell::Text(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, false)?,
+            Cell::Binary(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, true)?,
+        });
+    }
+    schema.validate_partial_row(&row)?;
+    Ok(row)
 }
 
 pub fn decode_row(schema: &TableSchema, relation: &Relation, tuple: &Tuple) -> Result<Row> {
