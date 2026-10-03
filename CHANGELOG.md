@@ -130,6 +130,9 @@ This will be the initial public release, `0.1.0`.
 
 ### Fixed
 
+- PostgreSQL date and timestamp arrays accept finite values beyond Chrono's
+  calendar range whenever scalar decoding supports them, preserving the existing
+  JSON string representation and rejection of infinite dates and timestamps.
 - A streamed transaction could publish the changes of a savepoint it had
   rolled back. When PostgreSQL spills a transaction and later streams a
   savepoint with more than 4096 changes from the spill, it sends no abort for

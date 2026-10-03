@@ -1110,6 +1110,10 @@ fn postgres_era(text: &str) -> (&str, bool) {
         .map_or((text, false), |date| (date, true))
 }
 
+const DAYS_PER_ERA: i64 = 146_097;
+const POSTGRES_EPOCH_DAY: i64 = 730_425;
+const UNIX_EPOCH_DAY: i64 = POSTGRES_EPOCH_DAY - 10_957;
+
 // PostgreSQL emits unsigned wide years and a BC suffix. Integer Gregorian
 // arithmetic covers its full finite range, beyond chrono's calendar range.
 fn postgres_days(date: &str, bc: bool) -> Option<i64> {
@@ -1152,9 +1156,30 @@ fn postgres_days(date: &str, bc: bool) -> Option<i64> {
     let month = i64::from(month) + if month > 2 { -3 } else { 9 };
     let day_of_year = (153 * month + 2) / 5 + i64::from(day) - 1;
     Some(
-        era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
-            - 730_425,
+        era * DAYS_PER_ERA + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+            - POSTGRES_EPOCH_DAY,
     )
+}
+
+/// Invert the March-based Gregorian conversion above for model (Unix) days.
+/// Keep the array JSON convention: astronomical years and a sign outside 0000..9999.
+pub(crate) fn date_string(days: i32) -> String {
+    let days = i64::from(days) + UNIX_EPOCH_DAY;
+    let era = days.div_euclid(DAYS_PER_ERA);
+    let day_of_era = days.rem_euclid(DAYS_PER_ERA);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year = era * 400 + year_of_era;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month + 2) / 5 + 1;
+    let month = month + if month < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    if (0..=9999).contains(&year) {
+        format!("{year:04}-{month:02}-{day:02}")
+    } else {
+        format!("{year:+05}-{month:02}-{day:02}")
+    }
 }
 
 fn postgres_offset(offset: &str) -> Option<i64> {
@@ -1190,7 +1215,7 @@ fn date_value(days: i64, kind: &ColumnType) -> Result<Value> {
         return Err(invalid(kind));
     }
     Ok(Value::Date(
-        i32::try_from(days + 10_957).map_err(|_| invalid(kind))?,
+        i32::try_from(days + POSTGRES_EPOCH_DAY - UNIX_EPOCH_DAY).map_err(|_| invalid(kind))?,
     ))
 }
 
