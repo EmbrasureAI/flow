@@ -321,6 +321,17 @@ async fn live_busy_slot_waits_and_row_errors_block_only_their_table() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
 async fn live_default_identity_carries_unchanged_toast_values_forward() {
+    carries_unchanged_toast_values_forward(false).await;
+}
+
+/// Moving a live FULL table to DEFAULT keeps it publishing complete rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_full_to_default_identity_switch_keeps_publishing() {
+    carries_unchanged_toast_values_forward(true).await;
+}
+
+async fn carries_unchanged_toast_values_forward(switch_from_full: bool) {
     use arrow_array::{Array, Int64Array, StringArray};
     use futures::TryStreamExt;
     let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
@@ -332,8 +343,10 @@ async fn live_default_identity_carries_unchanged_toast_values_forward() {
         "CREATE SCHEMA {name};
          CREATE TABLE {name}.docs (id bigint PRIMARY KEY, body text, version bigint);
          ALTER TABLE {name}.docs ALTER COLUMN body SET STORAGE EXTERNAL;
+         ALTER TABLE {name}.docs REPLICA IDENTITY {};
          INSERT INTO {name}.docs SELECT id, repeat(md5(id::text), 1000), 0 FROM generate_series(1, 3) id;
-         CREATE PUBLICATION {name} FOR TABLE {name}.docs;"
+         CREATE PUBLICATION {name} FOR TABLE {name}.docs;",
+        if switch_from_full { "FULL" } else { "DEFAULT" }
     ))
     .await
     .unwrap();
@@ -345,7 +358,7 @@ async fn live_default_identity_carries_unchanged_toast_values_forward() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(identity, "d");
+    assert_eq!(identity, if switch_from_full { "f" } else { "d" });
     let root = tempfile::tempdir().unwrap();
     let mut config: Config = toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
     config.state_dir = root.path().join("state");
@@ -394,6 +407,15 @@ async fn live_default_identity_carries_unchanged_toast_values_forward() {
         let daemon = crate::runtime::run(config.clone(), false);
         tokio::pin!(daemon);
         let checks = async {
+            if switch_from_full {
+                // A live FULL table moves to DEFAULT: the same schema, not a block.
+                sql.batch_execute(&format!(
+                    "UPDATE {name}.docs SET version = 0 WHERE id = 3;
+                     ALTER TABLE {name}.docs REPLICA IDENTITY DEFAULT;"
+                ))
+                .await
+                .unwrap();
+            }
             // Rows 1 and 2 resolve from the initial copy's Iceberg rows; row 2
             // changes twice in one transaction; row 4 resolves in-epoch.
             sql.batch_execute(&format!(

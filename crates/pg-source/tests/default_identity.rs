@@ -428,3 +428,27 @@ fn key_only_delete_ignores_non_key_not_null_but_rejects_missing_key_values() {
         assert_eq!(journal.durable_lsn(), PgLsn(0));
     }
 }
+
+/// Switching a live table between FULL and DEFAULT keeps its schema: both
+/// capture keyed rows with the same columns. NOTHING and USING INDEX differ.
+#[test]
+fn full_and_default_identity_are_the_same_wire_schema() {
+    let (_, relation) = fixture();
+    for (left, right, same) in [
+        (b'f', b'd', true),
+        (b'd', b'f', true),
+        (b'd', b'd', true),
+        (b'f', b'n', false),
+        (b'd', b'i', false),
+    ] {
+        let mut old = relation.clone();
+        let mut new = relation.clone();
+        old.replica_identity = left;
+        new.replica_identity = right;
+        assert_eq!(
+            flow_pg_source::same_wire_schema(&old, &new),
+            same,
+            "{left} -> {right}"
+        );
+    }
+}

@@ -65,6 +65,10 @@ Mutable tables need a primary key and one of two replica identities:
   keys change: a key change that leaves a TOASTed value unchanged has no prior
   image under DEFAULT, so that table blocks and needs a resync.
 
+A live table can switch between DEFAULT and FULL with `ALTER TABLE ... REPLICA
+IDENTITY`; Flow treats both as the same schema and keeps publishing. NOTHING and
+USING INDEX are rejected.
+
 `check --source` and `discover` report which identity each table needs. Tables
 without a primary key can only be replicated in append-only mode.
 

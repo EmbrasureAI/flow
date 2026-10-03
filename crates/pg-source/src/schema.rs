@@ -199,15 +199,22 @@ pub fn same_wire_schema(left: &Relation, right: &Relation) -> bool {
     left.id == right.id
         && left.namespace == right.namespace
         && left.name == right.name
-        && left.replica_identity == right.replica_identity
+        && same_identity_class(left.replica_identity, right.replica_identity)
         && left.columns.len() == right.columns.len()
         && wire_prefix(left, right)
+}
+/// FULL and DEFAULT both capture keyed changes with identical column values;
+/// capture reads each event's own Relation to resolve unchanged values. A switch
+/// between them is therefore not a schema change. NOTHING and USING INDEX remain
+/// distinct so mutable validation still sees them.
+fn same_identity_class(left: u8, right: u8) -> bool {
+    left == right || (matches!(left, b'f' | b'd') && matches!(right, b'f' | b'd'))
 }
 fn wire_prefix(prefix: &Relation, next: &Relation) -> bool {
     prefix.id == next.id
         && prefix.namespace == next.namespace
         && prefix.name == next.name
-        && prefix.replica_identity == next.replica_identity
+        && same_identity_class(prefix.replica_identity, next.replica_identity)
         && prefix.columns.len() <= next.columns.len()
         && prefix.columns.iter().zip(&next.columns).all(|(old, new)| {
             old.name == new.name

@@ -28,6 +28,7 @@ This will be the initial public release, `0.1.0`.
   row image in the epoch or its indexed Iceberg row, so variable-width tables no
   longer need `FULL`. A primary-key change that leaves such a value unchanged
   blocks the table; keep `FULL` for tables whose keys change.
+  A live table can switch between `DEFAULT` and `FULL` without blocking.
 - Administrator-managed publications, including `FOR ALL TABLES` and
   `FOR TABLES IN SCHEMA`; Flow ignores tables it does not capture. A contract
   change to one configured table blocks only that table.
