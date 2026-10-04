@@ -339,7 +339,7 @@ async fn shared_puffin_counts_backing_requests_and_decodes_every_blob() {
     );
     assert_eq!(f.stage().await.unwrap(), 6);
     f.assert_positions();
-    assert_eq!(f.endpoint.counts.requests(), (6, 12)); // Baseline, before optimization.
+    assert_eq!(f.endpoint.counts.requests(), (1, 12));
 }
 
 #[tokio::test]
@@ -347,7 +347,7 @@ async fn multiple_puffin_files_count_backing_requests() {
     let f = Fixture::new(&[2, 2, 1], 1, Duration::ZERO, false).await;
     f.stage().await.unwrap();
     f.assert_positions();
-    assert_eq!(f.endpoint.counts.requests(), (10, 20)); // Baseline.
+    assert_eq!(f.endpoint.counts.requests(), (3, 20));
 }
 
 #[tokio::test]
@@ -384,7 +384,7 @@ async fn a_new_scan_rechecks_metadata_and_replaces_scratch_positions() {
         f.endpoint.counts.reset();
         f.stage().await.unwrap();
         f.assert_positions();
-        assert_eq!(f.endpoint.counts.requests(), (6, 12)); // Baseline.
+        assert_eq!(f.endpoint.counts.requests(), (1, 12));
     }
 }
 
@@ -398,7 +398,7 @@ async fn metadata_failure_can_be_retried_by_a_new_scan() {
     f.endpoint.counts.reset();
     f.stage().await.unwrap();
     f.assert_positions();
-    assert_eq!(f.endpoint.counts.requests(), (6, 12)); // Baseline.
+    assert_eq!(f.endpoint.counts.requests(), (1, 12));
 }
 
 #[tokio::test]

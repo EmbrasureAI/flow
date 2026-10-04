@@ -125,3 +125,49 @@ Decision: implement a scan-local size reuse and feed that observed size to the
 bounded Puffin reader. Both metadata calls must be addressed; then repeat the
 same workload and retain all validation. Do not change cumulative representation
 or range reads in this patch.
+
+## Implementation and safety
+
+`load_deletes` now holds a `HashMap<&str, u64>` for Puffin paths for the duration
+of one call. Only a successful storage metadata observation enters it. Every
+logical descriptor still compares its manifest size with the observed value,
+including descriptors encountered after a cache hit. Parquet handling is unchanged.
+
+The bounded reader now exposes `read_deletion_vector_with_size(&InputFile, ...)`.
+The existing `read_deletion_vector` entry point still observes metadata and keeps
+its pre-I/O validation order, then delegates to the same reader. The compactor
+passes the already observed size, not a trusted manifest size. This removes the
+second HEAD without duplicating or bypassing validation. The vendor provenance
+and replay patch are included.
+
+- Correctness: applicability, sequence filtering, row/byte budgets, cancellation,
+  range bounds, footer matching, checksum, cardinality and row-position checks
+  remain in their existing order in the loader/reader.
+- Freshness: the map is destroyed when the scan returns or fails. A later scan
+  observes storage again; there is no process-wide or publication-attempt cache.
+- Retries: OpenDAL's request retry behavior is unchanged. Failed observations
+  return their original error. A new scan starts fresh and discards prior scratch
+  state. HEAD counts in this report are for successful requests without retries.
+- Immutability: within-call reuse assumes published objects are immutable, as
+  the writer and Iceberg model require. Out-of-band replacement during the scan
+  is outside that contract; neither the old HEAD/GET sequence nor this patch
+  provides transactional reads of mutable objects. Same-size corruption remains
+  subject to the unchanged framing/CRC/identity checks.
+- Memory: O(unique Puffin paths), with borrowed path strings and one u64 size per
+  entry plus HashMap allocation overhead. No blobs or footer payloads are cached.
+- Error handling: the manifest-size mismatch text remains exactly
+  `delete file size differs from manifest`, even for a later shared descriptor.
+  The failed-HEAD and corrupt-later-blob tests exercise error propagation.
+
+New tests in `crates/compactor/tests/puffin_metadata.rs`:
+
+| Test | Evidence |
+| --- | --- |
+| `shared_puffin_counts_backing_requests_and_decodes_every_blob` | Three distinct offsets and lengths in one writer-produced object; one HEAD, twelve GETs, exact positions. |
+| `multiple_puffin_files_count_backing_requests` | Five vectors distributed 2/2/1; three HEADs, twenty GETs, exact positions. |
+| `every_descriptor_must_match_the_observed_object_size` | Wrong manifest sizes on the first and a later descriptor preserve the existing error. |
+| `a_new_scan_rechecks_metadata_and_replaces_scratch_positions` | Repeated calls each issue their own HEAD and retain the same exact staged positions. |
+| `metadata_failure_can_be_retried_by_a_new_scan` | HTTP 404 propagates before any GET; the next successful call observes metadata and loads all positions. |
+| `corrupt_blob_is_still_rejected` | A checksum error in the second blob is rejected after metadata has already been reused. |
+| `shared_puffin_preparation_benchmark` (ignored) | Repeatable before/after staging, copy, rebuild and memory-only decoding measurements. |
+| `baseline_metadata_request_cost` (ignored) | Independent cost of the original 128 HEAD requests through the actual S3 adapter. |

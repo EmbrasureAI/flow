@@ -82,3 +82,7 @@ The direct reader comparison uses the `post-workload-reader` metadata locations 
 These results were measured on a pre-release development build, which predates
 a later fix to shared-Puffin consolidation. A build of current source produces
 new evidence, not these exact timings.
+
+A [focused shared-Puffin metadata investigation](shared-puffin-metadata.md)
+counts backing HEAD/range requests and measures scan-local size reuse. Its local
+protocol-fixture timings are separate from the ingestion runs above.
