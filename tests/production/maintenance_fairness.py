@@ -135,9 +135,12 @@ class FairnessRun(ConcurrentRun):
         materialized = admitted["watermarks"]["materialized_lsn"]
         assert materialized < self.barrier, "build started only after the source backlog drained"
         assert admitted["pending_transactions"] > 0, "build admission did not overlap queued work"
-        pressure = [value for key, value in self.metrics().items()
-                    if key.startswith("flow_table_publication_pressure{")]
-        assert pressure and max(pressure) < 2, "hard debt, not fairness, admitted the build"
+        # Build logs and status can precede the throttled metrics export. Wait
+        # for pressure samples, but never retry away an observed hard debt.
+        pressure = self.until("publication pressure metrics were not exported", lambda:
+            [value for key, value in self.metrics().items()
+             if key.startswith("flow_table_publication_pressure{")], timeout=5)
+        assert max(pressure) < 2, f"hard debt, not fairness, admitted the build: {pressure}"
         def progressed():
             status = self.status()
             return status if status["watermarks"]["materialized_lsn"] > materialized else None
