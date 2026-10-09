@@ -29,3 +29,9 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+# Exercise the production S3 adapter against a request-counting local endpoint.
+[dev-dependencies.iceberg-storage-opendal]
+version = "=0.10.1"
+default-features = false
+features = ["opendal-s3"]
