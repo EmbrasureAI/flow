@@ -3,8 +3,7 @@
 ## Source baseline and path
 
 Baseline: upstream `main` at `2ed96d7bddd2294c9d3afd501ab217be1d1a528a`, fetched
-2026-10-04. The investigation branch is local. The existing snapshot-cleanup
-branch was left intact in its original checkout.
+2026-10-04. The path below describes the baseline before metadata reuse.
 
 1. `crates/materializer/src/deletion_vector.rs`: `VectorWriter::finish_target`
    appends one bitmap blob per target. `finish_object` closes the Puffin writer,
@@ -68,7 +67,7 @@ object upload. Neither the sum nor any one timer is full `other_prepare` or
 end-to-end publication throughput. Added server delay is a sensitivity experiment;
 Tokio timer granularity means it is not an exact simulated network RTT.
 
-Commands and results follow after the baseline and candidate runs.
+Commands and fresh baseline/candidate results are recorded below.
 
 ## Follow-up candidates (outside this patch)
 
@@ -171,3 +170,83 @@ New tests in `crates/compactor/tests/puffin_metadata.rs`:
 | `corrupt_blob_is_still_rejected` | A checksum error in the second blob is rejected after metadata has already been reused. |
 | `shared_puffin_preparation_benchmark` (ignored) | Repeatable before/after staging, copy, rebuild and memory-only decoding measurements. |
 | `baseline_metadata_request_cost` (ignored) | Independent cost of the original 128 HEAD requests through the actual S3 adapter. |
+
+## Review fixes and reproduction
+
+The original observed-size patch used repository-relative paths, which failed
+with the documented `patch -p1` invocation from an extracted crate. Its paths
+now match the other vendor patches (`a/src/...`, `b/src/...`). Applying it with
+`--fuzz=0` to the pre-optimization sources reproduces both current vendored
+files byte-for-byte.
+
+The HTTP-backed regression suite also checks an actual physical-size change
+between scans, recovery after a later blob fails with partial scratch state,
+and validation parity between the original and observed-size reader APIs.
+The original API still performs a HEAD on every call; the observed-size API
+performs none. Both reject invalid ranges, target/cardinality mismatches and
+resource-limit violations, with argument validation preceding all I/O. These tests live in the workspace so normal CI runs
+them; vendored-crate unit tests are excluded from `cargo test --workspace`.
+
+Run correctness checks and timings separately; concurrent builds and test runs
+can distort the benchmark. Use a separate Cargo target directory per checkout.
+If sharing one, run `cargo clean -p iceberg -p flow-compactor` before switching
+between baseline and candidate to prevent reuse of the other checkout's build
+artifacts. The candidate benchmark asserts its HEAD/GET counts before reporting
+timings.
+
+
+```sh
+cargo test --locked -j 2 -p flow-compactor -p flow-materializer -p flow-coordinator
+cargo test --locked -j 2 -p flow-testkit --test vendor_deletion_vectors --test v3_pipeline
+cargo clippy --locked -j 2 -p flow-compactor -p flow-materializer -p flow-coordinator --all-targets --no-deps -- -D warnings
+cargo fmt --all --check
+cargo test --locked -j 2 -p flow-compactor --test puffin_metadata shared_puffin_preparation_benchmark -- --ignored --exact --nocapture --test-threads=1
+cargo test --locked -j 2 -p flow-compactor --test puffin_metadata baseline_metadata_request_cost -- --ignored --exact --nocapture --test-threads=1
+```
+
+The HTTP fixture requires permission to bind a loopback socket. No external
+object store or credentials are needed.
+
+## Fresh comparison, 2026-10-09
+
+Rebuilt baseline production sources from `c4d5c73` and candidate sources from
+`ff50fd6` with the review tests. Both used the same HTTP fixture and timing
+workload, including the fixture's object-replacement lock. The baseline omitted
+the new-API-only regression test because that symbol does not exist there.
+Changed-package artifacts were cleared between builds. A trial candidate run
+that reused baseline artifacts failed the request-count regressions; its timings
+were discarded and both versions were rebuilt. The candidate benchmark now
+asserts request counts before reporting timings.
+
+Two warmups and nine measured iterations per case, run serially on the same
+host/toolchain/test profile described above. Median load/stage time in ms:
+
+| Base cardinality | Delay/request (ms) | Baseline | Candidate |
+| ---: | ---: | ---: | ---: |
+| 16 | 0 | 341.330 | 239.069 |
+| 16 | 2 | 1593.597 | 1108.206 |
+| 4096 | 0 | 2205.077 | 2027.408 |
+
+All three workloads went from **128 HEADs to 2**. Both versions issued 256 range
+GETs and read identical bytes: 421,024 for the small workloads and 949,568 for
+the large workload. Every iteration verified the exact staged positions.
+The independent 128-HEAD probe measured **80.533 ms median** in this run.
+The PR description's 16.1 ms isolated-HEAD claim is not supported by the recorded
+baseline or this rerun and should be replaced with these measured results.
+
+These are local observations, not production capacity estimates. Large-workload
+sample ranges overlap; the runs do not establish a robust speedup for that case.
+RocksDB scratch copying and bitmap reconstruction remain substantial costs.
+No AWS/MinIO, release-profile, ingestion-throughput, or full-publication benchmark
+was run. The artificial delay case demonstrates sensitivity to metadata latency.
+
+Validation: 67 affected-crate tests and 10 v3 pipeline/vendor-reader integration
+tests passed. All nine HTTP regressions and both normally ignored measurement
+tests then passed in the final serial run. Formatting and affected-crate Clippy
+passed. The separate standalone vendored-crate unit suite was not run; workspace
+integration tests exercised both public reader APIs. One unrelated ignored
+benchmark in the affected-crate suite was not run.
+
+Raw local evidence: `target/puffin-review-baseline-benchmark.log`,
+`target/puffin-review-candidate-benchmark.log`, `target/puffin-review-tests.log`,
+`target/puffin-review-v3.log`, and `target/puffin-review-clippy.log`.

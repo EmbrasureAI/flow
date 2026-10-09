@@ -1,7 +1,7 @@
-diff --git a/vendor/iceberg/src/puffin/deletion_vector.rs b/vendor/iceberg/src/puffin/deletion_vector.rs
+diff --git a/src/puffin/deletion_vector.rs b/src/puffin/deletion_vector.rs
 index 84c45ff..5239ba1 100644
---- a/vendor/iceberg/src/puffin/deletion_vector.rs
-+++ b/vendor/iceberg/src/puffin/deletion_vector.rs
+--- a/src/puffin/deletion_vector.rs
++++ b/src/puffin/deletion_vector.rs
 @@ -22,7 +22,7 @@ use roaring::{RoaringBitmap, RoaringTreemap};
  
  use super::{CompressionCodec, DELETION_VECTOR_V1, FileMetadata};
@@ -68,10 +68,10 @@ index 84c45ff..5239ba1 100644
      if size < 20 || end > size - 16 {
          return Err(invalid("Deletion vector byte range exceeds Puffin file"));
      }
-diff --git a/vendor/iceberg/src/puffin/mod.rs b/vendor/iceberg/src/puffin/mod.rs
+diff --git a/src/puffin/mod.rs b/src/puffin/mod.rs
 index 649bc6d..c1cb9d2 100644
---- a/vendor/iceberg/src/puffin/mod.rs
-+++ b/vendor/iceberg/src/puffin/mod.rs
+--- a/src/puffin/mod.rs
++++ b/src/puffin/mod.rs
 @@ -29,6 +29,7 @@ mod deletion_vector;
  pub use crate::delete_vector::DeleteVector;
  pub use deletion_vector::{

@@ -2,7 +2,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -56,6 +56,7 @@ struct Endpoint {
     url: String,
     counts: Arc<Counts>,
     task: tokio::task::JoinHandle<()>,
+    objects: Arc<RwLock<HashMap<String, bytes::Bytes>>>,
 }
 impl Drop for Endpoint {
     fn drop(&mut self) {
@@ -68,7 +69,8 @@ impl Endpoint {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let counts = Arc::new(Counts::default());
         let state = counts.clone();
-        let objects = Arc::new(objects);
+        let objects = Arc::new(RwLock::new(objects));
+        let served_objects = objects.clone();
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -76,7 +78,7 @@ impl Endpoint {
                     accepted = listener.accept() => {
                         let (mut socket, _) = accepted.unwrap();
                         let counts = state.clone();
-                        let objects = objects.clone();
+                        let objects = served_objects.clone();
                         connections.spawn(async move {
                             // Keep connections alive so OpenDAL can reuse its HTTP pool.
                             loop {
@@ -92,7 +94,7 @@ impl Endpoint {
                                 let mut first = request.lines().next().unwrap().split_whitespace();
                                 let method = first.next().unwrap();
                                 let path = first.next().unwrap();
-                                let object = &objects[path];
+                                let object = objects.read().unwrap()[path].clone();
                                 if !delay.is_zero() { tokio::time::sleep(delay).await; }
                                 let response = if method == "HEAD" {
                                     counts.heads.fetch_add(1, Ordering::SeqCst);
@@ -123,7 +125,18 @@ impl Endpoint {
                 }
             }
         });
-        Self { url, counts, task }
+        Self {
+            url,
+            counts,
+            task,
+            objects,
+        }
+    }
+    fn replace(&self, path: &str, bytes: bytes::Bytes) {
+        self.objects
+            .write()
+            .unwrap()
+            .insert(path.strip_prefix("s3:/").unwrap().to_owned(), bytes);
     }
     fn io(&self) -> FileIO {
         FileIOBuilder::new(Arc::new(OpenDalResolvingStorageFactory::new()))
@@ -414,6 +427,228 @@ async fn corrupt_blob_is_still_rejected() {
 }
 
 #[tokio::test]
+async fn a_new_scan_rejects_a_changed_physical_size() {
+    let f = Fixture::new(&[3], 1, Duration::ZERO, false).await;
+    f.stage().await.unwrap();
+    let path = f.view.live_files[&f.deletes.first().unwrap().0].file_path();
+    let original = f.source_io.new_input(path).unwrap().read().await.unwrap();
+    let mut changed = original.to_vec();
+    changed.push(0);
+    f.endpoint.replace(path, changed.into());
+    f.endpoint.counts.reset();
+    assert_eq!(
+        f.stage().await.unwrap_err().to_string(),
+        "delete file size differs from manifest"
+    );
+    assert_eq!(f.endpoint.counts.requests(), (1, 0));
+    f.endpoint.replace(path, original);
+    f.endpoint.counts.reset();
+    f.stage().await.unwrap();
+    f.assert_positions();
+    assert_eq!(f.endpoint.counts.requests(), (1, 12));
+}
+
+#[tokio::test]
+async fn retry_after_a_later_blob_failure_discards_partial_scratch_state() {
+    let mut f = Fixture::new(&[3], 1, Duration::ZERO, true).await;
+    assert!(
+        f.stage()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch")
+    );
+    assert_eq!(f.endpoint.counts.requests(), (1, 8));
+    assert_eq!(
+        f.store.position_deletes("scan", &f.schema.table_id).count(),
+        1
+    );
+
+    let first = f.deletes.pop_first().unwrap();
+    let descriptor = &f.view.live_files[&first.0].data_file;
+    let path = descriptor.file_path();
+    let original = f.source_io.new_input(path).unwrap().read().await.unwrap();
+    f.endpoint.replace(path, original);
+    // Retry a smaller selection to prove the previously staged row is removed.
+    let target = descriptor.referenced_data_file().unwrap();
+    f.expected.retain(|row| row.data_file_id.0 != target);
+    f.endpoint.counts.reset();
+    f.stage().await.unwrap();
+    f.assert_positions();
+    assert_eq!(f.endpoint.counts.requests(), (1, 8));
+}
+
+#[tokio::test]
+async fn observed_size_reader_preserves_validation_and_original_api_metadata() {
+    use iceberg::puffin::{
+        DeletionVectorLimits, read_deletion_vector, read_deletion_vector_with_size,
+    };
+    let f = Fixture::new(&[3], 1, Duration::ZERO, false).await;
+    let d = &f.view.live_files[&f.deletes.iter().nth(1).unwrap().0].data_file;
+    let io = f.table.file_io();
+    let input = io.new_input(d.file_path()).unwrap();
+    let size = input.metadata().await.unwrap().size;
+    let offset = d.content_offset().unwrap() as u64;
+    let length = d.content_size_in_bytes().unwrap() as u64;
+    let target = d.referenced_data_file().unwrap();
+    let cardinality = d.record_count();
+    let limits = DeletionVectorLimits::default();
+    f.endpoint.counts.reset();
+    for _ in 0..2 {
+        let decoded = read_deletion_vector(
+            io,
+            d.file_path(),
+            offset,
+            length,
+            &target,
+            cardinality,
+            limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decoded.iter().collect::<Vec<_>>(), [0, 2]);
+    }
+    assert_eq!(f.endpoint.counts.requests(), (2, 8));
+    f.endpoint.counts.reset();
+    let decoded =
+        read_deletion_vector_with_size(&input, size, offset, length, &target, cardinality, limits)
+            .await
+            .unwrap();
+    assert_eq!(decoded.iter().collect::<Vec<_>>(), [0, 2]);
+    assert_eq!(f.endpoint.counts.requests(), (0, 4));
+
+    for (offset, length, target, cardinality, limits, expected) in [
+        (
+            0,
+            length,
+            target.as_str(),
+            cardinality,
+            limits,
+            "overlaps Puffin header",
+        ),
+        (
+            u64::MAX,
+            length,
+            target.as_str(),
+            cardinality,
+            limits,
+            "byte range overflow",
+        ),
+        (
+            size,
+            length,
+            target.as_str(),
+            cardinality,
+            limits,
+            "exceeds Puffin file",
+        ),
+        (
+            offset,
+            length,
+            "wrong-target",
+            cardinality,
+            limits,
+            "metadata does not match",
+        ),
+        (
+            offset,
+            length,
+            target.as_str(),
+            cardinality + 1,
+            limits,
+            "metadata does not match",
+        ),
+        (
+            offset,
+            length,
+            target.as_str(),
+            cardinality,
+            DeletionVectorLimits {
+                max_blob_bytes: length - 1,
+                ..limits
+            },
+            "blob length exceeds limits",
+        ),
+        (
+            offset,
+            length,
+            target.as_str(),
+            cardinality,
+            DeletionVectorLimits {
+                max_cardinality: cardinality - 1,
+                ..limits
+            },
+            "cardinality exceeds limit",
+        ),
+        (
+            offset,
+            length,
+            target.as_str(),
+            cardinality,
+            DeletionVectorLimits {
+                max_footer_bytes: 1,
+                ..limits
+            },
+            "footer length exceeds limit",
+        ),
+    ] {
+        let (heads, gets) = match expected {
+            "metadata does not match" => (1, 3),
+            "footer length exceeds limit" => (1, 2),
+            "exceeds Puffin file" => (1, 0),
+            _ => (0, 0), // Argument validation must precede all I/O.
+        };
+        f.endpoint.counts.reset();
+        let original = read_deletion_vector(
+            io,
+            d.file_path(),
+            offset,
+            length,
+            target,
+            cardinality,
+            limits,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(f.endpoint.counts.requests(), (heads, gets));
+        f.endpoint.counts.reset();
+        let observed = read_deletion_vector_with_size(
+            &input,
+            size,
+            offset,
+            length,
+            target,
+            cardinality,
+            limits,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(original.to_string(), observed.to_string());
+        assert!(observed.to_string().contains(expected), "{observed}");
+        assert_eq!(f.endpoint.counts.requests(), (0, gets));
+    }
+    for size in [0, 19] {
+        f.endpoint.counts.reset();
+        assert!(
+            read_deletion_vector_with_size(
+                &input,
+                size,
+                offset,
+                length,
+                &target,
+                cardinality,
+                limits
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds Puffin file")
+        );
+        assert_eq!(f.endpoint.counts.requests(), (0, 0));
+    }
+}
+
+#[tokio::test]
 #[ignore = "focused timing workload; run explicitly with --ignored --nocapture"]
 async fn shared_puffin_preparation_benchmark() {
     for (cardinality, delay_ms) in [(16, 0), (16, 2), (4096, 0)] {
@@ -431,6 +666,8 @@ async fn shared_puffin_preparation_benchmark() {
             f.stage().await.unwrap();
             let stage = start.elapsed();
             let counts = f.endpoint.counts.requests();
+            // Do not report candidate timings if the intended reader was not used.
+            assert_eq!(counts, (2, f.deletes.len() * 4));
             let bytes = f.endpoint.counts.bytes.load(Ordering::SeqCst);
             let start = Instant::now();
             let mut decoded = 0;
