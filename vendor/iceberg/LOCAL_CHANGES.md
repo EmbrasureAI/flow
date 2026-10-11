@@ -65,6 +65,7 @@ patch -p1 < docs/patches/iceberg-uuid.patch
 patch -p1 < docs/patches/iceberg-v3.patch
 patch -p1 < docs/patches/iceberg-source-nullability.patch
 patch -p1 < docs/patches/iceberg-debug-redaction.patch
+patch -p1 < docs/patches/iceberg-scan-shared-entry.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is
@@ -87,3 +88,9 @@ redacted values, since they carry object-store credentials; `FileIO` and
 
 `src/puffin/deletion_vector.rs` is new Embrasure Flow code added by the v3 patch,
 not Apache Software Foundation code; it carries its own Apache-2.0 header.
+
+The scan cleanup removes an obsolete TODO about an expensive manifest-entry
+clone and uses `Arc::clone` explicitly. Manifest entries are already shared
+through `ManifestEntryRef`, so this does not change behavior or improve
+performance. Changed file: `src/scan/context.rs`. See
+`docs/patches/iceberg-scan-shared-entry.patch`.
