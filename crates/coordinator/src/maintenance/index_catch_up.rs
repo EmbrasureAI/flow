@@ -8,7 +8,7 @@
 //! added files, without rescanning unchanged data. Removals and insertions are
 //! separate operations because a moved key may appear only once per operation.
 //! Any disagreement with the index fails; the caller rebuilds from scratch.
-use super::{TableMaintenance, index_rows, worker_runtime};
+use super::{TableMaintenance, file_paths, index_rows, worker_runtime};
 use crate::blocking;
 use anyhow::{Context, Result, ensure};
 use flow_iceberg_ext::SnapshotView;
@@ -27,20 +27,14 @@ pub struct CatchUpStats {
     pub added_rows: u64,
 }
 
-fn data_files(view: &SnapshotView) -> BTreeSet<FileId> {
-    view.live_files
-        .values()
-        .filter(|entry| entry.content_type() == DataContentType::Data)
-        .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
-        .collect()
-}
-
-fn delete_files(view: &SnapshotView) -> BTreeSet<String> {
-    view.live_files
-        .values()
-        .filter(|entry| entry.content_type() != DataContentType::Data)
-        .map(|entry| flow_iceberg_ext::content_file_id(&entry.data_file))
-        .collect()
+impl std::ops::AddAssign for CatchUpStats {
+    fn add_assign(&mut self, other: Self) {
+        self.removed_files += other.removed_files;
+        self.added_files += other.added_files;
+        self.changed_files += other.changed_files;
+        self.removed_rows += other.removed_rows;
+        self.added_rows += other.added_rows;
+    }
 }
 
 impl TableMaintenance {
@@ -82,18 +76,24 @@ impl TableMaintenance {
                 .context("checkpoint snapshot is no longer retained")?,
             None => SnapshotView::default(),
         };
-        let before = data_files(&previous);
-        let after = data_files(&current);
+        let before = file_paths(&previous, DataContentType::Data);
+        let after = file_paths(&current, DataContentType::Data);
         let removed: BTreeSet<_> = before.difference(&after).cloned().collect();
         let added: BTreeSet<_> = after.difference(&before).cloned().collect();
-        let old_deletes = delete_files(&previous);
         // Shared files can only lose rows, through deletes the checkpoint lacked.
+        let new_deletes: BTreeSet<_> = file_paths(&current, DataContentType::PositionDeletes)
+            .difference(&file_paths(&previous, DataContentType::PositionDeletes))
+            .cloned()
+            .collect();
         let mut changed = BTreeSet::new();
-        for file in before.intersection(&after) {
-            if current.applicable_deletes(&file.0)?.iter().any(|entry| {
-                !old_deletes.contains(&flow_iceberg_ext::content_file_id(&entry.data_file))
-            }) {
-                changed.insert(file.clone());
+        if !new_deletes.is_empty() {
+            for file in before.intersection(&after) {
+                if current.applicable_deletes(&file.0)?.iter().any(|entry| {
+                    new_deletes
+                        .contains(&FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
+                }) {
+                    changed.insert(file.clone());
+                }
             }
         }
         let mut stats = CatchUpStats {
@@ -127,7 +127,6 @@ impl TableMaintenance {
         let read_limits = self.read_limits.clone();
         let worker_table = head.clone();
         let worker_schema = schema.clone();
-        let worker_index = index.clone();
         let base_sequence = match checkpoint_snapshot {
             Some(id) => head
                 .metadata()
@@ -140,11 +139,10 @@ impl TableMaintenance {
         let checkpoint_schema = state.schema_version;
         let removal = OperationId(format!("catch-up-remove-{}", uuid::Uuid::new_v4()));
         let insertion = OperationId(format!("catch-up-insert-{}", uuid::Uuid::new_v4()));
-        let staged = insertion.clone();
-        let (removed_rows, added_rows) =
-            tokio::task::spawn_blocking(move || -> Result<(u64, u64)> {
-                let index = worker_index;
-                let insertion = staged;
+        let (removed_rows, added_rows) = tokio::task::spawn_blocking({
+            let index = index.clone();
+            let insertion = insertion.clone();
+            move || -> Result<(u64, u64)> {
                 let batch_rows = index.batch_rows();
                 // 1. Remove entries whose rows are no longer live at the head.
                 let mut removed_rows = 0u64;
@@ -198,23 +196,24 @@ impl TableMaintenance {
                         index.stage_deltas(&removal, deltas)?;
                         Ok(())
                     };
-                    for file in &removed {
-                        for row in index.file_rows(&table_id, file) {
-                            pending.push(row?);
-                            if pending.len() >= batch_rows {
-                                stage(&mut pending, file)?;
-                            }
-                        }
-                        stage(&mut pending, file)?;
-                    }
-                    for file in &changed {
-                        let deleted = scratch
-                            .file_position_deletes(&deletes_scan, &table_id, file)
-                            .map(|location| location.map(|location| location.row_position))
-                            .collect::<flow_state_store::Result<BTreeSet<_>>>()?;
+                    // Removed files lose every row; changed files their deleted positions.
+                    for file in removed.iter().chain(&changed) {
+                        let deleted = if removed.contains(file) {
+                            None
+                        } else {
+                            Some(
+                                scratch
+                                    .file_position_deletes(&deletes_scan, &table_id, file)
+                                    .map(|location| location.map(|location| location.row_position))
+                                    .collect::<flow_state_store::Result<BTreeSet<_>>>()?,
+                            )
+                        };
                         for row in index.file_rows(&table_id, file) {
                             let (position, key) = row?;
-                            if deleted.contains(&position) {
+                            if deleted
+                                .as_ref()
+                                .is_none_or(|deleted| deleted.contains(&position))
+                            {
                                 pending.push((position, key));
                                 if pending.len() >= batch_rows {
                                     stage(&mut pending, file)?;
@@ -265,8 +264,9 @@ impl TableMaintenance {
                 ))?;
                 index.seal_prepare(&insertion, Vec::new(), Vec::new())?;
                 Ok((removed_rows, added_rows))
-            })
-            .await??;
+            }
+        })
+        .await??;
         stats.removed_rows = removed_rows;
         stats.added_rows = added_rows;
         let (snapshot_id, sequence) = snapshot

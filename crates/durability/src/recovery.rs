@@ -56,29 +56,6 @@ pub struct Layout {
     pub derived: Vec<String>,
 }
 
-impl Default for Layout {
-    fn default() -> Self {
-        Self {
-            control: "control".into(),
-            journals: vec!["journal".into()],
-            files: vec![
-                "source-identity.json".into(),
-                "publication-resync-required.json".into(),
-            ],
-            derived: [
-                "index",
-                "index-generations",
-                "checkpoints",
-                "bootstrap",
-                "spool",
-                "index-clean-shutdown",
-            ]
-            .map(String::from)
-            .to_vec(),
-        }
-    }
-}
-
 impl Layout {
     fn local_state_exists(&self, state_dir: &Path) -> bool {
         state_dir.join(&self.control).join("CURRENT").exists()
@@ -145,7 +122,9 @@ fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_durable(path: &Path, data: &[u8]) -> Result<()> {
+/// Replace `path` atomically and durably: write a temporary file, sync it,
+/// rename it into place and sync the directory.
+pub fn write_durable(path: &Path, data: &[u8]) -> Result<()> {
     let temporary = path.with_extension("durability-tmp");
     let mut file = File::create(&temporary)?;
     file.write_all(data)?;
@@ -865,6 +844,19 @@ pub(crate) async fn recover(
 mod tests {
     use super::*;
 
+    fn layout() -> Layout {
+        Layout {
+            control: "control".into(),
+            journals: vec!["journal".into()],
+            files: vec!["source-identity.json".into()],
+            derived: vec![
+                "index".into(),
+                "index-generations".into(),
+                "checkpoints".into(),
+            ],
+        }
+    }
+
     fn batch(epoch: u64, seq: u64, first_ordinal: u64, records: Vec<Record>) -> Batch {
         Batch {
             epoch,
@@ -981,7 +973,7 @@ mod tests {
             "memory://test",
             "source",
             state.path(),
-            &Layout::default(),
+            &layout(),
             Duration::from_secs(1),
             None,
         )

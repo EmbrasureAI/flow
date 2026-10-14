@@ -132,21 +132,19 @@ pub(crate) struct State {
     pub stats: Stats,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub batches: u64,
     pub records: u64,
     pub bytes: u64,
     pub retries: u64,
     pub checkpoints: u64,
-    pub last_checkpoint_ms: u64,
     pub deleted_objects: u64,
 }
 
 pub(crate) struct Shared {
     pub state: Mutex<State>,
     space: Condvar,
-    progress: Condvar,
     /// Increments on every frontier, lease or failure change for async waiters.
     changed: watch::Sender<u64>,
     pub wake_writer: Notify,
@@ -176,7 +174,6 @@ impl Shared {
                 stats: Stats::default(),
             }),
             space: Condvar::new(),
-            progress: Condvar::new(),
             changed: watch::channel(0).0,
             wake_writer: Notify::new(),
             renew_lease: Notify::new(),
@@ -193,7 +190,6 @@ impl Shared {
     }
 
     fn notify(&self) {
-        self.progress.notify_all();
         self.space.notify_all();
         self.changed.send_modify(|version| *version += 1);
     }
@@ -324,27 +320,15 @@ impl Shared {
         self.wait_async(target, false).await
     }
 
-    /// Block until every record appended so far is durable and this owner
-    /// still holds its lease. Waits as long as object storage is unavailable;
-    /// fails only once replication has stopped.
-    pub(crate) fn barrier_blocking(&self) -> Result<()> {
-        let started = Instant::now();
-        let mut warned = started;
-        let mut state = self.lock();
-        let target = state.next_ordinal - 1;
+    /// Resolves once replication has stopped.
+    pub(crate) async fn failed(&self) -> anyhow::Error {
+        let mut changed = self.changed.subscribe();
         loop {
-            let now = Instant::now();
-            if self.satisfied(&state, target, now)? {
-                metrics::histogram!("flow_durability_barrier_seconds")
-                    .record(started.elapsed().as_secs_f64());
-                return Ok(());
+            if let Some(error) = failure(self) {
+                return error;
             }
-            self.warn_stalled(&mut warned, started, target, &state);
-            state = self
-                .progress
-                .wait_timeout(state, Duration::from_millis(250))
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
+            // `self` owns the sender, so the channel never closes here.
+            let _ = changed.changed().await;
         }
     }
 

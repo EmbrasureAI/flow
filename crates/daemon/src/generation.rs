@@ -93,7 +93,7 @@ fn options(config: &Config) -> StateStoreOptions {
 
 /// Present only between a clean exit and the next open. Its absence means the
 /// previous process crashed, lost power, or stopped with an error.
-const CLEAN_SHUTDOWN: &str = "index-clean-shutdown";
+pub(crate) const CLEAN_SHUTDOWN: &str = "index-clean-shutdown";
 
 pub(crate) fn open(config: &Config, control: ControlStore) -> Result<StateStore> {
     crate::disk::warn_if_insufficient(config);
@@ -336,7 +336,7 @@ pub(crate) async fn rebuild(
     let mut checkpoints = control.checkpoints()?;
     checkpoints.sort_by_key(|checkpoint| std::cmp::Reverse(checkpoint.revision));
     let mut restored_candidate = None;
-    for checkpoint in checkpoints.clone() {
+    for checkpoint in &checkpoints {
         let usable = checkpoint.pending_operations.is_empty()
             && checkpoint.tables.len() == authority.len()
             && checkpoint.tables.iter().all(|(id, state)| {
@@ -351,24 +351,9 @@ pub(crate) async fn rebuild(
         if !usable || !checkpoint.path.join("CURRENT").is_file() {
             continue;
         }
-        let directory = candidate_directory(&config.state_dir)?;
-        let candidate = directory.path().to_owned();
-        let authority = control.clone();
-        let options = options(config);
-        match tokio::task::spawn_blocking(move || {
-            let index = authority.restore_checkpoint(&checkpoint, candidate, options)?;
-            index.validate_storage()?;
-            Ok::<_, flow_state_store::Error>(index)
-        })
-        .await?
-        {
-            Ok(index) => {
-                restored_candidate = Some(RebuildCandidate::new(index, directory));
-                break;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "checkpoint restore failed; trying another recovery source");
-            }
+        restored_candidate = restore_candidate(config, &control, checkpoint).await?;
+        if restored_candidate.is_some() {
+            break;
         }
     }
     if restored_candidate.is_none() {
@@ -379,7 +364,7 @@ pub(crate) async fn rebuild(
             &schemas,
             targets,
             &authority,
-            checkpoints,
+            &checkpoints,
         )
         .await?;
     }
@@ -397,13 +382,7 @@ pub(crate) async fn rebuild(
         let mut scratch_directory =
             CleanupDirectory::new(candidate.directory.path().with_extension("scratch"));
         let scratch = StateStore::open(scratch_directory.path(), options(config))?;
-        let maintenance = TableMaintenance::new(
-            candidate.store().clone(),
-            catalog.clone(),
-            config.compaction.clone(),
-            crate::services::writer_config(config),
-        )?
-        .with_read_limits(config.parquet_read.clone())?;
+        let maintenance = index_maintenance(config, candidate.store(), &catalog)?;
         for schema in &schemas {
             let table = targets
                 .get(&schema.table_id)
@@ -485,12 +464,11 @@ async fn catch_up_checkpoint(
     schemas: &[TableSchema],
     targets: &BTreeMap<TableId, Table>,
     authority: &BTreeMap<TableId, flow_state_store::TableState>,
-    checkpoints: Vec<flow_state_store::CheckpointRecord>,
+    checkpoints: &[flow_state_store::CheckpointRecord],
 ) -> Result<Option<RebuildCandidate>> {
     for checkpoint in checkpoints {
-        let tables: BTreeMap<_, _> = checkpoint.tables.iter().cloned().collect();
-        let eligible = tables.len() == authority.len()
-            && tables.iter().all(|(id, state)| {
+        let eligible = checkpoint.tables.len() == authority.len()
+            && checkpoint.tables.iter().all(|(id, state)| {
                 authority.get(id).is_some_and(|current| {
                     state.materialized_lsn <= current.materialized_lsn
                         && state.schema_version <= current.schema_version
@@ -506,25 +484,9 @@ async fn catch_up_checkpoint(
             continue;
         }
         let started = Instant::now();
-        let directory = candidate_directory(&config.state_dir)?;
-        let destination = directory.path().to_owned();
-        let source = control.clone();
-        let restore_options = options(config);
-        let record = checkpoint.clone();
-        let index = match tokio::task::spawn_blocking(move || {
-            let index = source.restore_checkpoint(&record, destination, restore_options)?;
-            index.validate_storage()?;
-            Ok::<_, flow_state_store::Error>(index)
-        })
-        .await?
-        {
-            Ok(index) => index,
-            Err(error) => {
-                tracing::warn!(%error, "checkpoint restore failed; trying another recovery source");
-                continue;
-            }
+        let Some(mut candidate) = restore_candidate(config, control, checkpoint).await? else {
+            continue;
         };
-        let mut candidate = RebuildCandidate::new(index, directory);
         let mut scratch_directory =
             CleanupDirectory::new(candidate.directory.path().with_extension("scratch"));
         let caught_up = async {
@@ -550,13 +512,7 @@ async fn catch_up_checkpoint(
             })
             .await??;
             let scratch = StateStore::open(scratch_directory.path(), options(config))?;
-            let maintenance = TableMaintenance::new(
-                candidate.store().clone(),
-                catalog.clone(),
-                config.compaction.clone(),
-                crate::services::writer_config(config),
-            )?
-            .with_read_limits(config.parquet_read.clone())?;
+            let maintenance = index_maintenance(config, candidate.store(), catalog)?;
             let mut totals = flow_coordinator::CatchUpStats::default();
             for schema in schemas {
                 let current = &authority[&schema.table_id];
@@ -571,11 +527,7 @@ async fn catch_up_checkpoint(
                         current.schema_version,
                     )
                     .await?;
-                totals.removed_files += stats.removed_files;
-                totals.added_files += stats.added_files;
-                totals.changed_files += stats.changed_files;
-                totals.removed_rows += stats.removed_rows;
-                totals.added_rows += stats.added_rows;
+                totals += stats;
             }
             Ok::<_, anyhow::Error>(totals)
         }
@@ -603,6 +555,48 @@ async fn catch_up_checkpoint(
         }
     }
     Ok(None)
+}
+
+/// Restore `checkpoint` into a new candidate generation. A checkpoint that
+/// fails to restore is logged and skipped so another source can be tried.
+async fn restore_candidate(
+    config: &Config,
+    control: &ControlStore,
+    checkpoint: &flow_state_store::CheckpointRecord,
+) -> Result<Option<RebuildCandidate>> {
+    let directory = candidate_directory(&config.state_dir)?;
+    let destination = directory.path().to_owned();
+    let control = control.clone();
+    let record = checkpoint.clone();
+    let options = options(config);
+    match tokio::task::spawn_blocking(move || {
+        let index = control.restore_checkpoint(&record, destination, options)?;
+        index.validate_storage()?;
+        Ok::<_, flow_state_store::Error>(index)
+    })
+    .await?
+    {
+        Ok(index) => Ok(Some(RebuildCandidate::new(index, directory))),
+        Err(error) => {
+            tracing::warn!(%error, "checkpoint restore failed; trying another recovery source");
+            Ok(None)
+        }
+    }
+}
+
+/// Maintenance that writes a rebuilt or caught-up index into `store`.
+fn index_maintenance(
+    config: &Config,
+    store: &StateStore,
+    catalog: &Arc<dyn Catalog>,
+) -> Result<TableMaintenance> {
+    TableMaintenance::new(
+        store.clone(),
+        catalog.clone(),
+        config.compaction.clone(),
+        crate::services::writer_config(config),
+    )?
+    .with_read_limits(config.parquet_read.clone())
 }
 
 fn candidate_directory(state_dir: &Path) -> Result<CleanupDirectory> {

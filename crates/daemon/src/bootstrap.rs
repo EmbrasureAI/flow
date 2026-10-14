@@ -202,7 +202,6 @@ pub async fn initialize(config: Config) -> Result<()> {
 // Reuse the normal generation rebuild before any source ACK or publication.
 async fn open_bootstrap_state(config: &Config, catalog: Arc<dyn Catalog>) -> Result<StateStore> {
     let control = crate::services::open_control(config).await?;
-    crate::durability::restore_index_checkpoint(&control, &config.state_dir).await?;
     match crate::generation::open(config, control.clone()) {
         Ok(store) => Ok(store),
         Err(error)

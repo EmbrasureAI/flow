@@ -17,12 +17,14 @@ const CATALOG_CA_FILE: &str = "tls_ca_file";
 const CATALOG_AUTH_URLS: [&str; 2] = ["uri", "oauth2-server-uri"];
 
 /// Open the control store first and, with remote durability, replicate
-/// everything this process inherited before any external effect.
+/// everything this process inherited before any external effect, and fetch a
+/// replicated index checkpoint if the local index is missing.
 pub(crate) async fn open_control(config: &Config) -> Result<ControlStore> {
     std::fs::create_dir_all(&config.state_dir)?;
     let control = ControlStore::open(config.state_dir.join("control"))?;
     crate::lifecycle::state_lock_acquired();
     crate::durability::attach_control(&control).await?;
+    crate::durability::restore_index_checkpoint(&control, &config.state_dir).await?;
     Ok(control)
 }
 

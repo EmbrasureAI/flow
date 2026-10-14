@@ -287,7 +287,7 @@ pub(crate) fn record_publication_changed<T>(config: &Config, result: Result<T>) 
     result
 }
 
-const RESYNC_MARKER: &str = crate::durability::RESYNC_MARKER;
+pub(crate) const RESYNC_MARKER: &str = "publication-resync-required.json";
 
 /// Durable proof that this slot's capture may have skipped changes. Restoring
 /// the publication cannot recover them, so only a resync may replace it.
@@ -323,16 +323,11 @@ pub(crate) fn require_resync(config: &Config, reason: &str) {
             publication: postgres.publication.clone(),
             reason: reason.to_owned(),
         };
-        let path = config.state_dir.join(RESYNC_MARKER);
-        let temporary = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(&marker)?;
-        let mut file = std::fs::File::create(&temporary)?;
-        std::io::Write::write_all(&mut file, &bytes)?;
-        file.sync_all()?;
-        std::fs::rename(temporary, path)?;
-        std::fs::File::open(&config.state_dir)?.sync_all()?;
-        crate::durability::write_file(RESYNC_MARKER, &bytes)?;
-        Ok(())
+        crate::durability::write_authority_file(
+            &config.state_dir,
+            RESYNC_MARKER,
+            &serde_json::to_vec_pretty(&marker)?,
+        )
     })();
     if let Err(error) = result {
         tracing::error!(%error, "could not persist the resync-required marker");

@@ -23,16 +23,34 @@ use std::{
 
 static ACTIVE: OnceLock<Durability> = OnceLock::new();
 
-/// Authority files below the state directory that replicate whole.
-pub(crate) const SOURCE_IDENTITY: &str = "source-identity.json";
-pub(crate) const RESYNC_MARKER: &str = "publication-resync-required.json";
+/// The state directory entries recovery owns, named where they are written.
+fn layout() -> Layout {
+    Layout {
+        control: "control".into(),
+        journals: vec!["journal".into()],
+        files: vec![
+            crate::source::SOURCE_IDENTITY.into(),
+            crate::lifecycle::RESYNC_MARKER.into(),
+        ],
+        derived: [
+            "index",
+            "index-generations",
+            "checkpoints",
+            "bootstrap",
+            "spool",
+            crate::generation::CLEAN_SHUTDOWN,
+        ]
+        .map(String::from)
+        .to_vec(),
+    }
+}
 
 /// Claim and, if needed, restore the state directory before anything opens it.
 pub(crate) async fn start(config: &Config) -> Result<()> {
     let Some(settings) = &config.durability else {
-        return flow_durability::ensure_state_dir_matches(&config.state_dir, false);
+        return flow_durability::ensure_not_replicated(&config.state_dir);
     };
-    let durability = Durability::open(settings, &config.state_dir, &config.source.id)
+    let durability = Durability::open(settings, &config.state_dir, &config.source.id, layout())
         .await
         .context("start remote durability")?;
     ACTIVE
@@ -40,7 +58,7 @@ pub(crate) async fn start(config: &Config) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("remote durability already started"))
 }
 
-pub(crate) fn active() -> Option<&'static Durability> {
+fn active() -> Option<&'static Durability> {
     ACTIVE.get()
 }
 
@@ -55,7 +73,7 @@ pub(crate) async fn attach_control(control: &ControlStore) -> Result<()> {
 
 async fn attach_with(durability: &Durability, control: &ControlStore) -> Result<()> {
     durability.attach_control(control).await?;
-    durability.baseline(&Layout::default()).await
+    durability.baseline().await
 }
 
 pub(crate) fn attach_journal(journal: &mut Journal) -> Result<()> {
@@ -65,8 +83,10 @@ pub(crate) fn attach_journal(journal: &mut Journal) -> Result<()> {
     }
 }
 
-/// Replicate an authority file that was just written locally.
-pub(crate) fn write_file(name: &str, data: &[u8]) -> Result<()> {
+/// Write an authority file below the state directory atomically and, with
+/// remote durability, replicate it.
+pub(crate) fn write_authority_file(state_dir: &Path, name: &str, data: &[u8]) -> Result<()> {
+    flow_durability::write_durable(&state_dir.join(name), data)?;
     match active() {
         Some(durability) => durability.write_file(name, data),
         None => Ok(()),
@@ -84,11 +104,9 @@ pub(crate) async fn barrier() -> Result<()> {
 /// Resolves only if replication stopped, for example because a newer owner
 /// claimed the state. The process must then stop all external effects.
 pub(crate) async fn failed() -> anyhow::Error {
-    loop {
-        if let Some(error) = active().and_then(Durability::failure) {
-            return error;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    match active() {
+        Some(durability) => durability.failed().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -194,18 +212,18 @@ pub(crate) fn status() -> Option<flow_durability::Status> {
 
 /// Source acknowledgements computed from local state, released in order once
 /// the replicated log covers the state they were computed from.
-pub(crate) struct AckGate<T = Acknowledgement> {
+pub(crate) struct AckGate {
     durability: Option<Durability>,
-    pending: VecDeque<(u64, T)>,
+    pending: VecDeque<(u64, Acknowledgement)>,
 }
 
-impl<T> Default for AckGate<T> {
+impl Default for AckGate {
     fn default() -> Self {
         Self::new(active().cloned())
     }
 }
 
-impl<T> AckGate<T> {
+impl AckGate {
     const LIMIT: usize = 64;
 
     pub(crate) fn new(durability: Option<Durability>) -> Self {
@@ -216,7 +234,7 @@ impl<T> AckGate<T> {
     }
 
     /// Record progress observed now; returns the newest progress safe to send.
-    pub(crate) fn admit(&mut self, progress: T) -> Option<T> {
+    pub(crate) fn admit(&mut self, progress: Acknowledgement) -> Option<Acknowledgement> {
         let Some(durability) = &self.durability else {
             return Some(progress);
         };
@@ -230,7 +248,7 @@ impl<T> AckGate<T> {
     }
 
     /// The newest admitted progress that is now durable, if any.
-    pub(crate) fn ready(&mut self) -> Option<T> {
+    pub(crate) fn ready(&mut self) -> Option<Acknowledgement> {
         let durability = self.durability.as_ref()?;
         let mut latest = None;
         while self
@@ -246,7 +264,7 @@ impl<T> AckGate<T> {
     /// Resolves once the oldest pending progress can be sent; never resolves
     /// while nothing is pending. Owns its inputs so callers may keep using the
     /// gate in other `select!` branches.
-    pub(crate) fn ready_signal(&self) -> impl std::future::Future<Output = Result<()>> + use<T> {
+    pub(crate) fn ready_signal(&self) -> impl std::future::Future<Output = Result<()>> + use<> {
         let durability = self.durability.clone();
         let target = self.pending.front().map(|(position, _)| *position);
         async move {
@@ -288,13 +306,17 @@ impl std::fmt::Debug for FencedCatalog {
 
 impl FencedCatalog {
     async fn guard(&self) -> iceberg::Result<()> {
-        self.durability.barrier().await.map_err(|error| {
-            iceberg::Error::new(
-                iceberg::ErrorKind::Unexpected,
-                format!("remote durability barrier failed before a catalog change: {error:#}"),
-            )
-        })
+        barrier_error(self.durability.barrier().await, "a catalog change")
     }
+}
+
+fn barrier_error(result: Result<()>, effect: &str) -> iceberg::Result<()> {
+    result.map_err(|error| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            format!("remote durability barrier failed before {effect}: {error:#}"),
+        )
+    })
 }
 
 #[async_trait::async_trait]
@@ -376,12 +398,7 @@ impl Catalog for FencedCatalog {
 
 /// Barrier for storage deletions, mapped to the storage error type.
 pub(crate) async fn storage_guard() -> iceberg::Result<()> {
-    barrier().await.map_err(|error| {
-        iceberg::Error::new(
-            iceberg::ErrorKind::Unexpected,
-            format!("remote durability barrier failed before deleting objects: {error:#}"),
-        )
-    })
+    barrier_error(barrier().await, "deleting objects")
 }
 
 #[cfg(test)]
@@ -405,15 +422,9 @@ mod tests {
     }
 
     async fn open(operator: &Operator, state: &std::path::Path) -> Durability {
-        Durability::open_with_operator(
-            &settings(),
-            operator.clone(),
-            state,
-            "source",
-            Layout::default(),
-        )
-        .await
-        .unwrap()
+        Durability::open_with_operator(&settings(), operator.clone(), state, "source", layout())
+            .await
+            .unwrap()
     }
 
     async fn catalog(name: &str) -> Arc<dyn Catalog> {
@@ -492,9 +503,13 @@ mod tests {
         attach_with(&durability, &control).await.unwrap();
         let mut gate = AckGate::new(Some(durability.clone()));
         // A new authority record has not reached object storage yet.
-        durability.write_file(SOURCE_IDENTITY, b"{}").unwrap();
+        durability
+            .write_file(crate::source::SOURCE_IDENTITY, b"{}")
+            .unwrap();
         let first = gate.admit(progress(10));
-        durability.write_file(SOURCE_IDENTITY, b"{}").unwrap();
+        durability
+            .write_file(crate::source::SOURCE_IDENTITY, b"{}")
+            .unwrap();
         let second = gate.admit(progress(20));
         if first.is_none() {
             assert!(gate.is_pending());

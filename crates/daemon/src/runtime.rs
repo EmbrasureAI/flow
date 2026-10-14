@@ -69,7 +69,6 @@ async fn run_service(
 ) -> Result<()> {
     let mut observation = crate::observation::Observation::install()?;
     let control = crate::services::open_control(&config).await?;
-    crate::durability::restore_index_checkpoint(&control, &config.state_dir).await?;
     let opened = crate::generation::open(&config, control.clone());
     if let Ok(store) = &opened {
         witness.observe(store);

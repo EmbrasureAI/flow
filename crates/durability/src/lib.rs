@@ -20,9 +20,7 @@ mod recovery;
 mod store;
 mod writer;
 
-pub use checkpoint::ControlSource;
-pub use recovery::{Layout, Mode, RestoreStats};
-pub use store::operator;
+pub use recovery::{Layout, Mode, RestoreStats, write_durable};
 pub use writer::Stats;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -190,12 +188,8 @@ pub struct Status {
     pub restore: Option<RestoreStats>,
     pub recovery_ms: u64,
     pub waited_for_previous_owner: bool,
-    pub batches: u64,
-    pub records: u64,
-    pub bytes: u64,
-    pub retries: u64,
-    pub checkpoints: u64,
-    pub deleted_objects: u64,
+    #[serde(flatten)]
+    pub stats: Stats,
 }
 
 struct Inner {
@@ -212,12 +206,26 @@ struct Inner {
     recovery: Duration,
     waited: bool,
     state_dir: PathBuf,
+    layout: Layout,
     /// Journal images of the checkpoint recovery started from. The baseline
     /// reuses parts whose bytes still match the local segments.
     inherited: BTreeMap<String, format::JournalImage>,
     operator: Operator,
     runtime: tokio::runtime::Handle,
     index_hashes: Arc<index::Hashes>,
+}
+
+/// What the replication runtime hands back once recovery finished.
+struct Ready {
+    shared: Arc<Shared>,
+    mode: Mode,
+    restore: Option<RestoreStats>,
+    recovery: Duration,
+    waited: bool,
+    replaced: Option<PathBuf>,
+    inherited: BTreeMap<String, format::JournalImage>,
+    operator: Operator,
+    runtime: tokio::runtime::Handle,
 }
 
 /// Handle to the replication process for one source's state directory.
@@ -228,15 +236,19 @@ impl Durability {
     /// Claim ownership, restore local state if object storage is
     /// authoritative, and start replication. Returns before any local state
     /// is opened by the caller.
-    pub async fn open(config: &Config, state_dir: &Path, source_id: &str) -> Result<Self> {
-        config.validate()?;
+    pub async fn open(
+        config: &Config,
+        state_dir: &Path,
+        source_id: &str,
+        layout: Layout,
+    ) -> Result<Self> {
         let operator = store::operator(
             &config.uri,
             config.region.as_deref(),
             config.endpoint.as_deref(),
             Duration::from_secs(config.request_timeout_secs),
         )?;
-        Self::open_with_operator(config, operator, state_dir, source_id, Layout::default()).await
+        Self::open_with_operator(config, operator, state_dir, source_id, layout).await
     }
 
     /// As `open`, with a prepared operator and layout.
@@ -273,6 +285,7 @@ impl Durability {
         let source_id = source_id.to_owned();
         let state_dir = state_dir.to_path_buf();
         let directory = state_dir.clone();
+        let recovery_layout = layout.clone();
         let thread = std::thread::Builder::new()
             .name("flow-durability".into())
             .spawn(move || {
@@ -295,7 +308,7 @@ impl Durability {
                         &uri,
                         &source_id,
                         &directory,
-                        &layout,
+                        &recovery_layout,
                         tuning.lease,
                         identity,
                     )
@@ -330,18 +343,17 @@ impl Durability {
                             recovered.history,
                         )),
                     ];
-                    let _ = ready.send(Ok((
-                        shared.clone(),
-                        recovered.mode,
-                        recovered.restore,
-                        started.elapsed(),
-                        recovered.waited_for_previous_owner,
-                        recovered.epoch,
-                        recovered.replaced_local,
+                    let _ = ready.send(Ok(Ready {
+                        shared: shared.clone(),
+                        mode: recovered.mode,
+                        restore: recovered.restore,
+                        recovery: started.elapsed(),
+                        waited: recovered.waited_for_previous_owner,
+                        replaced: recovered.replaced_local,
                         inherited,
-                        operator.clone(),
-                        tokio::runtime::Handle::current(),
-                    )));
+                        operator: operator.clone(),
+                        runtime: tokio::runtime::Handle::current(),
+                    }));
                     let _ = stopped.await;
                     shared.close();
                     for task in tasks {
@@ -350,24 +362,23 @@ impl Durability {
                 });
                 runtime.shutdown_timeout(Duration::from_secs(1));
             })?;
-        let (
+        let Ready {
             shared,
             mode,
             restore,
             recovery,
             waited,
-            epoch,
             replaced,
             inherited,
             operator,
             runtime,
-        ) = readiness
+        } = readiness
             .await
             .context("durability runtime stopped during recovery")??;
         tracing::info!(
             event = "durability_recovered",
             mode = ?mode,
-            epoch,
+            epoch = shared.epoch,
             elapsed_ms = recovery.as_millis() as u64,
             waited_for_previous_owner = waited,
             restored = ?restore,
@@ -386,6 +397,7 @@ impl Durability {
             recovery,
             waited,
             state_dir,
+            layout,
             inherited,
             operator,
             runtime,
@@ -406,9 +418,7 @@ impl Durability {
         control.attach_mirror(Arc::new(ControlAdapter(self.0.shared.clone())))?;
         self.0
             .requests
-            .send(checkpoint::Request::Control(Arc::new(ControlImage(
-                control.clone(),
-            ))))
+            .send(checkpoint::Request::Control(control.clone()))
             .await
             .context("durability runtime stopped")
     }
@@ -474,8 +484,13 @@ impl Durability {
         Ok(())
     }
 
-    /// Replicate a small authority file after writing it locally.
+    /// Replicate a small authority file after writing it locally. Only files
+    /// named by the layout are restored, so any other name is refused here.
     pub fn write_file(&self, name: &str, data: &[u8]) -> Result<()> {
+        ensure!(
+            self.0.layout.files.iter().any(|file| file == name),
+            "{name} is not a replicated authority file"
+        );
         self.0.shared.append(Item::File {
             name: name.to_owned(),
             data: data.to_vec(),
@@ -487,7 +502,8 @@ impl Durability {
     /// attached, and wait until it is durable. Barriers pass only afterwards,
     /// so nothing this process inherited is visible externally before it is
     /// replicated.
-    pub async fn baseline(&self, layout: &Layout) -> Result<()> {
+    pub async fn baseline(&self) -> Result<()> {
+        let layout = &self.0.layout;
         {
             let mut state = self.0.shared.lock();
             for name in &layout.journals {
@@ -532,11 +548,6 @@ impl Durability {
         self.0.shared.barrier().await
     }
 
-    /// Blocking form of [`Self::barrier`] for synchronous callers.
-    pub fn barrier_blocking(&self) -> Result<()> {
-        self.0.shared.barrier_blocking()
-    }
-
     /// Position of the last appended change.
     pub fn position(&self) -> u64 {
         self.0.shared.position()
@@ -568,12 +579,7 @@ impl Durability {
             restore: self.0.restore.clone(),
             recovery_ms: self.0.recovery.as_millis() as u64,
             waited_for_previous_owner: self.0.waited,
-            batches: state.stats.batches,
-            records: state.stats.records,
-            bytes: state.stats.bytes,
-            retries: state.stats.retries,
-            checkpoints: state.stats.checkpoints,
-            deleted_objects: state.stats.deleted_objects,
+            stats: state.stats.clone(),
         }
     }
 
@@ -621,6 +627,12 @@ impl Durability {
     /// The first error that stopped replication, if any.
     pub fn failure(&self) -> Option<anyhow::Error> {
         writer::failure(&self.0.shared)
+    }
+
+    /// Resolves once replication has stopped, for example because a newer
+    /// owner claimed the state.
+    pub async fn failed(&self) -> anyhow::Error {
+        self.0.shared.failed().await
     }
 
     /// Stop after a final barrier and a release record, so the next owner
@@ -764,23 +776,11 @@ fn scan_journal(root: &Path) -> Result<JournalModel> {
 struct ControlAdapter(Arc<Shared>);
 
 impl ControlMirror for ControlAdapter {
-    fn batch(&self, data: &[u8]) -> std::io::Result<()> {
-        self.0.append(Item::Control(data.to_vec())).map(|_| ())
+    fn batch(&self, data: Vec<u8>) -> std::io::Result<()> {
+        self.0.append(Item::Control(data)).map(|_| ())
     }
     fn position(&self) -> u64 {
         self.0.position()
-    }
-}
-
-struct ControlImage(ControlStore);
-
-impl ControlSource for ControlImage {
-    fn snapshot(&self) -> Result<(u64, Vec<flow_state_store::RawEntry>)> {
-        Ok(self.0.mirror_snapshot(|position, entries| {
-            entries
-                .collect::<flow_state_store::Result<Vec<_>>>()
-                .map(|entries| (position, entries))
-        })??)
     }
 }
 
@@ -832,10 +832,10 @@ impl Mirror for JournalAdapter {
     }
 }
 
-/// Reject configurations that would make a replicated state directory unsafe.
-pub fn ensure_state_dir_matches(state_dir: &Path, enabled: bool) -> Result<()> {
+/// Refuse to run a replicated state directory without `[durability]`.
+pub fn ensure_not_replicated(state_dir: &Path) -> Result<()> {
     let marker = state_dir.join(recovery::MARKER);
-    if !enabled && marker.exists() {
+    if marker.exists() {
         bail!(
             "{} is replicated to object storage; enable [durability] with the same uri, or remove {} to return it to local-only durability",
             state_dir.display(),

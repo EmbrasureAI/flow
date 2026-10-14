@@ -7,7 +7,7 @@ use crate::store::{self, Created};
 use crate::writer::Shared;
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
-use flow_state_store::RawEntry;
+use flow_state_store::ControlStore;
 use futures::{StreamExt, TryStreamExt};
 use opendal::Operator;
 use std::{
@@ -25,13 +25,8 @@ const MAX_PARTS: usize = 16;
 /// Journal parts uploaded at once; each is read into memory whole.
 const PART_UPLOADS: usize = 4;
 
-/// Produces a consistent control-store image and the log position it covers.
-pub trait ControlSource: Send + Sync {
-    fn snapshot(&self) -> Result<(u64, Vec<RawEntry>)>;
-}
-
 pub(crate) enum Request {
-    Control(Arc<dyn ControlSource>),
+    Control(ControlStore),
     Now(oneshot::Sender<Result<()>>),
 }
 
@@ -53,7 +48,7 @@ pub(crate) async fn checkpoint_loop(
     policy: Policy,
     mut history: History,
 ) {
-    let mut control: Option<Arc<dyn ControlSource>> = None;
+    let mut control: Option<ControlStore> = None;
     let mut waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
     let mut last = Instant::now();
     let mut retention_pending = false;
@@ -126,11 +121,7 @@ pub(crate) async fn checkpoint_loop(
                 let elapsed = started.elapsed();
                 metrics::histogram!("flow_durability_checkpoint_seconds")
                     .record(elapsed.as_secs_f64());
-                {
-                    let mut state = shared.lock();
-                    state.stats.checkpoints += 1;
-                    state.stats.last_checkpoint_ms = elapsed.as_millis() as u64;
-                }
+                shared.lock().stats.checkpoints += 1;
                 tracing::info!(
                     event = "durability_checkpoint",
                     key = %key,
@@ -210,11 +201,11 @@ async fn upload_part(
 async fn checkpoint(
     shared: &Arc<Shared>,
     operator: &Operator,
-    control: Arc<dyn ControlSource>,
+    control: ControlStore,
     history: &History,
     count: u64,
 ) -> Result<(String, Checkpoint)> {
-    let (control_ordinal, entries) = tokio::task::spawn_blocking(move || control.snapshot())
+    let (control_ordinal, entries) = tokio::task::spawn_blocking(move || control.mirror_snapshot())
         .await
         .context("control snapshot task")??;
     let (ordinal, journals, files) = {

@@ -17,16 +17,23 @@ fn config() -> Config {
     }
 }
 
+fn layout() -> Layout {
+    Layout {
+        control: "control".into(),
+        journals: vec!["journal".into()],
+        files: vec!["source-identity.json".into()],
+        derived: vec![
+            "index".into(),
+            "index-generations".into(),
+            "checkpoints".into(),
+        ],
+    }
+}
+
 async fn open(operator: &Operator, state: &Path) -> Durability {
-    Durability::open_with_operator(
-        &config(),
-        operator.clone(),
-        state,
-        "source",
-        Layout::default(),
-    )
-    .await
-    .unwrap()
+    Durability::open_with_operator(&config(), operator.clone(), state, "source", layout())
+        .await
+        .unwrap()
 }
 
 /// Open local state the way the daemon does: control first, then a
@@ -34,7 +41,7 @@ async fn open(operator: &Operator, state: &Path) -> Durability {
 async fn attach(durability: &Durability, state: &Path) -> (ControlStore, StateStore, Journal) {
     let control = ControlStore::open(state.join("control")).unwrap();
     durability.attach_control(&control).await.unwrap();
-    durability.baseline(&Layout::default()).await.unwrap();
+    durability.baseline().await.unwrap();
     let index = match control.active_generation().unwrap() {
         Some(active) if active.path.exists() => StateStore::open_with_control(
             active.path,
@@ -263,7 +270,7 @@ async fn clean_release_keeps_local_state_and_skips_the_lease_wait() {
     }
     index.put_source_transaction(b"k", b"v").unwrap();
     let expected = transactions(&journal);
-    durability.baseline(&Layout::default()).await.unwrap();
+    durability.baseline().await.unwrap();
     drop((control, index, journal));
     durability.release().await.unwrap();
 
@@ -300,8 +307,7 @@ async fn clean_release_keeps_local_state_and_skips_the_lease_wait() {
     durability.release().await.unwrap();
 
     // Disabling replication on a replicated directory is refused.
-    assert!(flow_durability::ensure_state_dir_matches(state.path(), false).is_err());
-    assert!(flow_durability::ensure_state_dir_matches(state.path(), true).is_ok());
+    assert!(flow_durability::ensure_not_replicated(state.path()).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -329,7 +335,7 @@ async fn existing_local_state_is_migrated_and_old_history_is_retired() {
         index
             .put_source_transaction(b"round", &round.to_be_bytes())
             .unwrap();
-        durability.baseline(&Layout::default()).await.unwrap();
+        durability.baseline().await.unwrap();
     }
     let log = operator.list("log/").await.unwrap();
     assert!(
@@ -418,8 +424,8 @@ async fn release_and_stop_return_promptly() {
     index.put_source_transaction(b"k", b"v").unwrap();
     drop((control, index, journal));
     // An unchanged state needs no second checkpoint; asking for one succeeds.
-    durability.baseline(&Layout::default()).await.unwrap();
-    durability.baseline(&Layout::default()).await.unwrap();
+    durability.baseline().await.unwrap();
+    durability.baseline().await.unwrap();
     let started = Instant::now();
     durability.release().await.unwrap();
     assert!(
@@ -523,20 +529,20 @@ async fn baselines_write_only_new_state_but_always_cover_new_files() {
     let durability = open(&operator, state.path()).await;
     let (control, index, journal) = attach(&durability, state.path()).await;
     // Cover the index and journal records written while attaching.
-    durability.baseline(&Layout::default()).await.unwrap();
-    let after_first = durability.status().checkpoints;
-    durability.baseline(&Layout::default()).await.unwrap();
+    durability.baseline().await.unwrap();
+    let after_first = durability.status().stats.checkpoints;
+    durability.baseline().await.unwrap();
     assert_eq!(
-        durability.status().checkpoints,
+        durability.status().stats.checkpoints,
         after_first,
         "an unchanged state is not checkpointed again"
     );
     // A file that appears without any log record must still be covered.
     std::fs::write(state.path().join("source-identity.json"), b"{\"late\":1}").unwrap();
-    durability.baseline(&Layout::default()).await.unwrap();
-    assert_eq!(durability.status().checkpoints, after_first + 1);
-    durability.baseline(&Layout::default()).await.unwrap();
-    assert_eq!(durability.status().checkpoints, after_first + 1);
+    durability.baseline().await.unwrap();
+    assert_eq!(durability.status().stats.checkpoints, after_first + 1);
+    durability.baseline().await.unwrap();
+    assert_eq!(durability.status().stats.checkpoints, after_first + 1);
     drop((control, index, journal));
     durability.stop();
 

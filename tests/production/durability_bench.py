@@ -16,17 +16,19 @@ PostgreSQL. Failures are reported, never retried into success.
 """
 import argparse
 import hashlib
+import http.client
 import http.server
 import json
 import os
 from pathlib import Path
 import random
-import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.request
 from uuid import uuid4
 
@@ -52,9 +54,14 @@ def lsn(value):
     return int(value)
 
 
-class Faults:
-    """Catalog fault switches applied by the local proxy."""
-    def __init__(self, report):
+class CatalogFaultProxy:
+    """Loopback HTTP proxy in front of the REST fixture with fault injection.
+
+    Table POSTs fail with 503 until `blocked_until`; `drop_next_commit`
+    replaces the next successful table POST with a 502. Every forwarded
+    request is recorded in `report['catalog_http']`."""
+    def __init__(self, upstream, report):
+        self.upstream = upstream.rstrip('/')
         self.report = report
         self.blocked_until = 0.0
         self.drop_next_commit = False
@@ -78,13 +85,6 @@ class Faults:
                 return 502, b'{"error":{"message":"injected ambiguous outcome","type":"ServiceUnavailableException","code":502}}'
         return None
 
-
-class LocalProxy:
-    """Loopback HTTP proxy in front of the REST fixture with fault injection."""
-    def __init__(self, upstream, faults):
-        self.upstream = upstream.rstrip('/')
-        self.faults = faults
-
     def __enter__(self):
         proxy = self
 
@@ -98,7 +98,7 @@ class LocalProxy:
                 length = int(self.headers.get('Content-Length') or 0)
                 body = self.rfile.read(length) if length else None
                 started = time.monotonic()
-                injected = proxy.faults.before(self.command, self.path)
+                injected = proxy.before(self.command, self.path)
                 if injected is None:
                     request = urllib.request.Request(proxy.upstream + self.path, data=body, method=self.command)
                     for name in ('Content-Type', 'Authorization'):
@@ -109,7 +109,7 @@ class LocalProxy:
                             status, payload = response.status, response.read()
                     except urllib.error.HTTPError as error:
                         status, payload = error.code, error.read()
-                    replaced = proxy.faults.after(self.command, self.path, status, started)
+                    replaced = proxy.after(self.command, self.path, status, started)
                     if replaced is not None:
                         status, payload = replaced
                 else:
@@ -123,9 +123,8 @@ class LocalProxy:
             do_GET = do_POST = do_HEAD = do_DELETE = handle_any
 
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        return {'uri': f'http://127.0.0.1:{self.server.server_address[1]}'}
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return f'http://127.0.0.1:{self.server.server_address[1]}'
 
     def __exit__(self, *_):
         self.server.shutdown()
@@ -149,7 +148,6 @@ class S3LatencyProxy:
         return base + size / (120 * 2**20)
 
     def __enter__(self):
-        import http.client
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -202,53 +200,51 @@ class S3LatencyProxy:
 
     def __exit__(self, *_):
         self.server.shutdown()
+        if self.log:
+            self.log.close()
 
 
-class Environment:
-    def __init__(self, args, name, faults):
-        self.args = args
-        self.name = name
-        self.faults = faults
+def free_port_pair():
+    """Two adjacent free loopback ports; a stale-owner replacement listens on the second."""
+    while True:
+        with socket.socket() as first, socket.socket() as second:
+            first.bind(('127.0.0.1', 0))
+            port = first.getsockname()[1]
+            try:
+                second.bind(('127.0.0.1', port + 1))
+            except (OSError, OverflowError):
+                continue
+            return port, port + 1
 
-    def database(self):
-        return self.args.namespace
 
-    def catalog(self):
-        return LocalProxy(self.args.rest_uri, self.faults)
+def metadata_location(args, table):
+    url = f'{args.rest_uri.rstrip("/")}/v1/namespaces/{args.namespace}/tables/{table}'
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return json.load(response)['metadata-location']
 
-    def catalog_toml(self, bridge):
-        return (f'uri = {json.dumps(bridge["uri"])}\nwarehouse = "s3://warehouse/"\n'
-                f'"s3.endpoint" = {json.dumps(self.flow_s3_endpoint)}\n"s3.region" = "us-east-1"\n'
-                '"s3.path-style-access" = "true"\n')
 
-    def durability_uri(self):
-        if self.args.durability_uri:
-            return self.args.durability_uri.rstrip('/') + '/' + self.name
-        return f's3://durability/{self.name}'
+def open_reader(args):
+    config = {'memory_limit': args.reader_memory, 'threads': 2}
+    if args.duckdb_extensions:
+        config['extension_directory'] = args.duckdb_extensions
+    connection = duckdb.connect(config=config)
+    for extension in ('httpfs', 'iceberg'):
+        connection.execute(f'INSTALL {extension}')
+        connection.execute(f'LOAD {extension}')
+    endpoint = args.s3_endpoint.split('://', 1)[1]
+    connection.execute(f"CREATE SECRET local (TYPE S3, KEY_ID 'demo-access', SECRET 'demo-secret-key', "
+                       f"ENDPOINT '{endpoint}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')")
+    return connection
 
-    def environment(self):
-        env = dict(os.environ)
-        env.update(AWS_ACCESS_KEY_ID='demo-access', AWS_SECRET_ACCESS_KEY='demo-secret-key',
-                   AWS_REGION='us-east-1')
-        return env
 
-    def metadata_location(self, table):
-        url = f'{self.args.rest_uri.rstrip("/")}/v1/namespaces/{self.args.namespace}/tables/{table}'
-        with urllib.request.urlopen(url, timeout=30) as response:
-            return json.load(response)['metadata-location']
-
-    def reader(self):
-        config = {'memory_limit': self.args.reader_memory, 'threads': 2}
-        if self.args.duckdb_extensions:
-            config['extension_directory'] = self.args.duckdb_extensions
-        connection = duckdb.connect(config=config)
-        for extension in ('httpfs', 'iceberg'):
-            connection.execute(f'INSTALL {extension}')
-            connection.execute(f'LOAD {extension}')
-        endpoint = self.args.s3_endpoint.split('://', 1)[1]
-        connection.execute(f"CREATE SECRET local (TYPE S3, KEY_ID 'demo-access', SECRET 'demo-secret-key', "
-                           f"ENDPOINT '{endpoint}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')")
-        return connection
+def log_events(logs):
+    """Structured `fields` of every JSON line in Flow's logs."""
+    for path in logs:
+        for line in path.read_text().splitlines():
+            try:
+                yield json.loads(line).get('fields', {})
+            except ValueError:
+                continue
 
 
 def scrape(port):
@@ -336,30 +332,14 @@ def main():
               'passed': False, 'transactions': [], 'checks': [], 'reader_failures': [], 'events': [],
               'binary_sha256': hashlib.file_digest(args.binary.open('rb'), 'sha256').hexdigest(),
               'harness_sha256': hashlib.file_digest(Path(__file__).open('rb'), 'sha256').hexdigest()}
-    faults = Faults(report)
-    environment = Environment(args, name, faults)
-    environment.tables = tables
-    environment.flow_s3_endpoint = args.s3_endpoint
+    catalog_proxy = CatalogFaultProxy(args.rest_uri, report)
+    flow_s3_endpoint = args.s3_endpoint
     latency_proxy = None
     if args.s3_latency_ms > 0:
         latency_proxy = S3LatencyProxy(args.s3_endpoint, args.s3_latency_ms, random.Random(7),
                                        directory / 's3-requests.jsonl')
-        environment.flow_s3_endpoint = latency_proxy.__enter__()
-    def free_port():
-        import socket
-        with socket.socket() as probe:
-            probe.bind(('127.0.0.1', 0))
-            return probe.getsockname()[1]
-    http_port = free_port()
-    while True:
-        # The replacement owner in stale-owner trials listens on the next port.
-        import socket
-        with socket.socket() as probe:
-            try:
-                probe.bind(('127.0.0.1', http_port + 1))
-                break
-            except OSError:
-                http_port = free_port()
+        flow_s3_endpoint = latency_proxy.__enter__()
+    http_port, replacement_port = free_port_pair()
     processes = []
     logs = []
     stopped = threading.Event()
@@ -386,7 +366,7 @@ def main():
 
     def rewrite(config, state_dir, label):
         text = config.read_text().replace(json.dumps(str(state)), json.dumps(str(state_dir)))
-        text = text.replace(f'listen = "127.0.0.1:{http_port}"', f'listen = "127.0.0.1:{http_port + 1}"')
+        text = text.replace(f'listen = "127.0.0.1:{http_port}"', f'listen = "127.0.0.1:{replacement_port}"')
         path = directory / f'flow-{label}.toml'
         path.write_text(text)
         return path
@@ -405,11 +385,11 @@ def main():
 
     def observe():
         try:
-            reader = environment.reader()
+            reader = open_reader(args)
             while not stopped.is_set():
                 for index, table in enumerate(tables):
                     try:
-                        location = environment.metadata_location(table)
+                        location = metadata_location(args, table)
                         seen = {int(-row[0]) for row in reader.execute(
                             'SELECT id FROM iceberg_scan(?) WHERE id < 0', [location]).fetchall()}
                         now = time.time_ns() / 1e6
@@ -459,11 +439,13 @@ def main():
         except urllib.error.HTTPError as error:
             if error.code != 409:
                 raise
-        with environment.catalog() as bridge:
+        with catalog_proxy as catalog_uri:
             text = f'state_dir = {json.dumps(str(state))}\n'
             text += f'[source]\nconnection_env = "FLOW_BENCH_PG"\nid = "{name}"\nslot = "{name}"\n'
             text += f'publication = "{name}"\nack_mode = "{args.ack_mode}"\n'
-            text += '[catalog]\n' + environment.catalog_toml(bridge)
+            text += (f'[catalog]\nuri = {json.dumps(catalog_uri)}\nwarehouse = "s3://warehouse/"\n'
+                     f'"s3.endpoint" = {json.dumps(flow_s3_endpoint)}\n"s3.region" = "us-east-1"\n'
+                     '"s3.path-style-access" = "true"\n')
             text += (f'[limits]\ntable_workers = {args.workers}\ncommits_per_second = 100\n'
                      'journal_bytes = 4294967296\nspool_bytes = 2147483648\n' + args.limits_toml + '\n')
             text += f'[storage]\nmin_free_bytes = 0\n[http]\nlisten = "127.0.0.1:{http_port}"\n'
@@ -472,12 +454,14 @@ def main():
                          'oldest_l0_soft_ms = 100000000\noldest_l0_hard_ms = 200000000\n'
                          'delete_files_soft = 1000000\ndelete_files_hard = 2000000\n')
             if args.durability == 'remote':
-                text += f'[durability]\nuri = {json.dumps(environment.durability_uri())}\n'
-                text += f'endpoint = {json.dumps(environment.flow_s3_endpoint)}\n'
+                durability_uri = (args.durability_uri.rstrip('/') + '/' + name if args.durability_uri
+                                  else f's3://durability/{name}')
+                text += f'[durability]\nuri = {json.dumps(durability_uri)}\n'
+                text += f'endpoint = {json.dumps(flow_s3_endpoint)}\n'
                 text += args.durability_toml + '\n'
             for table in tables:
                 text += (f'[[tables]]\nsource_namespace = "{name}"\nsource_table = "{table}"\n'
-                         f'target_namespace = ["{environment.database()}"]\ntarget_table = "{table}"\n'
+                         f'target_namespace = ["{args.namespace}"]\ntarget_table = "{table}"\n'
                          f'primary_key = [0]\nformat_version = {args.format_version}\ncolumns = [\n'
                          ' {field_id=1,name="id",data_type="Int64",nullable=false},\n'
                          ' {field_id=2,name="version",data_type="Int64",nullable=false},\n'
@@ -485,8 +469,9 @@ def main():
             config = directory / 'flow.toml'
             config.write_text(text)
             config.chmod(0o600)
-            env = environment.environment() | {'FLOW_BENCH_PG': args.pg + ' sslmode=disable',
-                                               'RUST_LOG': 'info,flow_events=debug'}
+            env = dict(os.environ) | {'AWS_ACCESS_KEY_ID': 'demo-access', 'AWS_SECRET_ACCESS_KEY': 'demo-secret-key',
+                                      'AWS_REGION': 'us-east-1', 'FLOW_BENCH_PG': args.pg + ' sslmode=disable',
+                                      'RUST_LOG': 'info,flow_events=debug'}
 
             copying = threading.Event()
 
@@ -557,10 +542,10 @@ def main():
                         writer.rollback()
                     third = max(1, total // 3)
                     if args.fault in ('disk-loss-backlog', 'catalog-outage') and sequence == third:
-                        faults.blocked_until = time.monotonic() + 15
+                        catalog_proxy.blocked_until = time.monotonic() + 15
                         event('catalog-outage', seconds=15)
                     if args.fault == 'lost-catalog-response' and sequence == third:
-                        faults.drop_next_commit = True
+                        catalog_proxy.drop_next_commit = True
                         event('drop-next-commit')
                     if args.fault == 'stale-owner' and sequence == third and stale is None:
                         # A replacement starts on a fresh disk while the old owner runs.
@@ -575,26 +560,19 @@ def main():
                         if args.fault == 'disk-loss-backlog':
                             slot = pg.execute('SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s', [name]).fetchone()[0]
                             report['pre_loss_slot'] = slot
-                            reader = environment.reader()
+                            reader = open_reader(args)
                             visible = [{int(-row[0]) for row in reader.execute(
-                                'SELECT id FROM iceberg_scan(?) WHERE id < 0', [environment.metadata_location(t)]).fetchall()}
+                                'SELECT id FROM iceberg_scan(?) WHERE id < 0', [metadata_location(args, t)]).fetchall()}
                                 for t in tables]
-                            journaled = {}
-                            for log in logs:
-                                for line in log.read_text().splitlines():
-                                    try:
-                                        fields = json.loads(line).get('fields', {})
-                                    except ValueError:
-                                        continue
-                                    if fields.get('event') == 'transaction_journaled':
-                                        journaled[fields['xid']] = lsn(fields['end_lsn'])
+                            journaled = {fields['xid']: lsn(fields['end_lsn']) for fields in log_events(logs)
+                                         if fields.get('event') == 'transaction_journaled'}
                             missing = [t['sequence'] for t in report['transactions']
                                        if t['xid'] in journaled and journaled[t['xid']] <= lsn(slot)
                                        and any(t['sequence'] not in seen for seen in visible)]
                             report['acknowledged_missing_before_loss'] = missing
                             assert missing, 'fault did not cover acknowledged, unpublished transactions'
                         if args.fault in ('disk-loss', 'disk-loss-backlog'):
-                            (state).rename(directory / 'lost-state')
+                            state.rename(directory / 'lost-state')
                         process = start(env, config)
                         report['fault'] = {'kind': args.fault, 'after_sequence': sequence, 'at_ms': fault_wall,
                                            'restart_after_seconds': time.monotonic() - fault_started}
@@ -619,16 +597,15 @@ def main():
                 time.sleep(.5)
             report['all_markers_observed'] = complete
             assert complete, 'timed out waiting for every marker in every Iceberg table'
-            report['metrics_text_tail'] = None
-            metrics_text = scrape(http_port + (1 if stale is not None else 0))
+            metrics_text = scrape(replacement_port if stale is not None else http_port)
             stopped.set()
             observer.join(30)
-            reader = environment.reader()
+            reader = open_reader(args)
+            normalize = lambda rows: [tuple(v.decode() if isinstance(v, bytes) else v for v in row) for row in rows]
             for table in tables:
                 source = pg.execute(sql.SQL('SELECT id, version, md5(payload) FROM {} ORDER BY id').format(sql.Identifier(name, table))).fetchall()
                 target = reader.execute('SELECT id, version, md5(payload) FROM iceberg_scan(?) ORDER BY id',
-                                        [environment.metadata_location(table)]).fetchall()
-                normalize = lambda rows: [tuple(v.decode() if isinstance(v, bytes) else v for v in row) for row in rows]
+                                        [metadata_location(args, table)]).fetchall()
                 source, target = normalize(source), normalize(target)
                 assert source == target, f'exact row mismatch: {table}'
                 report['checks'].append({'table': table, 'exact_rows': len(source),
@@ -650,18 +627,13 @@ def main():
                 report['final_status_durability'] = json.loads(status_path.read_text()).get('durability')
             stop(process)
         journaled, published = {}, []
-        for path in logs:
-            for line in path.read_text().splitlines():
-                try:
-                    fields = json.loads(line).get('fields', {})
-                except ValueError:
-                    continue
-                if fields.get('event') == 'transaction_journaled':
-                    journaled[fields['xid']] = fields
-                elif fields.get('event') == 'table_published' and not fields.get('already_committed'):
-                    published.append(fields)
-                elif fields.get('event') == 'durability_recovered':
-                    report.setdefault('recoveries', []).append(fields)
+        for fields in log_events(logs):
+            if fields.get('event') == 'transaction_journaled':
+                journaled[fields['xid']] = fields
+            elif fields.get('event') == 'table_published' and not fields.get('already_committed'):
+                published.append(fields)
+            elif fields.get('event') == 'durability_recovered':
+                report.setdefault('recoveries', []).append(fields)
         catalog, reader_latency = [], []
         for txn in report['transactions']:
             j = journaled.get(txn['xid'])
@@ -701,6 +673,8 @@ def main():
         for process in processes:
             if process.poll() is None:
                 stop(process)
+        if latency_proxy is not None:
+            latency_proxy.__exit__()
         report['logs'] = [str(p) for p in logs]
         save()
         if pg is not None:

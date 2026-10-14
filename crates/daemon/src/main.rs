@@ -142,13 +142,21 @@ fn fatal(error: &anyhow::Error, plain: bool) -> ExitCode {
     ExitCode::from(class.code())
 }
 
-/// Stop immediately if replication fails, for example because a newer owner
+/// Run `init` or `run` under remote durability, if configured. Stops
+/// immediately if replication fails, for example because a newer owner
 /// claimed this state; no further external effect may depend on it.
-async fn fenced(work: impl std::future::Future<Output = Result<()>>) -> Result<()> {
-    tokio::select! {
+async fn replicated(
+    config: &config::Config,
+    work: impl std::future::Future<Output = Result<()>>,
+) -> Result<ExitCode> {
+    durability::start(config).await?;
+    let result = tokio::select! {
         result = work => result,
         error = durability::failed() => Err(error),
-    }
+    };
+    let result = record_exit(config, result);
+    durability::finish(&result).await;
+    result
 }
 
 /// Keep why `init` or `run` stopped in `status`, after its cleanup ran; a
@@ -209,10 +217,7 @@ async fn command(cli: Cli) -> Result<ExitCode> {
             hardening::secure_state_dir(&config.state_dir)?;
             source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
-            durability::start(&config).await?;
-            let result = record_exit(&config, fenced(runtime::initialize(config.clone())).await);
-            durability::finish(&result).await;
-            result
+            replicated(&config, runtime::initialize(config.clone())).await
         }
         Command::Run { roles } => {
             ensure!(
@@ -231,13 +236,7 @@ async fn command(cli: Cli) -> Result<ExitCode> {
             source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
             let compaction = roles.iter().any(|r| r == "compactor");
-            durability::start(&config).await?;
-            let result = record_exit(
-                &config,
-                fenced(runtime::run(config.clone(), compaction)).await,
-            );
-            durability::finish(&result).await;
-            result
+            replicated(&config, runtime::run(config.clone(), compaction)).await
         }
         Command::Status => Ok(if runtime::status(config)? {
             ExitCode::SUCCESS

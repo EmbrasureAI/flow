@@ -901,31 +901,32 @@ async fn load_deletes(
         .filter(|entry| entry.file_format() == iceberg::spec::DataFileFormat::Puffin)
         .filter_map(|entry| entry.data_file.referenced_data_file())
         .collect::<BTreeSet<_>>();
+    let is_puffin = |file: &FileId| {
+        view.live_files[&file.0].file_format() == iceberg::spec::DataFileFormat::Puffin
+    };
     // Puffin vectors share objects and are read by offset; prefetch Parquet only.
     let mut prefetch = Prefetch::new(
         file_io,
-        delete_files.iter().map(|file| {
-            let entry = &view.live_files[&file.0];
-            let size = if entry.file_format() == iceberg::spec::DataFileFormat::Puffin {
-                u64::MAX
-            } else {
-                entry.data_file.file_size_in_bytes()
-            };
-            (file.0.clone(), size)
-        }),
+        delete_files
+            .iter()
+            .filter(|file| !is_puffin(file))
+            .map(|file| {
+                let size = view.live_files[&file.0].data_file.file_size_in_bytes();
+                (file.0.clone(), size)
+            }),
         read_limits,
     );
     for file in delete_files {
         check_cancelled(cancelled)?;
-        let source = prefetch.next(&file.0).await?;
-        let delete_entry = &view.live_files[&file.0];
-        let input = file_io.new_input(delete_entry.file_path())?;
-        let size = if let Input::Fetched(bytes) = &source {
-            // Prefetch already compared the fetched size with the manifest.
-            bytes.len() as u64
+        let source = if is_puffin(file) {
+            Input::Lazy
         } else {
-            input.metadata().await?.size
+            prefetch.next(&file.0).await?
         };
+        let delete_entry = &view.live_files[&file.0];
+        let size = source
+            .size(&file_io.new_input(delete_entry.file_path())?)
+            .await?;
         check_cancelled(cancelled)?;
         ensure!(
             size == delete_entry.data_file.file_size_in_bytes(),

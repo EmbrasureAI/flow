@@ -31,7 +31,7 @@ use std::{
 /// and must not wait for remote durability: an external effect that depends
 /// on control state waits on the replicator's own barrier.
 pub trait ControlMirror: Send + Sync {
-    fn batch(&self, data: &[u8]) -> std::io::Result<()>;
+    fn batch(&self, data: Vec<u8>) -> std::io::Result<()>;
     /// Replication position that covers every batch passed so far. Called
     /// under the control lock while taking a snapshot.
     fn position(&self) -> u64;
@@ -159,11 +159,8 @@ impl ControlStore {
 
     /// Read a consistent copy of all authority records together with the
     /// mirror position it covers. Writers are blocked only while the RocksDB
-    /// snapshot is taken, not while `consume` reads it.
-    pub fn mirror_snapshot<R>(
-        &self,
-        consume: impl FnOnce(u64, &mut dyn Iterator<Item = Result<RawEntry>>) -> R,
-    ) -> Result<R> {
+    /// snapshot is taken, not while it is read.
+    pub fn mirror_snapshot(&self) -> Result<(u64, Vec<RawEntry>)> {
         let guard = self.lock()?;
         let mirror = self
             .0
@@ -175,10 +172,11 @@ impl ControlStore {
         drop(guard);
         let mut options = ReadOptions::default();
         options.fill_cache(false);
-        let mut entries = snapshot
+        let entries = snapshot
             .iterator_opt(IteratorMode::Start, options)
-            .map(|entry| entry.map_err(Error::from));
-        Ok(consume(position, &mut entries))
+            .map(|entry| entry.map_err(Error::from))
+            .collect::<Result<_>>()?;
+        Ok((position, entries))
     }
 
     /// Every control mutation goes through here so the mirror observes the
@@ -188,7 +186,7 @@ impl ControlStore {
         let data = mirror.map(|_| batch.data().to_vec());
         self.0.db.write_opt(batch, options)?;
         if let (Some(mirror), Some(data)) = (mirror, data) {
-            mirror.batch(&data)?;
+            mirror.batch(data)?;
         }
         Ok(())
     }

@@ -341,7 +341,7 @@ pub(crate) enum Input {
 }
 
 impl Input {
-    async fn size(&self, input: &iceberg::io::InputFile) -> Result<u64> {
+    pub(crate) async fn size(&self, input: &iceberg::io::InputFile) -> Result<u64> {
         Ok(match self {
             Self::Fetched(bytes) => bytes.len() as u64,
             Self::Lazy => input.metadata().await?.size,

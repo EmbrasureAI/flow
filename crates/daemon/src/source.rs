@@ -350,7 +350,7 @@ pub(crate) async fn capture_loop(
                     }
                     durable = gate.ready_signal(), if gate.is_pending() => {
                         durable?;
-                        match acknowledge_ready(&mut source, &mut gate).await {
+                        match acknowledge(&mut source, gate.ready()).await {
                             Ok(()) => {},
                             Err(error) if retryable_connection(&error) => {
                                 tracing::warn!(%error, "source feedback disconnected"); break;
@@ -649,23 +649,17 @@ async fn acknowledge_and_reclaim(
     gate: &mut crate::durability::AckGate,
     progress: Acknowledgement,
 ) -> Result<()> {
-    if let Some(durable) = gate.admit(progress) {
-        source_deadline(async {
-            source.acknowledge(durable).await?;
-            Ok(())
-        })
-        .await?;
-    }
+    acknowledge(source, gate.admit(progress)).await?;
     journal.reclaim(progress.materialized)?;
     Ok(())
 }
 
-/// Send progress that became durable after it was observed.
-async fn acknowledge_ready(
+/// Send progress the acknowledgement gate released, if any.
+async fn acknowledge(
     source: &mut impl PostgresSource,
-    gate: &mut crate::durability::AckGate,
+    durable: Option<Acknowledgement>,
 ) -> Result<()> {
-    if let Some(durable) = gate.ready() {
+    if let Some(durable) = durable {
         source_deadline(async {
             source.acknowledge(durable).await?;
             Ok(())
@@ -1215,13 +1209,15 @@ struct SourceIdentity {
     timeline: u32,
 }
 
+/// Proof of the source incarnation this state directory is bound to.
+pub(crate) const SOURCE_IDENTITY: &str = "source-identity.json";
+
 pub(crate) async fn verify_source_identity(
     client: &Client,
     config: &Config,
     initialize: bool,
 ) -> Result<()> {
     use flow_pg_source::tokio_postgres::SimpleQueryMessage;
-    use std::io::Write;
     let response = client.simple_query("IDENTIFY_SYSTEM").await?;
     let row = response
         .iter()
@@ -1246,23 +1242,19 @@ pub(crate) async fn verify_source_identity(
             .context("source timeline is missing")?
             .parse()?,
     };
-    let path = config.state_dir.join("source-identity.json");
-    match std::fs::read(&path) {
+    match std::fs::read(config.state_dir.join(SOURCE_IDENTITY)) {
         Ok(bytes) => {
             let expected: SourceIdentity = serde_json::from_slice(&bytes).context("invalid saved source identity")?;
             ensure!(identity == expected, crate::exit::resync("PostgreSQL source system, database, timeline, or slot lineage changed; coordinated failover/resynchronization is required"));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && initialize => {
-            let bytes = serde_json::to_vec(&identity)?;
-            let temporary = path.with_extension("json.tmp");
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::rename(temporary, path)?;
-            std::fs::File::open(&config.state_dir)?.sync_all()?;
             // The source incarnation proof must survive losing this disk, or
             // recovery would correctly refuse to resume from replicated state.
-            crate::durability::write_file(crate::durability::SOURCE_IDENTITY, &bytes)?;
+            crate::durability::write_authority_file(
+                &config.state_dir,
+                SOURCE_IDENTITY,
+                &serde_json::to_vec(&identity)?,
+            )?;
         }
         Err(error) => return Err(error).context("source identity proof is missing or unreadable; do not bind existing state to an unverified source"),
     }
@@ -1343,7 +1335,7 @@ pub(crate) async fn source_identity_matches(client: &Client, config: &Config) ->
         Err(error) => return Err(error.into()),
     };
     let expected: SourceIdentity = serde_json::from_slice(
-        &std::fs::read(config.state_dir.join("source-identity.json"))
+        &std::fs::read(config.state_dir.join(SOURCE_IDENTITY))
             .context("source identity proof is missing or unreadable")?,
     )
     .context("invalid saved source identity")?;
