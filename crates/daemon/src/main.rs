@@ -61,7 +61,21 @@ enum Command {
         target_namespace: Option<String>,
     },
     /// Create a logical slot and copy a consistent initial snapshot, then exit.
-    Init,
+    Init {
+        /// Adopt and initialize newly added tables in configuration without resynchronizing existing tables.
+        #[arg(long)]
+        add_tables: bool,
+        /// Re-snapshot a specific table (as schema.table) without affecting other tables.
+        #[arg(long)]
+        resnapshot: Option<String>,
+    },
+    /// Adopt and initialize newly configured tables without resynchronizing existing tables.
+    AddTable,
+    /// Re-snapshot an existing table (as schema.table) without affecting other tables.
+    Resnapshot {
+        /// Table to re-snapshot as schema.table; a bare name means public.
+        table: String,
+    },
     /// Recover durable work and continuously capture and publish changes.
     Run {
         #[arg(
@@ -117,8 +131,10 @@ async fn run_cli() -> ExitCode {
     let cli = Cli::parse();
     // Services log only structured events; command-line tools also print the
     // plain error, as does any command attached to a terminal.
-    let plain = !matches!(cli.command, Command::Init | Command::Run { .. })
-        || std::io::stderr().is_terminal();
+    let plain = !matches!(
+        cli.command,
+        Command::Init { .. } | Command::AddTable | Command::Resnapshot { .. } | Command::Run { .. }
+    ) || std::io::stderr().is_terminal();
     command(cli)
         .await
         .unwrap_or_else(|error| fatal(&error, plain))
@@ -159,10 +175,16 @@ async fn command(cli: Cli) -> Result<ExitCode> {
     }
     .map_err(|error| exit::config(format!("{error:#}")))?;
     #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
-    if matches!(&cli.command, Command::Init | Command::Run { .. }) {
+    if matches!(
+        &cli.command,
+        Command::Init { .. } | Command::AddTable | Command::Resnapshot { .. } | Command::Run { .. }
+    ) {
         allocator::initialize();
     }
-    if matches!(&cli.command, Command::Init | Command::Run { .. }) {
+    if matches!(
+        &cli.command,
+        Command::Init { .. } | Command::AddTable | Command::Resnapshot { .. } | Command::Run { .. }
+    ) {
         tracing::info!(
             config = %cli.config.display(),
             state_dir = %config.state_dir.display(),
@@ -195,11 +217,47 @@ async fn command(cli: Cli) -> Result<ExitCode> {
             .await?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Init => {
+        Command::Init {
+            add_tables,
+            resnapshot,
+        } => {
             hardening::secure_state_dir(&config.state_dir)?;
             source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
-            record_exit(&config, runtime::initialize(config.clone()).await)
+            let options = bootstrap::InitOptions {
+                add_tables,
+                resnapshot,
+            };
+            record_exit(
+                &config,
+                runtime::initialize_with_options(config.clone(), options).await,
+            )
+        }
+        Command::AddTable => {
+            hardening::secure_state_dir(&config.state_dir)?;
+            source_tls::warn_if_unauthenticated(&config);
+            let _http = http::start(&config).await?;
+            let options = bootstrap::InitOptions {
+                add_tables: true,
+                resnapshot: None,
+            };
+            record_exit(
+                &config,
+                runtime::initialize_with_options(config.clone(), options).await,
+            )
+        }
+        Command::Resnapshot { table } => {
+            hardening::secure_state_dir(&config.state_dir)?;
+            source_tls::warn_if_unauthenticated(&config);
+            let _http = http::start(&config).await?;
+            let options = bootstrap::InitOptions {
+                add_tables: false,
+                resnapshot: Some(table),
+            };
+            record_exit(
+                &config,
+                runtime::initialize_with_options(config.clone(), options).await,
+            )
         }
         Command::Run { roles } => {
             ensure!(

@@ -1075,6 +1075,35 @@ impl StateStore {
         self.write(batch)
     }
 
+    /// Remove all index entries, reverse mappings, live-row counts, pending operations, and table state for a table.
+    pub fn clear_table_index(&self, table: &TableId) -> Result<()> {
+        let _guard = self.lock()?;
+        let mut batch = StateBatch::default();
+        let prefix = table.0.to_be_bytes();
+        self.delete_prefix(&mut batch, PK, &prefix);
+        self.delete_prefix(&mut batch, REVERSE, &prefix);
+        self.delete_prefix(&mut batch, FILE_COUNTS, &prefix);
+        self.delete(&mut batch, TABLES, &prefix);
+        for value in self.scan(OPERATIONS, Vec::new()) {
+            if let Ok((key, bytes)) = value {
+                if let Ok(record) = decode_operation_record(&key, &bytes) {
+                    if record.operation.table_id == *table {
+                        let id = &record.operation.id;
+                        self.delete_prefix(&mut batch, DELTAS, &operation_prefix(id));
+                        if self.0.control.is_some() {
+                            batch.control.delete(control::record_key(OPERATIONS, id.0.as_bytes()));
+                        }
+                        batch.delete_cf(
+                            &self.0.db.cf_handle(OPERATIONS).expect("opened column family"),
+                            &key,
+                        );
+                    }
+                }
+            }
+        }
+        self.write(batch)
+    }
+
     /// Remove a completed operation after the caller durably records table
     /// completion in the source ledger. Public data files and row indices stay
     /// untouched; replay is subsequently fenced by the materialized watermark.
@@ -1242,6 +1271,22 @@ impl StateStore {
             bytes,
         );
         Ok(())
+    }
+    fn delete(
+        &self,
+        batch: &mut StateBatch,
+        cf: &str,
+        key: impl AsRef<[u8]>,
+    ) {
+        if self.0.control.is_some() && control::is_authority(cf) {
+            batch
+                .control
+                .delete(control::record_key(cf, key.as_ref()));
+        }
+        batch.delete_cf(
+            &self.0.db.cf_handle(cf).expect("opened column family"),
+            key,
+        );
     }
     fn write(&self, batch: StateBatch) -> Result<()> {
         self.write_observed(batch).map(|_| ())
@@ -1679,5 +1724,18 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(error.requires_index_rebuild());
+    }
+
+    #[test]
+    fn clear_table_index_removes_table_rows_and_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let table = TableId(42);
+        store.complete_noop(&table, PgLsn(100), 1).unwrap();
+        assert_eq!(store.table_state(&table).unwrap().materialized_lsn, PgLsn(100));
+
+        store.clear_table_index(&table).unwrap();
+        assert_eq!(store.table_state(&table).unwrap().materialized_lsn, PgLsn(0));
+        assert!(store.index_is_empty(&table).unwrap());
     }
 }
