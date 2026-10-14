@@ -19,7 +19,9 @@ arrow-array.workspace = true
 bytes.workspace = true
 futures.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 serde.workspace = true
 tracing.workspace = true
 

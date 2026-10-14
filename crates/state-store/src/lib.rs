@@ -13,7 +13,7 @@ mod spool;
 #[path = "../tests/profiles/sst_staging.rs"]
 mod sst_staging_profile;
 pub use buffer::{BufferResult, CollapseBuffer, MemoryRows};
-pub use control::{CheckpointRecord, ControlStore, GenerationState};
+pub use control::{CheckpointRecord, ControlMirror, ControlRestore, ControlStore, GenerationState};
 pub use reader::{IndexSnapshot, RowIndex};
 pub use spool::{Change, CollapsedMutation};
 

@@ -3,7 +3,11 @@
 //! Limits cover fetched bytes and valid-file logical payloads. They do not
 //! bound allocator overhead or allocations caused by corrupt codec/page data.
 
-use std::{collections::BTreeSet, ops::Range, sync::Arc};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    ops::Range,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow_array::RecordBatch;
@@ -11,7 +15,7 @@ use bytes::Bytes;
 use futures::{TryStreamExt, future::BoxFuture};
 use iceberg::{
     arrow::ArrowFileReader,
-    io::{FileIO, FileMetadata},
+    io::{FileIO, FileMetadata, FileRead},
 };
 use parquet::{
     arrow::{
@@ -35,6 +39,13 @@ pub struct ReadLimits {
     pub row_group_uncompressed_bytes: u64,
     /// Expanded values, fixed slots, offsets and validity allowance per batch.
     pub batch_bytes: u64,
+    /// Input files fetched whole ahead of a sequential scan. Object-store
+    /// latency then overlaps instead of accumulating per small file. Zero
+    /// reads every file lazily by range.
+    pub prefetch_files: usize,
+    /// Only files at most this large are fetched whole; larger ones are read
+    /// by range. Bounds prefetched memory to about `prefetch_files` times this.
+    pub prefetch_file_bytes: u64,
 }
 
 impl Default for ReadLimits {
@@ -44,6 +55,8 @@ impl Default for ReadLimits {
             row_group_fetch_bytes: 128 << 20,
             row_group_uncompressed_bytes: 256 << 20,
             batch_bytes: 128 << 20,
+            prefetch_files: 4,
+            prefetch_file_bytes: 4 << 20,
         }
     }
 }
@@ -65,6 +78,7 @@ impl ReadLimits {
             ]
             .into_iter()
             .all(|bytes| usize::try_from(bytes).is_ok())
+                && usize::try_from(self.prefetch_file_bytes).is_ok()
                 && self.batch_bytes <= i32::MAX as u64,
             "Parquet read limits exceed platform or Arrow offset capacity"
         );
@@ -320,9 +334,166 @@ fn admit_group(
     Ok(low)
 }
 
+/// An input file fetched whole ahead of its scan, or one to read by range.
+pub(crate) enum Input {
+    Fetched(Bytes),
+    Lazy,
+}
+
+impl Input {
+    async fn size(&self, input: &iceberg::io::InputFile) -> Result<u64> {
+        Ok(match self {
+            Self::Fetched(bytes) => bytes.len() as u64,
+            Self::Lazy => input.metadata().await?.size,
+        })
+    }
+
+    async fn reader(&self, input: &iceberg::io::InputFile) -> Result<Box<dyn FileRead>> {
+        Ok(match self {
+            Self::Fetched(bytes) => Box::new(Fetched(bytes.clone())),
+            Self::Lazy => input.reader().await?,
+        })
+    }
+}
+
+struct Fetched(Bytes);
+
+#[async_trait::async_trait]
+impl FileRead for Fetched {
+    async fn read(&self, range: Range<u64>) -> iceberg::Result<Bytes> {
+        let invalid = || {
+            iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                "read outside a prefetched file",
+            )
+        };
+        let start = usize::try_from(range.start).map_err(|_| invalid())?;
+        let end = usize::try_from(range.end).map_err(|_| invalid())?;
+        if start > end || end > self.0.len() {
+            return Err(invalid());
+        }
+        Ok(self.0.slice(start..end))
+    }
+}
+
+/// Fetches small inputs whole, at most `prefetch_files` ahead of a consumer
+/// that takes them in the given order. Each fetch reads exactly the
+/// manifest's declared size, replacing a separate size request and bounding
+/// memory even if the object is larger: a shorter object fails the size check,
+/// a longer one the Parquet footer check.
+pub(crate) struct Prefetch {
+    file_io: FileIO,
+    queued: VecDeque<(String, u64)>,
+    pending: VecDeque<Pending>,
+    files: usize,
+    file_bytes: u64,
+}
+
+/// A planned input: its path, declared size and whole-file fetch, if any.
+type Pending = (
+    String,
+    u64,
+    Option<tokio::task::JoinHandle<iceberg::Result<Bytes>>>,
+);
+
+impl Prefetch {
+    /// `files` are `(path, declared size)` in consumption order.
+    pub(crate) fn new(
+        file_io: &FileIO,
+        files: impl IntoIterator<Item = (String, u64)>,
+        limits: &ReadLimits,
+    ) -> Self {
+        let mut prefetch = Self {
+            file_io: file_io.clone(),
+            queued: files.into_iter().collect(),
+            pending: VecDeque::new(),
+            files: limits.prefetch_files,
+            file_bytes: limits.prefetch_file_bytes,
+        };
+        prefetch.fill();
+        prefetch
+    }
+
+    fn fill(&mut self) {
+        while self.pending.len() < self.files.max(1) {
+            let Some((path, size)) = self.queued.pop_front() else {
+                break;
+            };
+            let fetch = (self.files > 0 && size <= self.file_bytes).then(|| {
+                let file_io = self.file_io.clone();
+                let path = path.clone();
+                tokio::spawn(async move {
+                    file_io
+                        .new_input(&path)?
+                        .reader()
+                        .await?
+                        .read(0..size)
+                        .await
+                })
+            });
+            self.pending.push_back((path, size, fetch));
+        }
+    }
+
+    /// The next input, which must be `path`.
+    pub(crate) async fn next(&mut self, path: &str) -> Result<Input> {
+        self.fill();
+        let (expected, size, fetch) = self
+            .pending
+            .pop_front()
+            .context("prefetch consumed past its inputs")?;
+        ensure!(expected == path, "prefetch consumed out of order");
+        let input = match fetch {
+            Some(fetch) => {
+                let bytes = fetch.await.context("prefetch task failed")??;
+                ensure!(
+                    bytes.len() as u64 == size,
+                    "input file size differs from manifest: {path}"
+                );
+                Input::Fetched(bytes)
+            }
+            None => Input::Lazy,
+        };
+        self.fill();
+        Ok(input)
+    }
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        for (_, _, fetch) in self.pending.drain(..) {
+            if let Some(fetch) = fetch {
+                fetch.abort();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn read_batches(
     file_io: &FileIO,
     path: &str,
+    field_ids: Option<&[i32]>,
+    batch_rows: usize,
+    limits: &ReadLimits,
+    visit: impl AsyncFnMut(RecordBatch) -> Result<()>,
+) -> Result<()> {
+    read_input_batches(
+        file_io,
+        path,
+        Input::Lazy,
+        field_ids,
+        batch_rows,
+        limits,
+        visit,
+    )
+    .await
+}
+
+pub(crate) async fn read_input_batches(
+    file_io: &FileIO,
+    path: &str,
+    source: Input,
     field_ids: Option<&[i32]>,
     batch_rows: usize,
     limits: &ReadLimits,
@@ -331,8 +502,11 @@ pub(crate) async fn read_batches(
     limits.validate()?;
     ensure!(batch_rows > 0, "Parquet batch row limit must be positive");
     let input = file_io.new_input(path)?;
-    let file_size = input.metadata().await?.size;
-    let reader = ArrowFileReader::new(FileMetadata { size: file_size }, input.reader().await?);
+    let file_size = source.size(&input).await?;
+    let reader = ArrowFileReader::new(
+        FileMetadata { size: file_size },
+        source.reader(&input).await?,
+    );
     let mut reader = BoundedReader::new(reader, file_size, limits);
     let metadata = ArrowReaderMetadata::load_async(
         &mut reader,
@@ -386,7 +560,10 @@ pub(crate) async fn read_batches(
         }
         let rows = admit_group(&metadata, group, &columns, batch_rows, file_size, limits)
             .with_context(|| format!("Parquet input {path}, row group {index}"))?;
-        let reader = ArrowFileReader::new(FileMetadata { size: file_size }, input.reader().await?);
+        let reader = ArrowFileReader::new(
+            FileMetadata { size: file_size },
+            source.reader(&input).await?,
+        );
         let reader = BoundedReader::new(reader, file_size, limits);
         let mut batches =
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata.clone())

@@ -153,6 +153,7 @@ No separate export task is created.
 | `flow_snapshot_cap_exceeded_by_table_policy` | 1 when an explicit table `history.expire.max-snapshot-age-ms` keeps the table above the snapshot cap |
 | `flow_snapshot_expiration_disabled` | 1 for targets with `gc.enabled=false`; Flow never expires their history |
 | `flow_bootstrap_runs_total{outcome}`, `flow_bootstrap_seconds{outcome}` | `init` runs and their duration, labelled `success` or `error` |
+| `flow_durability_*` | Remote durability queue, object writes, barriers, checkpoints and retention; see [remote durability](remote-durability.md#observability) |
 
 Recovered catalog markers are counted separately and excluded from latency samples. Source-to-service times require synchronized clocks; the production benchmark records calibration uncertainty and complete per-transaction observations. Artifact counters do not include internal SDK retry traffic or catalog-owned metadata writes and must not be presented as cloud billing measurements.
 

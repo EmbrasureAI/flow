@@ -581,3 +581,83 @@ async fn missing_size_statistics_coalesce_before_index_lookups_with_physical_pos
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn prefetched_inputs_decode_like_range_reads_and_check_manifest_sizes() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let schema = schema(&[ColumnType::Int64, ColumnType::String], &[1, 2]);
+    let mut files = Vec::new();
+    for file in 0..6i64 {
+        let path = directory.path().join(format!("{file}.parquet"));
+        let rows: Vec<Row> = (0..40)
+            .map(|row| {
+                vec![
+                    Value::Int64(file * 100 + row),
+                    Value::String(format!("v{row}")),
+                ]
+            })
+            .collect();
+        write_file(&path, &schema, &rows, 7)?;
+        files.push(path);
+    }
+    let file_io = FileIO::new_with_fs();
+    let largest = files
+        .iter()
+        .map(|path| Ok(std::fs::metadata(path)?.len()))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap();
+    let limits = ReadLimits {
+        prefetch_files: 2,
+        // The last file is read by range: its declared size exceeds the limit.
+        prefetch_file_bytes: largest,
+        ..ReadLimits::default()
+    };
+    let mut sizes: Vec<_> = files
+        .iter()
+        .map(|path| {
+            Ok((
+                path.to_str().unwrap().to_owned(),
+                std::fs::metadata(path)?.len(),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    sizes.last_mut().unwrap().1 = u64::MAX;
+    let decode = async |source: Input, path: &str| -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        read_input_batches(&file_io, path, source, None, 16, &limits, async |batch| {
+            rows.extend(rows_from_batch(&schema, &batch)?);
+            Ok(())
+        })
+        .await?;
+        Ok(rows)
+    };
+    let mut prefetch = Prefetch::new(&file_io, sizes.clone(), &limits);
+    for (index, (path, _)) in sizes.iter().enumerate() {
+        let source = prefetch.next(path).await?;
+        assert_eq!(matches!(source, Input::Fetched(_)), index + 1 < sizes.len());
+        assert_eq!(
+            decode(source, path).await?,
+            decode(Input::Lazy, path).await?
+        );
+    }
+    // A manifest size that disagrees with the object is rejected without
+    // reading past it: a larger one when fetching, a smaller one when decoding.
+    let (path, size) = &sizes[0];
+    let wide = ReadLimits {
+        prefetch_files: 2,
+        prefetch_file_bytes: size + 1,
+        ..ReadLimits::default()
+    };
+    let mut longer = Prefetch::new(&file_io, vec![(path.clone(), size + 1)], &wide);
+    assert!(longer.next(path).await.is_err());
+    let mut shorter = Prefetch::new(&file_io, vec![(path.clone(), size - 1)], &wide);
+    let source = shorter.next(path).await?;
+    assert!(matches!(&source, Input::Fetched(bytes) if bytes.len() as u64 == size - 1));
+    assert!(decode(source, path).await.is_err());
+    // Inputs must be consumed in the order they were planned.
+    let mut ordered = Prefetch::new(&file_io, sizes.clone(), &limits);
+    assert!(ordered.next(&sizes[1].0).await.is_err());
+    Ok(())
+}

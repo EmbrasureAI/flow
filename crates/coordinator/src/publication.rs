@@ -11,8 +11,8 @@ use crate::artifacts::{MetadataRegistration, WriterRegistration};
 use crate::blocking;
 use anyhow::{Result, ensure};
 use flow_iceberg_ext::{
-    ArtifactTracker, CommitBase, ManifestCache, RowDeltaAction, find_operation, read_artifact_plan,
-    write_artifact_plan,
+    ArtifactPlan, ArtifactTracker, CommitBase, ManifestCache, RowDeltaAction, find_operation,
+    read_artifact_plan, write_artifact_plan,
 };
 use flow_materializer::{DataWriter, DeleteWriter, WriterConfig, WrittenBatch, iceberg_schema};
 use flow_model::{OperationId, TableSchema};
@@ -39,6 +39,15 @@ struct RecoveryPlan {
     properties: HashMap<String, String>,
 }
 
+/// The head this publish call validated before writing artifacts, and the exact
+/// files it sealed. Only that call constructs it; restarts always read the
+/// persisted plan and a fresh catalog head. The catalog compare-and-swap still
+/// rejects a head that changed meanwhile.
+struct FreshPublication {
+    head: Table,
+    files: ArtifactPlan,
+}
+
 /// Resolve a persisted catalog action without relying on the replaceable index.
 /// `None` proves the operation cannot later publish against its exact base; an
 /// ambiguous response at the unchanged base remains an error and retains its fence.
@@ -61,6 +70,7 @@ pub async fn resolve_catalog_operation(
             table,
             ManifestCache::default(),
             tracker,
+            None,
         )
         .await?
         .map(|(snapshot, sequence, _)| (snapshot, sequence))),
@@ -82,12 +92,16 @@ async fn resolve_ingest_catalog_operation(
     table: &Table,
     cache: ManifestCache,
     tracker: Option<Arc<dyn ArtifactTracker>>,
+    fresh: Option<FreshPublication>,
 ) -> Result<Option<(i64, i64, bool)>> {
     if record.phase == OperationPhase::Building {
         return Ok(None);
     }
     let plan: RecoveryPlan = serde_json::from_slice(&record.operation.payload)?;
-    let head = catalog.load_table(table.identifier()).await?;
+    let (head, fresh_files) = match fresh {
+        Some(fresh) => (fresh.head, Some(fresh.files)),
+        None => (catalog.load_table(table.identifier()).await?, None),
+    };
     ensure!(
         head.metadata().uuid() == plan.base.uuid,
         "table incarnation changed during recovery"
@@ -122,7 +136,10 @@ async fn resolve_ingest_catalog_operation(
     if head.metadata().current_snapshot_id() != plan.base.snapshot_id {
         return Ok(None);
     }
-    let files = read_artifact_plan(head.file_io(), &plan.manifest_list).await?;
+    let files = match fresh_files {
+        Some(files) => files,
+        None => read_artifact_plan(head.file_io(), &plan.manifest_list).await?,
+    };
     let outcome = RowDeltaAction::from_base(plan.base.clone(), record.operation.id.0.clone())
         .require_base_snapshot()
         .add_data_files(files.added_data)
@@ -132,7 +149,7 @@ async fn resolve_ingest_catalog_operation(
         .with_properties(plan.properties)
         .with_manifest_cache(cache)
         .with_artifact_tracker(tracker)
-        .commit(catalog, &head)
+        .commit_on_loaded_table(catalog, &head)
         .await;
     match outcome {
         Ok(committed) => Ok(Some((
@@ -574,12 +591,28 @@ impl TablePublisher {
             other_prepare_ms = other_prepare.as_secs_f64() * 1000.0,
             "ingest artifacts and index deltas prepared"
         );
-        self.recover(&table, &epoch.id).await
+        let fresh = FreshPublication {
+            head: table.clone(),
+            files: ArtifactPlan {
+                added_data: data_files,
+                added_deletes: delete_files,
+            },
+        };
+        self.recover_inner(&table, &epoch.id, Some(fresh)).await
     }
 
     /// Resume Prepared/Committed operations. Building outputs were never eligible
     /// for publication and require deliberate discard/rebuild with new artifact IDs.
     pub async fn recover(&self, table: &Table, id: &OperationId) -> Result<Option<i64>> {
+        self.recover_inner(table, id, None).await
+    }
+
+    async fn recover_inner(
+        &self,
+        table: &Table,
+        id: &OperationId,
+        fresh: Option<FreshPublication>,
+    ) -> Result<Option<i64>> {
         let store = self.store.clone();
         let op = id.clone();
         let record = blocking(move || Ok(store.operation(&op)?))
@@ -601,6 +634,7 @@ impl TablePublisher {
                     self.catalog.as_ref(),
                     table,
                     self.manifest_cache.clone(),
+                    None,
                     None,
                 )
                 .await?;
@@ -630,6 +664,7 @@ impl TablePublisher {
                             record.operation.table_id,
                             record.operation.id.clone(),
                         )?),
+                        fresh,
                     )
                     .await?
                 else {

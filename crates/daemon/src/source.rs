@@ -57,11 +57,13 @@ pub(crate) fn open_source_journal(
     config: &Config,
     ledger: &flow_coordinator::SourceLedger,
 ) -> Result<(Journal, flow_ingress_journal::Recovery)> {
-    Ok(Journal::open_with_floor(
+    let (mut journal, recovery) = Journal::open_with_floor(
         config.state_dir.join("journal"),
         crate::services::journal_config(config),
         ledger.watermarks().journal_durable_lsn,
-    )?)
+    )?;
+    crate::durability::attach_journal(&mut journal)?;
+    Ok((journal, recovery))
 }
 
 /// FULL replica identity describes row images, not the uniqueness contract.
@@ -224,6 +226,8 @@ pub(crate) async fn capture_loop(
         let mut journal_drained_at = None;
         metrics::gauge!("flow_capture_journal_full").set(0.0);
         loop {
+            // Progress admitted on one connection is never replayed to another.
+            let mut gate = crate::durability::AckGate::default();
             let connected = tokio::select! {
                 _ = send.closed() => return Ok(()),
                 result = connect_owned(&config, true) => result,
@@ -268,7 +272,7 @@ pub(crate) async fn capture_loop(
                 .await?;
                 source.set_max_streamed_transactions(config.limits.spool_transactions);
                 let initial_progress = *ack.borrow_and_update();
-                acknowledge_and_reclaim(&mut source, &mut journal, initial_progress).await?;
+                acknowledge_and_reclaim(&mut source, &mut journal, &mut gate, initial_progress).await?;
                 Ok((source, sql, sql_connection, effective_schemas))
             })
             .await;
@@ -336,7 +340,17 @@ pub(crate) async fn capture_loop(
                         // Feedback covers an already durable prefix. Let the
                         // next group fill instead of sealing it for its own ACK.
                         let progress = *ack.borrow_and_update();
-                        match acknowledge_and_reclaim(&mut source, &mut journal, progress).await {
+                        match acknowledge_and_reclaim(&mut source, &mut journal, &mut gate, progress).await {
+                            Ok(()) => {},
+                            Err(error) if retryable_connection(&error) => {
+                                tracing::warn!(%error, "source feedback disconnected"); break;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    durable = gate.ready_signal(), if gate.is_pending() => {
+                        durable?;
+                        match acknowledge_ready(&mut source, &mut gate).await {
                             Ok(()) => {},
                             Err(error) if retryable_connection(&error) => {
                                 tracing::warn!(%error, "source feedback disconnected"); break;
@@ -405,7 +419,7 @@ pub(crate) async fn capture_loop(
                         // Feedback is independent of publication notifications;
                         // the journal quota bounds capture during a long backlog.
                         let progress = *ack.borrow();
-                        match acknowledge_and_reclaim(&mut source, &mut journal, progress).await {
+                        match acknowledge_and_reclaim(&mut source, &mut journal, &mut gate, progress).await {
                             Ok(()) => {},
                             Err(error) if retryable_connection(&error) => {
                                 tracing::warn!(%error, "source heartbeat disconnected"); break;
@@ -627,17 +641,37 @@ pub(crate) async fn capture_loop(
 
 // Startup and later notifications must reclaim the same proven prefix before
 // capture can append more WAL, including when no new watch notification arrives.
+// With remote durability, the source sees only progress whose local state is
+// already replicated; publishing it required a barrier, so reclaim needs none.
 async fn acknowledge_and_reclaim(
     source: &mut impl PostgresSource,
     journal: &mut Journal,
+    gate: &mut crate::durability::AckGate,
     progress: Acknowledgement,
 ) -> Result<()> {
-    source_deadline(async {
-        source.acknowledge(progress).await?;
-        Ok(())
-    })
-    .await?;
+    if let Some(durable) = gate.admit(progress) {
+        source_deadline(async {
+            source.acknowledge(durable).await?;
+            Ok(())
+        })
+        .await?;
+    }
     journal.reclaim(progress.materialized)?;
+    Ok(())
+}
+
+/// Send progress that became durable after it was observed.
+async fn acknowledge_ready(
+    source: &mut impl PostgresSource,
+    gate: &mut crate::durability::AckGate,
+) -> Result<()> {
+    if let Some(durable) = gate.ready() {
+        source_deadline(async {
+            source.acknowledge(durable).await?;
+            Ok(())
+        })
+        .await?;
+    }
     Ok(())
 }
 
@@ -1219,12 +1253,16 @@ pub(crate) async fn verify_source_identity(
             ensure!(identity == expected, crate::exit::resync("PostgreSQL source system, database, timeline, or slot lineage changed; coordinated failover/resynchronization is required"));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && initialize => {
+            let bytes = serde_json::to_vec(&identity)?;
             let temporary = path.with_extension("json.tmp");
             let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&serde_json::to_vec(&identity)?)?;
+            file.write_all(&bytes)?;
             file.sync_all()?;
             std::fs::rename(temporary, path)?;
             std::fs::File::open(&config.state_dir)?.sync_all()?;
+            // The source incarnation proof must survive losing this disk, or
+            // recovery would correctly refuse to resume from replicated state.
+            crate::durability::write_file(crate::durability::SOURCE_IDENTITY, &bytes)?;
         }
         Err(error) => return Err(error).context("source identity proof is missing or unreadable; do not bind existing state to an unverified source"),
     }
@@ -1988,9 +2026,14 @@ mod tests {
             materialized: PgLsn(41),
         });
         let progress = *ack.borrow_and_update();
-        acknowledge_and_reclaim(&mut Feedback, &mut journal, progress)
-            .await
-            .unwrap();
+        acknowledge_and_reclaim(
+            &mut Feedback,
+            &mut journal,
+            &mut crate::durability::AckGate::default(),
+            progress,
+        )
+        .await
+        .unwrap();
         assert!(!ack.has_changed().unwrap());
         assert_eq!(
             journal

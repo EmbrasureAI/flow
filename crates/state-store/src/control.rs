@@ -18,13 +18,58 @@ use crate::{
     prefix_end,
 };
 use flow_model::{OperationId, TableId};
-use rocksdb::{DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch};
+use rocksdb::{DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, atomic::Ordering},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, atomic::Ordering},
 };
+
+/// Receives every control batch after it is locally durable, in commit order,
+/// while the control commit lock is held. Implementations replicate the batch
+/// and must not wait for remote durability: an external effect that depends
+/// on control state waits on the replicator's own barrier.
+pub trait ControlMirror: Send + Sync {
+    fn batch(&self, data: &[u8]) -> std::io::Result<()>;
+    /// Replication position that covers every batch passed so far. Called
+    /// under the control lock while taking a snapshot.
+    fn position(&self) -> u64;
+}
+
+/// Rebuilds a control store from a replicated snapshot and later batches.
+pub struct ControlRestore {
+    db: DB,
+    pending: WriteBatch,
+}
+
+impl ControlRestore {
+    /// Snapshot entries, in any order, before any `apply` call.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.pending.put(key, value);
+        if self.pending.len() >= 4096 {
+            self.db.write(std::mem::take(&mut self.pending))?;
+        }
+        Ok(())
+    }
+
+    /// A replicated batch, in its original commit order.
+    pub fn apply(&mut self, data: &[u8]) -> Result<()> {
+        if !self.pending.is_empty() {
+            self.db.write(std::mem::take(&mut self.pending))?;
+        }
+        self.db.write(WriteBatch::from_data(data))?;
+        Ok(())
+    }
+
+    /// Make the restored authority durable and close it.
+    pub fn finish(mut self) -> Result<()> {
+        self.db
+            .write_opt(std::mem::take(&mut self.pending), &durable_write())?;
+        self.db.flush_wal(true)?;
+        Ok(())
+    }
+}
 
 const ACTIVE: &[u8] = b"active-generation";
 const INITIALIZING: &[u8] = b"initializing-generation";
@@ -52,6 +97,7 @@ pub struct CheckpointRecord {
 struct Inner {
     db: DB,
     writer: Mutex<()>,
+    mirror: OnceLock<Arc<dyn ControlMirror>>,
 }
 
 #[derive(Clone)]
@@ -59,14 +105,7 @@ pub struct ControlStore(Arc<Inner>);
 
 impl ControlStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut options = Options::default();
-        options.create_if_missing(true);
-        options.set_write_buffer_size(4 << 20);
-        options.set_max_write_buffer_number(2);
-        options.set_max_background_jobs(2);
-        // Authority is small; bound its share of the process descriptor limit.
-        options.set_max_open_files(CONTROL_MAX_OPEN_FILES);
-        let db = DB::open(&options, path)?;
+        let db = DB::open(&Self::options(), path)?;
         match db.get(VERSION)? {
             Some(version) if version != [1] => {
                 return Err(Error::InvalidState(
@@ -79,9 +118,79 @@ impl ControlStore {
         let store = Self(Arc::new(Inner {
             db,
             writer: Mutex::new(()),
+            mirror: OnceLock::new(),
         }));
         store.validate_operation_records()?;
         Ok(store)
+    }
+
+    fn options() -> Options {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.set_write_buffer_size(4 << 20);
+        options.set_max_write_buffer_number(2);
+        options.set_max_background_jobs(2);
+        // Authority is small; bound its share of the process descriptor limit.
+        options.set_max_open_files(CONTROL_MAX_OPEN_FILES);
+        options
+    }
+
+    /// Start rebuilding authority in a directory without an existing database.
+    pub fn begin_restore(path: impl AsRef<Path>) -> Result<ControlRestore> {
+        if path.as_ref().join("CURRENT").exists() {
+            return Err(Error::InvalidState(
+                "control restore requires an empty directory".into(),
+            ));
+        }
+        Ok(ControlRestore {
+            db: DB::open(&Self::options(), path)?,
+            pending: WriteBatch::default(),
+        })
+    }
+
+    /// Replicate every later durable write. Attach before sharing the store.
+    pub fn attach_mirror(&self, mirror: Arc<dyn ControlMirror>) -> Result<()> {
+        let _guard = self.lock()?;
+        self.0
+            .mirror
+            .set(mirror)
+            .map_err(|_| Error::InvalidState("control mirror is already attached".into()))
+    }
+
+    /// Read a consistent copy of all authority records together with the
+    /// mirror position it covers. Writers are blocked only while the RocksDB
+    /// snapshot is taken, not while `consume` reads it.
+    pub fn mirror_snapshot<R>(
+        &self,
+        consume: impl FnOnce(u64, &mut dyn Iterator<Item = Result<RawEntry>>) -> R,
+    ) -> Result<R> {
+        let guard = self.lock()?;
+        let mirror = self
+            .0
+            .mirror
+            .get()
+            .ok_or_else(|| Error::InvalidState("control mirror is not attached".into()))?;
+        let snapshot = self.0.db.snapshot();
+        let position = mirror.position();
+        drop(guard);
+        let mut options = ReadOptions::default();
+        options.fill_cache(false);
+        let mut entries = snapshot
+            .iterator_opt(IteratorMode::Start, options)
+            .map(|entry| entry.map_err(Error::from));
+        Ok(consume(position, &mut entries))
+    }
+
+    /// Every control mutation goes through here so the mirror observes the
+    /// exact local commit order. Callers hold the control lock, except `open`.
+    fn write_control(&self, batch: WriteBatch, options: &WriteOptions) -> Result<()> {
+        let mirror = self.0.mirror.get();
+        let data = mirror.map(|_| batch.data().to_vec());
+        self.0.db.write_opt(batch, options)?;
+        if let (Some(mirror), Some(data)) = (mirror, data) {
+            mirror.batch(&data)?;
+        }
+        Ok(())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ()>> {
@@ -122,9 +231,9 @@ impl ControlStore {
                 "control authority is missing; refusing to adopt a previously managed index".into(),
             ));
         }
-        self.0
-            .db
-            .put_opt(INITIALIZING, &encoded, &durable_write())?;
+        let mut initializing = WriteBatch::default();
+        initializing.put(INITIALIZING, &encoded);
+        self.write_control(initializing, &durable_write())?;
         // Copy bounded records first; only ACTIVE makes the import authoritative.
         self.copy_authority_from(&index)?;
         index
@@ -135,7 +244,7 @@ impl ControlStore {
         let mut commit = WriteBatch::default();
         commit.put(ACTIVE, encoded);
         commit.delete(INITIALIZING);
-        self.0.db.write_opt(commit, &durable_write())?;
+        self.write_control(commit, &durable_write())?;
         drop(index);
         drop(guard);
         StateStore::open_with_control(path, config, self.clone())
@@ -149,7 +258,7 @@ impl ControlStore {
                 &prefix,
                 &prefix_end(&prefix).expect("bounded control prefix"),
             );
-            self.0.db.write(clear)?;
+            self.write_control(clear, &WriteOptions::default())?;
             let mut records = index.scan(family, Vec::new());
             loop {
                 let mut batch = WriteBatch::default();
@@ -162,7 +271,7 @@ impl ControlStore {
                 if count == 0 {
                     break;
                 }
-                self.0.db.write(batch)?;
+                self.write_control(batch, &WriteOptions::default())?;
             }
         }
         Ok(())
@@ -224,9 +333,7 @@ impl ControlStore {
                 .0
                 .db
                 .write_opt(std::mem::take(&mut batch.index), &durable_write())?;
-            self.0
-                .db
-                .write_opt(std::mem::take(&mut batch.control), &durable_write())?;
+            self.write_control(std::mem::take(&mut batch.control), &durable_write())?;
             index.0.revision.store(active.revision, Ordering::Release);
             Ok(observation)
         })();
@@ -351,7 +458,7 @@ impl ControlStore {
         let mut batch = WriteBatch::default();
         batch.put(record_key(SOURCE, key), value);
         batch.put(ACTIVE, bincode::serialize(&active)?);
-        self.0.db.write_opt(batch, &durable_write())?;
+        self.write_control(batch, &durable_write())?;
         Ok(())
     }
 
@@ -414,7 +521,7 @@ impl ControlStore {
             bincode::serialize(&state)?,
         );
         batch.put(ACTIVE, bincode::serialize(&active)?);
-        self.0.db.write_opt(batch, &durable_write())?;
+        self.write_control(batch, &durable_write())?;
         Ok(())
     }
 
@@ -507,7 +614,7 @@ impl ControlStore {
             .put_opt(REVISION, active.revision.to_be_bytes(), &durable_write())?;
         sync_directory(&active.path)?;
         control.put(ACTIVE, bincode::serialize(&active)?);
-        self.0.db.write_opt(control, &durable_write())?;
+        self.write_control(control, &durable_write())?;
         Ok(active)
     }
 
@@ -532,11 +639,9 @@ impl ControlStore {
             tables: self.table_states()?,
             pending_operations: self.pending_operations()?,
         };
-        self.0.db.put_opt(
-            checkpoint_key(&record.path),
-            bincode::serialize(&record)?,
-            &durable_write(),
-        )?;
+        let mut batch = WriteBatch::default();
+        batch.put(checkpoint_key(&record.path), bincode::serialize(&record)?);
+        self.write_control(batch, &durable_write())?;
         Ok(record)
     }
 
@@ -563,6 +668,34 @@ impl ControlStore {
         StateStore::open(destination, config)
     }
 
+    /// Re-register a checkpoint whose files were restored at another path,
+    /// such as after downloading a replica on a replacement host.
+    pub fn relocate_checkpoint(
+        &self,
+        record: &CheckpointRecord,
+        path: impl AsRef<Path>,
+    ) -> Result<CheckpointRecord> {
+        let _guard = self.lock()?;
+        let key = checkpoint_key(&record.path);
+        if self.0.db.get(&key)?.as_deref() != Some(bincode::serialize(record)?.as_slice()) {
+            return Err(Error::InvalidState(
+                "checkpoint registration changed or is missing".into(),
+            ));
+        }
+        let relocated = CheckpointRecord {
+            path: fs::canonicalize(path.as_ref())?,
+            ..record.clone()
+        };
+        let mut batch = WriteBatch::default();
+        batch.delete(key);
+        batch.put(
+            checkpoint_key(&relocated.path),
+            bincode::serialize(&relocated)?,
+        );
+        self.write_control(batch, &durable_write())?;
+        Ok(relocated)
+    }
+
     pub fn checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
         self.scan(vec![CHECKPOINT])
             .map(|entry| entry.and_then(|(_, value)| decode(&value)))
@@ -577,7 +710,9 @@ impl ControlStore {
                 "checkpoint registration changed or is missing".into(),
             ));
         }
-        self.0.db.delete_opt(key, &durable_write())?;
+        let mut batch = WriteBatch::default();
+        batch.delete(key);
+        self.write_control(batch, &durable_write())?;
         Ok(())
     }
 
@@ -935,6 +1070,7 @@ mod tests {
         let control = ControlStore(Arc::new(Inner {
             db: DB::open_for_read_only(&Options::default(), &control_path, false).unwrap(),
             writer: Mutex::new(()),
+            mirror: OnceLock::new(),
         }));
         let index =
             StateStore::open_with_control(&path, StateStoreOptions::default(), control.clone())
@@ -981,6 +1117,7 @@ mod tests {
         let control = ControlStore(Arc::new(Inner {
             db: DB::open_for_read_only(&Options::default(), &control_path, false).unwrap(),
             writer: Mutex::new(()),
+            mirror: OnceLock::new(),
         }));
         let index =
             StateStore::open_with_control(&path, StateStoreOptions::default(), control.clone())

@@ -31,6 +31,10 @@ pub struct Config {
     /// Local state volume safety.
     #[serde(default)]
     pub storage: Storage,
+    /// Replicate the journal and control state to object storage, so a worker
+    /// and its local disk can be replaced without losing acknowledged changes.
+    #[serde(default)]
+    pub durability: Option<flow_durability::Config>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -310,6 +314,15 @@ impl Config {
         self.validate_source()
     }
 
+    /// Replicated state is independent of this machine's disk by construction.
+    pub fn journal_durability(&self) -> JournalDurability {
+        if self.durability.is_some() {
+            JournalDurability::IndependentStorage
+        } else {
+            self.source.journal_durability
+        }
+    }
+
     fn validate_source(&self) -> Result<()> {
         ensure!(
             !self.source.id.is_empty()
@@ -319,9 +332,12 @@ impl Config {
         );
         ensure!(
             self.source.ack_mode != AckMode::Journaled
-                || self.source.journal_durability == JournalDurability::IndependentStorage,
+                || self.journal_durability() == JournalDurability::IndependentStorage,
             "journaled acknowledgement requires independently durable storage"
         );
+        if let Some(durability) = &self.durability {
+            durability.validate()?;
+        }
         ensure!(self.catalog.contains_key("uri"), "catalog.uri is required");
         for key in ["token", "credential"] {
             if let Some(name) = self.catalog.get(&format!("{key}_env")) {

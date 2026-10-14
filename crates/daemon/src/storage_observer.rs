@@ -163,19 +163,24 @@ impl Storage for ObservedStorage {
             metrics: self.metrics.clone(),
         }))
     }
+    // Deletion decisions come from local state; with remote durability they
+    // must be replicated first so a successor never sees a deleted object as live.
     async fn delete(&self, path: &str) -> Result<()> {
+        crate::durability::storage_guard().await?;
         self.metrics
             .delete
             .record(self.inner.delete(path), |_| 0)
             .await
     }
     async fn delete_prefix(&self, path: &str) -> Result<()> {
+        crate::durability::storage_guard().await?;
         self.metrics
             .delete_prefix
             .record(self.inner.delete_prefix(path), |_| 0)
             .await
     }
     async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
+        crate::durability::storage_guard().await?;
         self.metrics
             .delete_stream
             .record(self.inner.delete_stream(paths), |_| 0)

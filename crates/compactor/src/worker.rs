@@ -1,4 +1,7 @@
-use crate::{CompactionPlan, ReadLimits, parquet_scan::read_batches};
+use crate::{
+    CompactionPlan, ReadLimits,
+    parquet_scan::{Input, Prefetch, read_input_batches},
+};
 use anyhow::{Result, bail, ensure};
 use arrow_array::{Array, Int64Array, StringArray};
 use flow_iceberg_ext::SnapshotView;
@@ -604,8 +607,19 @@ async fn scan_staged_live_files(
     cancelled: Option<&AtomicBool>,
     mut visit: impl AsyncFnMut(LiveBatch) -> Result<()>,
 ) -> Result<()> {
+    let mut prefetch = Prefetch::new(
+        table.file_io(),
+        files.iter().map(|file| {
+            (
+                file.0.clone(),
+                view.live_files[&file.0].data_file.file_size_in_bytes(),
+            )
+        }),
+        read_limits,
+    );
     for file in files {
         check_cancelled(cancelled)?;
+        let source = prefetch.next(&file.0).await?;
         let mut deletes = scratch.file_position_deletes(scan_id, &schema.table_id, file);
         let mut next_delete = deletes
             .next()
@@ -618,9 +632,10 @@ async fn scan_staged_live_files(
         let entry = &view.live_files[&file.0];
         let mut lineage = v3.then(Vec::new);
         let mut owned_bytes = 0u64;
-        read_batches(
+        read_input_batches(
             table.file_io(),
             &file.0,
+            source,
             None,
             batch_rows,
             read_limits,
@@ -886,14 +901,34 @@ async fn load_deletes(
         .filter(|entry| entry.file_format() == iceberg::spec::DataFileFormat::Puffin)
         .filter_map(|entry| entry.data_file.referenced_data_file())
         .collect::<BTreeSet<_>>();
+    // Puffin vectors share objects and are read by offset; prefetch Parquet only.
+    let mut prefetch = Prefetch::new(
+        file_io,
+        delete_files.iter().map(|file| {
+            let entry = &view.live_files[&file.0];
+            let size = if entry.file_format() == iceberg::spec::DataFileFormat::Puffin {
+                u64::MAX
+            } else {
+                entry.data_file.file_size_in_bytes()
+            };
+            (file.0.clone(), size)
+        }),
+        read_limits,
+    );
     for file in delete_files {
         check_cancelled(cancelled)?;
+        let source = prefetch.next(&file.0).await?;
         let delete_entry = &view.live_files[&file.0];
         let input = file_io.new_input(delete_entry.file_path())?;
-        let metadata = input.metadata().await?;
+        let size = if let Input::Fetched(bytes) = &source {
+            // Prefetch already compared the fetched size with the manifest.
+            bytes.len() as u64
+        } else {
+            input.metadata().await?.size
+        };
         check_cancelled(cancelled)?;
         ensure!(
-            metadata.size == delete_entry.data_file.file_size_in_bytes(),
+            size == delete_entry.data_file.file_size_in_bytes(),
             "delete file size differs from manifest"
         );
         bytes = bytes
@@ -980,9 +1015,10 @@ async fn load_deletes(
             continue;
         }
         let mut file_rows = 0u64;
-        read_batches(
+        read_input_batches(
             file_io,
             delete_entry.file_path(),
+            source,
             Some(&[2147483546, 2147483545]),
             batch_rows,
             read_limits,

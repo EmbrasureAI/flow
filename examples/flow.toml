@@ -65,6 +65,19 @@ footer_bytes = 8388608
 row_group_fetch_bytes = 134217728
 row_group_uncompressed_bytes = 268435456
 batch_bytes = 134217728
+# Maintenance scans fetch this many small input files whole, ahead of use,
+# so object-store latency overlaps; 0 reads every file lazily by range.
+prefetch_files = 4
+prefetch_file_bytes = 4194304
+
+# Optional: replicate the journal and control state to object storage, so a
+# worker and its whole state volume can be replaced without losing changes
+# acknowledged to the source. Use a new prefix for each source incarnation.
+# See docs/remote-durability.md.
+# [durability]
+# uri = "s3://warehouse-bucket/flow/orders-primary-v1"
+# checkpoint_interval_secs = 30
+# lease_secs = 10
 
 # Optional HTTP probes and metrics: GET /healthz, /readyz and /metrics.
 # Unauthenticated; bind to a private interface.

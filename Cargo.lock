@@ -1393,6 +1393,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "async-trait",
  "bytes",
  "flow-iceberg-ext",
  "flow-materializer",
@@ -1449,6 +1450,7 @@ dependencies = [
  "clap",
  "flow-compactor",
  "flow-coordinator",
+ "flow-durability",
  "flow-iceberg-ext",
  "flow-ingress-journal",
  "flow-materializer",
@@ -1483,6 +1485,31 @@ dependencies = [
  "tracing-subscriber",
  "typetag",
  "uuid",
+]
+
+[[package]]
+name = "flow-durability"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "blake3",
+ "bytes",
+ "crc32fast",
+ "flow-ingress-journal",
+ "flow-model",
+ "flow-state-store",
+ "fs2",
+ "futures",
+ "metrics",
+ "opendal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]
