@@ -1400,6 +1400,7 @@ dependencies = [
  "flow-state-store",
  "futures",
  "iceberg",
+ "iceberg-storage-opendal",
  "parquet",
  "serde",
  "tempfile",

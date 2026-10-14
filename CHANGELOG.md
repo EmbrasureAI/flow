@@ -130,6 +130,8 @@ This will be the initial public release, `0.1.0`.
 
 ### Fixed
 
+- Reuse observed Puffin object sizes within a delete scan, avoiding repeated
+  metadata requests for shared v3 deletion vectors while preserving validation.
 - PostgreSQL date and timestamp arrays accept finite values beyond Chrono's
   calendar range whenever scalar decoding supports them, preserving the existing
   JSON string representation and rejection of infinite dates and timestamps.
