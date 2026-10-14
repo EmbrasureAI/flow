@@ -10,7 +10,7 @@ use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSch
 use flow_state_store::{IndexDelta, OperationKind, PreparedOperation, RowIndex, StateStore};
 use iceberg::{io::FileIO, spec::DataFile, table::Table};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Artifacts and durable row mappings only. There is deliberately no catalog
@@ -895,6 +895,9 @@ async fn load_deletes(
 ) -> Result<u64> {
     let mut bytes = 0u64;
     let mut rows = 0u64;
+    // Descriptors can share an immutable Puffin object. Re-observe its size on
+    // each scan, but validate every descriptor against that observation.
+    let mut puffin_sizes = HashMap::new();
     let vector_targets = view
         .live_files
         .values()
@@ -924,9 +927,19 @@ async fn load_deletes(
             prefetch.next(&file.0).await?
         };
         let delete_entry = &view.live_files[&file.0];
-        let size = source
-            .size(&file_io.new_input(delete_entry.file_path())?)
-            .await?;
+        let input = file_io.new_input(delete_entry.file_path())?;
+        let size = if is_puffin(file) {
+            // Deletion vectors share Puffin objects; stat each object once.
+            if let Some(size) = puffin_sizes.get(delete_entry.file_path()) {
+                *size
+            } else {
+                let size = input.metadata().await?.size;
+                puffin_sizes.insert(delete_entry.file_path(), size);
+                size
+            }
+        } else {
+            source.size(&input).await?
+        };
         check_cancelled(cancelled)?;
         ensure!(
             size == delete_entry.data_file.file_size_in_bytes(),
@@ -957,9 +970,9 @@ async fn load_deletes(
                 .live_files
                 .get(&target.0)
                 .ok_or_else(|| anyhow::anyhow!("DV target is not live"))?;
-            let vector = iceberg::puffin::read_deletion_vector(
-                file_io,
-                descriptor.file_path(),
+            let vector = iceberg::puffin::read_deletion_vector_with_size(
+                &input,
+                size,
                 u64::try_from(
                     descriptor
                         .content_offset()
