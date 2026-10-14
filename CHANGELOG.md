@@ -92,6 +92,23 @@ This will be the initial public release, `0.1.0`.
 - PostgreSQL TLS modes and configured CA bundles; `sslmode=verify-ca` requires
   `sslrootcert`, as in libpq.
 
+**Remote durability**
+
+- Optional `[durability]` makes object storage (`s3://`, S3-compatible
+  endpoints or `file://`) the authority for the journal, control state and
+  source identity, so a worker and its whole state volume can be replaced
+  without losing changes acknowledged to the source. Appends are written behind;
+  catalog changes, object deletions, source acknowledgements and slot creation
+  wait until the state they depend on is replicated and the owner's lease is
+  valid. Row-index checkpoints are replicated too. See
+  [remote durability](docs/remote-durability.md).
+- A stale row-index checkpoint is advanced from Iceberg file changes instead of
+  rebuilding every table, with or without `[durability]`.
+- Maintenance scans fetch small inputs whole, a bounded number ahead
+  (`parquet_read.prefetch_files`, `parquet_read.prefetch_file_bytes`), and
+  fresh publications reuse the catalog head and plan they already validated,
+  removing multi-second maintenance stalls from publication latency.
+
 **Operations and observability**
 
 - Exit codes for supervisors: 78 = configuration invalid or incompatible with

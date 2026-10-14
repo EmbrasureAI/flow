@@ -16,12 +16,22 @@ const CATALOG_CA_FILE: &str = "tls_ca_file";
 /// Catalog properties whose URLs receive the bearer token or OAuth credential.
 const CATALOG_AUTH_URLS: [&str; 2] = ["uri", "oauth2-server-uri"];
 
-pub(crate) fn state(config: &Config) -> Result<StateStore> {
+/// Open the control store first and, with remote durability, replicate
+/// everything this process inherited before any external effect, and fetch a
+/// replicated index checkpoint if the local index is missing.
+pub(crate) async fn open_control(config: &Config) -> Result<ControlStore> {
     std::fs::create_dir_all(&config.state_dir)?;
-    crate::generation::open(
-        config,
-        ControlStore::open(config.state_dir.join("control"))?,
-    )
+    let control = ControlStore::open(config.state_dir.join("control"))?;
+    crate::lifecycle::state_lock_acquired();
+    crate::durability::attach_control(&control).await?;
+    crate::durability::restore_index_checkpoint(&control, &config.state_dir).await?;
+    Ok(control)
+}
+
+#[cfg(test)]
+pub(crate) async fn state(config: &Config) -> Result<StateStore> {
+    let control = open_control(config).await?;
+    crate::generation::open(config, control)
 }
 pub(crate) fn journal_config(config: &Config) -> JournalConfig {
     JournalConfig {
@@ -51,9 +61,11 @@ pub(crate) async fn catalog(config: &Config) -> Result<Arc<dyn Catalog>> {
         .get("uri")
         .and_then(|uri| TEST_CATALOGS.lock().unwrap().get(uri).cloned())
     {
-        return Ok(catalog);
+        return Ok(crate::durability::fence(catalog));
     }
-    rest_catalog(config.catalog_properties()?).await
+    Ok(crate::durability::fence(
+        rest_catalog(config.catalog_properties()?).await?,
+    ))
 }
 
 async fn rest_catalog(mut properties: HashMap<String, String>) -> Result<Arc<dyn Catalog>> {
@@ -158,7 +170,7 @@ pub(crate) fn ledger(store: &StateStore, config: &Config) -> Result<SourceLedger
         store.clone(),
         SourceId(config.source.id.clone()),
         config.source.ack_mode,
-        config.source.journal_durability,
+        config.journal_durability(),
     )
 }
 pub(crate) fn target(namespace: &[String], name: &str) -> Result<TableIdent> {

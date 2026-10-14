@@ -33,6 +33,7 @@ clap.workspace = true
 fs2 = "0.4"
 flow-compactor.workspace = true
 flow-coordinator.workspace = true
+flow-durability.workspace = true
 flow-iceberg-ext.workspace = true
 flow-ingress-journal.workspace = true
 flow-materializer.workspace = true
