@@ -19,6 +19,13 @@ fn transaction(source: &SourceId, xid: u32) -> SourceTransaction {
     }
 }
 
+fn pending_for(ledger: &SourceLedger, table: u32) -> Vec<PgLsn> {
+    ledger
+        .pending_table_transactions_after(TableId(table), PgLsn(0))
+        .map(|transaction| transaction.unwrap().end_lsn)
+        .collect()
+}
+
 #[test]
 #[ignore = "manual local RocksDB durability microbenchmark; reports timings without a speed assertion"]
 fn measure_durable_ledger_batches() {
@@ -108,10 +115,9 @@ fn atomic_pages_preserve_replay_and_contiguous_ack_across_control_reopen() {
             .table_materialized_batch(&[PgLsn(11), PgLsn(999)], TableId(1), 100)
             .is_err()
     );
-    assert_eq!(
-        ledger.pending_tables(PgLsn(11)).unwrap(),
-        vec![TableId(1), TableId(2)]
-    );
+    let unchanged = [PgLsn(11), PgLsn(21), PgLsn(31)];
+    assert_eq!(pending_for(&ledger, 1), unchanged);
+    assert_eq!(pending_for(&ledger, 2), unchanged);
     for table in [TableId(1), TableId(2)] {
         ledger
             .table_materialized_batch(&[PgLsn(31), PgLsn(21), PgLsn(21)], table, 100)
@@ -140,7 +146,8 @@ fn atomic_pages_preserve_replay_and_contiguous_ack_across_control_reopen() {
             .unwrap(),
         transactions[..3]
     );
-    assert!(ledger.pending_tables(PgLsn(21)).unwrap().is_empty());
+    assert_eq!(pending_for(&ledger, 1), [PgLsn(11)]);
+    assert_eq!(pending_for(&ledger, 2), [PgLsn(11)]);
     ledger
         .table_materialized_batch(&[PgLsn(11)], TableId(1), 100)
         .unwrap();
@@ -150,7 +157,8 @@ fn atomic_pages_preserve_replay_and_contiguous_ack_across_control_reopen() {
             .table_materialized_batch(&[PgLsn(11), PgLsn(21)], TableId(2), 999)
             .is_err()
     );
-    assert_eq!(ledger.pending_tables(PgLsn(11)).unwrap(), vec![TableId(2)]);
+    assert!(pending_for(&ledger, 1).is_empty());
+    assert_eq!(pending_for(&ledger, 2), [PgLsn(11)]);
     ledger
         .table_materialized_batch(&[PgLsn(11)], TableId(2), 100)
         .unwrap();

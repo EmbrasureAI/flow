@@ -150,7 +150,7 @@ fn mutation_threshold_legacy_work_and_zero_rows_preserve_deadlines() {
 }
 
 #[test]
-fn continued_arrivals_and_force_preserve_overdue_order() {
+fn continued_arrivals_preserve_overdue_order() {
     let start = Instant::now();
     let mut scheduler = Scheduler::new(1, 1024, 10, start).unwrap();
     for (table, tick) in [(1, 0), (2, 1), (1, 2)] {
@@ -163,7 +163,6 @@ fn continued_arrivals_and_force_preserve_overdue_order() {
             start + Duration::from_millis(tick),
         );
     }
-    scheduler.force(TableId(1), start + Duration::from_millis(3));
     assert_eq!(scheduler.next_deadline(), Some(start));
     assert_eq!(
         scheduler.take_ready(start + Duration::from_millis(3)),

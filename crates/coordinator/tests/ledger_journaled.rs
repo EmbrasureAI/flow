@@ -89,10 +89,8 @@ fn ack_follows_the_journal_while_materialization_retains_every_descriptor() {
     assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(0));
     assert_eq!(ledger.acknowledgement(), PgLsn(31));
     assert_eq!(pending(&ledger), [1, 2, 3]);
-    assert_eq!(
-        ledger.pending_tables(PgLsn(11)).unwrap(),
-        [TableId(1), TableId(2)]
-    );
+    assert_eq!(pending_for(&ledger, 1), [1]);
+    assert_eq!(pending_for(&ledger, 2), [1]);
 
     ledger.table_materialized(PgLsn(11), TableId(1), 7).unwrap();
     assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(0));
