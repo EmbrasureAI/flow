@@ -355,6 +355,18 @@ pub(super) struct TableWork {
     pub(super) metadata_backoff: Arc<Mutex<MetadataBackoff>>,
     pub(super) compaction: bool,
 }
+
+/// What recovering a table's unfinished operation did.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingRecovery {
+    /// Nothing, or a building operation discarded without the catalog.
+    Local,
+    /// A maintenance operation was resolved, possibly by a catalog commit.
+    Catalog,
+    /// An ingest operation was recovered and must be reconciled first.
+    Ingest,
+}
+
 impl TableWork {
     async fn start_build(
         &self,
@@ -718,11 +730,10 @@ impl TableWork {
         Ok((table.metadata().uuid() == *uuid).then_some(table))
     }
 
-    /// Discard a building operation or resolve a prepared one. Returns true
-    /// when an ingest operation was recovered and must be reconciled first.
-    async fn recover_pending(&self, table: &Table, id: TableId) -> Result<bool> {
+    /// Discard a building operation or resolve a prepared one.
+    async fn recover_pending(&self, table: &Table, id: TableId) -> Result<PendingRecovery> {
         let Some(operation) = self.store.table_state(&id)?.pending_operation else {
-            return Ok(false);
+            return Ok(PendingRecovery::Local);
         };
         let record = self
             .store
@@ -732,13 +743,13 @@ impl TableWork {
             (OperationPhase::Building, _) => {
                 self.store.discard_uncommitted(&operation)?;
                 self.store.discard_transaction(&operation.0)?;
-                Ok(false)
+                Ok(PendingRecovery::Local)
             }
             (_, OperationKind::Ingest) => {
                 let recovery = self.publisher.recover(table, &operation).await;
                 discard_unowned_spool(self.store.clone(), operation.clone()).await?;
                 recovery?;
-                Ok(true)
+                Ok(PendingRecovery::Ingest)
             }
             (
                 _,
@@ -747,7 +758,7 @@ impl TableWork {
                 self.maintenance.recover(table, &operation).await?;
                 let store = self.store.clone();
                 tokio::task::spawn_blocking(move || store.forget_applied(&operation)).await??;
-                Ok(false)
+                Ok(PendingRecovery::Catalog)
             }
             _ => bail!("index reconstruction must finish before publication"),
         }
@@ -768,9 +779,10 @@ impl TableWork {
                 transactions.is_empty() && candidate.is_none(),
                 "build probe contains publication work"
             );
-            return self.probe_build(&table, schema).await;
+            return self.probe_build(table, schema).await;
         }
-        if self.recover_pending(&table, id).await? {
+        let recovery = self.recover_pending(&table, id).await?;
+        if recovery == PendingRecovery::Ingest {
             // Reconcile the recovered operation separately from newly
             // admitted CDC. Its original batch may differ after restart.
             return Ok(TableOutcome::Recovered);
@@ -805,7 +817,13 @@ impl TableWork {
                 "journal schema is newer than durable source registry"
             );
         }
-        let mut current = crate::schema::refresh_table(self.catalog.as_ref(), &table).await?;
+        // `table` was loaded just before this call. Only a recovery that may
+        // have committed through the catalog requires loading it again.
+        let mut current = if recovery == PendingRecovery::Catalog {
+            crate::schema::refresh_table(self.catalog.as_ref(), &table).await?
+        } else {
+            table.clone()
+        };
         current = crate::schema::ensure_table_schema(
             &self.store,
             self.catalog.as_ref(),
@@ -1003,7 +1021,7 @@ impl TableWork {
 
     /// Capture only a soft data build. Recovery, schema changes, dependency
     /// repair and synchronous maintenance belong to ordinary table work.
-    async fn probe_build(&self, table: &Table, schema: TableSchema) -> Result<TableOutcome> {
+    async fn probe_build(&self, current: Table, schema: TableSchema) -> Result<TableOutcome> {
         if !self.compaction {
             return Ok(TableOutcome::ProbeComplete);
         }
@@ -1014,7 +1032,6 @@ impl TableWork {
         }
         let source = SourceId(self.config.source.id.clone());
         let schema = crate::schema::latest_schema(&self.store, &source, id)?.unwrap_or(schema);
-        let current = crate::schema::refresh_table(self.catalog.as_ref(), table).await?;
         if indexed.snapshot_id != current.metadata().current_snapshot_id()
             || indexed.schema_version != schema.version
             || !flow_coordinator::same_iceberg_schema(
@@ -1793,6 +1810,109 @@ mod metadata_maintenance_tests {
         work: TableWork,
         schema: TableSchema,
         head: Table,
+        catalog: Arc<CountingCatalog>,
+    }
+
+    /// Counts table loads and can fail the next commit before it applies.
+    #[derive(Debug)]
+    struct CountingCatalog {
+        inner: iceberg::memory::MemoryCatalog,
+        loads: std::sync::atomic::AtomicUsize,
+        fail_next_update: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingCatalog {
+        fn loads(&self) -> usize {
+            self.loads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for CountingCatalog {
+        async fn list_namespaces(
+            &self,
+            parent: Option<&NamespaceIdent>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            self.inner.list_namespaces(parent).await
+        }
+        async fn create_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: std::collections::HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.inner.create_namespace(namespace, properties).await
+        }
+        async fn get_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.inner.get_namespace(namespace).await
+        }
+        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            self.inner.namespace_exists(namespace).await
+        }
+        async fn update_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: std::collections::HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            self.inner.update_namespace(namespace, properties).await
+        }
+        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            self.inner.drop_namespace(namespace).await
+        }
+        async fn list_tables(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<Vec<iceberg::TableIdent>> {
+            self.inner.list_tables(namespace).await
+        }
+        async fn create_table(
+            &self,
+            namespace: &NamespaceIdent,
+            creation: TableCreation,
+        ) -> iceberg::Result<Table> {
+            self.inner.create_table(namespace, creation).await
+        }
+        async fn load_table(&self, table: &iceberg::TableIdent) -> iceberg::Result<Table> {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.load_table(table).await
+        }
+        async fn drop_table(&self, table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            self.inner.drop_table(table).await
+        }
+        async fn purge_table(&self, table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            self.inner.purge_table(table).await
+        }
+        async fn table_exists(&self, table: &iceberg::TableIdent) -> iceberg::Result<bool> {
+            self.inner.table_exists(table).await
+        }
+        async fn rename_table(
+            &self,
+            src: &iceberg::TableIdent,
+            dest: &iceberg::TableIdent,
+        ) -> iceberg::Result<()> {
+            self.inner.rename_table(src, dest).await
+        }
+        async fn register_table(
+            &self,
+            table: &iceberg::TableIdent,
+            metadata_location: String,
+        ) -> iceberg::Result<Table> {
+            self.inner.register_table(table, metadata_location).await
+        }
+        async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
+            if self
+                .fail_next_update
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "injected catalog commit failure",
+                ));
+            }
+            self.inner.update_table(commit).await
+        }
     }
 
     /// A target with `commits` Flow-indexed snapshots.
@@ -1809,8 +1929,8 @@ mod metadata_maintenance_tests {
         let store = control
             .initialize_index(root.path().join("index"), StateStoreOptions::default())
             .unwrap();
-        let catalog: Arc<dyn Catalog> = Arc::new(
-            MemoryCatalogBuilder::default()
+        let counting = Arc::new(CountingCatalog {
+            inner: MemoryCatalogBuilder::default()
                 .load(
                     "retention",
                     std::collections::HashMap::from([(
@@ -1820,7 +1940,10 @@ mod metadata_maintenance_tests {
                 )
                 .await
                 .unwrap(),
-        );
+            loads: Default::default(),
+            fail_next_update: Default::default(),
+        });
+        let catalog: Arc<dyn Catalog> = counting.clone();
         let namespace = NamespaceIdent::new("replicated".into());
         catalog
             .create_namespace(&namespace, std::collections::HashMap::new())
@@ -1927,6 +2050,7 @@ mod metadata_maintenance_tests {
             work,
             schema,
             head,
+            catalog: counting,
         }
     }
 
@@ -2050,6 +2174,110 @@ mod metadata_maintenance_tests {
             .await
             .unwrap();
         assert_eq!(load(&f).await.metadata().snapshots().len(), 4);
+    }
+
+    /// Without an unfinished operation, an epoch publishes on the head it
+    /// loaded first; only publication's recheck loads the table again.
+    #[tokio::test]
+    async fn an_epoch_reuses_its_loaded_target_head() {
+        let mut f = fixture(|_| {}, 1).await;
+        f.work
+            .garbage_checked
+            .lock()
+            .unwrap()
+            .insert(f.schema.table_id, Instant::now());
+        let transaction = journal_insert(&mut f, 100, 1000);
+        let before = f.catalog.loads();
+        let completion = f
+            .work
+            .clone()
+            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            completion.outcome,
+            TableOutcome::Complete {
+                operation: Some(_),
+                snapshot: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(f.catalog.loads() - before, 2);
+        let indexed = f.work.store.table_state(&f.schema.table_id).unwrap();
+        assert_eq!(
+            indexed.snapshot_id,
+            load(&f).await.metadata().current_snapshot_id()
+        );
+        assert_eq!(indexed.materialized_lsn, PgLsn(1000));
+    }
+
+    /// A maintenance commit that failed ambiguously is completed by the next
+    /// epoch's recovery. That epoch must publish on the head recovery
+    /// committed, not on the head it loaded before recovering.
+    #[tokio::test]
+    async fn epoch_after_catalog_recovery_publishes_on_the_recovered_head() {
+        let mut f = fixture(|_| {}, 3).await;
+        let id = f.schema.table_id;
+        f.work
+            .garbage_checked
+            .lock()
+            .unwrap()
+            .insert(id, Instant::now());
+        f.catalog
+            .fail_next_update
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let policy = flow_iceberg_ext::ManifestRewritePolicy {
+            min_manifest_count: 2,
+            ..Default::default()
+        };
+        f.work
+            .maintenance
+            .rewrite_manifests(&f.head, id, &policy)
+            .await
+            .unwrap_err();
+        let fence = f.work.store.table_state(&id).unwrap().pending_operation;
+        let operation = fence.expect("ambiguous failure retains its fence");
+        assert_eq!(
+            f.work.store.operation(&operation).unwrap().unwrap().phase,
+            OperationPhase::Prepared
+        );
+        assert_eq!(
+            load(&f).await.metadata().current_snapshot_id(),
+            f.head.metadata().current_snapshot_id()
+        );
+
+        let transaction = journal_insert(&mut f, 100, 1000);
+        let completion = f
+            .work
+            .clone()
+            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .await
+            .unwrap();
+        // Publishing on the pre-recovery head would first reconcile the index
+        // against it in a scratch store.
+        assert!(!f.work.config.state_dir.join("reconcile").exists());
+        let TableOutcome::Complete {
+            operation: Some(epoch),
+            snapshot: Some(published),
+            ..
+        } = completion.outcome
+        else {
+            panic!("expected a published epoch");
+        };
+        let head = load(&f).await;
+        let rewrite = flow_iceberg_ext::find_operation(head.metadata(), &operation.0)
+            .expect("recovery committed the manifest rewrite");
+        assert_eq!(
+            rewrite.parent_snapshot_id(),
+            f.head.metadata().current_snapshot_id()
+        );
+        let epoch = flow_iceberg_ext::find_operation(head.metadata(), &epoch.0).unwrap();
+        assert_eq!(epoch.snapshot_id(), published);
+        assert_eq!(epoch.parent_snapshot_id(), Some(rewrite.snapshot_id()));
+        let indexed = f.work.store.table_state(&id).unwrap();
+        assert_eq!(indexed.pending_operation, None);
+        assert_eq!(indexed.snapshot_id, Some(published));
+        assert_eq!(indexed.materialized_lsn, PgLsn(1000));
     }
 
     /// A bounded rewrite that stays above the hard limit is not retried by
