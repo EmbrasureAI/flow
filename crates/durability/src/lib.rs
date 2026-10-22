@@ -615,13 +615,13 @@ impl Durability {
     /// call from a blocking thread. Returns total and newly uploaded bytes.
     pub fn upload_index_checkpoint(&self, directory: &Path) -> Result<(u64, u64)> {
         let operator = self.0.operator.clone();
+        let shared = self.0.shared.clone();
         let hashes = self.0.index_hashes.clone();
         let directory = directory.to_path_buf();
         let started = Instant::now();
-        let (total, uploaded) = self
-            .0
-            .runtime
-            .block_on(async move { index::upload(&operator, &hashes, &directory).await })?;
+        let (total, uploaded) = self.0.runtime.block_on(async move {
+            index::upload(&shared, &operator, &hashes, &directory).await
+        })?;
         metrics::histogram!("flow_durability_index_checkpoint_seconds")
             .record(started.elapsed().as_secs_f64());
         metrics::counter!("flow_durability_index_checkpoint_bytes_total").increment(uploaded);

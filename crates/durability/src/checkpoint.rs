@@ -380,7 +380,7 @@ async fn retain(shared: &Arc<Shared>, operator: &Operator, history: &History) ->
     if doomed.is_empty() {
         return Ok(());
     }
-    shared.require_lease(shared.tuning.lease / 2)?;
+    shared.require_lease(shared.tuning.lease / 2, "delete objects")?;
     let deleted = store::delete_all(operator, doomed).await?;
     metrics::counter!("flow_durability_deleted_objects_total").increment(deleted as u64);
     let mut state = shared.lock();
