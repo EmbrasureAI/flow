@@ -461,23 +461,27 @@ impl Cursor {
         self.offset += count;
         Ok(bytes)
     }
+    /// Fixed-width fields are read in place; only variable-length values
+    /// share the message buffer as `Bytes`.
+    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        if N > self.remaining() {
+            return Err(Error::Protocol("truncated message"));
+        }
+        let bytes = self.bytes[self.offset..self.offset + N].try_into().unwrap();
+        self.offset += N;
+        Ok(bytes)
+    }
     fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        Ok(self.array::<1>()?[0])
     }
     fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_be_bytes(
-            self.take(2)?.as_ref().try_into().unwrap(),
-        ))
+        Ok(u16::from_be_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_be_bytes(
-            self.take(4)?.as_ref().try_into().unwrap(),
-        ))
+        Ok(u32::from_be_bytes(self.array()?))
     }
     fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_be_bytes(
-            self.take(8)?.as_ref().try_into().unwrap(),
-        ))
+        Ok(u64::from_be_bytes(self.array()?))
     }
     fn i64(&mut self) -> Result<i64> {
         Ok(self.u64()? as i64)
@@ -494,9 +498,11 @@ impl Cursor {
             .iter()
             .position(|&b| b == 0)
             .ok_or(Error::Protocol("unterminated string"))?;
-        let bytes = self.take(length)?;
-        self.u8()?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::Protocol("invalid UTF-8 identifier"))
+        let name = std::str::from_utf8(&self.bytes[self.offset..self.offset + length])
+            .map_err(|_| Error::Protocol("invalid UTF-8 identifier"))?
+            .to_owned();
+        self.offset += length + 1;
+        Ok(name)
     }
     fn tuple(&mut self) -> Result<Tuple> {
         let count = self.u16()? as usize;

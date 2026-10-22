@@ -265,29 +265,46 @@ impl<'a> SnapshotSession<'a> {
 
 /// Reuse the pinned transport's binary COPY framing and our same row/type
 /// conversion as CDC. This keeps initial-copy and update encodings identical.
-pub fn decode_copy_row(
-    schema: &TableSchema,
-    relation: &Relation,
-    row: &BinaryCopyOutRow,
-) -> Result<Row> {
-    decode_copy_row_with_types(schema, relation, row, &crate::TypeRegistry::default())
+/// The relation is validated once, not for every copied row.
+pub struct CopyRowDecoder<'a> {
+    schema: &'a TableSchema,
+    relation: &'a Relation,
+    types: &'a crate::TypeRegistry,
 }
-pub fn decode_copy_row_with_types(
-    schema: &TableSchema,
-    relation: &Relation,
-    row: &BinaryCopyOutRow,
-    types: &crate::TypeRegistry,
-) -> Result<Row> {
-    types.validate_relation(schema, relation)?;
-    let mut values = Vec::with_capacity(schema.columns.len());
-    for (index, (column, pg)) in schema.columns.iter().zip(&relation.columns).enumerate() {
-        values.push(match row.try_get::<Option<RawColumn<'_>>>(index)? {
-            Some(raw) => types.decode(&column.data_type, pg.type_oid, raw.0, true)?,
-            None => Value::Null,
-        });
+
+impl<'a> CopyRowDecoder<'a> {
+    pub fn new(
+        schema: &'a TableSchema,
+        relation: &'a Relation,
+        types: &'a crate::TypeRegistry,
+    ) -> Result<Self> {
+        types.validate_relation(schema, relation)?;
+        Ok(Self {
+            schema,
+            relation,
+            types,
+        })
     }
-    schema.validate_row(&values)?;
-    Ok(values)
+
+    pub fn decode(&self, row: &BinaryCopyOutRow) -> Result<Row> {
+        let mut values = Vec::with_capacity(self.schema.columns.len());
+        for (index, (column, pg)) in self
+            .schema
+            .columns
+            .iter()
+            .zip(&self.relation.columns)
+            .enumerate()
+        {
+            values.push(match row.try_get::<Option<RawColumn<'_>>>(index)? {
+                Some(raw) => self
+                    .types
+                    .decode(&column.data_type, pg.type_oid, raw.0, true)?,
+                None => Value::Null,
+            });
+        }
+        self.schema.validate_row(&values)?;
+        Ok(values)
+    }
 }
 
 struct RawColumn<'a>(&'a [u8]);

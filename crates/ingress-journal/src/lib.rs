@@ -582,18 +582,18 @@ impl Journal {
     /// Flushes the terminal commit and every referenced chunk before advancing
     /// `durable_lsn`. The caller owns policy for reporting this LSN to Postgres.
     pub fn commit(&mut self, txn: SourceTransaction) -> Result<()> {
-        self.stage_commit(txn)?;
+        self.stage_commit(&txn)?;
         self.flush_commits()
     }
 
     /// Append a complete terminal without exposing it to journal readers.
     /// Open and staged XIDs share the configured transaction limit. Call
     /// `flush_commits` before reporting durability or releasing source spools.
-    pub fn stage_commit(&mut self, txn: SourceTransaction) -> Result<()> {
+    pub fn stage_commit(&mut self, txn: &SourceTransaction) -> Result<()> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        validate_transaction(&txn)?;
+        validate_transaction(txn)?;
         if txn.table_mutation_counts.is_none() {
             return Err(Error::Transaction(
                 "new terminals require per-table mutation counts",
@@ -617,9 +617,9 @@ impl Journal {
                 "terminal references must cover exactly the transaction chunks in order",
             ));
         }
-        let payload = bincode::serialize(&txn)?;
+        let payload = bincode::serialize(txn)?;
         let reference = self.append(COMMIT, txn.xid, &payload)?;
-        if let Err(error) = self.terminal_writer.append(&reference, &txn) {
+        if let Err(error) = self.terminal_writer.append(&reference, txn) {
             self.poisoned = true;
             return Err(error);
         }
@@ -1068,7 +1068,7 @@ mod sync_failure_tests {
         let (mut journal, _) = Journal::open(root.path(), JournalConfig::default()).unwrap();
         for xid in 1..=3 {
             journal
-                .stage_commit(SourceTransaction {
+                .stage_commit(&SourceTransaction {
                     source_id: SourceId("source".into()),
                     xid,
                     begin_lsn: PgLsn(1),
