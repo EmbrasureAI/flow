@@ -94,7 +94,26 @@ impl DeleteWriter {
     pub async fn write(&mut self, positions: &[RowLocation]) -> Result<()> {
         match &mut self.inner {
             Writer::Parquet(writer) => writer.write(positions).await,
-            Writer::Puffin(writer) => writer.write(positions).await,
+            Writer::Puffin(writer) => writer.write(positions, None).await,
+        }
+    }
+
+    /// V3 only: when a target starts, union its vector from `priors` with the
+    /// new positions. Merged positions may repeat or precede new ones.
+    pub async fn write_with_priors(
+        &mut self,
+        positions: &[RowLocation],
+        priors: &mut HashMap<String, DeleteVector>,
+    ) -> Result<()> {
+        match &mut self.inner {
+            Writer::Parquet(writer) => {
+                ensure!(
+                    priors.is_empty(),
+                    "position-delete files cannot merge deletion vectors"
+                );
+                writer.write(positions).await
+            }
+            Writer::Puffin(writer) => writer.write(positions, Some(priors)).await,
         }
     }
 
@@ -143,7 +162,11 @@ impl VectorWriter {
         format!("{}-delete-{:06}.puffin", self.prefix, self.ordinal)
     }
 
-    async fn write(&mut self, positions: &[RowLocation]) -> Result<()> {
+    async fn write(
+        &mut self,
+        positions: &[RowLocation],
+        mut priors: Option<&mut HashMap<String, DeleteVector>>,
+    ) -> Result<()> {
         let limit = self
             .config
             .row_group_bytes
@@ -152,9 +175,9 @@ impl VectorWriter {
             // A new high-key bitmap costs at most 32 encoded bytes per inserted
             // position. Reserve that headroom once per batch; near the limit,
             // exact checks retain the same admission boundary.
-            let check_each = chunk.len().saturating_mul(32)
+            let mut check_each = chunk.len().saturating_mul(32)
                 > limit.saturating_sub(self.positions.serialized_size());
-            for position in chunk {
+            for (index, position) in chunk.iter().enumerate() {
                 let target = &position.data_file_id.0;
                 ensure!(
                     position.spec_id == self.spec_id
@@ -179,6 +202,11 @@ impl VectorWriter {
                     }
                     self.target = Some(target.clone());
                     self.last_position = None;
+                    if let Some(prior) = priors.as_deref_mut().and_then(|p| p.remove(target)) {
+                        self.positions = prior;
+                        check_each = (chunk.len() - index).saturating_mul(32)
+                            > limit.saturating_sub(self.positions.serialized_size());
+                    }
                 }
                 self.positions.insert(position.row_position);
                 self.last_position = Some(position.row_position);
