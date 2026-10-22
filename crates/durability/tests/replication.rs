@@ -801,7 +801,7 @@ async fn flush_and_release_give_up_after_one_lease_while_storage_is_unavailable(
     assert!(released.is_err());
     durability.stop();
     assert!(
-        started.elapsed() < Duration::from_secs(12),
+        started.elapsed() < Duration::from_secs(8),
         "shutdown took {:?}",
         started.elapsed()
     );

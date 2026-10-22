@@ -69,10 +69,10 @@ segment, fails it after three attempts. The source retains WAL meanwhile. Queued
 count against `queue_memory_bytes`; journal extents count only their small
 descriptors, since their bytes are read from the local segment when batched, and
 contiguous extents share one. Appends block once the budget is used. A clean
-shutdown waits at most one lease for its final checkpoint and release record,
-then stops without a release, so the next start waits one lease. A shutdown
-after an error likewise waits at most one lease for queued records, such as a
-resync marker, to replicate.
+shutdown waits about one lease at most for its final checkpoint and release
+record, then stops without a release, so the next start waits one lease. A
+shutdown after an error likewise waits about one lease at most for queued
+records, such as a resync marker, to replicate.
 
 ## Ownership and fencing
 

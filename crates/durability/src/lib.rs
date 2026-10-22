@@ -200,7 +200,11 @@ struct Inner {
     lock: Mutex<Option<fs::File>>,
     requests: mpsc::Sender<checkpoint::Request>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// Sends the deadline by which replication must have stopped.
+    stop: Mutex<Option<oneshot::Sender<Instant>>>,
+    /// One lease after the latest release or flush began. Stopping drains
+    /// only until then, so a whole shutdown takes about one lease at most.
+    shutdown: Mutex<Option<Instant>>,
     uri: String,
     mode: Mode,
     restore: Option<RestoreStats>,
@@ -275,7 +279,7 @@ impl Durability {
         })?;
         let identity = recovery::lock_identity(&lock);
         let (ready, readiness) = oneshot::channel();
-        let (stop, stopped) = oneshot::channel::<()>();
+        let (stop, stopped) = oneshot::channel::<Instant>();
         let (requests, receiver) = mpsc::channel(16);
         let tuning = config.tuning();
         let lease = tuning.lease;
@@ -356,11 +360,15 @@ impl Durability {
                         operator: operator.clone(),
                         runtime: tokio::runtime::Handle::current(),
                     }));
-                    let _ = stopped.await;
+                    let deadline = stopped.await.unwrap_or_else(|_| Instant::now() + lease);
                     shared.close();
-                    // Queued records drain while the lease lasts; renewal
-                    // has stopped, so no write can start after it.
-                    let _ = tokio::time::timeout(lease, futures::future::join_all(tasks)).await;
+                    // Queued records drain until the deadline, at most one
+                    // lease; renewal has stopped, so no write starts later.
+                    let _ = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        futures::future::join_all(tasks),
+                    )
+                    .await;
                 });
                 runtime.shutdown_timeout(Duration::from_secs(1));
             })?;
@@ -393,6 +401,7 @@ impl Durability {
             requests,
             thread: Mutex::new(Some(thread)),
             stop: Mutex::new(Some(stop)),
+            shutdown: Mutex::new(None),
             uri: config.uri.clone(),
             mode,
             restore,
@@ -710,16 +719,33 @@ impl Durability {
         work: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
         let lease = self.0.shared.tuning.lease;
-        tokio::time::timeout(lease, work).await.with_context(|| {
-            format!(
-                "remote durability {what} did not complete within the {}s lease",
-                lease.as_secs()
-            )
-        })?
+        let deadline = Instant::now() + lease;
+        *self
+            .0
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
+        let deadline = tokio::time::Instant::from_std(deadline);
+        tokio::time::timeout_at(deadline, work)
+            .await
+            .with_context(|| {
+                format!(
+                    "remote durability {what} did not complete within the {}s lease",
+                    lease.as_secs()
+                )
+            })?
     }
 
     /// Stop replication without a release. The next owner waits one lease.
+    /// Queued records drain until one lease after the latest release or
+    /// flush began, or otherwise for one lease.
     pub fn stop(&self) {
+        let deadline = self
+            .0
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|| Instant::now() + self.0.shared.tuning.lease);
         if let Some(stop) = self
             .0
             .stop
@@ -727,7 +753,7 @@ impl Durability {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            let _ = stop.send(());
+            let _ = stop.send(deadline);
         }
         if let Some(thread) = self
             .0
