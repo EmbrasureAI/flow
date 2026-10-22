@@ -423,6 +423,49 @@ fn release_blocked_candidates<B, P>(
     released
 }
 
+/// One periodic visit runs at a time: the most overdue eligible table.
+fn next_periodic_visit(
+    due: &BTreeMap<TableId, Instant>,
+    active: bool,
+    now: Instant,
+    eligible: impl Fn(&TableId) -> bool,
+) -> Option<TableId> {
+    if active {
+        return None;
+    }
+    due.iter()
+        .filter(|(id, due)| **due <= now && eligible(id))
+        .min_by_key(|(_, due)| **due)
+        .map(|(id, _)| *id)
+}
+
+/// Every outcome of an admitted periodic visit releases the single periodic
+/// slot. A visit that only recovered an unfinished operation did not maintain
+/// the table, so the table stays due.
+fn finish_periodic_visit(
+    table: TableId,
+    outcome: &TableOutcome,
+    active: &mut bool,
+    due: &mut BTreeMap<TableId, Instant>,
+    now: Instant,
+) {
+    *active = false;
+    match outcome {
+        TableOutcome::PeriodicComplete {
+            next_due: Some(next),
+        } => {
+            due.insert(table, *next);
+        }
+        TableOutcome::PeriodicComplete { next_due: None } | TableOutcome::Blocked { .. } => {
+            due.remove(&table);
+        }
+        TableOutcome::Recovered => {
+            due.entry(table).or_insert(now + OPTIONAL_MAINTENANCE_DELAY);
+        }
+        _ => {}
+    }
+}
+
 fn feedback(ledger: &SourceLedger) -> Acknowledgement {
     Acknowledgement {
         received: ledger.watermarks().received_lsn,
@@ -745,6 +788,9 @@ impl PublishRuntime {
                         lane.record_release(id, Instant::now());
                     }
                     scheduler.stall(id, false);
+                    if periodic_maintenance {
+                        finish_periodic_visit(id, &outcome, &mut periodic_active, &mut periodic_due, Instant::now());
+                    }
                     match outcome {
                         TableOutcome::Blocked { error_code } => {
                             let indexed = store.table_state(&id)?;
@@ -761,9 +807,6 @@ impl PublishRuntime {
                             maintenance_due.remove(&id);
                             periodic_due.remove(&id);
                             idle_work.retain(|queued| *queued != id);
-                            if periodic_maintenance {
-                                periodic_active = false;
-                            }
                         }
                         TableOutcome::Recovered => {
                             if reserved_build {
@@ -782,14 +825,9 @@ impl PublishRuntime {
                             }));
                             maintenance_due.remove(&id);
                         }
-                        TableOutcome::PeriodicComplete { next_due } => {
-                            periodic_active = false;
-                            ensure!(!reserved_build && transactions.is_empty(), "invalid periodic maintenance completion");
-                            if let Some(due) = next_due {
-                                periodic_due.insert(id, due);
-                            } else {
-                                periodic_due.remove(&id);
-                            }
+                        TableOutcome::PeriodicComplete { .. } => {
+                            ensure!(periodic_maintenance && !reserved_build && transactions.is_empty(),
+                                "invalid periodic maintenance completion");
                         }
                         TableOutcome::ProbeComplete => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid background build probe");
@@ -1123,12 +1161,11 @@ impl PublishRuntime {
                         let cdc_ready = scheduler.next_deadline().is_some_and(|due| due <= now);
                         // One periodic visit at a time; ready CDC must receive a
                         // dispatch between visits even across different tables.
-                        let periodic = if optional_allowed && !periodic_active && !(periodic_yield_to_cdc && cdc_ready) {
-                            periodic_due.iter()
-                                .filter(|(id, due)| **due <= now && !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none()
-                                    && !build_active.contains(*id) && !retiring_builds.contains(*id))
-                                .min_by_key(|(_, due)| **due)
-                                .map(|(id, _)| *id)
+                        let periodic = if optional_allowed && !(periodic_yield_to_cdc && cdc_ready) {
+                            next_periodic_visit(&periodic_due, periodic_active, now, |id| {
+                                !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
+                                    && !build_active.contains(id) && !retiring_builds.contains(id)
+                            })
                         } else {
                             None
                         };
@@ -1434,6 +1471,59 @@ mod maintenance_admission_tests {
         admission.observe(SourceHealthStatus::Healthy);
         assert!(admission.optional_allowed(4, 4, false));
         assert!(admission.optional_allowed(1, 1, true));
+    }
+
+    #[test]
+    fn a_periodic_visit_that_only_recovers_keeps_later_periodic_visits_running() {
+        let start = Instant::now();
+        let (recovered, quiet) = (TableId(1), TableId(2));
+        let mut due =
+            BTreeMap::from([(recovered, start), (quiet, start + Duration::from_secs(60))]);
+        let mut active = false;
+        let admit = |due: &mut BTreeMap<_, _>, active: &mut bool, now| {
+            let table = next_periodic_visit(due, *active, now, |_| true)?;
+            *active = true;
+            due.remove(&table);
+            Some(table)
+        };
+
+        // The visit finds an unfinished ingest operation and only recovers it.
+        assert_eq!(admit(&mut due, &mut active, start), Some(recovered));
+        assert_eq!(
+            next_periodic_visit(&due, active, start + Duration::from_secs(60), |_| true),
+            None
+        );
+        finish_periodic_visit(
+            recovered,
+            &TableOutcome::Recovered,
+            &mut active,
+            &mut due,
+            start,
+        );
+        assert!(!active);
+
+        // Its maintenance still runs, and so do later visits to other tables.
+        let retry = start + OPTIONAL_MAINTENANCE_DELAY;
+        assert_eq!(admit(&mut due, &mut active, retry), Some(recovered));
+        let complete = TableOutcome::PeriodicComplete { next_due: None };
+        finish_periodic_visit(recovered, &complete, &mut active, &mut due, retry);
+        let later = start + Duration::from_secs(60);
+        assert_eq!(admit(&mut due, &mut active, later), Some(quiet));
+        let continuation = TableOutcome::PeriodicComplete {
+            next_due: Some(later),
+        };
+        finish_periodic_visit(quiet, &continuation, &mut active, &mut due, later);
+        assert_eq!(admit(&mut due, &mut active, later), Some(quiet));
+        finish_periodic_visit(
+            quiet,
+            &TableOutcome::Blocked {
+                error_code: "catalog_unavailable",
+            },
+            &mut active,
+            &mut due,
+            later,
+        );
+        assert!(!active && due.is_empty());
     }
 
     #[test]
