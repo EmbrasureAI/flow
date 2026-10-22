@@ -191,6 +191,10 @@ async fn resolve_ingest_catalog_operation(
 #[error("table changed during publication; reconcile and replan from the journal")]
 pub struct ReplanRequired;
 
+/// Budget of the publisher's manifest cache. The daemon shares it with
+/// maintenance, which reads the same current manifests.
+const MANIFEST_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+
 /// One owner per table. Persistent table fencing survives loss of this actor.
 pub struct TablePublisher {
     store: StateStore,
@@ -223,7 +227,7 @@ impl TablePublisher {
             writer,
             batch_rows,
             batch_bytes,
-            manifest_cache: ManifestCache::default(),
+            manifest_cache: ManifestCache::new(MANIFEST_CACHE_BYTES),
             read_limits: flow_compactor::ReadLimits::default(),
         })
     }
@@ -235,7 +239,9 @@ impl TablePublisher {
         self.read_limits = limits;
         Ok(self)
     }
-    /// Parsed manifests shared by every table's publications.
+    /// Parsed manifests shared by every table's publications. Pass it to
+    /// [`crate::TableMaintenance::with_manifest_cache`] so maintenance reuses
+    /// the manifests publication already read.
     pub fn manifest_cache(&self) -> &ManifestCache {
         &self.manifest_cache
     }
