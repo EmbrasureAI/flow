@@ -118,7 +118,7 @@ No separate export task is created.
 | `flow_journal_committed_payload_bytes_total` | Serialized mutation-chunk payload bytes in successfully synced source transactions; excludes aborted subtransactions, journal framing and terminal records |
 | `flow_source_registration_seconds` | Successful dispatcher page read and durable source-ledger registration, before feedback; includes blocking database work |
 | `flow_source_registration_transactions` | Newly registered transactions per successful dispatcher page; histogram count measures registration pages |
-| `flow_capture_phase_seconds` | Schema validation and spool begin/replay/disposal per transaction; journal sync per durability group, labelled by bounded phase and success/error |
+| `flow_capture_phase_seconds` | Schema validation and spool replay per transaction, spool begin/disposal per transaction spilled to disk; journal sync per durability group, labelled by bounded phase and success/error |
 | `flow_journal_commit_group_transactions` | Number of complete source transactions sharing a successful journal durability barrier |
 | `flow_catalog_commit_seconds` | Catalog publication path, including preparing and committing metadata |
 | `flow_catalog_commit_attempts_total{table_id}` | CDC catalog commit attempts, including retries and recovery of a prepared operation |
@@ -324,7 +324,7 @@ Checkpoint and index-generation events include their revisions, paths, durations
 
 Capture seals a group when it reaches 32 complete transactions, crosses 4 MiB of transaction payload, or reaches a five-millisecond scheduling deadline. The payload threshold can be exceeded by the final complete transaction; its payload stays disk-backed and the transaction remains atomic. Source/schema interruptions may seal smaller groups. Terminal records and their chunks become discoverable by concurrent journal readers together, only after sync; source notifications and ACK eligibility follow that boundary. Slow disk or source I/O can exceed the scheduling deadline.
 
-Capture phase timings isolate work within the capture actor, not time waiting for PostgreSQL or queued WAL. Schema validation includes the final buffered chunk flush; ordinary verified schemas do not require a SQL query per transaction. Spool replay includes journal chunk appends but excludes terminal sync. Journal sync measures the commit `sync_data` call; it excludes terminal serialization and index bookkeeping. Spool begin and disposal measure filesystem lifecycle calls. These phases do not cover all capture CPU time and must not be treated as a complete latency decomposition.
+Capture phase timings isolate work within the capture actor, not time waiting for PostgreSQL or queued WAL. Schema validation includes the final buffered chunk flush; ordinary verified schemas do not require a SQL query per transaction. Spool replay includes journal chunk appends but excludes terminal sync. Journal sync measures the commit `sync_data` call; it excludes terminal serialization and index bookkeeping. Spool begin and disposal measure filesystem lifecycle calls; transactions that stay within the spool's memory bound make none. These phases do not cover all capture CPU time and must not be treated as a complete latency decomposition.
 
 `status` also reports `blocked_tables` with stable error codes, retry timestamps,
 attempt counts, and retained operation IDs. `table_progress` reports each table's

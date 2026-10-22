@@ -161,7 +161,7 @@ impl CaptureAssembler {
     }
 
     /// Bound terminal descriptors waiting for one journal durability barrier.
-    /// Row payloads remain in the disk spool and journal, independent of this
+    /// Row payloads remain in the bounded spool and journal, independent of this
     /// limit. The caller chooses when to flush by count, payload bytes or age.
     pub fn with_pending_commit_limit(mut self, limit: usize) -> Result<Self> {
         if limit == 0 || !self.pending_commits.is_empty() {

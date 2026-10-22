@@ -551,7 +551,15 @@ fn buffered_capture_preserves_spools_and_mixed_schema_transactions_until_group_s
         ..Default::default()
     };
     let (mut journal, _) = Journal::open(root.path().join("journal"), cfg.clone()).unwrap();
-    let spool = TransactionSpool::open(&spool_path, SpoolConfig::default()).unwrap();
+    // Write every spooled transaction to disk so its retention is observable.
+    let spool = TransactionSpool::open(
+        &spool_path,
+        SpoolConfig {
+            memory_transaction_bytes: 0,
+            ..SpoolConfig::default()
+        },
+    )
+    .unwrap();
     let mut capture = CaptureAssembler::new(SourceId("source".into()), spool, [schema(11)], 128)
         .unwrap()
         .with_pending_commit_limit(2)
@@ -701,6 +709,18 @@ fn buffered_capture_preserves_spools_and_mixed_schema_transactions_until_group_s
                 xid: 5,
                 final_lsn: PgLsn(30),
                 commit_timestamp_micros: 3,
+            },
+            PgLsn(22),
+            &mut journal,
+        )
+        .unwrap();
+    capture
+        .push_buffered_at(
+            SourceEvent::Insert {
+                xid: 5,
+                subxid: 5,
+                relation: 11,
+                row: [row("5", "open"), vec![Cell::Null]].concat(),
             },
             PgLsn(22),
             &mut journal,
