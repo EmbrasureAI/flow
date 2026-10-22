@@ -1830,6 +1830,17 @@ mod startup_recovery_tests {
         let blocked = TableId(8);
         let end = PgLsn(11);
         let id = OperationId("durable-applied-epoch".into());
+        let pending_tables = |ledger: &SourceLedger| {
+            [published, blocked]
+                .into_iter()
+                .filter(|table| {
+                    ledger
+                        .pending_table_transactions_after(*table, PgLsn(0))
+                        .map(|transaction| transaction.unwrap().end_lsn)
+                        .eq([end])
+                })
+                .collect::<Vec<_>>()
+        };
 
         let control = ControlStore::open(&control_path).unwrap();
         let store = control
@@ -1918,7 +1929,7 @@ mod startup_recovery_tests {
         assert_eq!(ledger.acknowledgement(), PgLsn(0));
         assert_eq!(reconcile_source_progress(&store, &mut ledger).unwrap(), 1);
         assert_eq!(ledger.acknowledgement(), PgLsn(0));
-        assert_eq!(ledger.pending_tables(end).unwrap(), [blocked]);
+        assert_eq!(pending_tables(&ledger), [blocked]);
         assert!(store.operation(&id).unwrap().is_none());
         assert!(control.operation(&id).unwrap().is_none());
         assert_eq!(
@@ -1941,7 +1952,7 @@ mod startup_recovery_tests {
             JournalDurability::LocalDisk,
         )
         .unwrap();
-        assert_eq!(ledger.pending_tables(end).unwrap(), [blocked]);
+        assert_eq!(pending_tables(&ledger), [blocked]);
         assert!(store.applied_operations(2).unwrap().is_empty());
         assert_eq!(
             control.table_state(&published).unwrap(),

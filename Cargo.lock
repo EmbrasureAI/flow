@@ -1431,7 +1431,6 @@ dependencies = [
  "iceberg",
  "metrics",
  "opendal",
- "proptest",
  "serde",
  "serde_json",
  "tempfile",
