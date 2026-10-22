@@ -751,7 +751,7 @@ fn scan_journal(root: &Path) -> Result<JournalModel> {
                         id,
                         SegmentModel {
                             length: entry.metadata()?.len(),
-                            parts: Vec::new(),
+                            ..SegmentModel::default()
                         },
                     );
                 }
