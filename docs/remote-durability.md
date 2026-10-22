@@ -32,9 +32,10 @@ uri = "s3://bucket/flow/orders-primary-v1"
 
 S3 credentials come from the standard chain (environment, profile, ECS task
 role or instance metadata). The prefix needs `GetObject`, `PutObject` with
-conditional writes, `DeleteObject`, and `ListBucket` on the bucket, so a missing
-object reports 404 rather than 403. With `[durability]` configured, the journal
-counts as independently durable, so `ack_mode = "journaled"` is allowed.
+conditional writes, `DeleteObject`, `AbortMultipartUpload` (row-index files
+larger than 8 MiB are uploaded in parts) and `ListBucket` on the bucket, so a
+missing object reports 404 rather than 403. With `[durability]` configured, the
+journal counts as independently durable, so `ack_mode = "journaled"` is allowed.
 
 ## Contract
 
@@ -62,15 +63,26 @@ If object storage is unavailable, local capture continues within its journal
 quota and queue budget, but nothing is acknowledged, published or deleted:
 barriers wait, logging a warning every `stall_warning_secs`, and fail only once
 replication has stopped, for example because a newer owner claimed the state.
-The source retains WAL meanwhile.
+Log batches and checkpoint objects retry transient errors, so the startup
+checkpoint waits the same way. The source retains WAL meanwhile. Queued records
+count against `queue_memory_bytes`; journal extents count only their small
+descriptors, since their bytes are read from the local segment when batched, and
+contiguous extents share one. Appends block once the budget is used. A clean
+shutdown waits at most one lease for its final checkpoint and release record,
+then stops without a release, so the next start waits one lease. A shutdown
+after an error likewise waits at most one lease for queued records, such as a
+resync marker, to replicate.
 
 ## Ownership and fencing
 
 Each process start claims the next owner epoch with a conditionally created
 `owners/<epoch>.json`. The owner renews a lease every quarter of `lease_secs` by
 checking that no successor claim exists; barriers require a lease with more
-than two seconds left, and no object write starts unless the lease outlasts
-`request_timeout_secs`. A replaced owner fails its next barrier and stops
+than two seconds left. After startup, no object write starts unless the lease
+outlasts `request_timeout_secs`: log batches and checkpoint objects wait for
+one, and row-index uploads are skipped without one. The format identity, owner
+claim and epoch start written during startup precede the lease and are
+conditional creates. A replaced owner fails its next barrier and stops
 writing, and the daemon exits.
 
 A successor waits one lease after its claim before reading the final log tail,
@@ -160,9 +172,11 @@ every record it reflects is durable. Snapshot and part names include their
 checksum, so no owner can replace an object another checkpoint names; journal
 parts are uploaded concurrently. After a checkpoint, the owner deletes log
 batches and objects that neither it nor its predecessor needs; a predecessor
-checkpoint is always kept as a fallback. Only an owner with a fresh lease
-deletes. Journal reclamation is replicated in order, so restored journals keep
-exactly the retained segments. A segment whose bytes are not durable yet is
+checkpoint is always kept as a fallback. Row-index replicas no longer
+registered locally, and files only they used, are deleted too. Only an owner
+with a lease valid for at least half of `lease_secs` deletes. Journal
+reclamation is replicated in order, so restored journals keep exactly the
+retained segments. A segment whose bytes are not durable yet is
 kept locally until a later reclamation instead of blocking the journal. Index
 checkpoint files are hashed and uploaded in 8 MiB pieces, and hashes of
 hard-linked SST files carry over between checkpoints.
@@ -187,13 +201,13 @@ deleted objects.
 | Metric | Meaning |
 | --- | --- |
 | `flow_durability_pending_records` | Appended records not yet durable |
-| `flow_durability_put_seconds{kind}` | Object writes for `log` batches, `control` snapshots and journal `part`s |
+| `flow_durability_put_seconds{kind}` | Object writes for `log` batches, `control` snapshots, journal `part`s and `checkpoint` manifests |
 | `flow_durability_batch_bytes`, `flow_durability_batch_records` | Size of each log batch |
 | `flow_durability_barrier_seconds` | Time external effects waited for replication |
-| `flow_durability_retries_total{kind}` | Retried log writes |
+| `flow_durability_retries_total{kind}` | Retried object writes, by the same kinds |
 | `flow_durability_checkpoint_seconds` | Checkpoint duration |
 | `flow_durability_control_snapshot_bytes` | Latest control snapshot size |
-| `flow_durability_deleted_objects_total` | Objects removed by retention |
+| `flow_durability_deleted_objects_total` | Objects removed by retention, including row-index replicas |
 | `flow_durability_lease_seconds` | Configured lease, set at each renewal |
 | `flow_durability_failed` | 1 once replication stopped; the process exits |
 | `flow_durability_index_checkpoint_seconds`, `flow_durability_index_checkpoint_bytes_total` | Index checkpoint replication time and newly uploaded bytes |
@@ -206,6 +220,12 @@ and checkpoint; `index_checkpoint_replicated`, `index_checkpoint_downloaded` and
 
 - One process owns a prefix. Fencing relies on bounded clock rates and on
   object requests finishing within `request_timeout_secs`.
+- Each log batch, control snapshot and journal part is written with a single
+  request that must finish within `request_timeout_secs`. A batch can reach
+  `max_batch_bytes` and a part a whole journal segment (64 MiB), so the default
+  4 seconds needs about 16 MiB/s of upload bandwidth for the largest parts.
+  Slower links retry with warnings that name the object size; raise
+  `request_timeout_secs` together with `lease_secs`, or lower `max_batch_bytes`.
 - Downloading the index checkpoint scales with index size, and catch-up with
   the files changed since that checkpoint. Without a usable replica, the full
   rebuild scales with table size.

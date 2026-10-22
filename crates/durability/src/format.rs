@@ -5,11 +5,13 @@
 //! ```text
 //! <prefix>/format.json                         identity of the source using this prefix
 //! <prefix>/owners/<epoch>.json                 one claim per process start
-//! <prefix>/log/<seq>.batch                     ordered records, contiguous from 0
-//! <prefix>/checkpoints/<replay>-<ordinal>-<epoch>-<ms>.json state as of a log position
-//! <prefix>/control/<ordinal>.snapshot          control store image named by a checkpoint
-//! <prefix>/journals/<name>/<segment>-<start>-<end>.part  journal bytes named by a checkpoint
+//! <prefix>/log/<seq>.batch                     ordered records, contiguous from the last checkpoint
+//! <prefix>/checkpoints/<replay>-<ordinal>-<epoch>-<count>.json state as of a log position
+//! <prefix>/control/<ordinal>-<epoch>-<crc>.snapshot control store image named by a checkpoint
+//! <prefix>/journals/<name>/<segment>-<start>-<end>-<crc>.part journal bytes named by a checkpoint
 //! ```
+//!
+//! Row-index checkpoints live below `index/`; see the `index` module.
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
 use flow_state_store::RawEntry;
