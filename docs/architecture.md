@@ -50,7 +50,8 @@ then downloads the newest replicated row-index checkpoint.
 Index recovery advances a stale checkpoint from Iceberg file changes rather than
 rescanning every table: it removes entries in data files the head no longer
 contains and at positions newly deleted in shared files, then inserts the rows
-of added files. Any disagreement falls back to the full rebuild.
+of added files. Any disagreement, including a delete removed or narrowed for a
+shared file, falls back to the full rebuild.
 
 ## Row identity
 

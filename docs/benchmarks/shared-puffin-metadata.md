@@ -162,8 +162,8 @@ New tests in `crates/compactor/tests/puffin_metadata.rs`:
 
 | Test | Evidence |
 | --- | --- |
-| `shared_puffin_counts_backing_requests_and_decodes_every_blob` | Three distinct offsets and lengths in one writer-produced object; one HEAD, twelve GETs, exact positions. |
-| `multiple_puffin_files_count_backing_requests` | Five vectors distributed 2/2/1; three HEADs, twenty GETs, exact positions. |
+| `shared_puffin_counts_backing_requests_and_decodes_every_blob` | Three distinct offsets and lengths in one writer-produced object; one HEAD, twelve GETs (one since the footer-once reader), exact positions. |
+| `multiple_puffin_files_count_backing_requests` | Five vectors distributed 2/2/1; three HEADs, twenty GETs (three since the footer-once reader), exact positions. |
 | `every_descriptor_must_match_the_observed_object_size` | Wrong manifest sizes on the first and a later descriptor preserve the existing error. |
 | `a_new_scan_rechecks_metadata_and_replaces_scratch_positions` | Repeated calls each issue their own HEAD and retain the same exact staged positions. |
 | `metadata_failure_can_be_retried_by_a_new_scan` | HTTP 404 propagates before any GET; the next successful call observes metadata and loads all positions. |
@@ -250,3 +250,29 @@ benchmark in the affected-crate suite was not run.
 Raw local evidence: `target/puffin-review-baseline-benchmark.log`,
 `target/puffin-review-candidate-benchmark.log`, `target/puffin-review-tests.log`,
 `target/puffin-review-v3.log`, and `target/puffin-review-clippy.log`.
+
+## Footer-once follow-up
+
+`flow_materializer::read_vectors` now serves the compactor's delete loader,
+compaction catch-up and v3 publication. Per physical object and scan it issues
+one HEAD, one tail read (the whole object up to 64 KiB, otherwise the header and
+the last 64 KiB together, plus the footer if it is larger), then one range read
+per requested blob outside the tail. Objects and blobs are read with
+`prefetch_files` concurrency and `prefetch_files × prefetch_file_bytes` batch
+bytes. Validation matches `read_deletion_vector_with_size`; unit tests compare
+every single-byte corruption, truncation, duplicate offset and LZ4 footer
+against the vendored reader. Publication merges prior vectors into the new
+vector in memory when their encoded total fits one materializer batch, and
+otherwise keeps the disk-backed union.
+
+The same ignored benchmark, unoptimized test profile on a shared 8-thread host
+under parallel builds (load average about 10), so timings are indicative only:
+
+| Base cardinality | Server delay/request | HEADs | Ranges | Range bytes | Load/stage | Scratch copy |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 0 ms | 2 | 2 | 21,527 | 71.423 | 85.062 |
+| 16 | 2 ms | 2 | 2 | 21,527 | 84.138 | 88.706 |
+| 4,096 | 0 ms | 2 | 54 | 542,680 | 4,673.020 | 8,545.319 |
+
+Request counts are exact. With 4,096-position vectors the stage time is
+dominated by RocksDB staging, as the scratch-copy column shows.
