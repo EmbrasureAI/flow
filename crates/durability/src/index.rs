@@ -132,7 +132,10 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// Upload every file of a local checkpoint directory, then its manifest.
+/// Like every write after startup, each object write starts only while the
+/// lease outlasts the request; without one the checkpoint is skipped.
 pub(crate) async fn upload(
+    shared: &Shared,
     operator: &Operator,
     hashes: &Hashes,
     directory: &Path,
@@ -186,6 +189,7 @@ pub(crate) async fn upload(
                 let object = format!("{FILES}{hash}-{size}");
                 let mut uploaded = 0;
                 if !existing.contains(&object) {
+                    shared.require_lease(shared.tuning.request_timeout, "upload")?;
                     upload_file(&operator, &object, &path, &hash).await?;
                     uploaded = size;
                 }
@@ -215,6 +219,7 @@ pub(crate) async fn upload(
         name: name.clone(),
         files: results.into_iter().map(|(file, _, _)| file).collect(),
     };
+    shared.require_lease(shared.tuning.request_timeout, "upload")?;
     operator
         .write(&manifest_key(&name), serde_json::to_vec(&manifest)?)
         .await
@@ -245,8 +250,11 @@ pub(crate) async fn retain(shared: &Shared, operator: &Operator, keep: &[String]
     if doomed.is_empty() {
         return Ok(0);
     }
-    shared.require_lease(shared.tuning.lease / 2)?;
-    store::delete_all(operator, doomed).await
+    shared.require_lease(shared.tuning.lease / 2, "delete objects")?;
+    let deleted = store::delete_all(operator, doomed).await?;
+    metrics::counter!("flow_durability_deleted_objects_total").increment(deleted as u64);
+    shared.lock().stats.deleted_objects += deleted as u64;
+    Ok(deleted)
 }
 
 /// Download the replicated checkpoint `name` into `directory`. Returns false

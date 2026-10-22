@@ -316,7 +316,7 @@ impl Shared {
     }
 
     /// Fail unless the lease remains valid for at least `remaining`.
-    pub(crate) fn require_lease(&self, remaining: Duration) -> Result<()> {
+    pub(crate) fn require_lease(&self, remaining: Duration, what: &str) -> Result<()> {
         let state = self.lock();
         if let Some(failure) = &state.failure {
             bail!("remote durability unavailable: {failure}");
@@ -326,7 +326,7 @@ impl Shared {
             .is_some_and(|until| until > Instant::now() + remaining)
         {
             self.renew_lease.notify_one();
-            bail!("remote durability lease is not fresh enough to delete objects");
+            bail!("remote durability lease is not fresh enough to {what}");
         }
         Ok(())
     }
