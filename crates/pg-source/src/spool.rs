@@ -1,12 +1,17 @@
 //! Transaction-local sequential spill. It is intentionally not an ACK durability
 //! boundary: after a disconnect, start fresh and replay from the journal LSN.
+//!
+//! A transaction's first frames stay in a bounded memory buffer with the same
+//! layout as its first segment file. Past its per-transaction or the global
+//! memory bound, the buffer is written out as that file and later frames go
+//! to disk, so small transactions never touch the filesystem.
 
 use crate::{Error, Result};
 use fs2::FileExt;
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{IoSlice, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -22,6 +27,13 @@ pub struct SpoolConfig {
     pub max_chunk_bytes: u32,
     pub max_transactions: usize,
     pub max_subtransactions: usize,
+    /// Bytes all open transactions may allocate for frames in memory before
+    /// spilling.
+    /// Memory frames still count against `quota_bytes`.
+    pub memory_bytes: u64,
+    /// Frame bytes one transaction may hold in memory, capped by
+    /// `segment_bytes`. Zero writes every transaction to disk.
+    pub memory_transaction_bytes: u64,
 }
 impl Default for SpoolConfig {
     fn default() -> Self {
@@ -33,6 +45,8 @@ impl Default for SpoolConfig {
             // Tracked per open transaction, only for subtransactions that
             // captured rows: roughly 100 bytes of memory each.
             max_subtransactions: 1 << 20,
+            memory_bytes: 32 << 20,
+            memory_transaction_bytes: 256 << 10,
         }
     }
 }
@@ -63,7 +77,8 @@ struct Savepoint {
 }
 
 struct Transaction {
-    file: File,
+    /// Segment 0's frames until the transaction spills; then the open segment.
+    storage: Storage,
     segment: u64,
     offset: u64,
     bytes: u64,
@@ -74,12 +89,18 @@ struct Transaction {
     excluded: Vec<u32>,
 }
 
+enum Storage {
+    Memory(Vec<u8>),
+    File(File),
+}
+
 pub struct TransactionSpool {
     root: PathBuf,
     config: SpoolConfig,
     _lock: File,
     transactions: HashMap<u32, Transaction>,
     bytes: u64,
+    memory_bytes: u64,
 }
 
 impl TransactionSpool {
@@ -112,6 +133,7 @@ impl TransactionSpool {
             _lock: lock,
             transactions: HashMap::new(),
             bytes: 0,
+            memory_bytes: 0,
         })
     }
 
@@ -124,26 +146,10 @@ impl TransactionSpool {
                 limit: self.config.max_transactions,
             });
         }
-        let path = self.root.join(format!("txn-{xid}"));
-        let started = Instant::now();
-        let opened = (|| {
-            fs::create_dir(&path)?;
-            OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(path.join("0"))
-        })();
-        metrics::histogram!(
-            "flow_capture_phase_seconds",
-            "phase" => "spool_begin",
-            "result" => if opened.is_ok() { "success" } else { "error" }
-        )
-        .record(started.elapsed().as_secs_f64());
-        let file = opened?;
         self.transactions.insert(
             xid,
             Transaction {
-                file,
+                storage: Storage::Memory(Vec::new()),
                 segment: 0,
                 offset: 0,
                 bytes: 0,
@@ -161,9 +167,19 @@ impl TransactionSpool {
     pub fn max_chunk_bytes(&self) -> u32 {
         self.config.max_chunk_bytes
     }
+    /// Bytes allocated for open transactions' in-memory frames.
+    pub fn memory_bytes_used(&self) -> u64 {
+        self.memory_bytes
+    }
+    /// Whether `xid` still holds all its frames in memory.
+    pub fn is_in_memory(&self, xid: u32) -> bool {
+        self.transactions
+            .get(&xid)
+            .is_some_and(|txn| matches!(txn.storage, Storage::Memory(_)))
+    }
 
-    /// Payloads should contain complete encoded mutation chunks. No row payload
-    /// is retained in memory after this call returns.
+    /// Payloads should contain complete encoded mutation chunks. Memory holds
+    /// at most the configured bounds; later frames are written to disk.
     pub fn append(&mut self, xid: u32, subxid: u32, payload: &[u8]) -> Result<()> {
         if payload.len() > self.config.max_chunk_bytes as usize {
             return Err(Error::Protocol(
@@ -197,20 +213,50 @@ impl TransactionSpool {
                 bytes: txn.bytes,
             });
         }
+        let mut header = [0; HEADER as usize];
+        header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        header[4..8].copy_from_slice(&subxid.to_le_bytes());
+        header[8..].copy_from_slice(&frame_checksum(subxid, payload).to_le_bytes());
+        if let Storage::Memory(frames) = &mut txn.storage {
+            let limit = self
+                .config
+                .memory_transaction_bytes
+                .min(self.config.segment_bytes);
+            // Charge allocated capacity, growing geometrically up to the
+            // transaction limit, so the bound holds for real allocations.
+            let used = frames.len() as u64;
+            let capacity = frames.capacity() as u64;
+            let grown = if used + length <= capacity {
+                capacity
+            } else {
+                (used + length).max(capacity.saturating_mul(2)).min(limit)
+            };
+            if txn.offset + length <= limit
+                && self.memory_bytes + grown.saturating_sub(capacity) <= self.config.memory_bytes
+            {
+                frames.reserve_exact((grown - used) as usize);
+                frames.extend_from_slice(&header);
+                frames.extend_from_slice(payload);
+                txn.offset += length;
+                txn.bytes += length;
+                self.memory_bytes += frames.capacity() as u64 - capacity;
+                self.bytes += length;
+                return Ok(());
+            }
+            spill(&self.root, xid, txn, &mut self.memory_bytes)?;
+        }
+        let Storage::File(file) = &mut txn.storage else {
+            unreachable!("spilled transactions write to disk");
+        };
         if txn.offset + length > self.config.segment_bytes {
             txn.segment += 1;
-            txn.file = OpenOptions::new()
+            *file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .open(self.root.join(format!("txn-{xid}/{}", txn.segment)))?;
             txn.offset = 0;
         }
-        let mut header = [0; HEADER as usize];
-        header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        header[4..8].copy_from_slice(&subxid.to_le_bytes());
-        header[8..].copy_from_slice(&frame_checksum(subxid, payload).to_le_bytes());
-        txn.file.write_all(&header)?;
-        txn.file.write_all(payload)?;
+        write_frame(file, &header, payload)?;
         txn.offset += length;
         txn.bytes += length;
         self.bytes += length;
@@ -249,13 +295,24 @@ impl TransactionSpool {
             return Ok(());
         };
         let start = txn.savepoints[index];
-        for segment in start.segment + 1..=txn.segment {
-            fs::remove_file(self.root.join(format!("txn-{xid}/{segment}")))?;
+        match &mut txn.storage {
+            Storage::Memory(frames) => {
+                // Memory holds only segment 0, so every savepoint is within it.
+                let capacity = frames.capacity() as u64;
+                frames.truncate(start.offset as usize);
+                frames.shrink_to(start.offset as usize);
+                self.memory_bytes -= capacity - frames.capacity() as u64;
+            }
+            Storage::File(file) => {
+                for segment in start.segment + 1..=txn.segment {
+                    fs::remove_file(self.root.join(format!("txn-{xid}/{segment}")))?;
+                }
+                *file = OpenOptions::new()
+                    .append(true)
+                    .open(self.root.join(format!("txn-{xid}/{}", start.segment)))?;
+                file.set_len(start.offset)?;
+            }
         }
-        txn.file = OpenOptions::new()
-            .append(true)
-            .open(self.root.join(format!("txn-{xid}/{}", start.segment)))?;
-        txn.file.set_len(start.offset)?;
         txn.segment = start.segment;
         txn.offset = start.offset;
         self.bytes -= txn.bytes - start.bytes;
@@ -274,32 +331,52 @@ impl TransactionSpool {
             .get(&xid)
             .ok_or(Error::Protocol("replay of unknown spool transaction"))?;
         let mut buffer = Vec::new();
+        if let Storage::Memory(frames) = &txn.storage {
+            return self.replay_segment(
+                txn,
+                &mut frames.as_slice(),
+                frames.len() as u64,
+                &mut buffer,
+                &mut consume,
+            );
+        }
         for segment in 0..=txn.segment {
             let mut file = File::open(self.root.join(format!("txn-{xid}/{segment}")))?;
             let size = file.metadata()?.len();
-            let mut offset = 0;
-            while offset < size {
-                let mut header = [0; HEADER as usize];
-                file.read_exact(&mut header)?;
-                let len = u32::from_le_bytes(header[..4].try_into().unwrap());
-                if len > self.config.max_chunk_bytes || offset + HEADER + u64::from(len) > size {
-                    return Err(Error::Protocol("corrupt transaction spool frame"));
-                }
-                buffer.resize(len as usize, 0);
-                file.read_exact(&mut buffer)?;
-                // The checksum covers the XID tag, so a damaged tag cannot
-                // silently keep or drop the wrong changes.
-                let subxid = u32::from_le_bytes(header[4..8].try_into().unwrap());
-                if frame_checksum(subxid, &buffer)
-                    != u32::from_le_bytes(header[8..].try_into().unwrap())
-                {
-                    return Err(Error::Protocol("transaction spool checksum mismatch"));
-                }
-                if txn.excluded.binary_search(&subxid).is_err() {
-                    consume(&buffer)?;
-                }
-                offset += HEADER + u64::from(len);
+            self.replay_segment(txn, &mut file, size, &mut buffer, &mut consume)?;
+        }
+        Ok(())
+    }
+
+    fn replay_segment(
+        &self,
+        txn: &Transaction,
+        reader: &mut impl Read,
+        size: u64,
+        buffer: &mut Vec<u8>,
+        consume: &mut impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut offset = 0;
+        while offset < size {
+            let mut header = [0; HEADER as usize];
+            reader.read_exact(&mut header)?;
+            let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+            if len > self.config.max_chunk_bytes || offset + HEADER + u64::from(len) > size {
+                return Err(Error::Protocol("corrupt transaction spool frame"));
             }
+            buffer.resize(len as usize, 0);
+            reader.read_exact(buffer)?;
+            // The checksum covers the XID tag, so a damaged tag cannot
+            // silently keep or drop the wrong changes.
+            let subxid = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            if frame_checksum(subxid, buffer) != u32::from_le_bytes(header[8..].try_into().unwrap())
+            {
+                return Err(Error::Protocol("transaction spool checksum mismatch"));
+            }
+            if txn.excluded.binary_search(&subxid).is_err() {
+                consume(buffer)?;
+            }
+            offset += HEADER + u64::from(len);
         }
         Ok(())
     }
@@ -336,6 +413,11 @@ impl TransactionSpool {
             .transactions
             .remove(&xid)
             .ok_or(Error::Protocol("discard of unknown spool transaction"))?;
+        if let Storage::Memory(frames) = &txn.storage {
+            self.memory_bytes -= frames.capacity() as u64;
+            self.bytes -= txn.bytes;
+            return Ok(());
+        }
         let started = Instant::now();
         let discarded = fs::remove_dir_all(self.root.join(format!("txn-{xid}")));
         metrics::histogram!(
@@ -348,6 +430,55 @@ impl TransactionSpool {
         self.bytes -= txn.bytes;
         Ok(())
     }
+}
+
+/// Write an in-memory transaction's frames as its first segment file and
+/// continue on disk. The file has the buffer's exact layout, so savepoints and
+/// the open segment offset stay valid.
+fn spill(root: &Path, xid: u32, txn: &mut Transaction, memory_bytes: &mut u64) -> Result<()> {
+    let path = root.join(format!("txn-{xid}"));
+    let started = Instant::now();
+    let opened = (|| {
+        fs::create_dir(&path)?;
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path.join("0"))
+    })();
+    metrics::histogram!(
+        "flow_capture_phase_seconds",
+        "phase" => "spool_begin",
+        "result" => if opened.is_ok() { "success" } else { "error" }
+    )
+    .record(started.elapsed().as_secs_f64());
+    let mut file = opened?;
+    let Storage::Memory(frames) = &txn.storage else {
+        return Ok(());
+    };
+    file.write_all(frames)?;
+    *memory_bytes -= frames.capacity() as u64;
+    txn.storage = Storage::File(file);
+    Ok(())
+}
+
+/// One frame with a single vectored write in the common case.
+fn write_frame(file: &mut File, header: &[u8], payload: &[u8]) -> std::io::Result<()> {
+    let total = header.len() + payload.len();
+    let mut written = 0;
+    while written < total {
+        let result = if written < header.len() {
+            file.write_vectored(&[IoSlice::new(&header[written..]), IoSlice::new(payload)])
+        } else {
+            file.write(&payload[written - header.len()..])
+        };
+        match result {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn frame_checksum(subxid: u32, payload: &[u8]) -> u32 {

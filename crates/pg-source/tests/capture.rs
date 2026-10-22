@@ -116,6 +116,7 @@ fn streamed_nested_abort_truncates_descendants_and_spills_with_bounded_chunks() 
         max_chunk_bytes: 64,
         max_transactions: 8,
         max_subtransactions: 8,
+        ..SpoolConfig::default()
     };
     let mut spool = TransactionSpool::open(dir.path(), config.clone()).unwrap();
     let mut decoder = Decoder::new(1024);
@@ -290,6 +291,7 @@ fn each_spool_and_stream_limit_reports_its_own_setting() {
         max_chunk_bytes: 64,
         max_transactions: 2,
         max_subtransactions: 2,
+        ..SpoolConfig::default()
     };
     let mut spool = TransactionSpool::open(dir.path(), config).unwrap();
     spool.begin(1).unwrap();
@@ -353,6 +355,7 @@ fn spool_frames_carry_their_subtransaction_and_exclusion_skips_only_it() {
             max_chunk_bytes: 16,
             max_transactions: 4,
             max_subtransactions: 8,
+            ..SpoolConfig::default()
         },
     )
     .unwrap();
@@ -390,7 +393,14 @@ fn spool_frames_carry_their_subtransaction_and_exclusion_skips_only_it() {
 #[test]
 fn a_damaged_spool_subtransaction_tag_fails_its_checksum() {
     let dir = tempfile::tempdir().unwrap();
-    let mut spool = TransactionSpool::open(dir.path(), SpoolConfig::default()).unwrap();
+    let mut spool = TransactionSpool::open(
+        dir.path(),
+        SpoolConfig {
+            memory_transaction_bytes: 0,
+            ..SpoolConfig::default()
+        },
+    )
+    .unwrap();
     spool.begin(7).unwrap();
     spool.append(7, 8, b"rolled back").unwrap();
     spool.append(7, 7, b"kept").unwrap();
@@ -457,4 +467,158 @@ fn stream_aborts_are_checked_against_this_connections_streams() {
             subxid: 42
         }
     );
+}
+
+fn replay_all(spool: &TransactionSpool, xid: u32) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    spool
+        .replay(xid, |bytes| {
+            frames.push(bytes.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    frames
+}
+
+#[test]
+fn small_transactions_stay_in_memory_and_never_touch_the_spool_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = TransactionSpool::open(dir.path(), SpoolConfig::default()).unwrap();
+    spool.begin(7).unwrap();
+    spool.append(7, 7, b"first").unwrap();
+    spool.append(7, 8, b"rolled back").unwrap();
+    spool.append(7, 8, b"also rolled back").unwrap();
+    assert!(spool.is_in_memory(7));
+    assert!(!dir.path().join("txn-7").exists());
+    // Memory is charged by allocation, which grows geometrically.
+    let charged = spool.memory_bytes_used();
+    assert!(charged >= spool.bytes_used() && charged < 2 * spool.bytes_used());
+    assert_eq!(spool.savepoint(7, 8), Some(12 + 5));
+    spool.abort(7, 8).unwrap();
+    // A rollback returns the truncated allocation.
+    assert!(spool.memory_bytes_used() < charged);
+    spool.append(7, 9, b"excluded").unwrap();
+    spool.append(7, 7, b"last").unwrap();
+    assert_eq!(spool.subtransactions(7).unwrap(), [9]);
+    spool.exclude(7, &[9]).unwrap();
+    assert_eq!(replay_all(&spool, 7), [b"first".to_vec(), b"last".to_vec()]);
+    assert_eq!(spool.bytes_used(), 3 * 12 + 5 + 8 + 4);
+    assert!(spool.memory_bytes_used() >= spool.bytes_used());
+    spool.discard(7).unwrap();
+    assert_eq!((spool.bytes_used(), spool.memory_bytes_used()), (0, 0));
+    assert!(!dir.path().join("txn-7").exists());
+    // A whole-transaction rollback releases its memory too.
+    spool.begin(8).unwrap();
+    spool.append(8, 8, b"gone").unwrap();
+    spool.abort(8, 8).unwrap();
+    assert_eq!((spool.bytes_used(), spool.memory_bytes_used()), (0, 0));
+}
+
+#[test]
+fn a_transaction_past_its_memory_bound_spills_with_identical_frames_and_savepoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = TransactionSpool::open(
+        dir.path(),
+        SpoolConfig {
+            segment_bytes: 256,
+            max_chunk_bytes: 64,
+            memory_transaction_bytes: 112,
+            ..SpoolConfig::default()
+        },
+    )
+    .unwrap();
+    spool.begin(7).unwrap();
+    // Four 28-byte frames fit 112 bytes; savepoint 8 starts in memory.
+    for (index, subxid) in [7, 7, 8, 7].into_iter().enumerate() {
+        spool.append(7, subxid, &[index as u8; 16]).unwrap();
+        assert!(spool.is_in_memory(7));
+    }
+    assert_eq!(spool.memory_bytes_used(), 4 * 28);
+    // Later frames go to disk, across several segments.
+    for index in 4..40_u8 {
+        spool
+            .append(7, if index == 20 { 9 } else { 7 }, &[index; 16])
+            .unwrap();
+    }
+    assert!(!spool.is_in_memory(7));
+    assert_eq!(spool.memory_bytes_used(), 0);
+    assert_eq!(spool.bytes_used(), 40 * 28);
+    assert!(dir.path().join("txn-7/0").is_file());
+    assert!(dir.path().join("txn-7/4").is_file());
+    let expected: Vec<Vec<u8>> = (0..40_u8).map(|index| vec![index; 16]).collect();
+    assert_eq!(replay_all(&spool, 7), expected);
+    // Excluding the subtransaction that began in memory skips only its frame.
+    spool.exclude(7, &[8]).unwrap();
+    let mut kept = expected.clone();
+    kept.remove(2);
+    assert_eq!(replay_all(&spool, 7), kept);
+    // A received rollback of a savepoint recorded before the spill truncates
+    // the spilled first segment at its in-memory offset.
+    spool.abort(7, 8).unwrap();
+    assert_eq!(replay_all(&spool, 7), expected[..2].to_vec());
+    assert_eq!(spool.bytes_used(), 2 * 28);
+    assert!(!dir.path().join("txn-7/1").exists());
+    spool.append(7, 7, b"after rollback").unwrap();
+    assert!(!spool.is_in_memory(7));
+    assert_eq!(replay_all(&spool, 7).last().unwrap(), b"after rollback");
+    spool.discard(7).unwrap();
+    assert!(!dir.path().join("txn-7").exists());
+    assert_eq!(spool.bytes_used(), 0);
+}
+
+#[test]
+fn the_global_memory_bound_spills_the_transaction_that_would_exceed_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = TransactionSpool::open(
+        dir.path(),
+        SpoolConfig {
+            memory_bytes: 100,
+            ..SpoolConfig::default()
+        },
+    )
+    .unwrap();
+    for xid in [1, 2, 3] {
+        spool.begin(xid).unwrap();
+    }
+    spool.append(1, 1, &[1; 48]).unwrap();
+    spool.append(2, 2, &[2; 30]).unwrap();
+    assert_eq!(spool.memory_bytes_used(), 60);
+    assert!(spool.is_in_memory(1) && !spool.is_in_memory(2));
+    // Transaction 1 keeps its memory; others still fit beside it.
+    spool.append(3, 3, &[3; 20]).unwrap();
+    assert!(spool.is_in_memory(3));
+    assert_eq!(spool.memory_bytes_used(), 60 + 32);
+    spool.discard(1).unwrap();
+    assert_eq!(spool.memory_bytes_used(), 32);
+    // Once spilled, a transaction stays on disk even after memory frees up.
+    spool.append(2, 2, &[4; 4]).unwrap();
+    assert!(!spool.is_in_memory(2));
+    assert_eq!(replay_all(&spool, 2), [vec![2; 30], vec![4; 4]]);
+    assert_eq!(replay_all(&spool, 3), [vec![3; 20]]);
+    assert_eq!(spool.bytes_used(), 42 + 16 + 32);
+}
+
+#[test]
+fn a_failed_spill_is_an_error_and_releases_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = TransactionSpool::open(
+        dir.path(),
+        SpoolConfig {
+            memory_transaction_bytes: 40,
+            ..SpoolConfig::default()
+        },
+    )
+    .unwrap();
+    spool.begin(7).unwrap();
+    spool.append(7, 7, b"in memory").unwrap();
+    // A non-directory entry where the spill directory belongs.
+    std::fs::write(dir.path().join("txn-7"), b"").unwrap();
+    assert!(matches!(
+        spool.append(7, 7, &[0; 32]).unwrap_err(),
+        Error::Io(_)
+    ));
+    assert!(spool.is_in_memory(7));
+    assert_eq!(spool.memory_bytes_used(), 21);
+    assert_eq!(spool.bytes_used(), 21);
+    assert_eq!(replay_all(&spool, 7), [b"in memory".to_vec()]);
 }
