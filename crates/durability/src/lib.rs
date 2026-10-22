@@ -30,7 +30,7 @@ use flow_state_store::{ControlMirror, ControlStore};
 use opendal::Operator;
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Entry},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -505,33 +505,59 @@ impl Durability {
     /// so nothing this process inherited is visible externally before it is
     /// replicated.
     pub async fn baseline(&self) -> Result<()> {
-        let layout = &self.0.layout;
-        {
-            let mut state = self.0.shared.lock();
-            for name in &layout.journals {
-                if state.journals.contains_key(name) {
-                    continue;
-                }
-                let mut model = scan_journal(&self.0.state_dir.join(name))?;
-                if let Some(image) = self.0.inherited.get(name) {
+        // Model what is not attached yet without holding the shared state:
+        // verifying reused parts reads every retained journal byte.
+        let (journals, files) = {
+            let state = self.0.shared.lock();
+            let journals: Vec<String> = (self.0.layout.journals.iter())
+                .filter(|name| !state.journals.contains_key(*name))
+                .cloned()
+                .collect();
+            let files: Vec<String> = (self.0.layout.files.iter())
+                .filter(|name| !state.files.contains_key(*name))
+                .cloned()
+                .collect();
+            (journals, files)
+        };
+        let inner = self.0.clone();
+        let (journals, files) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut models = Vec::new();
+            for name in journals {
+                let mut model = scan_journal(&inner.state_dir.join(&name))?;
+                if let Some(image) = inner.inherited.get(&name) {
                     reuse_parts(&mut model, image)?;
                 }
-                state.journals.insert(name.clone(), model);
-                state.models_changed = true;
+                models.push((name, model));
             }
-            for name in &layout.files {
-                if state.files.contains_key(name) {
-                    continue;
-                }
-                match fs::read(self.0.state_dir.join(name)) {
-                    Ok(data) => {
-                        state.files.insert(name.clone(), data);
-                        state.models_changed = true;
-                    }
+            let mut contents = Vec::new();
+            for name in files {
+                match fs::read(inner.state_dir.join(&name)) {
+                    Ok(data) => contents.push((name, data)),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
             }
+            Ok((models, contents))
+        })
+        .await
+        .context("baseline scan task")??;
+        {
+            // Anything attached or written meanwhile is already modeled.
+            let mut state = self.0.shared.lock();
+            let mut changed = false;
+            for (name, model) in journals {
+                if let Entry::Vacant(entry) = state.journals.entry(name) {
+                    entry.insert(model);
+                    changed = true;
+                }
+            }
+            for (name, data) in files {
+                if let Entry::Vacant(entry) = state.files.entry(name) {
+                    entry.insert(data);
+                    changed = true;
+                }
+            }
+            state.models_changed |= changed;
         }
         let (reply, response) = oneshot::channel();
         self.0
