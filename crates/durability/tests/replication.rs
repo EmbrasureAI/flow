@@ -27,6 +27,10 @@ mod faults {
             self.0.lock().unwrap().push((prefix.to_owned(), times));
         }
 
+        pub fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+
         pub fn remaining(&self) -> usize {
             self.0.lock().unwrap().iter().map(|(_, times)| times).sum()
         }
@@ -720,4 +724,35 @@ async fn a_stalled_baseline_waits_like_a_barrier_and_fails_once_replaced() {
     assert!(durability.failure().is_some());
     drop(control);
     durability.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flush_and_release_give_up_after_one_lease_while_storage_is_unavailable() {
+    let (faults, operator) = faulty();
+    let state = tempfile::tempdir().unwrap();
+    let durability = open(&operator, state.path()).await;
+    let (control, index, journal) = attach(&durability, state.path()).await;
+    faults.fail("", usize::MAX);
+    index.put_source_transaction(b"k", b"v").unwrap();
+    let started = Instant::now();
+    assert!(durability.flush().await.is_err());
+    assert!(started.elapsed() < Duration::from_secs(8));
+    // Once storage is back, the same records flush.
+    faults.clear();
+    durability.flush().await.unwrap();
+
+    faults.fail("", usize::MAX);
+    index.put_source_transaction(b"k", b"w").unwrap();
+    drop((control, index, journal));
+    let started = Instant::now();
+    let released = tokio::time::timeout(Duration::from_secs(20), durability.release())
+        .await
+        .expect("release must not hang while storage is unavailable");
+    assert!(released.is_err());
+    durability.stop();
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
 }
