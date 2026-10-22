@@ -573,6 +573,19 @@ impl AppliedOperations {
     }
 }
 
+/// Remove a joined worker's scratch store off the scheduler task. Paths are
+/// never reused, and a directory left behind only holds disk until the next
+/// start removes abandoned scratch.
+fn remove_scratch(path: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(path = %path.display(), %error,
+                "could not remove compaction scratch; the next start removes it");
+        }
+        _ => {}
+    })
+}
+
 struct PublishRuntime {
     work: TableWork,
     schemas: BTreeMap<TableId, TableSchema>,
@@ -1015,7 +1028,7 @@ impl PublishRuntime {
                         }
                         Err(error) => {
                             // wait() joins the actual worker before releasing ownership.
-                            std::fs::remove_dir_all(path)?;
+                            remove_scratch(path);
                             build_active.remove(&id);
                             let hard_pressure = waiting_for_build.remove(&id);
                             scheduler.stall(id, busy.contains(&id));
@@ -1122,7 +1135,7 @@ impl PublishRuntime {
                         }
                         Err(error) => {
                             // wait() joins the actual worker before releasing BUILD.
-                            std::fs::remove_dir_all(path)?;
+                            remove_scratch(path);
                             build_active.remove(&id);
                             activation_pending.remove(&id);
                             let hard_pressure = waiting_for_build.remove(&id);
@@ -1155,7 +1168,7 @@ impl PublishRuntime {
                 }
                 Some(completion) = retirements.next(), if !retirements.is_empty() => {
                     let RetirementCompletion { id, path, result } = completion;
-                    std::fs::remove_dir_all(path)?;
+                    remove_scratch(path);
                     retiring_builds.remove(&id);
                     let hard_pressure = waiting_for_build.remove(&id);
                     scheduler.stall(id, busy.contains(&id));
@@ -1939,6 +1952,22 @@ mod startup_recovery_tests {
         ledger.reconcile_table_progress().unwrap();
         assert_eq!(ledger.acknowledgement(), end);
         assert_eq!(ledger.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn scratch_cleanup_runs_off_the_scheduler_and_tolerates_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("CURRENT"), "scratch").unwrap();
+        remove_scratch(scratch.clone()).await.unwrap();
+        assert!(!scratch.exists());
+        // Missing or unremovable scratch is logged, never fatal.
+        remove_scratch(scratch).await.unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, "").unwrap();
+        remove_scratch(file.clone()).await.unwrap();
+        assert!(file.exists());
     }
 
     #[test]
