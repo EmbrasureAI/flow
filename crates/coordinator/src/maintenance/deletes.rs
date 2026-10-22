@@ -440,11 +440,7 @@ impl TableMaintenance {
             }
             return Ok(None);
         };
-        let path = format!(
-            "{}/metadata/{}-prepared.avro",
-            table.metadata().location().trim_end_matches('/'),
-            id.0
-        );
+        let path = crate::artifacts::prepared_plan_path(&table, &id);
         write_artifact_plan(&table, &path, &[], &output).await?;
         let payload = serde_json::to_vec(&RewriteRecovery {
             output_data_sequence: None,

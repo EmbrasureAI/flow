@@ -528,11 +528,7 @@ impl TablePublisher {
             metrics::counter!("flow_artifact_bytes_written_total", "table_id" => epoch.table.0.to_string(), "kind" => kind)
                 .increment(bytes);
         }
-        let path = format!(
-            "{}/metadata/{}-prepared.avro",
-            table.metadata().location().trim_end_matches('/'),
-            attempt.0
-        );
+        let path = crate::artifacts::prepared_plan_path(&table, &attempt);
         write_artifact_plan(&table, &path, &data_files, &delete_files).await?;
         let properties = HashMap::from([
             ("streaming.writer-id".into(), "embrasure-flow".into()),

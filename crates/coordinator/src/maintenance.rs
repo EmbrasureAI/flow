@@ -569,11 +569,7 @@ impl TableMaintenance {
         if indexed.snapshot_id != head.metadata().current_snapshot_id() {
             return Err(ReplanRequired.into());
         }
-        let path = format!(
-            "{}/metadata/{}-prepared.avro",
-            head.metadata().location().trim_end_matches('/'),
-            output.operation_id.0
-        );
+        let path = artifacts::prepared_plan_path(head, &output.operation_id);
         write_artifact_plan(head, &path, &output.data_files, &output.delete_files).await?;
         let level = match output.plan.output_level {
             Level::L0 => "L0",
