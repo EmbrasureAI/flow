@@ -22,7 +22,10 @@ This will be the initial public release, `0.1.0`.
   journal, persistent row index, background compaction and reconciliation of
   external maintenance.
 - Independent per-table publication, so a failing table does not stop the
-  others.
+  others. A table that needs a resync (incompatible schema change, TRUNCATE,
+  publication change, or another writer's row changes, reported as
+  `external_mutation`) drops its later changes and stops holding the source
+  acknowledgement, so it never retains source WAL.
 - `REPLICA IDENTITY DEFAULT` for primary-key tables whose replicated columns
   are all fixed-width.
 - Administrator-managed publications, including `FOR ALL TABLES` and

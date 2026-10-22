@@ -62,6 +62,16 @@ fn worker_runtime() -> Result<&'static tokio::runtime::Runtime> {
         .map_err(|error| anyhow::anyhow!("start maintenance I/O runtime: {error}"))
 }
 
+/// Another writer changed the target's rows: they no longer mirror the
+/// source, so the index cannot be reconciled. Only a resync re-establishes the
+/// table; other tables keep publishing.
+#[derive(Debug, thiserror::Error)]
+#[error("external snapshot {snapshot_id} changed table rows: {detail}")]
+pub struct ExternalMutation {
+    pub snapshot_id: i64,
+    pub detail: &'static str,
+}
+
 /// Reader-health inventory with exact live-row counts from the index at the
 /// same snapshot. Shared delete files cannot inflate per-file deletion density.
 pub struct Inventory {
@@ -888,7 +898,9 @@ impl TableMaintenance {
         schema: &TableSchema,
         scratch: StateStore,
     ) -> Result<Option<i64>> {
-        use flow_catalog_watch::{Classification, SnapshotChange, SnapshotOperation, classify};
+        use flow_catalog_watch::{
+            Classification, PauseReason, SnapshotChange, SnapshotOperation, classify,
+        };
         let head = self.catalog.load_table(table.identifier()).await?;
         CommitBase::new(&head).validate(&head)?;
         ensure!(
@@ -929,14 +941,19 @@ impl TableMaintenance {
                 .snapshot_by_id(id)
                 .ok_or_else(|| anyhow::anyhow!("snapshot disappeared from loaded metadata"))?;
             let after = SnapshotView::load_with_cache(&head, id, &self.cache).await?;
-            ensure!(
-                before
-                    .live_files
-                    .values()
-                    .chain(after.live_files.values())
-                    .all(|entry| entry.content_type() != DataContentType::EqualityDeletes),
-                "equality-delete maintenance is unsupported"
-            );
+            // The service never writes equality deletes.
+            if before
+                .live_files
+                .values()
+                .chain(after.live_files.values())
+                .any(|entry| entry.content_type() == DataContentType::EqualityDeletes)
+            {
+                return Err(ExternalMutation {
+                    snapshot_id: id,
+                    detail: "equality deletes",
+                }
+                .into());
+            }
             let before_data = file_paths(&before, DataContentType::Data);
             let after_data = file_paths(&after, DataContentType::Data);
             let before_deletes = file_paths(&before, DataContentType::PositionDeletes);
@@ -1006,6 +1023,15 @@ impl TableMaintenance {
             };
             let classification = classify(&change, before.snapshot_id, false);
             match classification {
+                Classification::Pause(PauseReason::ExternalLogicalMutation) => {
+                    return Err(ExternalMutation {
+                        snapshot_id: id,
+                        detail: "added or removed rows",
+                    }
+                    .into());
+                }
+                // Missing history or an unknown service operation can mean
+                // restored or foreign local state: never isolate those.
                 Classification::Pause(reason) => {
                     bail!("external snapshot {id} paused publication: {reason:?}")
                 }

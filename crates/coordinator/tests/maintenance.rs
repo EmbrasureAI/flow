@@ -786,3 +786,140 @@ async fn keyless_external_rewrites_preserve_duplicates_and_identity_across_resta
         );
     }
 }
+
+/// Another writer's appended rows no longer mirror the source. Reconciliation
+/// reports a typed, table-scoped failure before touching the index, so the
+/// daemon can block only this table and stop holding source acknowledgement.
+#[tokio::test]
+async fn external_logical_mutation_is_typed_and_leaves_the_index_unchanged() {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let temp = TempDir::new().unwrap();
+    let index = StateStore::open(temp.path().join("index"), StateStoreOptions::default()).unwrap();
+    let schema = TableSchema {
+        table_id: TableId(3),
+        version: 0,
+        columns: vec![Column {
+            field_id: 1,
+            name: "value".into(),
+            data_type: ColumnType::Int64,
+            nullable: false,
+        }],
+        primary_key: Vec::new(),
+        append_only: true,
+    };
+    let catalog = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "external",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.into(),
+                    "memory://external-warehouse".into(),
+                )]),
+            )
+            .await
+            .unwrap(),
+    );
+    let namespace = NamespaceIdent::new("test".into());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .unwrap();
+    let table = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("mirrored".into())
+                .schema(iceberg_schema(&schema).unwrap())
+                .format_version(FormatVersion::V2)
+                .build(),
+        )
+        .await
+        .unwrap();
+    let write = |name: &'static str, table: iceberg::table::Table, values: Vec<i64>| {
+        let schema = schema.clone();
+        async move {
+            let mut writer = DataWriter::new(
+                table.file_io().clone(),
+                table.metadata().location(),
+                &OperationId(name.into()),
+                schema,
+                0,
+                WriterConfig::default(),
+            )
+            .unwrap();
+            let rows: Vec<Row> = values.into_iter().map(|v| vec![Value::Int64(v)]).collect();
+            let locations = writer.write(&rows, PgLsn(10)).await.unwrap().locations;
+            (writer.close().await.unwrap(), locations)
+        }
+    };
+    let (files, locations) = write("flow-initial", table.clone(), vec![1, 2]).await;
+    let initial = RowDeltaAction::new(&table, "initial")
+        .add_data_files(files)
+        .commit(catalog.as_ref(), &table)
+        .await
+        .unwrap();
+    let operation = OperationId("initial".into());
+    index
+        .prepare(
+            PreparedOperation {
+                id: operation.clone(),
+                table_id: schema.table_id,
+                kind: OperationKind::Ingest,
+                base_snapshot_id: None,
+                last_lsn: PgLsn(10),
+                schema_version: 0,
+                artifacts: Vec::new(),
+                payload: Vec::new(),
+            },
+            locations
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, location)| IndexDelta {
+                    key: flow_model::PrimaryKey(vec![ordinal as u8]),
+                    expected: None,
+                    replacement: Some(location),
+                }),
+        )
+        .unwrap();
+    index
+        .mark_committed(&operation, initial.snapshot_id, initial.sequence_number)
+        .unwrap();
+    index.apply_committed(&operation).unwrap();
+
+    // A plain Iceberg append, as Spark or another engine would commit it.
+    let (files, _) = write("external-append", initial.table.clone(), vec![3]).await;
+    let transaction = Transaction::new(&initial.table);
+    let appended = transaction
+        .fast_append()
+        .add_data_files(files)
+        .apply(transaction)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+    let maintenance = TableMaintenance::new(
+        index.clone(),
+        catalog,
+        Policy::default(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let error = maintenance
+        .reconcile(
+            &appended,
+            &schema,
+            StateStore::open(temp.path().join("scratch"), StateStoreOptions::default()).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    let external = error
+        .downcast_ref::<flow_coordinator::ExternalMutation>()
+        .expect("typed external mutation");
+    assert_eq!(
+        Some(external.snapshot_id),
+        appended.metadata().current_snapshot_id()
+    );
+    let state = index.table_state(&schema.table_id).unwrap();
+    assert_eq!(state.snapshot_id, Some(initial.snapshot_id));
+    assert!(state.pending_operation.is_none());
+}

@@ -6,7 +6,7 @@ mod pending;
 mod table;
 
 use self::{
-    blocked::{BlockedTables, PUBLICATION_CHANGED},
+    blocked::{BlockedTables, PUBLICATION_CHANGED, requires_resync},
     health::{HealthCheckResult, check_health, observe_health, record_publication_changed},
     pending::{EPOCH_MAX_BYTES, EPOCH_MUTATION_TRIGGER, PendingWork, schedule_transactions},
     table::{
@@ -218,7 +218,7 @@ async fn run_service(
             )?;
             let validated = validate_publication(&sql, config, schemas, false).await;
             // Table-scoped violations block only those tables; the rest start.
-            // Latch them before schema refresh, which could otherwise quarantine.
+            // Latch them before schema refresh, which would report a schema cause.
             for violation in crate::lifecycle::record_publication_changed(config, validated)? {
                 registry.block_publication(violation.table, &violation.reason)?;
             }
@@ -361,10 +361,11 @@ async fn run_service(
     result
 }
 
-/// Capture drops a `publication_changed` table's changes; only a resync
-/// recovers it. Call only while no run owns the table: its outcome may still
-/// complete its transactions at a new snapshot, which must not race an earlier
-/// completion. Builds and preparations never complete transactions.
+/// A table whose block requires a resync never publishes again: capture drops
+/// its changes and only a resync recovers it. Call only while no run owns the
+/// table: its outcome may still complete its transactions at a new snapshot,
+/// which must not race an earlier completion. Builds and preparations never
+/// complete transactions.
 /// - An unfinished operation first needs a recovery-only attempt; its
 ///   transactions complete through the ordinary applied-operation path.
 /// - Otherwise one bounded page of transactions the table journaled before the
@@ -1152,7 +1153,7 @@ impl PublishRuntime {
                                 .find(|id| !busy.contains(id) && !recovering.contains(id))
                         };
                         if let Some(id) = retry
-                            && blocked.get(id).is_none_or(|record| record.error_code != PUBLICATION_CHANGED)
+                            && blocked.get(id).is_none_or(|record| !requires_resync(&record.error_code))
                             && store.table_state(&id)?.pending_operation.is_none()
                             && ledger.pending_table_transactions_after(id, PgLsn(0)).next().transpose()?.is_some()
                         {
@@ -1319,7 +1320,7 @@ impl PublishRuntime {
                                 pending.defer(id, &mut scheduler);
                             }
                         }
-                        if blocked.get(id).is_some_and(|record| record.error_code == PUBLICATION_CHANGED) {
+                        if blocked.get(id).is_some_and(|record| requires_resync(&record.error_code)) {
                             let (build, preparation) = release_blocked_candidates(
                                 id, &mut ready_builds, &mut ready_preparations, &mut build_active,
                                 &mut activation_pending, &mut waiting_for_build, &mut retiring_builds);

@@ -76,14 +76,18 @@ impl BlockedTables {
         );
         let wall_ms = now_ms()?;
         let previous = self.records.get(&id);
-        // Only a resync clears a publication block. A transient failure while
-        // settling its unfinished operation keeps the code and retries.
+        // Only a resync clears a block that requires one, and it keeps its
+        // first cause. A transient failure while settling its unfinished
+        // operation keeps the code and retries. A publication block supersedes
+        // another cause: changes may be missing, not merely unpublishable.
         let incoming = error_code;
-        let error_code = if previous.is_some_and(|record| record.error_code == PUBLICATION_CHANGED)
-        {
-            PUBLICATION_CHANGED
-        } else {
-            error_code
+        let error_code = match previous {
+            Some(record)
+                if requires_resync(&record.error_code) && incoming != PUBLICATION_CHANGED =>
+            {
+                record.error_code.as_str()
+            }
+            _ => incoming,
         };
         let attempts = previous.map_or(1, |record| record.attempts.saturating_add(1));
         let delay = crate::retry::delay(attempts - 1).min(MAX_RETRY_DELAY);
@@ -108,13 +112,13 @@ impl BlockedTables {
         Ok(())
     }
 
-    /// A completed publication cannot clear a publication block: the table's
-    /// changes may have been skipped, so only a resync replaces it.
+    /// A completed publication cannot clear a block that requires a resync:
+    /// the table's changes are dropped, so only a resync replaces it.
     pub(crate) fn clear(&mut self, id: TableId) -> Result<()> {
         if self
             .records
             .get(&id)
-            .is_none_or(|record| record.error_code == PUBLICATION_CHANGED)
+            .is_none_or(|record| requires_resync(&record.error_code))
         {
             return Ok(());
         }
@@ -183,10 +187,17 @@ fn now_ms() -> Result<u64> {
 }
 
 pub(crate) const PUBLICATION_CHANGED: &str = "publication_changed";
+/// Another writer changed the target's rows; see [`flow_coordinator::ExternalMutation`].
+pub(crate) const EXTERNAL_MUTATION: &str = "external_mutation";
 
-/// Capture latched these tables; retrying publication cannot clear them.
-fn requires_resync(code: &str) -> bool {
-    matches!(code, "source_schema_incompatible" | "publication_changed")
+/// Blocks only a resync clears. Their tables never publish again, so their
+/// changes are settled without publication instead of holding the source
+/// acknowledgement: a resync starts from a new slot and cannot use that WAL.
+pub(crate) fn requires_resync(code: &str) -> bool {
+    matches!(
+        code,
+        "source_schema_incompatible" | PUBLICATION_CHANGED | EXTERNAL_MUTATION
+    )
 }
 
 fn valid_error_code(code: &str) -> bool {
@@ -194,6 +205,7 @@ fn valid_error_code(code: &str) -> bool {
         code,
         "source_schema_incompatible"
             | "publication_changed"
+            | "external_mutation"
             | "publication_replan"
             | "maintenance_pressure"
             | "catalog_unavailable"
@@ -215,6 +227,9 @@ fn valid_error_code(code: &str) -> bool {
 pub(crate) fn publication_error_code(error: &anyhow::Error) -> Option<&'static str> {
     if error.is::<flow_model::SourceTableBlocked>() {
         return Some("source_schema_incompatible");
+    }
+    if error.is::<flow_coordinator::ExternalMutation>() {
+        return Some(EXTERNAL_MUTATION);
     }
     let replanning = error
         .downcast_ref::<flow_coordinator::ReplanRequired>()
@@ -462,6 +477,12 @@ mod tests {
             publication_error_code(&flow_compactor::Error::InvalidInventory("corrupt").into()),
             None
         );
+        let external = anyhow::Error::from(flow_coordinator::ExternalMutation {
+            snapshot_id: 7,
+            detail: "added or removed rows",
+        })
+        .context("reconcile table");
+        assert_eq!(publication_error_code(&external), Some(EXTERNAL_MUTATION));
     }
 
     #[test]
@@ -486,5 +507,50 @@ mod tests {
         assert_eq!(record.error_code, "publication_changed");
         assert_eq!(reloaded.deadline_for(TableId(12)), None);
         assert!(reloaded.get(TableId(11)).is_none());
+    }
+
+    #[test]
+    fn resync_blocks_survive_transient_failures_and_successful_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            StateStore::open(root.path().join("index"), StateStoreOptions::default()).unwrap();
+        let source = SourceId("resync".into());
+        let mut blocked = BlockedTables::load(&store, &source).unwrap();
+        for (id, code) in [
+            (TableId(1), "source_schema_incompatible"),
+            (TableId(2), EXTERNAL_MUTATION),
+            (TableId(3), PUBLICATION_CHANGED),
+        ] {
+            assert!(requires_resync(code));
+            blocked.record(id, code, None).unwrap();
+            assert_eq!(blocked.deadline_for(id), None, "no retry clears {code}");
+            // Settling an unfinished operation can fail transiently.
+            blocked.record(id, "catalog_unavailable", None).unwrap();
+            assert_eq!(blocked.get(id).unwrap().error_code, code);
+            blocked.clear(id).unwrap();
+            assert_eq!(blocked.get(id).unwrap().error_code, code);
+        }
+        // A publication block supersedes another resync cause, never the reverse.
+        blocked
+            .record(TableId(2), PUBLICATION_CHANGED, None)
+            .unwrap();
+        blocked
+            .record(TableId(3), "source_schema_incompatible", None)
+            .unwrap();
+        let reloaded = BlockedTables::load(&store, &source).unwrap();
+        let codes: Vec<_> = reloaded
+            .records()
+            .map(|record| record.error_code.as_str())
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                "source_schema_incompatible",
+                PUBLICATION_CHANGED,
+                PUBLICATION_CHANGED
+            ]
+        );
+        assert!(reloaded.due(Instant::now() + MAX_RETRY_DELAY).is_empty());
+        assert!(!requires_resync("catalog_unavailable"));
     }
 }

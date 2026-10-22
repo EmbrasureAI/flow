@@ -169,15 +169,17 @@ table from the publication blocks that table (`publication_changed`).
 | `VACUUM FULL`, `CLUSTER`, `pg_repack`, rewriting `ALTER TABLE` | The rewritten table is blocked; other tables continue | Resynchronize the source. Plain `VACUUM` is safe |
 | `TRUNCATE` of a configured table | That table is blocked once the transaction commits; a rolled-back TRUNCATE has no effect | Resynchronize the source |
 | A configured table leaves the publication or gains a row filter or column list | That table is blocked with `publication_changed` | Avoid it; otherwise resynchronize |
+| Another engine adds, updates or deletes rows in a target table, including equality deletes | That table is blocked with `external_mutation`; other tables continue. File rewrites that preserve the rows are reconciled | Write elsewhere; otherwise resynchronize |
 | The publication is dropped or stops publishing an operation | Capture stops with a resynchronization requirement | Avoid it; otherwise resynchronize |
 | Physical standby promotion (failover) | Source timeline changes; capture stops | Resynchronize from the promoted primary |
 | Major upgrade (`pg_upgrade`, dump/restore, logical migration) | Slot history does not carry over; slots migrated by `pg_upgrade` are unsupported | Resynchronize after the upgrade |
 
-A table blocked by a schema change, heap rewrite or TRUNCATE still holds the
-shared source acknowledgement, because an
-incomplete transaction cannot be skipped. Healthy tables keep publishing, but
-source WAL and the local journal grow until you resynchronize. Treat a block as
-urgent. `status` reports `blocked_tables` with the reason; see
+A table blocked by a schema change, heap rewrite, TRUNCATE, publication change
+or another writer's row changes needs a resynchronization, which starts from a
+new slot. Capture therefore drops the table's changes and settles its journaled
+transactions without publishing them, so it does not hold the shared source
+acknowledgement or retain source WAL; healthy tables keep publishing. The
+blocked target stops updating, so treat the block as urgent. `status` reports `blocked_tables` with the reason; see
 [table isolation and recovery](table-publication-isolation.md).
 
 Failover slots (PostgreSQL 17 `failover = true`) are not yet used. After a
