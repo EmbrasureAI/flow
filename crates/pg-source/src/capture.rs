@@ -6,7 +6,8 @@ use flow_model::{
     TableMutationCount, TableSchema, TableSchemaVersion, Value,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     time::Instant,
 };
 
@@ -102,6 +103,9 @@ pub struct CaptureAssembler {
     spool: TransactionSpool,
     schemas: HashMap<TableId, TableSchema>,
     relations: HashMap<u32, Relation>,
+    /// Relations already validated against their table's current decoder
+    /// schema and the type registry, so rows skip that per-column check.
+    validated: HashSet<u32>,
     transactions: HashMap<u32, PendingTransaction>,
     /// The transaction of the active StreamStart..StreamStop segment.
     streaming: Option<u32>,
@@ -145,6 +149,7 @@ impl CaptureAssembler {
             spool,
             schemas: configured,
             relations: HashMap::new(),
+            validated: HashSet::new(),
             transactions: HashMap::new(),
             streaming: None,
             buffer: None,
@@ -158,6 +163,7 @@ impl CaptureAssembler {
 
     pub fn set_types(&mut self, types: crate::TypeRegistry) {
         self.types = types;
+        self.validated.clear();
     }
 
     /// Bound terminal descriptors waiting for one journal durability barrier.
@@ -433,6 +439,7 @@ impl CaptureAssembler {
             ));
         }
         self.flush()?;
+        self.validated.remove(&schema.table_id.0);
         self.schemas.insert(schema.table_id, schema);
         Ok(())
     }
@@ -612,106 +619,12 @@ impl CaptureAssembler {
                     .get(&TableId(relation.id))
                     .ok_or(Error::Config("relation outside the capture set"))?;
                 self.types.validate_relation(schema, &relation)?;
+                self.validated.insert(relation.id);
                 self.relations.insert(relation.id, relation);
             }
-            SourceEvent::Insert {
-                xid,
-                subxid,
-                relation,
-                row,
-            } => {
-                let (schema, metadata) = self.table(relation)?;
-                let mutation = Mutation {
-                    table_id: schema.table_id,
-                    schema_version: schema.version,
-                    kind: MutationKind::Insert {
-                        row: decode_row_with_types(schema, metadata, &row, &self.types)?,
-                    },
-                };
-                self.append(xid, subxid, mutation)?;
-            }
-            SourceEvent::Update {
-                xid,
-                subxid,
-                relation,
-                old,
-                old_is_key,
-                mut row,
-            } => {
-                let (schema, metadata) = self.table(relation)?;
-                if schema.append_only {
-                    return Err(Error::AppendOnly {
-                        table: relation,
-                        operation: "UPDATE",
-                    });
-                }
-                let mut partial = row.iter().any(|cell| matches!(cell, Cell::UnchangedToast));
-                if partial && metadata.replica_identity == b'f' {
-                    // pgoutput omits unchanged TOAST values from the new tuple,
-                    // even with FULL identity. Its complete old tuple supplies
-                    // those values without consulting mutable source state.
-                    if old_is_key {
-                        return Err(Error::UnchangedToast(relation));
-                    }
-                    let previous = old.as_ref().ok_or(Error::UnchangedToast(relation))?;
-                    metadata.validate_row(previous)?;
-                    if row.len() != previous.len() {
-                        return Err(Error::Protocol("tuple column count differs from relation"));
-                    }
-                    for (cell, previous) in row.iter_mut().zip(previous) {
-                        if matches!(cell, Cell::UnchangedToast) {
-                            *cell = previous.clone();
-                        }
-                    }
-                    partial = false;
-                } else if partial && old.is_some() {
-                    // DEFAULT sends a key-only old tuple only when the key
-                    // changed. The new key's row has no prior image to carry.
-                    return Err(Error::UnchangedToast(relation));
-                }
-                // Under DEFAULT, the omitted values stay explicitly unchanged.
-                // Collapse and publication carry the key's previous values forward.
-                let row = if partial {
-                    decode_update_row_with_types(schema, metadata, &row, &self.types)?
-                } else {
-                    decode_row_with_types(schema, metadata, &row, &self.types)?
-                };
-                let old_key = if let Some(old) = old {
-                    decode_key(schema, metadata, &old, &self.types)?
-                } else {
-                    // Without an old tuple the key is unchanged; omitted values
-                    // are never key columns.
-                    schema.encode_partial_key(&row)?
-                };
-                let mutation = Mutation {
-                    table_id: schema.table_id,
-                    schema_version: schema.version,
-                    kind: MutationKind::Update { old_key, row },
-                };
-                self.append(xid, subxid, mutation)?;
-            }
-            SourceEvent::Delete {
-                xid,
-                subxid,
-                relation,
-                old,
-                old_is_key: _,
-            } => {
-                let (schema, metadata) = self.table(relation)?;
-                if schema.append_only {
-                    return Err(Error::AppendOnly {
-                        table: relation,
-                        operation: "DELETE",
-                    });
-                }
-                let key = decode_key(schema, metadata, &old, &self.types)?;
-                let mutation = Mutation {
-                    table_id: schema.table_id,
-                    schema_version: schema.version,
-                    kind: MutationKind::Delete { key },
-                };
-                self.append(xid, subxid, mutation)?;
-            }
+            SourceEvent::Insert { .. }
+            | SourceEvent::Update { .. }
+            | SourceEvent::Delete { .. } => self.push_row(&event)?,
             SourceEvent::Abort { xid, subxid } => {
                 if self.pending_commits.iter().any(|txn| txn.xid == xid) {
                     return Err(Error::Protocol("cannot abort a staged capture commit"));
@@ -895,6 +808,17 @@ impl CaptureAssembler {
                         "streamed transaction staged for a journal commit"
                     );
                 }
+                let mut affected_tables = Vec::with_capacity(tables.len());
+                let mut counts = Vec::with_capacity(tables.len());
+                let mut schema_versions = Vec::with_capacity(tables.len());
+                for (table_id, (version, mutations)) in tables {
+                    affected_tables.push(table_id);
+                    counts.push(TableMutationCount {
+                        table_id,
+                        mutations,
+                    });
+                    schema_versions.push(TableSchemaVersion { table_id, version });
+                }
                 let txn = SourceTransaction {
                     source_id: self.source.clone(),
                     xid,
@@ -902,27 +826,16 @@ impl CaptureAssembler {
                     commit_lsn,
                     end_lsn,
                     commit_timestamp_micros,
-                    affected_tables: tables.keys().copied().collect(),
-                    table_mutation_counts: Some(
-                        tables
-                            .iter()
-                            .map(|(&table_id, &(_, mutations))| TableMutationCount {
-                                table_id,
-                                mutations,
-                            })
-                            .collect(),
-                    ),
-                    schema_versions: tables
-                        .into_iter()
-                        .map(|(table_id, (version, _))| TableSchemaVersion { table_id, version })
-                        .collect(),
+                    affected_tables,
+                    table_mutation_counts: Some(counts),
+                    schema_versions,
                     mutation_chunks: journal.transaction_chunks(xid),
                 };
                 let pending_bytes = self
                     .pending_commit_bytes
                     .checked_add(txn.mutation_chunks.payload_bytes)
                     .ok_or(Error::Config("pending commit payload byte count overflow"))?;
-                journal.stage_commit(txn.clone())?;
+                journal.stage_commit(&txn)?;
                 if self.transactions[&xid].stream.is_some() {
                     self.streamed_staged.insert(xid);
                 }
@@ -940,7 +853,130 @@ impl CaptureAssembler {
         Ok(())
     }
 
-    fn table(&self, id: u32) -> Result<(&TableSchema, &Relation)> {
+    /// Spool one row change. Unlike [`Self::push_buffered_at`], this borrows
+    /// the event, so a caller can still quarantine it after a table-scoped
+    /// error. Any other event is rejected.
+    pub fn push_row(&mut self, event: &SourceEvent) -> Result<()> {
+        let (xid, relation) = match event {
+            SourceEvent::Insert { xid, relation, .. }
+            | SourceEvent::Update { xid, relation, .. }
+            | SourceEvent::Delete { xid, relation, .. } => (*xid, *relation),
+            _ => return Err(Error::Protocol("not a row change event")),
+        };
+        if !self.is_configured(relation) {
+            // Other published tables never reach the spool or journal.
+            if !self.transactions.contains_key(&xid) {
+                return Err(Error::Protocol("mutation outside capture transaction"));
+            }
+            return Ok(());
+        }
+        match event {
+            SourceEvent::Insert {
+                xid,
+                subxid,
+                relation,
+                row,
+            } => {
+                let (schema, metadata, types) = self.table(*relation)?;
+                let mutation = Mutation {
+                    table_id: schema.table_id,
+                    schema_version: schema.version,
+                    kind: MutationKind::Insert {
+                        row: decode_validated_row(schema, metadata, row, types)?,
+                    },
+                };
+                self.append(*xid, *subxid, mutation)
+            }
+            SourceEvent::Update {
+                xid,
+                subxid,
+                relation,
+                old,
+                old_is_key,
+                row,
+            } => {
+                let (schema, metadata, types) = self.table(*relation)?;
+                if schema.append_only {
+                    return Err(Error::AppendOnly {
+                        table: *relation,
+                        operation: "UPDATE",
+                    });
+                }
+                let mut row = Cow::Borrowed(row);
+                let mut partial = row.iter().any(|cell| matches!(cell, Cell::UnchangedToast));
+                if partial && metadata.replica_identity == b'f' {
+                    // pgoutput omits unchanged TOAST values from the new tuple,
+                    // even with FULL identity. Its complete old tuple supplies
+                    // those values without consulting mutable source state.
+                    if *old_is_key {
+                        return Err(Error::UnchangedToast(*relation));
+                    }
+                    let previous = old.as_ref().ok_or(Error::UnchangedToast(*relation))?;
+                    metadata.validate_row(previous)?;
+                    if row.len() != previous.len() {
+                        return Err(Error::Protocol("tuple column count differs from relation"));
+                    }
+                    for (cell, previous) in row.to_mut().iter_mut().zip(previous) {
+                        if matches!(cell, Cell::UnchangedToast) {
+                            *cell = previous.clone();
+                        }
+                    }
+                    partial = false;
+                } else if partial && old.is_some() {
+                    // DEFAULT sends a key-only old tuple only when the key
+                    // changed. The new key's row has no prior image to carry.
+                    return Err(Error::UnchangedToast(*relation));
+                }
+                // Under DEFAULT, the omitted values stay explicitly unchanged.
+                // Collapse and publication carry the key's previous values forward.
+                let row = if partial {
+                    decode_update_row(schema, metadata, &row, types)?
+                } else {
+                    decode_validated_row(schema, metadata, &row, types)?
+                };
+                let old_key = if let Some(old) = old {
+                    decode_key(schema, metadata, old, types)?
+                } else {
+                    // Without an old tuple the key is unchanged; omitted values
+                    // are never key columns.
+                    schema.encode_partial_key(&row)?
+                };
+                let mutation = Mutation {
+                    table_id: schema.table_id,
+                    schema_version: schema.version,
+                    kind: MutationKind::Update { old_key, row },
+                };
+                self.append(*xid, *subxid, mutation)
+            }
+            SourceEvent::Delete {
+                xid,
+                subxid,
+                relation,
+                old,
+                old_is_key: _,
+            } => {
+                let (schema, metadata, types) = self.table(*relation)?;
+                if schema.append_only {
+                    return Err(Error::AppendOnly {
+                        table: *relation,
+                        operation: "DELETE",
+                    });
+                }
+                let key = decode_key(schema, metadata, old, types)?;
+                let mutation = Mutation {
+                    table_id: schema.table_id,
+                    schema_version: schema.version,
+                    kind: MutationKind::Delete { key },
+                };
+                self.append(*xid, *subxid, mutation)
+            }
+            _ => unreachable!("row change events were matched above"),
+        }
+    }
+
+    /// A row's table decoder, validating its relation only once per Relation
+    /// message, decoder schema or type registry.
+    fn table(&mut self, id: u32) -> Result<(&TableSchema, &Relation, &crate::TypeRegistry)> {
         let schema = self
             .schemas
             .get(&TableId(id))
@@ -949,7 +985,11 @@ impl CaptureAssembler {
             .relations
             .get(&id)
             .ok_or(Error::Protocol("source row before relation metadata"))?;
-        Ok((schema, relation))
+        if !self.validated.contains(&id) {
+            self.types.validate_relation(schema, relation)?;
+            self.validated.insert(id);
+        }
+        Ok((schema, relation, &self.types))
     }
 
     fn append(&mut self, xid: u32, subxid: u32, mutation: Mutation) -> Result<()> {
@@ -1070,13 +1110,6 @@ fn decode_key(
             "key tuple column count differs from relation",
         ));
     }
-    let mut key_schema = schema.clone();
-    key_schema.columns = schema
-        .primary_key
-        .iter()
-        .map(|&i| schema.columns[i].clone())
-        .collect();
-    key_schema.primary_key = (0..key_schema.columns.len()).collect();
     let mut values = Vec::with_capacity(schema.primary_key.len());
     for &index in &schema.primary_key {
         let column = &schema.columns[index];
@@ -1088,19 +1121,19 @@ fn decode_key(
             Cell::Binary(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, true)?,
         });
     }
-    Ok(key_schema.encode_key(&values)?)
+    Ok(schema.encode_key_values(&values)?)
 }
 
 /// Decode an update image whose non-key unchanged TOAST values remain
 /// [`Value::Unchanged`]. Only DEFAULT-identity updates without a key change
 /// produce such images.
-fn decode_update_row_with_types(
+/// The caller has validated `relation` against `schema`.
+fn decode_update_row(
     schema: &TableSchema,
     relation: &Relation,
     tuple: &Tuple,
     types: &crate::TypeRegistry,
 ) -> Result<Row> {
-    types.validate_relation(schema, relation)?;
     if tuple.len() != relation.columns.len() {
         return Err(Error::Protocol("tuple column count differs from relation"));
     }
@@ -1133,6 +1166,16 @@ pub fn decode_row_with_types(
     types: &crate::TypeRegistry,
 ) -> Result<Row> {
     types.validate_relation(schema, relation)?;
+    decode_validated_row(schema, relation, tuple, types)
+}
+
+/// [`decode_row_with_types`] for a relation already validated against `schema`.
+fn decode_validated_row(
+    schema: &TableSchema,
+    relation: &Relation,
+    tuple: &Tuple,
+    types: &crate::TypeRegistry,
+) -> Result<Row> {
     relation.validate_row(tuple)?;
     let mut row = Vec::with_capacity(tuple.len());
     for ((cell, column), pg) in tuple.iter().zip(&schema.columns).zip(&relation.columns) {

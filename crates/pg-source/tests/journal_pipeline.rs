@@ -1284,3 +1284,102 @@ fn largest_admitted_row_keeps_decoded_quarantine_evidence() {
         bincode::serialized_size(&original).unwrap() + flow_pg_source::QUARANTINE_WRAP_BYTES
     );
 }
+
+#[test]
+fn a_decoder_schema_change_revalidates_the_cached_relation_before_its_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut journal, _) =
+        Journal::open(root.path().join("journal"), JournalConfig::default()).unwrap();
+    let spool = TransactionSpool::open(root.path().join("spool"), SpoolConfig::default()).unwrap();
+    let mut capture =
+        CaptureAssembler::new(SourceId("source".into()), spool, [schema(11)], 256).unwrap();
+    for event in [
+        SourceEvent::Relation(relation(11)),
+        SourceEvent::Begin {
+            xid: 1,
+            final_lsn: PgLsn(10),
+            commit_timestamp_micros: 0,
+        },
+    ] {
+        capture.push(event, &mut journal).unwrap();
+    }
+    let insert = |id| SourceEvent::Insert {
+        xid: 1,
+        subxid: 1,
+        relation: 11,
+        row: row(id, "body"),
+    };
+    capture.push_row(&insert("1")).unwrap();
+    capture.push_row(&insert("2")).unwrap();
+    // A successor decoder whose Relation has not arrived yet no longer
+    // matches the validated wire relation: its rows must not decode.
+    let mut successor = schema(11);
+    successor.version = 2;
+    successor.columns.push(Column {
+        field_id: 3,
+        name: "extra".into(),
+        data_type: ColumnType::String,
+        nullable: true,
+    });
+    capture.set_schema(successor).unwrap();
+    assert!(capture.push_row(&insert("3")).is_err());
+    // Its Relation validates once and later rows decode again.
+    let mut changed = relation(11);
+    changed.columns.push(PgColumn {
+        name: "extra".into(),
+        type_oid: 25,
+        type_modifier: -1,
+        identity: false,
+    });
+    capture
+        .push(SourceEvent::Relation(changed), &mut journal)
+        .unwrap();
+    capture
+        .push_row(&SourceEvent::Insert {
+            xid: 1,
+            subxid: 1,
+            relation: 11,
+            row: [row("4", "body"), vec![Cell::Null]].concat(),
+        })
+        .unwrap();
+    assert!(
+        capture
+            .push_row(&SourceEvent::Begin {
+                xid: 2,
+                final_lsn: PgLsn(20),
+                commit_timestamp_micros: 0,
+            })
+            .is_err()
+    );
+    let committed = capture
+        .push(
+            SourceEvent::Commit {
+                xid: 1,
+                commit_lsn: PgLsn(10),
+                end_lsn: PgLsn(11),
+                commit_timestamp_micros: 0,
+            },
+            &mut journal,
+        )
+        .unwrap()
+        .unwrap();
+    let keys: Vec<_> = journal
+        .chunks(&committed.mutation_chunks)
+        .unwrap()
+        .flat_map(|bytes| bincode::deserialize::<Vec<Mutation>>(&bytes.unwrap()).unwrap())
+        .map(|mutation| {
+            let MutationKind::Insert { row } = mutation.kind else {
+                panic!("insert expected");
+            };
+            (mutation.schema_version, row[0].clone())
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            (1, Value::Int32(1)),
+            (1, Value::Int32(2)),
+            (2, Value::Int32(4))
+        ]
+    );
+}

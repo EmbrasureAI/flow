@@ -16,8 +16,8 @@ use flow_model::{
     TableSchema, TableSchemaVersion,
 };
 use flow_pg_source::{
-    Acknowledgement, SnapshotSession, decode_copy_row_with_types, export_snapshot,
-    export_temporary_snapshot, fetch_relation,
+    Acknowledgement, CopyRowDecoder, SnapshotSession, export_snapshot, export_temporary_snapshot,
+    fetch_relation,
     tokio_postgres::{binary_copy::BinaryCopyOutStream, types::Type},
 };
 use flow_state_store::{ControlStore, OperationKind, OperationPhase, StateStore};
@@ -961,6 +961,7 @@ async fn copy_and_publish(
             recovered.transactions.is_empty(),
             "new COPY staging directory is not empty"
         );
+        let decoder = CopyRowDecoder::new(schema, &relation, &resolved_types)?;
         let mut rows = Vec::new();
         let mut bytes = 8u64;
         while let Some(row) = stream.as_mut().try_next().await? {
@@ -968,7 +969,7 @@ async fn copy_and_publish(
                 table_id: schema.table_id,
                 schema_version: schema.version,
                 kind: MutationKind::Insert {
-                    row: decode_copy_row_with_types(schema, &relation, &row, &resolved_types)?,
+                    row: decoder.decode(&row)?,
                 },
             };
             let size = bincode::serialized_size(&mutation)?;

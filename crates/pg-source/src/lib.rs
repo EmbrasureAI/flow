@@ -19,8 +19,8 @@ mod spool;
 pub use capture::{CaptureAssembler, QUARANTINE_WRAP_BYTES, decode_row, decode_row_with_types};
 pub use protocol::{Cell, Column, Decoder, Relation, SourceEvent, Tuple};
 pub use snapshot::{
-    SnapshotSession, TablePreflight, decode_copy_row, decode_copy_row_with_types, export_snapshot,
-    export_temporary_snapshot, fetch_relation, preflight_table,
+    CopyRowDecoder, SnapshotSession, TablePreflight, export_snapshot, export_temporary_snapshot,
+    fetch_relation, preflight_table,
 };
 pub use spool::{SpoolConfig, TransactionSpool};
 pub use tokio_postgres;
