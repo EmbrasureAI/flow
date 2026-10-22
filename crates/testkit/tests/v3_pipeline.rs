@@ -1262,6 +1262,61 @@ async fn corrupt_prior_vector_fails_publication_without_dropping_deletes() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_charges_each_intermediate_vector_once() {
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    for (lsn, ids) in [(10, 1..=6), (20, 7..=12)] {
+        f.publish(
+            lsn,
+            ids.map(|id| (id, Change::Insert(row(id, "initial"))))
+                .collect(),
+        )
+        .await;
+    }
+    f.publish(30, vec![(1, Change::Delete), (7, Change::Delete)])
+        .await;
+    // History reads A {1} -> {2} and B {1} -> {2}, then A {2} -> {4}: ten
+    // distinct positions. Charging A's middle vector twice would need twelve.
+    let maintenance = f.maintenance_with(
+        &f.store,
+        Policy {
+            max_delete_input_rows: 11,
+            ..Policy::default()
+        },
+    );
+    let ready = maintenance
+        .start_compaction(&f.head, &f.schema, f.scratch())
+        .await
+        .unwrap()
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    f.publish(
+        40,
+        vec![
+            (2, Change::Update(row(2, "late"))),
+            (8, Change::Update(row(8, "late"))),
+        ],
+    )
+    .await;
+    f.publish(
+        50,
+        vec![(3, Change::Update(row(3, "later"))), (4, Change::Delete)],
+    )
+    .await;
+    let before = f.live().await;
+    assert!(
+        maintenance
+            .finish_compaction(&f.head, &f.schema, ready)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    f.refresh().await;
+    assert_eq!(f.live().await, before);
+}
+
 /// Every indexed key with its location, fingerprint and data sequence.
 fn index_contents(
     store: &StateStore,
