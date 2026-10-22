@@ -109,7 +109,8 @@ impl ManifestDedup {
 }
 
 /// Intersect a bounded candidate set with every retained snapshot, including
-/// branches and tags. Walk manifests sequentially through the bounded cache;
+/// branches and tags. Walk manifests sequentially, reusing cached manifests
+/// without admitting historical ones that would evict the current snapshot's;
 /// the protection set never exceeds the candidate set. Deduplication retains at
 /// most a fixed estimated byte budget; excess manifests are safely read again.
 /// Deleted entries are not live references; older retained snapshots protect
@@ -159,7 +160,7 @@ pub async fn retained_artifacts(
             ) {
                 continue;
             }
-            let entries = cache.load(table, manifest).await?;
+            let entries = cache.peek_or_read(table, manifest).await?;
             for entry in entries.entries() {
                 if entry.is_alive() && candidates.contains(entry.file_path()) {
                     protected.insert(entry.file_path().to_owned());
