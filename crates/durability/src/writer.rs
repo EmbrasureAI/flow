@@ -332,6 +332,20 @@ impl Shared {
         }
     }
 
+    /// Resolves once replication has stopped or is closing.
+    pub(crate) async fn stopped(&self) {
+        let mut changed = self.changed.subscribe();
+        loop {
+            {
+                let state = self.lock();
+                if state.failure.is_some() || state.closing {
+                    return;
+                }
+            }
+            let _ = changed.changed().await;
+        }
+    }
+
     pub(crate) async fn barrier(&self) -> Result<()> {
         let target = self.position();
         self.wait_for(target).await
@@ -555,30 +569,40 @@ fn materialize(epoch: u64, seq: u64, taken: Taken) -> Result<(Bytes, u64, u64)> 
     Ok((Bytes::from(encoded), count, taken.last_ordinal))
 }
 
-/// Create one log batch, retrying transient failures indefinitely. Only a
-/// conflicting object, which proves another owner wrote this sequence, fails.
-async fn upload(shared: &Shared, operator: &Operator, seq: u64, bytes: Bytes) -> Result<()> {
-    let key = format::log_key(seq);
+/// Conditionally create one object, retrying transient failures until it
+/// lands or replication stops. Every attempt starts under a lease that
+/// outlasts the request. Only an existing object with other bytes, which
+/// proves another owner wrote the key, fails, and it stops replication.
+pub(crate) async fn create(
+    shared: &Shared,
+    operator: &Operator,
+    kind: &'static str,
+    key: &str,
+    bytes: Bytes,
+) -> Result<()> {
     let mut attempt = 0u32;
     loop {
         shared.writable().await?;
         let started = Instant::now();
-        match store::create(operator, &key, bytes.clone()).await {
+        match store::create(operator, key, bytes.clone()).await {
             Ok(Created::New | Created::Same) => {
-                metrics::histogram!("flow_durability_put_seconds", "kind" => "log")
+                metrics::histogram!("flow_durability_put_seconds", "kind" => kind)
                     .record(started.elapsed().as_secs_f64());
                 return Ok(());
             }
             Ok(Created::Different(_)) => {
-                bail!("log batch {seq} was written by another owner; this process was replaced")
+                let message =
+                    format!("{key} was written by another owner; this process was replaced");
+                shared.fail(message.clone());
+                bail!(message);
             }
             Err(error) => {
                 attempt += 1;
                 shared.lock().stats.retries += 1;
-                metrics::counter!("flow_durability_retries_total", "kind" => "log").increment(1);
-                tracing::warn!(seq, attempt, error = %format!("{error:#}"), "remote durability write failed; retrying");
-                if shared.lock().failure.is_some() {
-                    bail!("remote durability already failed");
+                metrics::counter!("flow_durability_retries_total", "kind" => kind).increment(1);
+                tracing::warn!(key, attempt, bytes = bytes.len(), error = %format!("{error:#}"), "remote durability write failed; retrying");
+                if let Some(error) = failure(shared) {
+                    return Err(error);
                 }
                 tokio::time::sleep(backoff(attempt)).await;
             }
@@ -689,7 +713,11 @@ pub(crate) async fn write_loop(shared: Arc<Shared>, operator: Operator) {
                 order.push_back((seq, last_ordinal, false));
                 let (task_shared, task_operator) = (shared.clone(), operator.clone());
                 inflight.push(async move {
-                    (seq, upload(&task_shared, &task_operator, seq, bytes).await)
+                    let key = format::log_key(seq);
+                    (
+                        seq,
+                        create(&task_shared, &task_operator, "log", &key, bytes).await,
+                    )
                 });
                 continue;
             }
