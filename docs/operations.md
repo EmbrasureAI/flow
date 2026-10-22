@@ -104,8 +104,13 @@ Logs are JSON lines on standard output, captured by the journal.
   state before the first stops; the lock makes it fail instead of corrupting
   state, but the rollout stalls.
 - Put `state_dir` on a PersistentVolumeClaim. It holds the journal and index
-  that recovery depends on; an `emptyDir` loses them on rescheduling. Set
-  `state_dir` to an absolute path on the mount.
+  that recovery depends on; an `emptyDir` loses them on rescheduling. With
+  [remote durability](remote-durability.md), an `emptyDir` (or other
+  ephemeral volume) is safe: a rescheduled pod restores the journal and
+  control state from object storage and downloads the row index, so it pays a
+  restore instead of losing data. It still needs the full
+  [disk capacity](#disk-capacity). Set `state_dir` to an absolute path on the
+  mount.
 - Run `init` as a one-shot Job, or as an initContainer: `init` exits 0
   immediately once initialization has completed, and resumes an interrupted
   initialization otherwise. Both need the same volume, configuration and
@@ -200,7 +205,9 @@ the journal much larger than the largest source transaction and at least four
 ## Disk capacity
 
 Everything Flow keeps locally lives in `state_dir`, normally on one volume.
-Size that volume for the sum of:
+[Remote durability](remote-durability.md) makes that volume replaceable, not
+smaller: Flow still captures, indexes and stages locally. Size the volume for
+the sum of:
 
 - **Journal**: up to `limits.journal_bytes` (64 GiB by default) of captured,
   unpublished transactions.
