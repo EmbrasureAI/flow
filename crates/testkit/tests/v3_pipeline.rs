@@ -210,6 +210,20 @@ impl Fixture {
     }
 }
 
+fn puffin_objects(directory: &std::path::Path) -> usize {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| {
+            if path.is_dir() {
+                puffin_objects(&path)
+            } else {
+                usize::from(path.extension().is_some_and(|ext| ext == "puffin"))
+            }
+        })
+        .sum()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_consolidation_must_retire_shared_puffin_objects() {
     let mut f = Fixture::new(FormatVersion::V3).await;
@@ -263,6 +277,7 @@ async fn delete_consolidation_must_retire_shared_puffin_objects() {
         max_input_files: 2,
         ..Default::default()
     };
+    let written = puffin_objects(f.temp.path());
     assert_eq!(
         f.maintenance()
             .compact_deletes(&f.head, &f.schema, f.scratch(), &policy)
@@ -270,6 +285,11 @@ async fn delete_consolidation_must_retire_shared_puffin_objects() {
             .unwrap(),
         None,
         "partial selection keeps both input objects live and must not add a third"
+    );
+    assert_eq!(
+        puffin_objects(f.temp.path()),
+        written,
+        "a rewrite known to be nonviable uploads nothing"
     );
     f.refresh().await;
     assert_eq!(f.head.metadata().current_snapshot_id(), snapshot);
