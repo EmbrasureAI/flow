@@ -1,8 +1,8 @@
 use super::{ReconcileRecovery, RewriteRecovery};
 use anyhow::{Result, ensure};
 use flow_iceberg_ext::{
-    ArtifactTracker, CommitBase, ManifestCache, RewriteFilesAction, RewriteManifestsAction,
-    find_operation, read_artifact_plan,
+    ArtifactPlan, ArtifactTracker, CommitBase, ManifestCache, RewriteFilesAction,
+    RewriteManifestsAction, find_operation, read_artifact_plan,
 };
 use flow_model::OperationId;
 use flow_state_store::{OperationKind, OperationPhase, OperationRecord};
@@ -37,14 +37,15 @@ pub(super) struct MaintenanceResolutionAttempt {
 }
 
 enum RewritePlan {
-    Data(RewriteRecovery),
+    /// The plan's files, when the caller already holds them.
+    Data(RewriteRecovery, Option<ArtifactPlan>),
     Manifests(RewriteManifestsAction),
 }
 
 impl RewritePlan {
     fn base(&self) -> &CommitBase {
         match self {
-            Self::Data(plan) => &plan.base,
+            Self::Data(plan, _) => &plan.base,
             Self::Manifests(plan) => plan.base(),
         }
     }
@@ -64,8 +65,11 @@ impl RewritePlan {
                 *elapsed = attempt.catalog_update_elapsed;
                 Ok(attempt.result?)
             }
-            Self::Data(plan) => {
-                let files = read_artifact_plan(head.file_io(), &plan.manifest_list).await?;
+            Self::Data(plan, fresh) => {
+                let files = match fresh {
+                    Some(files) => files,
+                    None => read_artifact_plan(head.file_io(), &plan.manifest_list).await?,
+                };
                 let rewrites_data = !plan.removed_data.is_empty();
                 let mut action = RewriteFilesAction::from_base(plan.base, id.0.clone())
                     .require_base_snapshot()
@@ -107,20 +111,28 @@ pub(crate) async fn resolve_maintenance_catalog_operation(
     table: &Table,
     tracker: Option<Arc<dyn ArtifactTracker>>,
 ) -> Result<Option<(i64, i64)>> {
-    Ok(
-        resolve_maintenance_operation(record, catalog, table, ManifestCache::default(), tracker)
-            .await
-            .result?
-            .outcome,
+    Ok(resolve_maintenance_operation(
+        record,
+        catalog,
+        table,
+        ManifestCache::default(),
+        tracker,
+        None,
     )
+    .await
+    .result?
+    .outcome)
 }
 
+/// `fresh` holds the files of a data rewrite's plan when its caller wrote that
+/// plan in this process; recovery after a restart reads the persisted plan.
 pub(super) async fn resolve_maintenance_operation(
     record: &OperationRecord,
     catalog: &dyn Catalog,
     table: &Table,
     cache: ManifestCache,
     tracker: Option<Arc<dyn ArtifactTracker>>,
+    fresh: Option<ArtifactPlan>,
 ) -> MaintenanceResolutionAttempt {
     let mut catalog_update_elapsed = None;
     let result = resolve_maintenance_operation_inner(
@@ -129,6 +141,7 @@ pub(super) async fn resolve_maintenance_operation(
         table,
         cache,
         tracker,
+        fresh,
         &mut catalog_update_elapsed,
     )
     .await;
@@ -144,6 +157,7 @@ async fn resolve_maintenance_operation_inner(
     table: &Table,
     cache: ManifestCache,
     tracker: Option<Arc<dyn ArtifactTracker>>,
+    fresh: Option<ArtifactPlan>,
     catalog_update_elapsed: &mut Option<Duration>,
 ) -> Result<MaintenanceResolution> {
     ensure!(
@@ -184,7 +198,7 @@ async fn resolve_maintenance_operation_inner(
     let plan = if record.operation.kind == OperationKind::ManifestRewrite {
         RewritePlan::Manifests(serde_json::from_slice(&record.operation.payload)?)
     } else {
-        RewritePlan::Data(serde_json::from_slice(&record.operation.payload)?)
+        RewritePlan::Data(serde_json::from_slice(&record.operation.payload)?, fresh)
     };
     let base = plan.base().clone();
     ensure!(
