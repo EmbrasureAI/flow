@@ -568,7 +568,7 @@ publication:
 | `flow_memory_index_block_cache_pinned_bytes` | Part of the block cache usage pinned by open readers |
 | `flow_memory_index_memtable_bytes` | Active, unflushed and pinned memtables across the row index's column families |
 | `flow_memory_index_table_reader_bytes` | Table-reader memory outside the block cache |
-| `flow_memory_manifest_cache_bytes{cache}` | Estimated bytes of parsed manifests in the shared `publication` or `maintenance` cache |
+| `flow_memory_manifest_cache_bytes{cache}` | Estimated bytes of parsed manifests in the `shared` cache used by publication and maintenance |
 | `flow_memory_manifest_cache_entries{cache}` | Parsed manifests in that cache |
 | `flow_memory_retained_index_bytes` | Estimated bytes last accounted by the garbage-collection reachability indexes |
 

@@ -296,6 +296,13 @@ impl TableMaintenance {
         &self.cache
     }
 
+    /// Share parsed manifests with publication instead of reading and holding
+    /// the same current manifests in a second cache.
+    pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
+        self.cache = cache;
+        self
+    }
+
     /// Estimated bytes of the per-process garbage reachability indexes.
     pub fn retained_index_bytes(&self) -> Result<usize> {
         self.garbage.bytes()

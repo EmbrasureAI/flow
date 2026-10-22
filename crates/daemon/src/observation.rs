@@ -382,7 +382,7 @@ fn table_lag_seconds(table: &TableProgress, now_micros: i64) -> f64 {
 }
 
 /// Usage of the process-wide memory budgets: the row index's RocksDB block
-/// cache and memtables, the shared publication and maintenance manifest caches,
+/// cache and memtables, the manifest cache shared by publication and maintenance,
 /// and the garbage reachability indexes. These are the estimates each budget
 /// evicts against. They overlap one another and the allocator gauges and are
 /// not a decomposition of RSS. Returns the reads that failed.
@@ -418,15 +418,12 @@ fn sample_memory_budgets(
         Ok(bytes) => metrics::gauge!("flow_memory_retained_index_bytes").set(bytes as f64),
         Err(error) => failures.push(format!("retained indexes: {error}")),
     }
-    for (cache, manifests) in [
-        ("publication", publisher.manifest_cache()),
-        ("maintenance", maintenance.manifest_cache()),
-    ] {
-        metrics::gauge!("flow_memory_manifest_cache_bytes", "cache" => cache)
-            .set(manifests.weighted_bytes() as f64);
-        metrics::gauge!("flow_memory_manifest_cache_entries", "cache" => cache)
-            .set(manifests.entry_count() as f64);
-    }
+    // Publication and maintenance share one manifest cache.
+    let manifests = publisher.manifest_cache();
+    metrics::gauge!("flow_memory_manifest_cache_bytes", "cache" => "shared")
+        .set(manifests.weighted_bytes() as f64);
+    metrics::gauge!("flow_memory_manifest_cache_entries", "cache" => "shared")
+        .set(manifests.entry_count() as f64);
     failures
 }
 

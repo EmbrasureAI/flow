@@ -244,7 +244,8 @@ async fn run_service(
             config.compaction.clone(),
             crate::services::writer_config(&config),
         )?
-        .with_read_limits(config.parquet_read.clone())?,
+        .with_read_limits(config.parquet_read.clone())?
+        .with_manifest_cache(publisher.manifest_cache().clone()),
     );
     for operation in store.pending_operations()? {
         ensure!(
