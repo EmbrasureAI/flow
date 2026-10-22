@@ -27,6 +27,16 @@ pub struct CollapsedMutation {
     pub row: Option<Row>,
 }
 
+/// A stored [`CollapsedMutation`] without its row image: bincode encodes an
+/// option's tag before its value, and decoding ignores the trailing row bytes.
+#[derive(Deserialize)]
+struct CollapsedPresence {
+    _table_id: TableId,
+    _key: PrimaryKey,
+    original: Option<RowLocation>,
+    row: Option<()>,
+}
+
 /// The first event constrains the indexed row; later events see only this row.
 #[derive(Debug)]
 pub(crate) struct PendingRow {
@@ -117,17 +127,10 @@ impl StateStore {
         transaction: &str,
         changes: impl IntoIterator<Item = (TableId, PrimaryKey, Change)>,
     ) -> Result<()> {
-        let started = Instant::now();
-        let _guard = self.lock()?;
-        if self
-            .get::<bool>(SPOOL, &transaction_prefix(transaction))?
-            .unwrap_or(false)
-        {
-            return Err(Error::InvalidState("transaction spool is sealed".into()));
-        }
         let fold_started = Instant::now();
         // Each key keeps its required initial presence and its final row. This
         // validates event order without retaining or cloning intermediate rows.
+        // The fold reads no stored state, so it runs before taking the row lock.
         let mut pending = BTreeMap::<Vec<u8>, (TableId, PrimaryKey, PendingRow)>::new();
         let mut count = 0;
         for (table_id, key, change) in changes {
@@ -148,6 +151,14 @@ impl StateStore {
                 }
             }
         }
+        let started = Instant::now();
+        let _guard = self.lock()?;
+        if self
+            .get::<bool>(SPOOL, &transaction_prefix(transaction))?
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidState("transaction spool is sealed".into()));
+        }
         let spool_started = Instant::now();
         let spool_cf = self.0.db.cf_handle(SPOOL).expect("opened column family");
         let mut existing = Vec::with_capacity(pending.len());
@@ -157,21 +168,22 @@ impl StateStore {
             // not multiply the memory required by a small replacement chunk.
             // A still-partial fold takes its unchanged values immediately; a
             // fold that does not require the key fails validation below.
-            let previous = self
-                .0
-                .db
-                .get_pinned_cf(&spool_cf, key)?
-                .map(|value| decode::<CollapsedMutation>(&value))
-                .transpose()?;
-            if let Some(Some(row)) = previous.as_ref().map(|value| value.row.as_ref())
-                && folded.is_partial()
-            {
-                folded.carry_forward(row)?;
-            }
-            existing.push(previous.map(|value| (value.original, value.row.is_some())));
-            if existing.last().is_some_and(Option::is_none) {
+            // Otherwise only the original location and presence are decoded.
+            let Some(value) = self.0.db.get_pinned_cf(&spool_cf, key)? else {
+                existing.push(None);
                 keys.push(pk_key(table_id, primary_key));
-            }
+                continue;
+            };
+            existing.push(Some(if folded.is_partial() {
+                let previous = decode::<CollapsedMutation>(&value)?;
+                if let Some(row) = &previous.row {
+                    folded.carry_forward(row)?;
+                }
+                (previous.original, previous.row.is_some())
+            } else {
+                let previous = decode::<CollapsedPresence>(&value)?;
+                (previous.original, previous.row.is_some())
+            }));
         }
         // Canonical spool order is also table/PK order. Only first occurrences
         // in this transaction need the authoritative index lookup.
@@ -211,8 +223,8 @@ impl StateStore {
             "standalone"
         };
         for (phase, start, end) in [
-            ("setup", started, fold_started),
-            ("fold", fold_started, spool_started),
+            ("fold", fold_started, started),
+            ("setup", started, spool_started),
             ("prior_spool", spool_started, lookup_started),
             ("index_lookup", lookup_started, bind_started),
             ("bind", bind_started, write_started),
@@ -405,4 +417,44 @@ fn reconcile_prefix(scan: &str, table: &TableId) -> Vec<u8> {
     result.push(2);
     result.extend_from_slice(&table.0.to_be_bytes());
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_model::{FileId, PgLsn, Value};
+
+    #[test]
+    fn presence_decoding_matches_the_stored_mutation() {
+        let location = RowLocation {
+            data_file_id: FileId("s3://bucket/data/file.parquet".into()),
+            row_position: 41,
+            data_sequence_number: 7,
+            spec_id: 0,
+            partition: vec![1, 2],
+            source_commit_lsn: PgLsn(99),
+            row_version: 3,
+            row_fingerprint: [5; 16],
+        };
+        let row = vec![
+            Value::Int64(1),
+            Value::String("wide".repeat(100)),
+            Value::Null,
+            Value::Unchanged,
+        ];
+        for original in [None, Some(location)] {
+            for row in [None, Some(row.clone()), Some(Vec::new())] {
+                let mutation = CollapsedMutation {
+                    table_id: TableId(9),
+                    key: PrimaryKey(vec![1, 3, 0, 255]),
+                    original: original.clone(),
+                    row,
+                };
+                let bytes = bincode::serialize(&mutation).unwrap();
+                let presence = decode::<CollapsedPresence>(&bytes).unwrap();
+                assert_eq!(presence.original, mutation.original);
+                assert_eq!(presence.row.is_some(), mutation.row.is_some());
+            }
+        }
+    }
 }

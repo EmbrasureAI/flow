@@ -1,8 +1,6 @@
 //! Ephemeral input for one current epoch. Capacity failure requires full replay.
 
-use crate::{
-    Change, CollapsedMutation, Error, Result, RowIndex, StateStore, TableState, spool::PendingRow,
-};
+use crate::{Change, CollapsedMutation, Error, Result, StateStore, TableState, spool::PendingRow};
 use flow_model::{PrimaryKey, Row, RowLocation, TableId, Value};
 use std::collections::{BTreeMap, btree_map};
 
@@ -150,8 +148,8 @@ impl StateStore {
             if batch.is_empty() {
                 break;
             }
-            let keys: Vec<_> = batch.iter().map(|(key, _)| (*key).clone()).collect();
-            let originals = snapshot.lookup_many(&buffer.table, &keys)?;
+            let originals =
+                snapshot.lookup_keys(&buffer.table, batch.iter().map(|(key, _)| *key))?;
             for ((_, (pending, bound)), original) in batch.into_iter().zip(originals) {
                 pending.validate_initial(original.is_some())?;
                 let extra = original.as_ref().map_or(Some(0), |location| {

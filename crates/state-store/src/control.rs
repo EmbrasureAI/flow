@@ -623,6 +623,9 @@ impl ControlStore {
         index: &StateStore,
         path: impl AsRef<Path>,
     ) -> Result<CheckpointRecord> {
+        // Flush memtables before taking the locks, so the flush inside the
+        // checkpoint covers only writes since and durable transitions wait less.
+        index.flush_memtables()?;
         let _index_guard = index.lock()?;
         let _guard = self.lock()?;
         index.ensure_writable()?;
