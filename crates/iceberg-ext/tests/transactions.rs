@@ -902,3 +902,34 @@ async fn loaded_head_publication_still_fences_a_concurrent_snapshot() {
     assert!(replay.already_committed);
     assert_eq!(replay.snapshot_id, committed.snapshot_id);
 }
+
+#[tokio::test]
+async fn manifest_cache_reuses_a_snapshots_manifest_list() {
+    let (catalog, empty) = setup().await;
+    let committed = RowDeltaAction::new(&empty, "initial")
+        .add_data_files(vec![data("cached")])
+        .commit(&catalog, &empty)
+        .await
+        .unwrap();
+    let table = committed.table;
+    let cache = flow_iceberg_ext::ManifestCache::default();
+    let first = SnapshotView::current_with_cache(&table, &cache)
+        .await
+        .unwrap();
+    // Manifest lists are immutable; a cached view no longer reads its object.
+    let list = table.metadata().current_snapshot().unwrap().manifest_list();
+    table.file_io().delete(list).await.unwrap();
+    let second = SnapshotView::current_with_cache(&table, &cache)
+        .await
+        .unwrap();
+    assert_eq!(second.snapshot_id, first.snapshot_id);
+    assert_eq!(
+        second.live_files.keys().collect::<Vec<_>>(),
+        first.live_files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        SnapshotView::current_with_cache(&table, &flow_iceberg_ext::ManifestCache::default())
+            .await
+            .is_err()
+    );
+}
