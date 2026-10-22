@@ -889,7 +889,7 @@ async fn external_row_changes_block_reconciliation_without_touching_the_index() 
     index.apply_committed(&operation).unwrap();
 
     // A plain Iceberg append, as another engine would commit it. Its rows no
-    // longer mirror the source, so only a resync can re-establish the table.
+    // longer mirror the source.
     let (files, _) = write("external-append", initial.table.clone(), vec![3]).await;
     let transaction = Transaction::new(&initial.table);
     let appended = transaction

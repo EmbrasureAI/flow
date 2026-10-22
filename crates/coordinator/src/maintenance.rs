@@ -63,8 +63,9 @@ fn worker_runtime() -> Result<&'static tokio::runtime::Runtime> {
 }
 
 /// Another writer changed the target's rows: they no longer mirror the
-/// source, so the index cannot be reconciled. Only a resync re-establishes the
-/// table; other tables keep publishing.
+/// source, so the index cannot be reconciled. Rolling back the foreign snapshot
+/// lets reconciliation succeed again; otherwise only a resync re-establishes
+/// the table. Other tables keep publishing.
 #[derive(Debug, thiserror::Error)]
 #[error("external snapshot {snapshot_id} changed table rows: {detail}")]
 pub struct ExternalMutation {

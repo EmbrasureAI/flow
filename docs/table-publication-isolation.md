@@ -94,7 +94,12 @@ Another writer's commit to a target is reconciled when it only rewrites files
 delete). A commit that adds or removes rows, or adds equality deletes, means the
 target no longer mirrors the source: the index cannot adopt it, and replaying
 later changes over it would publish wrong rows. That table is blocked with
-`external_mutation` and the other tables keep publishing. A `replace` snapshot
+`external_mutation` and the other tables keep publishing. For
+`limits.external_mutation_grace_secs` (15 minutes by default) the block is
+retryable: the table holds its source WAL, and rolling back the foreign
+snapshot lets reconciliation and publication resume. Once the grace passes, the
+record durably gains `resync_required` and only a resync recovers the table,
+see [blocks that require a resync](#blocks-that-require-a-resync). A `replace` snapshot
 whose rows or deletes differ from those it replaced is found only partway
 through reconciliation, so it stays connection-wide, as do missing snapshot
 history, an unknown Flow operation (both can mean restored or foreign local
@@ -115,8 +120,9 @@ Unknown/replaced source identities also retain coordinated recovery.
 
 ### Blocks that require a resync
 
-`source_schema_incompatible`, `publication_changed` and `external_mutation`
-blocks never clear without a resync, and a resync starts from a new slot. Source
+`source_schema_incompatible` and `publication_changed` blocks, and an
+`external_mutation` block whose grace has passed, never clear without a resync,
+and a resync starts from a new slot. Source
 WAL retained for the old slot cannot recover the table, so a blocked table must
 not hold the shared acknowledgement frontier: a table the operator cannot
 repair in place would otherwise fill the source database's disk.
@@ -126,7 +132,7 @@ row images and TRUNCATE entries before spool and journal, exactly like an
 unconfigured table, and skips rows that an open transaction spooled before the
 latch. An `external_mutation` block is detected by publication rather than
 capture, so the table's later changes are still journaled and are settled as
-they arrive. Transactions journaled before the latch are completed in the
+they arrive once its grace has passed. Transactions journaled before the latch are completed in the
 ledger at the table's unchanged snapshot, one bounded page per loop
 iteration and only while no run owns the table, so an admitted run's own
 completion is never contradicted. Its finished compaction candidates are

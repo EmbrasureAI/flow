@@ -6,7 +6,7 @@ mod pending;
 mod table;
 
 use self::{
-    blocked::{BlockedTables, PUBLICATION_CHANGED, requires_resync},
+    blocked::{BlockedTable, BlockedTables, PUBLICATION_CHANGED},
     health::{HealthCheckResult, check_health, observe_health, record_publication_changed},
     pending::{EPOCH_MAX_BYTES, EPOCH_MUTATION_TRIGGER, PendingWork, schedule_transactions},
     table::{
@@ -527,7 +527,10 @@ impl PublishRuntime {
         } = self;
         let config = &work.config;
         let store = &work.store;
-        let mut blocked = BlockedTables::load(store, &SourceId(config.source.id.clone()))?;
+        let mut blocked = BlockedTables::load(store, &SourceId(config.source.id.clone()))?
+            .with_external_grace(Duration::from_secs(
+                config.limits.external_mutation_grace_secs,
+            ));
         let mut excluded: HashSet<_> = blocked.ids().collect();
         let mut recovering: HashSet<TableId>;
         let mut retrying = HashSet::new();
@@ -1153,7 +1156,7 @@ impl PublishRuntime {
                                 .find(|id| !busy.contains(id) && !recovering.contains(id))
                         };
                         if let Some(id) = retry
-                            && blocked.get(id).is_none_or(|record| !requires_resync(&record.error_code))
+                            && blocked.get(id).is_none_or(|record| !record.requires_resync())
                             && store.table_state(&id)?.pending_operation.is_none()
                             && ledger.pending_table_transactions_after(id, PgLsn(0)).next().transpose()?.is_some()
                         {
@@ -1305,6 +1308,10 @@ impl PublishRuntime {
                     }
                 }
                 _ = health.tick() => {
+                    for id in blocked.expire_external_grace()? {
+                        tracing::warn!(event = "external_mutation_requires_resync", table_id = id.0,
+                            "external row changes were not rolled back; table changes settle until resync");
+                    }
                     for id in schemas.keys().copied() {
                         let cause = crate::schema::capture_block(store, &SourceId(config.source.id.clone()), id)?;
                         let recorded = blocked.get(id).map(|record| record.error_code.clone());
@@ -1320,7 +1327,7 @@ impl PublishRuntime {
                                 pending.defer(id, &mut scheduler);
                             }
                         }
-                        if blocked.get(id).is_some_and(|record| requires_resync(&record.error_code)) {
+                        if blocked.get(id).is_some_and(BlockedTable::requires_resync) {
                             let (build, preparation) = release_blocked_candidates(
                                 id, &mut ready_builds, &mut ready_preparations, &mut build_active,
                                 &mut activation_pending, &mut waiting_for_build, &mut retiring_builds);

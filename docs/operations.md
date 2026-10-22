@@ -130,7 +130,8 @@ Several changes require resynchronization: a changed table set, a publication
 violation (`publication-resync-required.json` or a `publication_changed` block), a lost or invalidated slot, a
 changed source identity (failover, major upgrade, restore), a table blocked for
 a heap rewrite or TRUNCATE, incompatible schema changes, and another writer's
-row changes to a target (`external_mutation`). Resynchronization starts a new
+row changes to a target that were not rolled back within its grace
+(`external_mutation`). Resynchronization starts a new
 incarnation beside the old one:
 
 1. Stop the daemon. Keep the old state directory for diagnosis; do not delete
@@ -294,7 +295,9 @@ orphan-file cleanup to that engine's maintenance, using a conservative age
 threshold (Iceberg's default is three days). Flow reconciles their file
 rewrites (`replace` snapshots that keep every row). A commit that adds or
 removes rows, or adds equality deletes, means the target no longer mirrors the
-source: that table is blocked with `external_mutation` until a resync, and the
-other tables continue. Write derived data to separate tables. See
+source: that table is blocked with `external_mutation`, and the other tables
+continue. Within `limits.external_mutation_grace_secs` (15 minutes by default)
+the table holds its source WAL, and rolling back the foreign snapshot resumes
+it; afterwards it requires a resync. Write derived data to separate tables. See
 [getting started](getting-started.md#recovery-and-operational-limits) for
 snapshot retention and reference coordination.

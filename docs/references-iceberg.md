@@ -157,7 +157,8 @@ are processed in ancestry order. Delete-file rewrites compare effective
 position sets; data rewrites additionally compare live keys, row fingerprints,
 and cardinality. Survivors' delete sets must remain unchanged. A snapshot that
 adds or removes rows outside `replace`, or adds equality deletes, blocks only
-that table until a resync (`external_mutation`). Other unsupported logical
+that table (`external_mutation`); unless it is rolled back within
+`limits.external_mutation_grace_secs`, the table then requires a resync. Other unsupported logical
 changes, missing history, unknown service operations and schema or spec
 changes stop the connection.
 

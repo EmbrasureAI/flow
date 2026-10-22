@@ -197,25 +197,24 @@ impl Fixture {
     /// Run the daemon until `write` has been published and acknowledged,
     /// then stop it and wait until it released the slot and local state.
     async fn publish(&self, sql: &Client, write: &str) {
-        self.run_until(sql, write, async |mark| {
+        self.run_until(&self.config, sql, write, async |mark| {
             materialized(&self.config) >= mark
                 && confirmed(sql, &self.name).await.unwrap_or(0) >= mark
         })
         .await;
     }
 
-    /// Run the daemon until `write` is durable in the journal but, because it
-    /// blocks its table, neither published nor acknowledged.
+    /// Run the daemon until `write` is durable in the journal but, within the
+    /// slowest publication priority's deadline, neither published nor
+    /// acknowledged.
     async fn journal_unpublished(&self, sql: &Client, write: &str) -> u64 {
+        let mut config = self.config.clone();
+        config.tables[0].priority = flow_coordinator::Priority::Efficient;
         let mark = self
-            .run_until(sql, write, async |mark| {
-                let status = status(&self.config);
-                status["watermarks"]["journal_durable_lsn"]
+            .run_until(&config, sql, write, async |mark| {
+                status(&self.config)["watermarks"]["journal_durable_lsn"]
                     .as_u64()
                     .is_some_and(|durable| durable >= mark)
-                    && status["blocked_tables"]
-                        .as_array()
-                        .is_some_and(|blocked| !blocked.is_empty())
             })
             .await;
         assert!(materialized(&self.config) < mark);
@@ -223,7 +222,13 @@ impl Fixture {
         mark
     }
 
-    async fn run_until(&self, sql: &Client, write: &str, ready: impl AsyncFn(u64) -> bool) -> u64 {
+    async fn run_until(
+        &self,
+        config: &Config,
+        sql: &Client,
+        write: &str,
+        ready: impl AsyncFn(u64) -> bool,
+    ) -> u64 {
         let checks = async {
             sql.batch_execute(&write.replace("{name}", &self.name))
                 .await
@@ -234,7 +239,7 @@ impl Fixture {
         };
         let mark = {
             // The pinned runtime future is dropped, and capture closed, at the end of this block.
-            let daemon = crate::runtime::run(self.config.clone(), false);
+            let daemon = crate::runtime::run(config.clone(), false);
             tokio::pin!(daemon);
             tokio::select! {
                 result = &mut daemon => panic!("daemon stopped: {result:?}"),
@@ -417,16 +422,16 @@ async fn truncated_journal(sql: &Client) -> String {
         // Materialized journal content is reclaimable. Only a durably journaled
         // transaction the ledger still needs makes the truncation a loss.
         fixture
-            .journal_unpublished(
-                sql,
-                "BEGIN; TRUNCATE {name}.items; INSERT INTO {name}.items VALUES (600, 'after truncate'); COMMIT",
-            )
+            .journal_unpublished(sql, "INSERT INTO {name}.items VALUES (600, 'journaled')")
             .await;
         let journal = fixture.config.state_dir.join("journal");
         let mut segments: Vec<_> = std::fs::read_dir(&journal)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "segment"))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "segment")
+            })
             .collect();
         segments.sort();
         let last = segments.last().expect("journal has no segment");
