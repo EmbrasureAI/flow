@@ -4,7 +4,15 @@ use crate::format::{MAX_OBJECT_BYTES, key_number};
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use opendal::{ErrorKind, Operator, layers::TimeoutLayer, services};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    io::Write,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+/// Staging directory for filesystem creates, outside every listed prefix.
+const STAGING: &str = ".staging";
 
 /// Build an operator rooted at the configured prefix. `endpoint` selects an
 /// S3-compatible service instead of AWS, using path-style addressing.
@@ -86,22 +94,62 @@ pub(crate) enum Created {
 /// existing object, so a retried request whose first response was lost is
 /// still recognised as our own write.
 pub(crate) async fn create(operator: &Operator, key: &str, bytes: Bytes) -> Result<Created> {
-    match operator
-        .write_with(key, bytes.clone())
-        .if_not_exists(true)
-        .await
-    {
-        Ok(_) => Ok(Created::New),
-        Err(error) if conflict(&error) => {
-            let existing = read(operator, key).await?;
-            Ok(if existing == bytes {
-                Created::Same
-            } else {
-                Created::Different(existing)
-            })
+    if operator.info().scheme() == "fs" {
+        let root = PathBuf::from(operator.info().root());
+        let (path, data) = (key.to_owned(), bytes.clone());
+        let created = tokio::task::spawn_blocking(move || create_file(&root, &path, &data))
+            .await
+            .context("create task")?
+            .with_context(|| format!("create {key}"))?;
+        if created {
+            return Ok(Created::New);
         }
-        Err(error) => Err(error).with_context(|| format!("create {key}")),
+    } else {
+        match operator
+            .write_with(key, bytes.clone())
+            .if_not_exists(true)
+            .await
+        {
+            Ok(_) => return Ok(Created::New),
+            Err(error) if conflict(&error) => {}
+            Err(error) => return Err(error).with_context(|| format!("create {key}")),
+        }
     }
+    let existing = read(operator, key).await?;
+    Ok(if existing == bytes {
+        Created::Same
+    } else {
+        Created::Different(existing)
+    })
+}
+
+/// Create `key` below a filesystem root only if it is absent, never exposing
+/// a partial object: OpenDAL writes in place, so a failed write would leave a
+/// truncated object that a retry then mistakes for another owner's. The
+/// bytes are synced in a private staging file, which is then hard-linked
+/// into place; linking fails if the key exists. Returns false then.
+fn create_file(root: &Path, key: &str, bytes: &[u8]) -> std::io::Result<bool> {
+    let target = root.join(key);
+    let parent = target.parent().unwrap_or(root);
+    std::fs::create_dir_all(parent)?;
+    let staging = root.join(STAGING);
+    std::fs::create_dir_all(&staging)?;
+    let temporary = staging.join(uuid::Uuid::new_v4().to_string());
+    let result = (|| {
+        let mut file = std::fs::File::create_new(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        match std::fs::hard_link(&temporary, &target) {
+            Ok(()) => {
+                std::fs::File::open(parent)?.sync_all()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
 }
 
 pub(crate) async fn read(operator: &Operator, key: &str) -> Result<Bytes> {
@@ -187,6 +235,55 @@ pub(crate) async fn delete_all(operator: &Operator, keys: Vec<String>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn filesystem_creates_are_exclusive_and_never_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", root.path().display());
+        let operator = super::operator(&uri, None, None, Duration::from_secs(4)).unwrap();
+        let ours = Bytes::from_static(b"ours");
+        assert!(matches!(
+            create(&operator, "log/a.batch", ours.clone())
+                .await
+                .unwrap(),
+            Created::New
+        ));
+        assert!(matches!(
+            create(&operator, "log/a.batch", ours).await.unwrap(),
+            Created::Same
+        ));
+        assert!(matches!(
+            create(&operator, "log/a.batch", Bytes::from_static(b"theirs"))
+                .await
+                .unwrap(),
+            Created::Different(_)
+        ));
+        // Racing creates of one key: exactly one wins, the rest see it whole.
+        let racers = (0..8u8).map(|index| {
+            let operator = operator.clone();
+            tokio::spawn(async move {
+                create(&operator, "log/b.batch", Bytes::from(vec![index; 1 << 16])).await
+            })
+        });
+        let mut created = 0;
+        for racer in racers {
+            match racer.await.unwrap().unwrap() {
+                Created::New => created += 1,
+                Created::Same => {}
+                Created::Different(existing) => assert_eq!(existing.len(), 1 << 16),
+            }
+        }
+        assert_eq!(created, 1);
+        assert_eq!(read(&operator, "log/b.batch").await.unwrap().len(), 1 << 16);
+        // Staging files stay outside every listed prefix and are removed.
+        assert_eq!(list_recursive(&operator, "log/").await.unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_dir(root.path().join(STAGING))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
 
     #[test]
     fn a_racing_conditional_write_is_retried_not_resolved() {
