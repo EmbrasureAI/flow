@@ -14,7 +14,7 @@ use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSch
 use flow_state_store::{IndexDelta, OperationKind, PreparedOperation, RowIndex, StateStore};
 use iceberg::{io::FileIO, spec::DataFile, table::Table};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Artifacts and durable row mappings only. There is deliberately no catalog
@@ -1030,58 +1030,20 @@ async fn load_deletes(
     read_limits: &ReadLimits,
     cancelled: Option<&AtomicBool>,
 ) -> Result<u64> {
-    let mut bytes = 0u64;
-    let mut rows = 0u64;
-    // Descriptors can share an immutable Puffin object. Re-observe its size on
-    // each scan, but validate every descriptor against that observation.
-    let mut puffin_sizes = HashMap::new();
     let vector_targets = view
         .live_files
         .values()
         .filter(|entry| entry.file_format() == iceberg::spec::DataFileFormat::Puffin)
         .filter_map(|entry| entry.data_file.referenced_data_file())
         .collect::<BTreeSet<_>>();
-    let is_puffin = |file: &FileId| {
-        view.live_files[&file.0].file_format() == iceberg::spec::DataFileFormat::Puffin
-    };
-    // Puffin vectors share objects and are read by offset; prefetch Parquet only.
-    let mut prefetch = Prefetch::new(
-        file_io,
-        delete_files
-            .iter()
-            .filter(|file| !is_puffin(file))
-            .map(|file| {
-                let size = view.live_files[&file.0].data_file.file_size_in_bytes();
-                (file.0.clone(), size)
-            }),
-        read_limits,
-    );
+    // Charge every declared input before reading any object.
+    let mut bytes = 0u64;
+    let mut declared = 0u64;
+    let mut vectors = Vec::new();
+    let mut vector_files = Vec::new();
+    let mut parquet_files = Vec::new();
     for file in delete_files {
-        check_cancelled(cancelled)?;
-        let source = if is_puffin(file) {
-            Input::Lazy
-        } else {
-            prefetch.next(&file.0).await?
-        };
         let delete_entry = &view.live_files[&file.0];
-        let input = file_io.new_input(delete_entry.file_path())?;
-        let size = if is_puffin(file) {
-            // Deletion vectors share Puffin objects; stat each object once.
-            if let Some(size) = puffin_sizes.get(delete_entry.file_path()) {
-                *size
-            } else {
-                let size = input.metadata().await?.size;
-                puffin_sizes.insert(delete_entry.file_path(), size);
-                size
-            }
-        } else {
-            source.size(&input).await?
-        };
-        check_cancelled(cancelled)?;
-        ensure!(
-            size == delete_entry.data_file.file_size_in_bytes(),
-            "delete file size differs from manifest"
-        );
         bytes = bytes
             .checked_add(flow_iceberg_ext::delete_content_size(
                 &delete_entry.data_file,
@@ -1093,78 +1055,120 @@ async fn load_deletes(
         );
         let declared_rows = delete_entry.data_file.record_count();
         ensure!(
-            declared_rows <= limits.max_rows.saturating_sub(rows),
+            declared_rows <= limits.max_rows.saturating_sub(declared),
             "delete scan exceeds input row budget"
         );
-        if delete_entry.data_file.file_format() == iceberg::spec::DataFileFormat::Puffin {
-            let descriptor = &delete_entry.data_file;
-            let target = FileId(
-                descriptor
-                    .referenced_data_file()
-                    .ok_or_else(|| anyhow::anyhow!("DV lacks target"))?,
-            );
-            let data = view
-                .live_files
-                .get(&target.0)
-                .ok_or_else(|| anyhow::anyhow!("DV target is not live"))?;
-            let vector = iceberg::puffin::read_deletion_vector_with_size(
-                &input,
-                size,
-                u64::try_from(
-                    descriptor
-                        .content_offset()
-                        .ok_or_else(|| anyhow::anyhow!("DV lacks offset"))?,
-                )?,
-                u64::try_from(
-                    descriptor
-                        .content_size_in_bytes()
-                        .ok_or_else(|| anyhow::anyhow!("DV lacks length"))?,
-                )?,
-                &target.0,
-                declared_rows,
+        if delete_entry.file_format() == iceberg::spec::DataFileFormat::Puffin {
+            let read = flow_materializer::VectorRead::new(
+                &delete_entry.data_file,
                 iceberg::puffin::DeletionVectorLimits {
                     max_blob_bytes: read_limits
                         .row_group_uncompressed_bytes
                         .min(limits.max_bytes),
                     max_footer_bytes: read_limits.footer_bytes,
-                    max_cardinality: limits.max_rows.saturating_sub(rows),
+                    max_cardinality: limits.max_rows.saturating_sub(declared),
                 },
-            )
-            .await?;
+            )?;
+            let data = view
+                .live_files
+                .get(&read.referenced_data_file)
+                .ok_or_else(|| anyhow::anyhow!("DV target is not live"))?;
+            let target = FileId(read.referenced_data_file.clone());
+            let applies = input_files.contains(&target)
+                && flow_iceberg_ext::position_delete_may_apply(delete_entry, data);
+            vectors.push(read);
+            vector_files.push((target, data, applies));
+        } else {
+            parquet_files.push((file, delete_entry));
+        }
+        declared += declared_rows;
+    }
+    check_cancelled(cancelled)?;
+    // Vectors share Puffin objects. Each object's size and footer are read
+    // once per scan; every descriptor is still validated against both.
+    let mut rows = 0u64;
+    let concurrency = read_limits.prefetch_files.max(1);
+    flow_materializer::read_vectors(
+        file_io,
+        &vectors,
+        flow_materializer::VectorReadLimits {
+            max_footer_bytes: read_limits.footer_bytes,
+            concurrency,
+            max_batch_bytes: read_limits
+                .prefetch_file_bytes
+                .saturating_mul(concurrency as u64),
+        },
+        |index, vector| {
+            check_cancelled(cancelled)?;
+            let (target, data, applies) = &vector_files[index];
             rows = rows
                 .checked_add(vector.len())
                 .ok_or_else(|| anyhow::anyhow!("delete row count overflow"))?;
-            let mut locations = Vec::with_capacity(batch_rows);
-            for position in vector.iter() {
-                check_cancelled(cancelled)?;
-                ensure!(
-                    position < data.data_file.record_count(),
-                    "delete position exceeds data row count"
-                );
-                if !input_files.contains(&target)
-                    || !flow_iceberg_ext::position_delete_may_apply(delete_entry, data)
-                {
-                    continue;
-                }
-                locations.push(RowLocation {
-                    data_file_id: target.clone(),
-                    row_position: position,
-                    data_sequence_number: data
-                        .sequence_number
-                        .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
-                    spec_id,
-                    partition: Vec::new(),
-                    source_commit_lsn: PgLsn(0),
-                    row_version: 0,
-                    row_fingerprint: [0; 16],
-                });
-                if locations.len() == batch_rows {
-                    scratch.put_position_deletes(scan_id, &schema.table_id, locations.drain(..))?;
-                }
+            ensure!(
+                vector
+                    .iter()
+                    .last()
+                    .is_none_or(|position| position < data.data_file.record_count()),
+                "delete position exceeds data row count"
+            );
+            if !applies {
+                return Ok(());
             }
-            scratch.put_position_deletes(scan_id, &schema.table_id, locations)?;
-            continue;
-        }
+            let sequence = data
+                .sequence_number
+                .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?;
+            let mut positions = vector.iter();
+            loop {
+                let mut batch = positions.by_ref().take(batch_rows).peekable();
+                if batch.peek().is_none() {
+                    return Ok(());
+                }
+                scratch.put_position_deletes(
+                    scan_id,
+                    &schema.table_id,
+                    batch.map(|position| RowLocation {
+                        data_file_id: target.clone(),
+                        row_position: position,
+                        data_sequence_number: sequence,
+                        spec_id,
+                        partition: Vec::new(),
+                        source_commit_lsn: PgLsn(0),
+                        row_version: 0,
+                        row_fingerprint: [0; 16],
+                    }),
+                )?;
+            }
+        },
+    )
+    .await?;
+    let input_paths: HashSet<&str> = input_files.iter().map(|file| file.0.as_str()).collect();
+    let mut prefetch = Prefetch::new(
+        file_io,
+        parquet_files
+            .iter()
+            .map(|(file, entry)| (file.0.clone(), entry.data_file.file_size_in_bytes())),
+        read_limits,
+    );
+    for (file, delete_entry) in parquet_files {
+        check_cancelled(cancelled)?;
+        // Observe a lazy input's size once; the reader below reuses it.
+        let (source, size) = match prefetch.next(&file.0).await? {
+            Input::Fetched(bytes) => {
+                let size = bytes.len() as u64;
+                (Input::Fetched(bytes), size)
+            }
+            _ => {
+                let input = file_io.new_input(delete_entry.file_path())?;
+                let size = input.metadata().await?.size;
+                (Input::Sized(size), size)
+            }
+        };
+        check_cancelled(cancelled)?;
+        ensure!(
+            size == delete_entry.data_file.file_size_in_bytes(),
+            "delete file size differs from manifest"
+        );
+        let declared_rows = delete_entry.data_file.record_count();
         let mut file_rows = 0u64;
         read_input_batches(
             file_io,
@@ -1214,11 +1218,11 @@ async fn load_deletes(
                         !paths.is_null(idx) && !positions.is_null(idx) && positions.value(idx) >= 0,
                         "invalid null or negative position delete"
                     );
-                    let id = FileId(paths.value(idx).to_owned());
-                    if !input_files.contains(&id) || vector_targets.contains(&id.0) {
+                    let path = paths.value(idx);
+                    if !input_paths.contains(path) || vector_targets.contains(path) {
                         continue;
                     }
-                    let data = &view.live_files[&id.0];
+                    let data = &view.live_files[path];
                     if !flow_iceberg_ext::position_delete_may_apply(delete_entry, data) {
                         continue;
                     }
@@ -1227,7 +1231,7 @@ async fn load_deletes(
                         "delete position exceeds data row count"
                     );
                     locations.push(RowLocation {
-                        data_file_id: id,
+                        data_file_id: FileId(path.to_owned()),
                         row_position: positions.value(idx) as u64,
                         data_sequence_number: data
                             .sequence_number
