@@ -296,9 +296,14 @@ pub(crate) async fn download(operator: &Operator, name: &str, directory: &Path) 
                     .await
                     .with_context(|| format!("download {}", file.object))?
                 {
+                    size += chunk.len() as u64;
+                    ensure!(
+                        size <= file.size,
+                        "index checkpoint file {} is damaged",
+                        file.object
+                    );
                     hasher.update(&chunk);
                     output.write_all(&chunk).await?;
-                    size += chunk.len() as u64;
                 }
                 ensure!(
                     size == file.size && hasher.finalize().to_hex().as_str() == file.blake3,
