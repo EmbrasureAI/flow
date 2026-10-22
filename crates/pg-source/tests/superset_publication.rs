@@ -248,16 +248,15 @@ fn other_published_tables_are_ignored_and_their_transactions_commit_empty() {
 
 #[test]
 fn truncate_stops_capture_only_when_it_includes_a_captured_table() {
+    let mut capture = Capture::new();
     assert_eq!(
-        truncate(1, vec![OTHER, CAPTURED, OTHER + 1]).retain_relations(|id| id == CAPTURED),
+        capture
+            .assembler
+            .configured(truncate(1, vec![OTHER, CAPTURED, OTHER + 1])),
         Some(truncate(1, vec![CAPTURED]))
     );
-    assert_eq!(
-        truncate(1, vec![OTHER]).retain_relations(|id| id == CAPTURED),
-        None
-    );
+    assert_eq!(capture.assembler.configured(truncate(1, vec![OTHER])), None);
 
-    let mut capture = Capture::new();
     capture.push(SourceEvent::Relation(relation(CAPTURED)));
     capture.push(SourceEvent::Relation(relation(OTHER)));
     capture.push(begin(1, 100));

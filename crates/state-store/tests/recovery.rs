@@ -1421,7 +1421,7 @@ fn corrupt_persisted_apply_cursors_fail_closed_after_reopen() {
 }
 
 #[test]
-fn applied_delta_stream_accepts_complete_payload_then_atomic_pruning() {
+fn applied_delta_stream_accepts_complete_payload_then_atomic_retirement() {
     let temp = TempDir::new().unwrap();
     let id = OperationId("pruned-deltas".into());
     let deltas = vec![insert(1, "a", 0), insert(2, "a", 1)];
@@ -1439,10 +1439,12 @@ fn applied_delta_stream_accepts_complete_payload_then_atomic_pruning() {
             .unwrap(),
         deltas
     );
-    store.prune_applied_deltas(&id).unwrap();
+    store
+        .forget_applied_batch(std::slice::from_ref(&id))
+        .unwrap();
     drop(store);
     let store = open(temp.path());
     store.validate_storage().unwrap();
-    assert_eq!(store.operation(&id).unwrap().unwrap().delta_count, 2);
-    assert!(store.prepared_deltas(&id).unwrap().next().is_none());
+    assert!(store.operation(&id).unwrap().is_none());
+    assert!(store.prepared_deltas(&id).is_err());
 }

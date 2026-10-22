@@ -5,7 +5,7 @@ use flow_model::{
 };
 use flow_pg_source::{
     CaptureAssembler, Cell, Column as PgColumn, Error, Relation, SourceEvent, SpoolConfig,
-    TransactionSpool,
+    TransactionSpool, TypeRegistry,
 };
 
 fn fixture() -> (TableSchema, Relation) {
@@ -261,7 +261,11 @@ fn default_eligibility_accepts_variable_width_and_rejects_other_identities() {
     let (mut schema, mut relation) = fixture();
     for identity in *b"ni" {
         relation.replica_identity = identity;
-        assert!(relation.validate_schema(&schema).is_err());
+        assert!(
+            TypeRegistry::default()
+                .validate_relation(&schema, &relation)
+                .is_err()
+        );
     }
     relation.replica_identity = b'd';
     for (oid, kind) in [
@@ -272,13 +276,19 @@ fn default_eligibility_accepts_variable_width_and_rejects_other_identities() {
     ] {
         relation.columns[1].type_oid = oid;
         schema.columns[1].data_type = kind;
-        relation.validate_schema(&schema).unwrap();
+        TypeRegistry::default()
+            .validate_relation(&schema, &relation)
+            .unwrap();
     }
     relation.replica_identity = b'f';
-    relation.validate_schema(&schema).unwrap();
+    TypeRegistry::default()
+        .validate_relation(&schema, &relation)
+        .unwrap();
     schema.append_only = true;
     relation.replica_identity = b'n';
-    relation.validate_schema(&schema).unwrap();
+    TypeRegistry::default()
+        .validate_relation(&schema, &relation)
+        .unwrap();
 }
 
 fn text_body_capture(root: &std::path::Path) -> (TableSchema, CaptureAssembler, Journal) {

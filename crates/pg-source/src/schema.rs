@@ -225,20 +225,6 @@ fn wire_prefix(prefix: &Relation, next: &Relation) -> bool {
 
 /// Infer only new column types. Existing OIDs and type modifiers are immutable,
 /// even where two PostgreSQL types share the same Rust representation.
-pub fn nullable_successor(
-    base: &TableSchema,
-    base_relation: &Relation,
-    relation: &Relation,
-    version: u32,
-) -> Result<TableSchema> {
-    nullable_successor_with_types(
-        base,
-        base_relation,
-        relation,
-        version,
-        &crate::TypeRegistry::default(),
-    )
-}
 pub fn nullable_successor_with_types(
     base: &TableSchema,
     base_relation: &Relation,
