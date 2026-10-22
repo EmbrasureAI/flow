@@ -63,8 +63,9 @@ If object storage is unavailable, local capture continues within its journal
 quota and queue budget, but nothing is acknowledged, published or deleted:
 barriers wait, logging a warning every `stall_warning_secs`, and fail only once
 replication has stopped, for example because a newer owner claimed the state.
-Log batches and checkpoint objects retry transient errors, so the startup
-checkpoint waits the same way. The source retains WAL meanwhile. Queued records
+Log batches and checkpoint objects retry object-storage errors, so the startup
+checkpoint waits the same way; a local error, such as an unreadable journal
+segment, fails it after three attempts. The source retains WAL meanwhile. Queued records
 count against `queue_memory_bytes`; journal extents count only their small
 descriptors, since their bytes are read from the local segment when batched, and
 contiguous extents share one. Appends block once the budget is used. A clean

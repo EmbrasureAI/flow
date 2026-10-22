@@ -24,6 +24,8 @@ use tokio::sync::{mpsc, oneshot};
 const MAX_PARTS: usize = 16;
 /// Journal parts uploaded at once; each is read into memory whole.
 const PART_UPLOADS: usize = 4;
+/// Consecutive failed checkpoints, one per second, before waiters fail.
+const WAITER_ATTEMPTS: u32 = 3;
 
 pub(crate) enum Request {
     Control(ControlStore),
@@ -54,6 +56,7 @@ pub(crate) async fn checkpoint_loop(
     let mut retention_pending = false;
     let mut count = 0;
     let mut warned: Option<Instant> = None;
+    let mut failures = 0;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -137,6 +140,7 @@ pub(crate) async fn checkpoint_loop(
                     "remote durability checkpoint written"
                 );
                 warned = None;
+                failures = 0;
                 shared.set_baseline();
                 for waiter in waiters.drain(..) {
                     let _ = waiter.send(Ok(()));
@@ -147,12 +151,21 @@ pub(crate) async fn checkpoint_loop(
                     retention_pending = true;
                 }
             }
-            // Waiters keep waiting, as at a barrier: the next tick retries
-            // until a checkpoint lands or replication stops. The models are
+            // Object writes retry inside the checkpoint, so waiting on object
+            // storage never ends up here. What does is local, such as a
+            // segment reclaimed while it was being read: retry it a few
+            // times, then fail the waiters rather than hang. The models are
             // still unwritten, so an unchanged log must not satisfy them.
             Err(error) => {
                 shared.lock().models_changed = true;
-                if warned.is_none_or(|at| at.elapsed() >= shared.tuning.stall_warning) {
+                failures += 1;
+                if failures >= WAITER_ATTEMPTS && !waiters.is_empty() {
+                    failures = 0;
+                    tracing::warn!(error = %format!("{error:#}"), "remote durability checkpoint failed");
+                    for waiter in waiters.drain(..) {
+                        let _ = waiter.send(Err(anyhow::anyhow!("{error:#}")));
+                    }
+                } else if warned.is_none_or(|at| at.elapsed() >= shared.tuning.stall_warning) {
                     warned = Some(Instant::now());
                     tracing::warn!(error = %format!("{error:#}"), waiting = waiters.len(), "remote durability checkpoint failed; retrying");
                 }
