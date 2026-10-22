@@ -806,3 +806,33 @@ async fn flush_and_release_give_up_after_one_lease_while_storage_is_unavailable(
         started.elapsed()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_baseline_that_cannot_read_local_state_fails_instead_of_hanging() {
+    let operator = Operator::new(Memory::default()).unwrap().finish();
+    let state = tempfile::tempdir().unwrap();
+    {
+        let (mut journal, _) =
+            Journal::open(state.path().join("journal"), JournalConfig::default()).unwrap();
+        commit(&mut journal, 1, b"legacy");
+    }
+    // A segment the baseline lists but cannot read.
+    let segment = state
+        .path()
+        .join("journal")
+        .join(flow_ingress_journal::segment_file_name(0));
+    std::fs::remove_file(&segment).unwrap();
+    std::os::unix::fs::symlink(state.path().join("missing"), &segment).unwrap();
+    let durability = open(&operator, state.path()).await;
+    assert_eq!(durability.mode(), Mode::Migrated);
+    let control = ControlStore::open(state.path().join("control")).unwrap();
+    durability.attach_control(&control).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), durability.baseline())
+        .await
+        .expect("a local error must fail the baseline, not hang it");
+    assert!(result.is_err());
+    // Only the request failed; replication itself keeps running.
+    assert!(durability.failure().is_none());
+    drop(control);
+    durability.stop();
+}
