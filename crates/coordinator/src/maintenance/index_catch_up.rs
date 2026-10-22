@@ -2,10 +2,12 @@
 //!
 //! A checkpoint index exactly describes the live rows of its table snapshot.
 //! The current head differs by whole files: data files removed (compaction,
-//! external rewrites), data files added, and position deletes added against
-//! files that both snapshots share. Catch-up therefore removes every index
-//! entry whose physical row is no longer live, then inserts the live rows of
-//! added files, without rescanning unchanged data. Removals and insertions are
+//! external rewrites), data files added, and position deletes added, replaced
+//! or removed for files that both snapshots share. Catch-up therefore removes
+//! every index entry whose physical row is no longer live, then inserts the
+//! live rows of added files, without rescanning unchanged data. A shared file
+//! must keep every row it had deleted; its remaining entries plus the head's
+//! deletes must account for all of its rows. Removals and insertions are
 //! separate operations because a moved key may appear only once per operation.
 //! Any disagreement with the index fails; the caller rebuilds from scratch.
 use super::{TableMaintenance, file_paths, index_rows, worker_runtime};
@@ -80,22 +82,30 @@ impl TableMaintenance {
         let after = file_paths(&current, DataContentType::Data);
         let removed: BTreeSet<_> = before.difference(&after).cloned().collect();
         let added: BTreeSet<_> = after.difference(&before).cloned().collect();
-        // Shared files can only lose rows, through deletes the checkpoint lacked.
-        let new_deletes: BTreeSet<_> = file_paths(&current, DataContentType::PositionDeletes)
-            .difference(&file_paths(&previous, DataContentType::PositionDeletes))
-            .cloned()
-            .collect();
+        // Recheck every shared file whose applicable deletes changed. Usually
+        // it only loses rows, but a removed or narrowed delete would restore
+        // rows that the checkpoint lacks; the coverage check below rejects it.
         let mut changed = BTreeSet::new();
-        if !new_deletes.is_empty() {
+        if file_paths(&current, DataContentType::PositionDeletes)
+            != file_paths(&previous, DataContentType::PositionDeletes)
+        {
+            let ids = |view: &SnapshotView, file: &FileId| -> Result<BTreeSet<String>> {
+                Ok(view
+                    .applicable_deletes(&file.0)?
+                    .iter()
+                    .map(|entry| flow_iceberg_ext::content_file_id(&entry.data_file))
+                    .collect())
+            };
             for file in before.intersection(&after) {
-                if current.applicable_deletes(&file.0)?.iter().any(|entry| {
-                    new_deletes
-                        .contains(&FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
-                }) {
+                if ids(&current, file)? != ids(&previous, file)? {
                     changed.insert(file.clone());
                 }
             }
         }
+        let changed_rows = changed
+            .iter()
+            .map(|file| current.live_files[&file.0].data_file.record_count())
+            .collect::<Vec<_>>();
         let mut stats = CatchUpStats {
             removed_files: removed.len(),
             added_files: added.len(),
@@ -196,31 +206,52 @@ impl TableMaintenance {
                         index.stage_deltas(&removal, deltas)?;
                         Ok(())
                     };
-                    // Removed files lose every row; changed files their deleted positions.
-                    for file in removed.iter().chain(&changed) {
-                        let deleted = if removed.contains(file) {
-                            None
-                        } else {
-                            Some(
-                                scratch
-                                    .file_position_deletes(&deletes_scan, &table_id, file)
-                                    .map(|location| location.map(|location| location.row_position))
-                                    .collect::<flow_state_store::Result<BTreeSet<_>>>()?,
-                            )
-                        };
+                    // Removed files lose every row.
+                    for file in &removed {
                         for row in index.file_rows(&table_id, file) {
-                            let (position, key) = row?;
-                            if deleted
-                                .as_ref()
-                                .is_none_or(|deleted| deleted.contains(&position))
-                            {
-                                pending.push((position, key));
-                                if pending.len() >= batch_rows {
-                                    stage(&mut pending, file)?;
-                                }
+                            pending.push(row?);
+                            if pending.len() >= batch_rows {
+                                stage(&mut pending, file)?;
                             }
                         }
                         stage(&mut pending, file)?;
+                    }
+                    // Changed files lose their deleted positions. Both scans are
+                    // ordered by position; merge them and count every row.
+                    for (file, record_count) in changed.iter().zip(&changed_rows) {
+                        let mut deletes = scratch
+                            .file_position_deletes(&deletes_scan, &table_id, file)
+                            .map(|location| location.map(|location| location.row_position))
+                            .peekable();
+                        let mut deleted_rows = 0u64;
+                        let mut live_rows = 0u64;
+                        for row in index.file_rows(&table_id, file) {
+                            let (position, key) = row?;
+                            let mut deleted = false;
+                            while let Some(next) = deletes.next_if(|next| {
+                                next.as_ref().map_or(true, |next| *next <= position)
+                            }) {
+                                deleted_rows += 1;
+                                deleted |= next? == position;
+                            }
+                            if !deleted {
+                                live_rows += 1;
+                                continue;
+                            }
+                            pending.push((position, key));
+                            if pending.len() >= batch_rows {
+                                stage(&mut pending, file)?;
+                            }
+                        }
+                        for next in deletes {
+                            next?;
+                            deleted_rows += 1;
+                        }
+                        stage(&mut pending, file)?;
+                        ensure!(
+                            live_rows + deleted_rows == *record_count,
+                            "a delete was removed or narrowed for a checkpoint file"
+                        );
                     }
                     index.seal_prepare(&removal, Vec::new(), Vec::new())?;
                     index.mark_committed(&removal, base, base_sequence)?;

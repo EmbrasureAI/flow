@@ -124,13 +124,16 @@ impl Fixture {
         .unwrap()
     }
     fn maintenance(&self) -> TableMaintenance {
+        self.maintenance_with(&self.store, Policy::default())
+    }
+    fn maintenance_with(&self, store: &StateStore, policy: Policy) -> TableMaintenance {
         TableMaintenance::new(
-            self.store.clone(),
+            store.clone(),
             self.catalog.clone(),
             Policy {
                 l0_soft_files: 2,
                 min_file_age_ms: 0,
-                ..Default::default()
+                ..policy
             },
             WriterConfig::default(),
         )
@@ -1257,4 +1260,97 @@ async fn corrupt_prior_vector_fails_publication_without_dropping_deletes() {
         row(4, "initial"),
     ])
     .await;
+}
+
+/// Every indexed key with its location, fingerprint and data sequence.
+fn index_contents(
+    store: &StateStore,
+    schema: &TableSchema,
+    view: &SnapshotView,
+) -> BTreeMap<(FileId, u64), Vec<u8>> {
+    let mut rows = BTreeMap::new();
+    for entry in view
+        .live_files
+        .values()
+        .filter(|entry| entry.content_type() == DataContentType::Data)
+    {
+        let file = FileId(entry.file_path().into());
+        for item in store.file_rows(&schema.table_id, &file) {
+            let (position, key) = item.unwrap();
+            let location = store.lookup(&schema.table_id, &key).unwrap().unwrap();
+            assert_eq!(
+                (&location.data_file_id, location.row_position),
+                (&file, position)
+            );
+            let mut summary = key.0.clone();
+            summary.extend_from_slice(&location.row_fingerprint);
+            summary.extend_from_slice(&location.data_sequence_number.to_be_bytes());
+            rows.insert((file.clone(), position), summary);
+        }
+    }
+    rows
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_checkpoint_catches_up_through_replaced_vectors() {
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    f.publish(
+        10,
+        (1..=6)
+            .map(|id| (id, Change::Insert(row(id, "initial"))))
+            .collect(),
+    )
+    .await;
+    f.publish(
+        20,
+        vec![(1, Change::Delete), (2, Change::Update(row(2, "a")))],
+    )
+    .await;
+    let checkpoint = f.temp.path().join("checkpoint");
+    f.store.checkpoint(&checkpoint).unwrap();
+    let at_checkpoint = f.store.table_state(&f.schema.table_id).unwrap();
+    // Each epoch replaces the shared file's vector with a superset.
+    f.publish(
+        30,
+        vec![(3, Change::Delete), (2, Change::Update(row(2, "b")))],
+    )
+    .await;
+    f.publish(40, vec![(4, Change::Update(row(4, "c")))]).await;
+    let current = f.store.table_state(&f.schema.table_id).unwrap();
+    let restored = StateStore::open(&checkpoint, options()).unwrap();
+    let stats = f
+        .maintenance_with(&restored, Policy::default())
+        .catch_up_index(
+            &f.head,
+            &f.schema,
+            restored.clone(),
+            f.scratch(),
+            at_checkpoint.snapshot_id,
+            current.materialized_lsn,
+            current.schema_version,
+        )
+        .await
+        .unwrap();
+    assert!(stats.changed_files > 0 && stats.removed_rows > 0);
+    let rebuilt = StateStore::open(f.temp.path().join("rebuilt"), options()).unwrap();
+    f.maintenance_with(&rebuilt, Policy::default())
+        .rebuild_index(
+            &f.head,
+            &f.schema,
+            rebuilt.clone(),
+            f.scratch(),
+            current.materialized_lsn,
+            current.schema_version,
+        )
+        .await
+        .unwrap();
+    let view = SnapshotView::current(&f.head).await.unwrap();
+    assert_eq!(
+        restored.table_state(&f.schema.table_id).unwrap(),
+        rebuilt.table_state(&f.schema.table_id).unwrap()
+    );
+    assert_eq!(
+        index_contents(&restored, &f.schema, &view),
+        index_contents(&rebuilt, &f.schema, &view)
+    );
 }
