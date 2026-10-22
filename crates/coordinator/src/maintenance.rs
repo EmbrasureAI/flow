@@ -505,6 +505,7 @@ impl TableMaintenance {
         let mut writer = self.writer.clone();
         writer.artifact_tracker = Some(ownership.clone());
         let read_limits = self.read_limits.clone();
+        let cache = self.cache.clone();
         let worker_started = std::time::Instant::now();
         let operation_id_for_result = operation_id.clone();
         let output = tokio::task::spawn_blocking(move || {
@@ -517,6 +518,7 @@ impl TableMaintenance {
                 scratch,
                 writer,
                 &read_limits,
+                &cache,
             ))
         })
         .await??;
