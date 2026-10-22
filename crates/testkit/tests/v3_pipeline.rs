@@ -38,6 +38,7 @@ struct Fixture {
     store: StateStore,
     schema: TableSchema,
     head: Table,
+    batch_bytes: usize,
 }
 impl Fixture {
     async fn new(version: FormatVersion) -> Self {
@@ -73,6 +74,7 @@ impl Fixture {
             store,
             schema,
             head,
+            batch_bytes: 1 << 20,
         }
     }
     // Optional retained artifacts let independent engines verify this same fixture.
@@ -108,7 +110,7 @@ impl Fixture {
             self.catalog.clone(),
             WriterConfig::default(),
             2,
-            1 << 20,
+            self.batch_bytes,
         )
         .unwrap()
     }
@@ -1152,4 +1154,107 @@ async fn external_rewrite_of_vector_targets_replans_speculative_compaction() {
     assert!(f.store.pending_operations().unwrap().is_empty());
     f.refresh().await;
     assert_eq!(f.live().await, before);
+}
+
+async fn prior_vector_scenario(batch_bytes: usize) -> Fixture {
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    f.batch_bytes = batch_bytes;
+    f.publish(
+        10,
+        (0..800)
+            .map(|id| (id, Change::Insert(row(id, "initial"))))
+            .collect(),
+    )
+    .await;
+    f.publish(20, (0..600).map(|id| (id, Change::Delete)).collect())
+        .await;
+    f.publish(30, vec![(700, Change::Update(row(700, "late")))])
+        .await;
+    f.publish(40, vec![(650, Change::Delete), (750, Change::Delete)])
+        .await;
+    f
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prior_vectors_merge_in_memory_or_through_disk_identically() {
+    // The 600-position vector exceeds a 1 KiB batch, forcing disk staging.
+    let memory = prior_vector_scenario(1 << 20).await;
+    let disk = prior_vector_scenario(1024).await;
+    let expected: Vec<_> = (600..800)
+        .filter(|id| ![650, 750].contains(id))
+        .map(|id| row(id, if id == 700 { "late" } else { "initial" }))
+        .collect();
+    for f in [&memory, &disk] {
+        f.assert_rows(expected.clone()).await;
+        let view = SnapshotView::current(&f.head).await.unwrap();
+        let vectors: Vec<_> = view
+            .live_files
+            .values()
+            .filter(|entry| entry.file_format() == DataFileFormat::Puffin)
+            .collect();
+        assert_eq!(
+            vectors.len(),
+            1,
+            "one cumulative vector for the shared file"
+        );
+        assert_eq!(vectors[0].data_file().record_count(), 603);
+        assert!(flow_iceberg_ext::delete_content_size(vectors[0].data_file()) > 1024);
+    }
+    assert_eq!(memory.live().await, disk.live().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_prior_vector_fails_publication_without_dropping_deletes() {
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    f.publish(
+        10,
+        (1..=4)
+            .map(|id| (id, Change::Insert(row(id, "initial"))))
+            .collect(),
+    )
+    .await;
+    f.publish(20, vec![(1, Change::Delete)]).await;
+    let view = SnapshotView::current(&f.head).await.unwrap();
+    let vector = view
+        .live_files
+        .values()
+        .find(|entry| entry.file_format() == DataFileFormat::Puffin)
+        .unwrap();
+    let path = vector.file_path().trim_start_matches("file://").to_owned();
+    let original = std::fs::read(&path).unwrap();
+    let mut corrupt = original.clone();
+    // Flip a bitmap byte inside the blob; the CRC must reject it.
+    corrupt[vector.data_file().content_offset().unwrap() as usize + 10] ^= 1;
+    std::fs::write(&path, &corrupt).unwrap();
+    let snapshot = f.head.metadata().current_snapshot_id();
+    let (_, collapsed) = collapse_fixture(
+        &f.store,
+        &f.head,
+        &f.schema,
+        SourceId("v3-pipeline".into()),
+        PgLsn(30),
+        [(
+            f.schema.encode_key(&row(2, "")).unwrap(),
+            Change::Update(row(2, "late")),
+        )]
+        .into_iter(),
+    );
+    let error = f
+        .publisher()
+        .publish(&f.head, &f.schema, collapsed)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("checksum mismatch"),
+        "{error:#}"
+    );
+    f.refresh().await;
+    assert_eq!(f.head.metadata().current_snapshot_id(), snapshot);
+    std::fs::write(&path, &original).unwrap();
+    f.assert_rows(vec![
+        row(2, "initial"),
+        row(3, "initial"),
+        row(4, "initial"),
+    ])
+    .await;
 }

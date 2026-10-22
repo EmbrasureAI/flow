@@ -2,7 +2,7 @@ use flow_materializer::{DeleteWriter, WriterConfig};
 use flow_model::{FileId, OperationId, PgLsn, RowLocation};
 use iceberg::{
     io::FileIO,
-    puffin::{DeletionVectorLimits, read_deletion_vector},
+    puffin::{DeleteVector, DeletionVectorLimits, read_deletion_vector},
     spec::FormatVersion,
 };
 
@@ -102,5 +102,65 @@ async fn exact_budget_admits_container_transition_and_rejects_next_high_key() ->
         .await
         .unwrap_err();
     assert!(error.to_string().contains("memory budget"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn prior_vectors_union_with_new_positions_once_per_target() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let io = FileIO::new_with_fs();
+    let location = directory.path().to_str().unwrap();
+    let mut priors = std::collections::HashMap::from([
+        (
+            "a".to_owned(),
+            DeleteVector::new([0, 5, 9].into_iter().collect()),
+        ),
+        ("c".to_owned(), DeleteVector::new([1].into_iter().collect())),
+    ]);
+    let mut writer = DeleteWriter::new_for_version(
+        io.clone(),
+        location,
+        &OperationId("priors".into()),
+        0,
+        WriterConfig::default(),
+        FormatVersion::V3,
+    )?;
+    // New positions may precede or repeat merged ones.
+    writer
+        .write_with_priors(&[position("a", 3), position("a", 5)], &mut priors)
+        .await?;
+    writer
+        .write_with_priors(&[position("a", 10), position("b", 2)], &mut priors)
+        .await?;
+    assert_eq!(priors.len(), 1, "an unvisited target keeps its prior");
+    let files = writer.close().await?;
+    let mut vectors = Vec::new();
+    for file in &files {
+        let vector = read_deletion_vector(
+            &io,
+            file.file_path(),
+            file.content_offset().unwrap() as u64,
+            file.content_size_in_bytes().unwrap() as u64,
+            &file.referenced_data_file().unwrap(),
+            file.record_count(),
+            DeletionVectorLimits::default(),
+        )
+        .await?;
+        vectors.push(vector.iter().collect::<Vec<_>>());
+    }
+    assert_eq!(vectors, [vec![0, 3, 5, 9, 10], vec![2]]);
+    let mut legacy = DeleteWriter::new(
+        io,
+        location,
+        &OperationId("legacy".into()),
+        0,
+        WriterConfig::default(),
+    )?;
+    assert!(
+        legacy
+            .write_with_priors(&[position("c", 0)], &mut priors)
+            .await
+            .is_err()
+    );
     Ok(())
 }

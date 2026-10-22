@@ -22,7 +22,7 @@ use flow_state_store::{
     CollapsedMutation, ControlStore, IndexDelta, MemoryRows, OperationKind, OperationPhase,
     OperationRecord, PreparedOperation, StateStore,
 };
-use iceberg::{Catalog, spec::DataFile, table::Table};
+use iceberg::{Catalog, puffin::DeleteVector, spec::DataFile, table::Table};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -246,31 +246,121 @@ impl TablePublisher {
         &self.manifest_cache
     }
 
+    /// V3 replaces each referenced target's vector with the union of its prior
+    /// effective deletes and the epoch's positions. Returns the replaced vector
+    /// IDs and the prior vectors to merge in memory. Legacy position deletes,
+    /// and priors beyond one batch budget, are staged in the epoch's
+    /// disk-backed delete set instead.
     async fn merge_previous_deletes(
         &self,
         table: &Table,
         schema: &TableSchema,
         epoch: &Epoch,
         referenced: &BTreeSet<String>,
-    ) -> Result<BTreeSet<String>> {
+    ) -> Result<(BTreeSet<String>, HashMap<String, DeleteVector>)> {
+        let mut priors = HashMap::new();
         if table.metadata().format_version() != iceberg::spec::FormatVersion::V3
             || referenced.is_empty()
         {
-            return Ok(BTreeSet::new());
+            return Ok((BTreeSet::new(), priors));
         }
         let view =
             flow_iceberg_ext::SnapshotView::current_with_cache(table, &self.manifest_cache).await?;
-        let files = referenced.iter().cloned().map(flow_model::FileId).collect();
+        let read_limits = flow_compactor::ReadLimits::default();
         let mut removed = BTreeSet::new();
+        let mut staged = BTreeSet::new();
+        let mut reads = Vec::new();
+        let mut rows = Vec::new();
+        let mut vector_bytes = 0u64;
         for target in referenced {
-            for entry in view.applicable_deletes(target)? {
-                if entry.data_file.file_format() == iceberg::spec::DataFileFormat::Puffin {
+            let applicable = view.applicable_deletes(target)?;
+            // A live vector supersedes legacy files and is unique per target.
+            match applicable.as_slice() {
+                [] => {}
+                [entry]
+                    if entry.data_file.file_format() == iceberg::spec::DataFileFormat::Puffin =>
+                {
                     removed.insert(flow_iceberg_ext::content_file_id(&entry.data_file));
+                    vector_bytes = vector_bytes
+                        .saturating_add(flow_iceberg_ext::delete_content_size(&entry.data_file));
+                    reads.push(flow_materializer::VectorRead::new(
+                        &entry.data_file,
+                        iceberg::puffin::DeletionVectorLimits {
+                            max_blob_bytes: read_limits.row_group_uncompressed_bytes,
+                            max_footer_bytes: read_limits.footer_bytes,
+                            max_cardinality: u64::MAX,
+                        },
+                    )?);
+                    rows.push(view.live_files[target].data_file.record_count());
+                }
+                entries => {
+                    // The cumulative vector replaces every prior vector; keep
+                    // shared legacy files for their other targets.
+                    removed.extend(
+                        entries
+                            .iter()
+                            .filter(|entry| {
+                                entry.data_file.file_format()
+                                    == iceberg::spec::DataFileFormat::Puffin
+                            })
+                            .map(|entry| flow_iceberg_ext::content_file_id(&entry.data_file)),
+                    );
+                    staged.insert(flow_model::FileId(target.clone()));
                 }
             }
         }
-        // Keep shared legacy position files for their other targets. A cumulative
-        // DV supersedes their positions only for its own target.
+        ensure!(
+            view.live_files.values().all(
+                |entry| entry.content_type() != iceberg::spec::DataContentType::EqualityDeletes
+            ),
+            "live-row scanner refuses unsupported equality deletes"
+        );
+        ensure!(
+            table
+                .metadata()
+                .table_properties()?
+                .encryption_key_id
+                .is_none(),
+            "encrypted compaction/rebuild is not supported"
+        );
+        // Sparse vectors decode to a few times their encoded size. Beyond one
+        // materializer batch, use the disk-backed path for every prior.
+        if vector_bytes > self.batch_bytes as u64 {
+            staged.extend(
+                reads
+                    .drain(..)
+                    .map(|read| flow_model::FileId(read.referenced_data_file)),
+            );
+        }
+        if !reads.is_empty() {
+            let concurrency = read_limits.prefetch_files.max(1);
+            flow_materializer::read_vectors(
+                table.file_io(),
+                &reads,
+                flow_materializer::VectorReadLimits {
+                    max_footer_bytes: read_limits.footer_bytes,
+                    concurrency,
+                    max_batch_bytes: read_limits
+                        .prefetch_file_bytes
+                        .saturating_mul(concurrency as u64),
+                },
+                |index, vector| {
+                    ensure!(
+                        vector
+                            .iter()
+                            .last()
+                            .is_none_or(|position| position < rows[index]),
+                        "delete position exceeds data row count"
+                    );
+                    priors.insert(reads[index].referenced_data_file.clone(), vector);
+                    Ok(())
+                },
+            )
+            .await?;
+        }
+        if staged.is_empty() {
+            return Ok((removed, priors));
+        }
         let scan_id = format!("{}-prior-deletes", epoch.id.0);
         let store = self.store.clone();
         let table = table.clone();
@@ -283,11 +373,11 @@ impl TablePublisher {
                 &table,
                 &schema,
                 &view,
-                &files,
+                &staged,
                 &store,
                 &scan_id,
                 batch_rows,
-                &flow_compactor::ReadLimits::default(),
+                &read_limits,
             ));
             let result = result.and_then(|()| {
                 let mut positions = store.position_deletes(&scan_id, &epoch.table);
@@ -307,7 +397,7 @@ impl TablePublisher {
             result
         })
         .await?;
-        Ok(removed)
+        Ok((removed, priors))
     }
 
     /// Builds artifacts, durably seals their plan, then commits. Ambiguous
@@ -502,7 +592,7 @@ impl TablePublisher {
                 Ok(())
             }));
         };
-        let removed_deletes = self
+        let (removed_deletes, mut priors) = self
             .merge_previous_deletes(&table, schema, epoch, &referenced)
             .await?;
         let mut delete_writer = DeleteWriter::new_for_version(
@@ -516,9 +606,13 @@ impl TablePublisher {
         let mut deletes = self.delete_batches(epoch);
         while let Some(batch) = deletes.recv().await.transpose()? {
             let write_started = Instant::now();
-            delete_writer.write(&batch).await?;
+            delete_writer.write_with_priors(&batch, &mut priors).await?;
             delete_write += write_started.elapsed();
         }
+        ensure!(
+            priors.is_empty(),
+            "prior deletion vector has no new position for its target"
+        );
         let write_started = Instant::now();
         let delete_files = delete_writer.close().await?;
         delete_write += write_started.elapsed();
