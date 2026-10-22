@@ -138,13 +138,21 @@ fn codec() -> impl Options {
         .with_limit(MAX_OBJECT_BYTES)
 }
 
-fn seal(magic: &[u8; 4], body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 12);
+/// Encode the body directly after a reserved header, so large batches are
+/// not copied a second time to prepend it.
+fn seal(
+    magic: &[u8; 4],
+    capacity: usize,
+    body: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(capacity + 12);
     out.extend_from_slice(magic);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
-    out.extend_from_slice(body);
-    out
+    out.extend_from_slice(&[0; 4]);
+    body(&mut out)?;
+    let checksum = crc32fast::hash(&out[12..]);
+    out[8..12].copy_from_slice(&checksum.to_le_bytes());
+    Ok(out)
 }
 
 fn open<'a>(magic: &[u8; 4], bytes: &'a [u8], what: &str) -> Result<&'a [u8]> {
@@ -167,7 +175,10 @@ fn open<'a>(magic: &[u8; 4], bytes: &'a [u8], what: &str) -> Result<&'a [u8]> {
 
 pub(crate) fn encode_batch(batch: &Batch) -> Result<Vec<u8>> {
     ensure!(!batch.records.is_empty(), "empty durability batch");
-    Ok(seal(BATCH_MAGIC, &codec().serialize(batch)?))
+    let size = usize::try_from(codec().serialized_size(batch)?)?;
+    seal(BATCH_MAGIC, size, |out| {
+        Ok(codec().serialize_into(out, batch)?)
+    })
 }
 
 pub(crate) fn decode_batch(bytes: &[u8]) -> Result<Batch> {
@@ -191,7 +202,11 @@ pub(crate) fn encode_snapshot(entries: &[RawEntry]) -> Result<Vec<u8>> {
         raw.extend_from_slice(&(value.len() as u32).to_le_bytes());
         raw.extend_from_slice(value);
     }
-    Ok(seal(SNAPSHOT_MAGIC, &zstd::bulk::compress(&raw, 3)?))
+    let compressed = zstd::bulk::compress(&raw, 3)?;
+    seal(SNAPSHOT_MAGIC, compressed.len(), |out| {
+        out.extend_from_slice(&compressed);
+        Ok(())
+    })
 }
 
 pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
