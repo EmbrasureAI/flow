@@ -840,6 +840,7 @@ async fn partial_catch_up_staging_remains_unpublished_across_restart() {
         f.scratch("partial-build"),
         WriterConfig::default(),
         &flow_compactor::ReadLimits::default(),
+        &flow_iceberg_ext::ManifestCache::default(),
         &std::sync::atomic::AtomicBool::new(false),
     )
     .await

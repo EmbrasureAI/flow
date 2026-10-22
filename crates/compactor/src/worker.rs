@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use arrow_array::{Array, Int64Array, StringArray};
-use flow_iceberg_ext::SnapshotView;
+use flow_iceberg_ext::{ManifestCache, SnapshotView};
 use flow_materializer::{DataWriter, DeleteWriter, WriterConfig, rows_from_batch};
 use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value};
 use flow_state_store::{IndexDelta, OperationKind, PreparedOperation, RowIndex, StateStore};
@@ -111,6 +111,7 @@ pub async fn compact(
     scratch: StateStore,
     config: WriterConfig,
     read_limits: &ReadLimits,
+    cache: &ManifestCache,
 ) -> Result<WorkerOutput> {
     let built = build_data(
         table,
@@ -121,6 +122,7 @@ pub async fn compact(
         scratch,
         config.clone(),
         read_limits,
+        cache,
         &AtomicBool::new(false),
     )
     .await?;
@@ -161,6 +163,7 @@ pub async fn build_data(
     scratch: StateStore,
     mut config: WriterConfig,
     read_limits: &ReadLimits,
+    cache: &ManifestCache,
     cancelled: &AtomicBool,
 ) -> Result<BuiltData> {
     ensure!(
@@ -186,7 +189,8 @@ pub async fn build_data(
     );
     ensure!(!plan.input_files.is_empty(), "compaction requires inputs");
     check_cancelled(Some(cancelled))?;
-    let view = SnapshotView::load(table, plan.base_snapshot_id).await?;
+    // Planning normally just loaded these manifests through the same cache.
+    let view = SnapshotView::load_with_cache(table, plan.base_snapshot_id, cache).await?;
     check_cancelled(Some(cancelled))?;
     let required_deletes: BTreeSet<_> = plan
         .input_files

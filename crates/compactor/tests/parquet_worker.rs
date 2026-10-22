@@ -231,6 +231,7 @@ async fn parquet_compaction_applies_position_deletes_and_stock_reader_sees_ident
         keyless_scratch,
         WriterConfig::default(),
         &flow_compactor::ReadLimits::default(),
+        &flow_iceberg_ext::ManifestCache::default(),
     )
     .await
     .unwrap();
@@ -248,6 +249,7 @@ async fn parquet_compaction_applies_position_deletes_and_stock_reader_sees_ident
         scratch,
         WriterConfig::default(),
         &flow_compactor::ReadLimits::default(),
+        &flow_iceberg_ext::ManifestCache::default(),
     )
     .await
     .unwrap();
