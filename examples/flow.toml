@@ -74,6 +74,40 @@ batch_bytes = 134217728
 prefetch_files = 4
 prefetch_file_bytes = 4194304
 
+# Optional: local compaction thresholds, shown with their defaults. A soft limit
+# schedules background maintenance; a hard limit pauses that table's publication
+# until maintenance clears the debt.
+# [compaction]
+# "all", "l0-only", or "disabled"; delete-file compaction runs in every scope.
+# data_rewrite_scope = "all"
+# Uncompacted ingest output (L0): file count, total bytes and oldest file age.
+# l0_soft_files = 24
+# l0_hard_files = 32
+# l0_soft_bytes = 134217728
+# l0_hard_bytes = 268435456
+# oldest_l0_soft_ms = 10000
+# oldest_l0_hard_ms = 30000
+# Files outside L0 smaller than l1_target_bytes, such as external rewrite output.
+# stable_small_soft_files = 24
+# stable_small_hard_files = 32
+# Delete files that apply to any single data file.
+# delete_files_soft = 8
+# delete_files_hard = 16
+# Rewrite a data file once this share of its rows is deleted.
+# deleted_rows_percent = 30
+# Bounds of one rewrite group and its applicable delete inputs.
+# min_group_files = 2
+# max_group_files = 32
+# max_input_bytes = 1073741824
+# max_delete_input_files = 32
+# max_delete_input_bytes = 33554432
+# max_delete_input_rows = 1000000
+# Output file sizes for L0 -> L1 and L1 -> L2 rewrites.
+# l1_target_bytes = 134217728
+# l2_target_bytes = 536870912
+# Files younger than this are not rewritten unless publication is paused.
+# min_file_age_ms = 1000
+
 # Optional: replicate the journal and control state to object storage, so a
 # worker and its whole state volume can be replaced without losing changes
 # acknowledged to the source. Use a new prefix for each source incarnation.
