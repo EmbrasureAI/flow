@@ -100,6 +100,15 @@ impl OwnedArtifacts {
         .into_bytes()
     }
 }
+/// Manifest list of an attempt's prepared plan. Its manifests append `-m0.avro`
+/// (data) and `-m1.avro` (deletes).
+pub(crate) fn prepared_plan_path(table: &Table, attempt: &OperationId) -> String {
+    format!(
+        "{}/metadata/{}-prepared.avro",
+        table.metadata().location().trim_end_matches('/'),
+        attempt.0
+    )
+}
 pub(super) fn registry_prefix(uuid: uuid::Uuid) -> String {
     // Older engines do not protect catalog JSON. A distinct registry namespace
     // makes rollback retain new records instead of deleting a live JSON pointer.
@@ -339,7 +348,7 @@ impl WriterRegistration {
         attempt: &OperationId,
     ) -> Result<Arc<Self>> {
         let location = table.metadata().location().trim_end_matches('/');
-        let plan = Self::plan_path(table, attempt);
+        let plan = prepared_plan_path(table, attempt);
         let owner = OwnedArtifacts::new(
             table,
             table_id,
@@ -373,13 +382,6 @@ impl WriterRegistration {
             owner: Mutex::new(owner),
             store,
         }))
-    }
-    pub(crate) fn plan_path(table: &Table, attempt: &OperationId) -> String {
-        format!(
-            "{}/metadata/{}-prepared.avro",
-            table.metadata().location().trim_end_matches('/'),
-            attempt.0
-        )
     }
     pub(crate) async fn record(&self) -> Result<(Vec<u8>, Vec<u8>)> {
         Ok((
