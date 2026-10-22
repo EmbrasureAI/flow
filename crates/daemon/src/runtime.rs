@@ -349,6 +349,16 @@ async fn run_service(
     let result = publishing
         .run(&mut ledger, &mut receive, &ack_send, &mut observation)
         .await;
+    // The stopped state and exit reason must follow the last observation.
+    let flushed = observation.flush_status();
+    let result = match (result, flushed) {
+        (Ok(()), flushed) => flushed,
+        (Err(error), Err(flush)) => {
+            tracing::warn!(error = %flush, "could not write the final status observation");
+            Err(error)
+        }
+        (result, Ok(())) => result,
+    };
     drop(receive);
     drop(ack_send);
     // Closing both channels interrupts a healthy capture actor. Socket operations
