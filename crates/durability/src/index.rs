@@ -15,12 +15,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Instant,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const FILES: &str = "index/files/";
 const CHECKPOINTS: &str = "index/checkpoints/";
@@ -274,24 +273,31 @@ pub(crate) async fn download(operator: &Operator, name: &str, directory: &Path) 
             let staging = staging.clone();
             async move {
                 ensure!(valid_name(&file.path), "invalid index checkpoint file name");
-                let data = operator
-                    .read(&file.object)
+                let mut stream = operator
+                    .reader(&file.object)
                     .await
                     .with_context(|| format!("download {}", file.object))?
-                    .to_vec();
+                    .into_bytes_stream(..)
+                    .await
+                    .with_context(|| format!("download {}", file.object))?;
+                let mut output = tokio::fs::File::create(staging.join(&file.path)).await?;
+                let mut hasher = blake3::Hasher::new();
+                let mut size = 0u64;
+                while let Some(chunk) = stream
+                    .try_next()
+                    .await
+                    .with_context(|| format!("download {}", file.object))?
+                {
+                    hasher.update(&chunk);
+                    output.write_all(&chunk).await?;
+                    size += chunk.len() as u64;
+                }
                 ensure!(
-                    data.len() as u64 == file.size
-                        && blake3::hash(&data).to_hex().as_str() == file.blake3,
+                    size == file.size && hasher.finalize().to_hex().as_str() == file.blake3,
                     "index checkpoint file {} is damaged",
                     file.object
                 );
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut output = fs::File::create(staging.join(&file.path))?;
-                    output.write_all(&data)?;
-                    output.sync_all()?;
-                    Ok(())
-                })
-                .await??;
+                output.sync_all().await?;
                 Ok::<_, anyhow::Error>(())
             }
         })

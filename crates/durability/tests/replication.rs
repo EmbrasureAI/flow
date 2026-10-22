@@ -648,6 +648,43 @@ async fn baselines_write_only_new_state_but_always_cover_new_files() {
     durability.stop();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_journal_of_many_segments_restores_exactly() {
+    let small = JournalConfig {
+        segment_bytes: 4096,
+        max_frame_bytes: 1024,
+        ..JournalConfig::default()
+    };
+    let operator = Operator::new(Memory::default()).unwrap().finish();
+    let state = tempfile::tempdir().unwrap();
+    {
+        let (mut journal, _) = Journal::open(state.path().join("journal"), small.clone()).unwrap();
+        for xid in 1..=40 {
+            commit(&mut journal, xid, &[xid as u8; 600]);
+        }
+    }
+    let durability = open(&operator, state.path()).await;
+    let control = ControlStore::open(state.path().join("control")).unwrap();
+    durability.attach_control(&control).await.unwrap();
+    durability.baseline().await.unwrap();
+    let (journal, _) = Journal::open(state.path().join("journal"), small.clone()).unwrap();
+    let expected = transactions(&journal);
+    let segments = journal.layout().segments.len();
+    assert!(segments > 4, "only {segments} segments");
+    drop((journal, control));
+    durability.release().await.unwrap();
+
+    let restored = tempfile::tempdir().unwrap();
+    let durability = open(&operator, restored.path()).await;
+    assert_eq!(durability.mode(), Mode::Restored);
+    let (journal, recovery) = Journal::open(restored.path().join("journal"), small).unwrap();
+    assert_eq!(recovery.truncated_bytes, 0);
+    assert_eq!(journal.layout().segments.len(), segments);
+    assert_eq!(transactions(&journal), expected);
+    drop(journal);
+    durability.stop();
+}
+
 fn faulty() -> (faults::Faults, Operator) {
     let faults = faults::Faults::default();
     let operator = Operator::new(Memory::default())

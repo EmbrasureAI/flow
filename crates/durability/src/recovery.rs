@@ -9,8 +9,8 @@
 //! the recovered history and cannot have been the basis of an external effect.
 use crate::checkpoint::History;
 use crate::format::{
-    self, Batch, Checkpoint, IDENTITY_KEY, Identity, LockIdentity, Owner, Record, log_key,
-    owner_key,
+    self, Batch, Checkpoint, IDENTITY_KEY, Identity, LockIdentity, Owner, Record, SegmentImage,
+    log_key, owner_key,
 };
 use crate::store::{self, Created};
 use anyhow::{Context, Result, bail, ensure};
@@ -414,6 +414,51 @@ async fn extend(
     Ok(())
 }
 
+/// Write one journal segment from its checkpoint parts, streaming each part
+/// to disk so restore memory does not grow with part size.
+async fn restore_segment(
+    operator: &Operator,
+    path: PathBuf,
+    segment: u64,
+    image: &SegmentImage,
+) -> Result<u64> {
+    let mut file = File::create(&path)?;
+    let mut expected = 0;
+    for part in &image.parts {
+        let mut stream = operator
+            .reader(&part.object)
+            .await
+            .with_context(|| format!("read {}", part.object))?
+            .into_bytes_stream(..)
+            .await
+            .with_context(|| format!("read {}", part.object))?;
+        let mut crc32 = crc32fast::Hasher::new();
+        let mut length = 0u64;
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .with_context(|| format!("read {}", part.object))?
+        {
+            crc32.update(&chunk);
+            file.write_all(&chunk)?;
+            length += chunk.len() as u64;
+        }
+        ensure!(
+            part.start == expected
+                && length == part.end - part.start
+                && crc32.finalize() == part.crc32,
+            "journal part {} is damaged or out of order",
+            part.object
+        );
+        expected = part.end;
+    }
+    ensure!(
+        expected == image.length,
+        "journal segment {segment} image is incomplete"
+    );
+    Ok(expected)
+}
+
 /// Rebuilds local files in a private staging directory, then installs them.
 struct Restorer {
     staging: PathBuf,
@@ -469,39 +514,21 @@ impl Restorer {
                     "checkpoint names unknown journal {name}"
                 );
                 restorer.journals.insert(name.clone(), image.reclaimed);
-                for (segment, image) in &image.segments {
-                    let path = restorer
-                        .staging
+            }
+            let staging = &restorer.staging;
+            let segments = checkpoint.journals.iter().flat_map(|(name, image)| {
+                image.segments.iter().map(move |(segment, image)| {
+                    let path = staging
                         .join(name)
                         .join(flow_ingress_journal::segment_file_name(*segment));
-                    let mut file = File::create(&path)?;
-                    let mut expected = 0;
-                    let mut parts = futures::stream::iter(image.parts.iter())
-                        .map(|part| async move {
-                            Ok::<_, anyhow::Error>((
-                                part,
-                                store::read(operator, &part.object).await?,
-                            ))
-                        })
-                        .buffered(READ_CONCURRENCY);
-                    while let Some((part, data)) = parts.try_next().await? {
-                        ensure!(
-                            part.start == expected
-                                && data.len() as u64 == part.end - part.start
-                                && crc32fast::hash(&data) == part.crc32,
-                            "journal part {} is damaged or out of order",
-                            part.object
-                        );
-                        file.write_all(&data)?;
-                        expected = part.end;
-                        restorer.stats.journal_bytes += data.len() as u64;
-                    }
-                    ensure!(
-                        expected == image.length,
-                        "journal segment {segment} image is incomplete"
-                    );
-                }
-            }
+                    restore_segment(operator, path, *segment, image)
+                })
+            });
+            let restored: Vec<u64> = futures::stream::iter(segments)
+                .buffer_unordered(READ_CONCURRENCY)
+                .try_collect()
+                .await?;
+            restorer.stats.journal_bytes += restored.iter().sum::<u64>();
             restorer.files = checkpoint.files.clone();
         }
         restorer.control = Some(control);
