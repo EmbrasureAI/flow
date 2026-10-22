@@ -133,6 +133,10 @@ pub(crate) struct State {
     pub baseline: bool,
     /// Journal or file models changed without a record, as by a baseline scan.
     pub models_changed: bool,
+    /// Queued extents below this ordinal no longer take more bytes: a
+    /// checkpoint copied the models at it and treats every ordinal below as
+    /// reflected, so later bytes need a new ordinal to be replayed.
+    pub merge_floor: u64,
     pub journals: BTreeMap<String, JournalModel>,
     pub files: BTreeMap<String, Vec<u8>>,
     /// Batch sequence and last ordinal of batches not yet retired by a checkpoint.
@@ -176,6 +180,7 @@ impl Shared {
                 lease_until: None,
                 baseline: false,
                 models_changed: false,
+                merge_floor: 0,
                 journals: BTreeMap::new(),
                 files: BTreeMap::new(),
                 batches: VecDeque::new(),
@@ -434,7 +439,8 @@ impl Shared {
 }
 
 /// Extend the newest queued extent by `item` if it continues it, returning
-/// that extent's ordinal. The result still fits a single batch.
+/// that extent's ordinal. The result still fits a single batch. Taken
+/// records are no longer queued, so only unwritten bytes ever merge.
 fn merge_extent(state: &mut State, item: &Item) -> Option<u64> {
     if state.failure.is_some() || state.closing {
         return None;
@@ -448,7 +454,11 @@ fn merge_extent(state: &mut State, item: &Item) -> Option<u64> {
     else {
         return None;
     };
+    let floor = state.merge_floor;
     let (ordinal, queued) = state.queue.back_mut()?;
+    if *ordinal < floor {
+        return None;
+    }
     let Item::Extent {
         journal: queued_journal,
         segment: queued_segment,
