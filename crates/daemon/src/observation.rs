@@ -28,6 +28,7 @@ pub(crate) struct Observation {
     started_at: SystemTime,
     memory_warned_at: Option<Instant>,
     memory_sample: Option<tokio::task::JoinHandle<Vec<String>>>,
+    status: crate::lifecycle::StatusWriter,
     #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
     allocator_sample: Option<(Instant, Option<crate::allocator::MemoryUsage>)>,
 }
@@ -66,6 +67,7 @@ impl Observation {
             started_at: SystemTime::now(),
             memory_warned_at: None,
             memory_sample: None,
+            status: Default::default(),
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         })
@@ -199,6 +201,11 @@ impl Observation {
         }
     }
 
+    /// Write the latest status observation before the process records its exit.
+    pub(crate) fn flush_status(&self) -> Result<()> {
+        self.status.flush()
+    }
+
     fn write_at(
         &mut self,
         config: &Config,
@@ -209,6 +216,7 @@ impl Observation {
     ) -> Result<bool> {
         let ready = ready && self.source_health.permits_readiness();
         crate::lifecycle::emit_running(
+            &self.status,
             config,
             ledger,
             captured,
@@ -609,6 +617,7 @@ mod tests {
             started_at: SystemTime::now(),
             memory_warned_at: None,
             memory_sample: None,
+            status: Default::default(),
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         };
