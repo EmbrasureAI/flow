@@ -61,8 +61,8 @@ impl SchemaRegistry {
                 let record = SchemaRecord::decode(&bytes)?;
                 identities.insert((record.relation.namespace, record.relation.name), id);
             }
-            // A schema block latched by an earlier version keeps its
-            // quarantined journal entries; settlement releases them.
+            // A schema block may have quarantined journal entries from an
+            // earlier build; settlement releases them.
             if let Some(cause) = capture_block(&store, &source, id)? {
                 blocked.insert(id, cause);
             }
@@ -228,8 +228,8 @@ impl SchemaRegistry {
         self.blocked.contains_key(&table)
     }
 
-    /// Blocked tables, whose capture drops changes; see [`CaptureAssembler::drop_table`].
-    pub(crate) fn dropped(&self) -> impl Iterator<Item = TableId> + '_ {
+    /// Capture drops every blocked table's changes; see [`CaptureAssembler::drop_table`].
+    pub(crate) fn blocked(&self) -> impl Iterator<Item = TableId> + '_ {
         self.blocked.keys().copied()
     }
 
@@ -1373,7 +1373,7 @@ mod target_identity_tests {
         registry.block(TableId(11), "schema").unwrap();
         // Every durable block drops its table's changes, whatever the cause.
         assert_eq!(
-            registry.dropped().collect::<Vec<_>>(),
+            registry.blocked().collect::<Vec<_>>(),
             [TableId(11), TableId(12)]
         );
         // A publication change supersedes a schema block in status.
@@ -1396,9 +1396,9 @@ mod target_identity_tests {
 
         // Durable across restart, whatever the publication looks like then.
         let restarted = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
-        // A schema block latched before this version also drops on restart.
+        // A schema block latched by an earlier build also drops on restart.
         assert_eq!(
-            restarted.dropped().collect::<Vec<_>>(),
+            restarted.blocked().collect::<Vec<_>>(),
             [TableId(11), TableId(12)]
         );
         assert_eq!(

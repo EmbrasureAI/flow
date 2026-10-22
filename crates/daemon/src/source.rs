@@ -314,7 +314,7 @@ pub(crate) async fn capture_loop(
                 config.limits.chunk_bytes,
             )?
             .with_pending_commit_limit(JOURNAL_GROUP_TRANSACTIONS)?;
-            for table in registry.dropped() {
+            for table in registry.blocked() {
                 assembler.drop_table(table)?;
             }
             let mut wire_relations = std::collections::HashMap::new();

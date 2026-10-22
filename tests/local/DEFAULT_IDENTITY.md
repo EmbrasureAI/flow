@@ -28,8 +28,8 @@ row values. Updates without an old tuple derive the unchanged key from the new
 row. A changed key uses the existing old-key delete/new-row insert application.
 Only FULL may fill an unchanged-TOAST marker from its complete old tuple; all
 unresolved markers fail. Invalid events cannot produce a successful capture
-commit. The materialized checkpoint and source acknowledgement remain behind
-quarantined/unapplied changes; the ingress journal may safely retain later WAL.
+commit. An unsupported change blocks its table until a resync: the target stays
+unchanged, and the source acknowledgement passes the table's dropped changes.
 
 ## Engine-only run
 

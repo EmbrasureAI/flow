@@ -264,6 +264,15 @@ primary_key = [0]
         ).fetchone()[0]
         return max(barrier, lsn(marker))
 
+    def wait_acknowledged(self, barrier):
+        # A table blocked until resync must not hold the slot behind its changes.
+        barrier = self.materialization_barrier(barrier)
+        return self.until("source ACK stayed behind a resync-blocked table", lambda: (
+            value if (value := self.pg.execute(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = %s", (self.name,)
+            ).fetchone()[0]) and lsn(value) >= barrier else None
+        ))
+
     def wait_materialized(self, barrier, timeout=None):
         barrier = self.materialization_barrier(barrier)
         def reached():
@@ -570,8 +579,8 @@ primary_key = [0]
         self.until("TRUNCATE did not block its table", blocked)
         expected = self.pg.execute("SELECT * FROM accounts ORDER BY id").fetchall()
         self.until("healthy table stopped behind TRUNCATE", lambda: self.rows("accounts") == expected)
-        confirmed = self.pg.execute("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = %s", (self.name,)).fetchone()[0]
-        assert lsn(confirmed) < barrier, "unsupported source operation was acknowledged"
+        # Only a resync recovers the table, so the slot advances past its TRUNCATE.
+        confirmed = self.wait_acknowledged(barrier)
         assert self.table("orders")["metadata"]["current-snapshot-id"] == before['orders']
         return {"table_blocked": True, "confirmed_flush_lsn": confirmed, "healthy_table_continued": True}
 
@@ -587,7 +596,7 @@ primary_key = [0]
             self.phase("replication-connection-recovery", self.reconnect)
             self.phase("sigkill-and-wal-backlog-recovery", self.restart)
             self.phase("compaction-and-native-metadata", self.compaction)
-            self.phase("truncate-isolates-before-ack", self.truncate)
+            self.phase("truncate-isolates-and-releases-ack", self.truncate)
             self.report["passed"] = True
         except BaseException as error:
             self.report["failure"] = str(error)

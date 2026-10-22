@@ -1030,8 +1030,9 @@ impl TableMaintenance {
                     }
                     .into());
                 }
-                // Missing history or an unknown service operation can mean
-                // restored or foreign local state: never isolate those.
+                // Missing history, an unknown service operation or a schema
+                // change can mean restored or foreign local state, or need
+                // operator repair: never isolate those.
                 Classification::Pause(reason) => {
                     bail!("external snapshot {id} paused publication: {reason:?}")
                 }

@@ -361,8 +361,8 @@ async fn run_service(
     result
 }
 
-/// A table whose block requires a resync never publishes again: capture drops
-/// its changes and only a resync recovers it. Call only while no run owns the
+/// A table whose block requires a resync never publishes again, so its
+/// transactions complete without publication. Call only while no run owns the
 /// table: its outcome may still complete its transactions at a new snapshot,
 /// which must not race an earlier completion. Builds and preparations never
 /// complete transactions.
@@ -371,7 +371,7 @@ async fn run_service(
 /// - Otherwise one bounded page of transactions the table journaled before the
 ///   latch completes at its unchanged snapshot, so they stop holding the
 ///   acknowledgement frontier. Returns whether a page was completed.
-fn settle_dropped_table(
+fn settle_resync_table(
     ledger: &mut SourceLedger,
     store: &StateStore,
     blocked: &mut BlockedTables,
@@ -708,7 +708,7 @@ impl PublishRuntime {
                 _ = tokio::task::yield_now(), if settling.iter().any(|id| !busy.contains(id)) => {
                     // One bounded page per loop iteration, like other completion work.
                     let id = *settling.iter().find(|id| !busy.contains(*id)).expect("settling table");
-                    if !settle_dropped_table(ledger, store, &mut blocked, id)? {
+                    if !settle_resync_table(ledger, store, &mut blocked, id)? {
                         settling.remove(&id);
                     }
                     ledger.drain_completed_prefix()?;
@@ -1864,14 +1864,14 @@ mod startup_recovery_tests {
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(0));
 
         // The batch capacity is two: one tick settles one page.
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(20));
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(40));
         assert_eq!(ledger.pending_count(), 0);
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
     }
 
     /// A run admitted before the latch may still commit its transactions at a
@@ -1895,7 +1895,7 @@ mod startup_recovery_tests {
             blocked.get(dropped).unwrap().error_code,
             PUBLICATION_CHANGED
         );
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
 
@@ -1941,7 +1941,7 @@ mod startup_recovery_tests {
             })
             .unwrap();
         assert_eq!(blocked.deadline_for(dropped), None);
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         assert!(
             blocked.deadline_for(dropped).is_some(),
             "recovery-only attempt admitted"
@@ -1960,7 +1960,7 @@ mod startup_recovery_tests {
         store.discard_uncommitted(&id).unwrap();
         blocked.record(dropped, PUBLICATION_CHANGED, None).unwrap();
         assert_eq!(blocked.deadline_for(dropped), None);
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
     }
@@ -2003,7 +2003,7 @@ mod startup_recovery_tests {
         assert!(retiring_builds.contains(&dropped) && ready_builds.is_empty());
 
         // Only a run owns the table's ledger share, so settling proceeds.
-        while settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap() {}
+        while settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap() {}
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(20));
     }

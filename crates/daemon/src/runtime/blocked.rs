@@ -187,8 +187,6 @@ fn now_ms() -> Result<u64> {
 }
 
 pub(crate) const PUBLICATION_CHANGED: &str = "publication_changed";
-/// Another writer changed the target's rows; see [`flow_coordinator::ExternalMutation`].
-pub(crate) const EXTERNAL_MUTATION: &str = "external_mutation";
 
 /// Blocks only a resync clears. Their tables never publish again, so their
 /// changes are settled without publication instead of holding the source
@@ -196,7 +194,7 @@ pub(crate) const EXTERNAL_MUTATION: &str = "external_mutation";
 pub(crate) fn requires_resync(code: &str) -> bool {
     matches!(
         code,
-        "source_schema_incompatible" | PUBLICATION_CHANGED | EXTERNAL_MUTATION
+        "source_schema_incompatible" | "publication_changed" | "external_mutation"
     )
 }
 
@@ -229,7 +227,7 @@ pub(crate) fn publication_error_code(error: &anyhow::Error) -> Option<&'static s
         return Some("source_schema_incompatible");
     }
     if error.is::<flow_coordinator::ExternalMutation>() {
-        return Some(EXTERNAL_MUTATION);
+        return Some("external_mutation");
     }
     let replanning = error
         .downcast_ref::<flow_coordinator::ReplanRequired>()
@@ -482,31 +480,7 @@ mod tests {
             detail: "added or removed rows",
         })
         .context("reconcile table");
-        assert_eq!(publication_error_code(&external), Some(EXTERNAL_MUTATION));
-    }
-
-    #[test]
-    fn publication_changed_is_permanent_and_survives_reload() {
-        let root = tempfile::tempdir().unwrap();
-        let control = ControlStore::open(root.path().join("control")).unwrap();
-        let store = control
-            .initialize_index(root.path().join("index"), StateStoreOptions::default())
-            .unwrap();
-        let source = SourceId("publication".into());
-        let mut blocked = BlockedTables::load(&store, &source).unwrap();
-        blocked
-            .record(TableId(12), "publication_changed", None)
-            .unwrap();
-        assert_eq!(
-            blocked.deadline_for(TableId(12)),
-            None,
-            "no retry clears it"
-        );
-        let reloaded = BlockedTables::load(&store, &source).unwrap();
-        let record = reloaded.get(TableId(12)).unwrap();
-        assert_eq!(record.error_code, "publication_changed");
-        assert_eq!(reloaded.deadline_for(TableId(12)), None);
-        assert!(reloaded.get(TableId(11)).is_none());
+        assert_eq!(publication_error_code(&external), Some("external_mutation"));
     }
 
     #[test]
@@ -518,8 +492,8 @@ mod tests {
         let mut blocked = BlockedTables::load(&store, &source).unwrap();
         for (id, code) in [
             (TableId(1), "source_schema_incompatible"),
-            (TableId(2), EXTERNAL_MUTATION),
-            (TableId(3), PUBLICATION_CHANGED),
+            (TableId(2), "external_mutation"),
+            (TableId(3), "publication_changed"),
         ] {
             assert!(requires_resync(code));
             blocked.record(id, code, None).unwrap();
@@ -532,7 +506,7 @@ mod tests {
         }
         // A publication block supersedes another resync cause, never the reverse.
         blocked
-            .record(TableId(2), PUBLICATION_CHANGED, None)
+            .record(TableId(2), "publication_changed", None)
             .unwrap();
         blocked
             .record(TableId(3), "source_schema_incompatible", None)
@@ -546,8 +520,8 @@ mod tests {
             codes,
             [
                 "source_schema_incompatible",
-                PUBLICATION_CHANGED,
-                PUBLICATION_CHANGED
+                "publication_changed",
+                "publication_changed"
             ]
         );
         assert!(reloaded.due(Instant::now() + MAX_RETRY_DELAY).is_empty());

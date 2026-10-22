@@ -70,17 +70,19 @@ failures block the table the same way. Inside a streamed, still-uncommitted
 transaction these decisions are provisional: the change is quarantined in that
 transaction's spool, other transactions keep publishing the table, and the
 block is latched only if the transaction commits with it; a rollback or
-savepoint rollback discards the decision with the change. Row limits reserve
-room to wrap any admitted decoded row as quarantine. Only raw wire evidence
-larger than one chunk (text-encoded row images, or the row that exceeded
-`limits.chunk_bytes` itself) is replaced by a bounded marker recording its
-table and size. Incompatible DDL that commits after all of
-its streamed rows were rolled back to a savepoint is blocked by the table's next
-Relation message or the five-second catalog refresh rather than at its own
-commit, still before any row of the new shape is published. `ADD COLUMN ...
-DEFAULT` blocks even on an empty table, because PostgreSQL still records a
-missing value for it; add the column without a default to avoid that. Explicitly excluded cells
-are projected out before quarantine, including when a selected column disappears.
+savepoint rollback discards the decision with the change. Quarantined changes
+stay in that transaction's spool and never reach the journal. Row limits
+reserve room to wrap any admitted decoded row as quarantine. Only raw wire
+evidence larger than one chunk (text-encoded row images, or the row that
+exceeded `limits.chunk_bytes` itself) is replaced by a bounded marker recording
+its table and size. Incompatible DDL that commits after all of its streamed
+rows were rolled back to a savepoint is blocked by the table's next Relation
+message or the five-second catalog refresh rather than at its own commit,
+still before any row of the new shape is published. `ADD COLUMN ... DEFAULT`
+blocks even on an empty table, because PostgreSQL still records a missing
+value for it; add the column without a default to avoid that. Explicitly
+excluded cells are projected out before quarantine, including when a selected
+column disappears.
 
 A source-table block persists across restart and source repair. Use an explicit
 resync/replacement to establish new authoritative state; never clear the block or
@@ -92,9 +94,24 @@ Another writer's commit to a target is reconciled when it only rewrites files
 delete). A commit that adds or removes rows, or adds equality deletes, means the
 target no longer mirrors the source: the index cannot adopt it, and replaying
 later changes over it would publish wrong rows. That table is blocked with
-`external_mutation` and the other tables keep publishing. Missing snapshot
-history and an unknown Flow operation can mean restored or foreign local state,
-so they stay connection-wide.
+`external_mutation` and the other tables keep publishing. A `replace` snapshot
+whose rows or deletes differ from those it replaced is found only partway
+through reconciliation, so it stays connection-wide, as do missing snapshot
+history, an unknown Flow operation (both can mean restored or foreign local
+state) and a foreign schema or partition-spec change.
+
+Journal corruption, source connection/slot/identity failures, state-store failures,
+spool limits, a replication message larger than `limits.source_message_bytes`
+(rejected before its table can be read), invalid shared invariants, and
+unclassified errors remain connection-wide. A replication slot still held by a
+previous session (SQLSTATE 55006) and a server out of connection slots (53300)
+are retried with backoff like a disconnect; PostgreSQL releases a stale
+walsender's slot within `wal_sender_timeout`. Retries never stop, so once
+failures have lasted five minutes or twice `wal_sender_timeout`, whichever is
+longer, capture logs an error with the slot holder's `active_pid` and sets `flow_capture_reconnect_stalled`. Completed bootstrap with intact local authority
+can load and recover targets independently. Initial snapshot/bootstrap and
+whole-index reconstruction still require their coordinated recovery path.
+Unknown/replaced source identities also retain coordinated recovery.
 
 ### Blocks that require a resync
 
@@ -119,23 +136,11 @@ operation is discarded, and a prepared or committed one is resolved through
 the ordinary recovery path without publishing new changes. If the table's
 target is gone or was replaced, that operation is abandoned locally instead,
 since whatever it may have committed belongs to a table this pipeline no
-longer owns and a resync rebuilds it. So the
-blocked table stops holding the acknowledgement frontier and source WAL is not
-retained for it. Quarantined changes that an earlier version journaled for a
-schema block are settled the same way.
-
-Journal corruption, source connection/slot/identity failures, state-store failures,
-spool limits, a replication message larger than `limits.source_message_bytes`
-(rejected before its table can be read), invalid shared invariants, and
-unclassified errors remain connection-wide. A replication slot still held by a
-previous session (SQLSTATE 55006) and a server out of connection slots (53300)
-are retried with backoff like a disconnect; PostgreSQL releases a stale
-walsender's slot within `wal_sender_timeout`. Retries never stop, so once
-failures have lasted five minutes or twice `wal_sender_timeout`, whichever is
-longer, capture logs an error with the slot holder's `active_pid` and sets `flow_capture_reconnect_stalled`. Completed bootstrap with intact local authority
-can load and recover targets independently. Initial snapshot/bootstrap and
-whole-index reconstruction still require their coordinated recovery path.
-Unknown/replaced source identities also retain coordinated recovery.
+longer owns and a resync rebuilds it. Once its journaled transactions are
+settled, the blocked table no longer holds the acknowledgement frontier or
+source WAL; an unfinished operation whose recovery keeps failing still does.
+Quarantined schema-block changes already in the journal are settled the same
+way.
 
 ### Publication changes
 
@@ -171,7 +176,8 @@ publication.
 Independent table progress does not imply atomic visibility across tables. A
 source transaction that touches two tables can become visible in one before the
 other. The source acknowledgement still advances only through transactions whose
-affected tables have all completed materialization. Local journal storage is not
+affected tables have all completed materialization, or were settled because the
+table requires a resync. Local journal storage is not
 sufficient to enable journaled acknowledgements.
 
 Consequently, publication isolation provides bounded tolerance for an outage.
@@ -215,8 +221,9 @@ failure guarantees. The Moonlink references identify a fixed public revision.
 
 `tests/local/schema_isolation.py` covers real PostgreSQL/Iceberg nullable updates,
 lost schema commit responses, streamed DDL, subsequent additions, incompatible
-schema blocks, mixed transactions beyond admission capacity, acknowledgement
-fencing, process restart, and exclusion of unselected values. Run it with and
+schema blocks, mixed transactions beyond admission capacity, release of the
+source acknowledgement past a blocked table, process restart, and exclusion of
+unselected values. Run it with and
 without `--explicit`, and with `--heap-rewrite`, which blocks a table on a
 volatile-default heap rewrite and checks that the block survives a crash
 restart while the other table keeps publishing. The PostgreSQL 14–18 CI matrix

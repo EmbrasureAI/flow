@@ -129,7 +129,8 @@ example alerting rules.
 Several changes require resynchronization: a changed table set, a publication
 violation (`publication-resync-required.json` or a `publication_changed` block), a lost or invalidated slot, a
 changed source identity (failover, major upgrade, restore), a table blocked for
-a heap rewrite, and incompatible schema changes. Resynchronization starts a new
+a heap rewrite or TRUNCATE, incompatible schema changes, and another writer's
+row changes to a target (`external_mutation`). Resynchronization starts a new
 incarnation beside the old one:
 
 1. Stop the daemon. Keep the old state directory for diagnosis; do not delete
@@ -169,18 +170,17 @@ table from the publication blocks that table (`publication_changed`).
 | `VACUUM FULL`, `CLUSTER`, `pg_repack`, rewriting `ALTER TABLE` | The rewritten table is blocked; other tables continue | Resynchronize the source. Plain `VACUUM` is safe |
 | `TRUNCATE` of a configured table | That table is blocked once the transaction commits; a rolled-back TRUNCATE has no effect | Resynchronize the source |
 | A configured table leaves the publication or gains a row filter or column list | That table is blocked with `publication_changed` | Avoid it; otherwise resynchronize |
-| Another engine adds, updates or deletes rows in a target table, including equality deletes | That table is blocked with `external_mutation`; other tables continue. File rewrites that preserve the rows are reconciled | Write elsewhere; otherwise resynchronize |
 | The publication is dropped or stops publishing an operation | Capture stops with a resynchronization requirement | Avoid it; otherwise resynchronize |
 | Physical standby promotion (failover) | Source timeline changes; capture stops | Resynchronize from the promoted primary |
 | Major upgrade (`pg_upgrade`, dump/restore, logical migration) | Slot history does not carry over; slots migrated by `pg_upgrade` are unsupported | Resynchronize after the upgrade |
 
 A table blocked by a schema change, heap rewrite, TRUNCATE, publication change
 or another writer's row changes needs a resynchronization, which starts from a
-new slot. Capture therefore drops the table's changes and settles its journaled
-transactions without publishing them, so it does not hold the shared source
-acknowledgement or retain source WAL; healthy tables keep publishing. The
-blocked target stops updating, so treat the block as urgent. `status` reports `blocked_tables` with the reason; see
-[table isolation and recovery](table-publication-isolation.md).
+new slot. Flow therefore completes the table's changes without publishing them,
+so once they are settled it no longer holds the shared source acknowledgement
+or retains source WAL; healthy tables keep publishing. The blocked target stops
+updating, so treat the block as urgent. `status` reports `blocked_tables` with
+the reason; see [table isolation and recovery](table-publication-isolation.md).
 
 Failover slots (PostgreSQL 17 `failover = true`) are not yet used. After a
 promotion, Flow cannot prove that the new primary's slot history matches its
@@ -189,7 +189,7 @@ journal, so it requires resynchronization.
 ## Journal capacity
 
 The local journal holds captured transactions until every affected table has
-published them. When `limits.journal_bytes` is full, capture pauses and
+published them, or settled them because it requires a resync. When `limits.journal_bytes` is full, capture pauses and
 `flow_capture_journal_full` is 1. Publication keeps draining the journal, and
 the source slot retains the unjournaled WAL. Capture resumes automatically
 after the drain; nothing is acknowledged or dropped in between. A long pause
@@ -291,6 +291,10 @@ such a table needs attention. It does not delete files it did not register: data
 other engines, their failed writes and catalog files outside Flow's records are
 not Flow's to remove. If other writers commit to the same tables, give their
 orphan-file cleanup to that engine's maintenance, using a conservative age
-threshold (Iceberg's default is three days). See
+threshold (Iceberg's default is three days). Flow reconciles their file
+rewrites (`replace` snapshots that keep every row). A commit that adds or
+removes rows, or adds equality deletes, means the target no longer mirrors the
+source: that table is blocked with `external_mutation` until a resync, and the
+other tables continue. Write derived data to separate tables. See
 [getting started](getting-started.md#recovery-and-operational-limits) for
 snapshot retention and reference coordination.

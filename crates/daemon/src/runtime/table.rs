@@ -606,8 +606,13 @@ impl TableWork {
                 {
                     error_code = cause.code();
                 }
-                tracing::warn!(table = ?schema.table_id, error_code, %error,
-                    "table publication blocked; releasing worker until retry");
+                if super::blocked::requires_resync(error_code) {
+                    tracing::warn!(table = ?schema.table_id, error_code, %error,
+                        "table publication blocked until resync; releasing worker");
+                } else {
+                    tracing::warn!(table = ?schema.table_id, error_code, %error,
+                        "table publication blocked; releasing worker until retry");
+                }
                 TableOutcome::Blocked { error_code }
             }
             result => result?,
@@ -1760,7 +1765,7 @@ mod publication_retry_tests {
 
         let mut blocked = super::super::blocked::BlockedTables::load(&store, &source).unwrap();
         blocked.record(id, cause.code(), None).unwrap();
-        super::super::settle_dropped_table(&mut ledger, &store, &mut blocked, id).unwrap();
+        super::super::settle_resync_table(&mut ledger, &store, &mut blocked, id).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
     }

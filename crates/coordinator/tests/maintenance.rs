@@ -787,11 +787,10 @@ async fn keyless_external_rewrites_preserve_duplicates_and_identity_across_resta
     }
 }
 
-/// Another writer's appended rows no longer mirror the source. Reconciliation
-/// reports a typed, table-scoped failure before touching the index, so the
-/// daemon can block only this table and stop holding source acknowledgement.
 #[tokio::test]
-async fn external_logical_mutation_is_typed_and_leaves_the_index_unchanged() {
+async fn external_row_changes_block_reconciliation_without_touching_the_index() {
+    use flow_coordinator::ExternalMutation;
+    use flow_model::PrimaryKey;
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     let temp = TempDir::new().unwrap();
     let index = StateStore::open(temp.path().join("index"), StateStoreOptions::default()).unwrap();
@@ -847,7 +846,10 @@ async fn external_logical_mutation_is_typed_and_leaves_the_index_unchanged() {
                 WriterConfig::default(),
             )
             .unwrap();
-            let rows: Vec<Row> = values.into_iter().map(|v| vec![Value::Int64(v)]).collect();
+            let rows: Vec<Row> = values
+                .into_iter()
+                .map(|value| vec![Value::Int64(value)])
+                .collect();
             let locations = writer.write(&rows, PgLsn(10)).await.unwrap().locations;
             (writer.close().await.unwrap(), locations)
         }
@@ -875,7 +877,7 @@ async fn external_logical_mutation_is_typed_and_leaves_the_index_unchanged() {
                 .into_iter()
                 .enumerate()
                 .map(|(ordinal, location)| IndexDelta {
-                    key: flow_model::PrimaryKey(vec![ordinal as u8]),
+                    key: PrimaryKey(vec![ordinal as u8]),
                     expected: None,
                     replacement: Some(location),
                 }),
@@ -886,7 +888,8 @@ async fn external_logical_mutation_is_typed_and_leaves_the_index_unchanged() {
         .unwrap();
     index.apply_committed(&operation).unwrap();
 
-    // A plain Iceberg append, as Spark or another engine would commit it.
+    // A plain Iceberg append, as another engine would commit it. Its rows no
+    // longer mirror the source, so only a resync can re-establish the table.
     let (files, _) = write("external-append", initial.table.clone(), vec![3]).await;
     let transaction = Transaction::new(&initial.table);
     let appended = transaction
@@ -913,7 +916,7 @@ async fn external_logical_mutation_is_typed_and_leaves_the_index_unchanged() {
         .await
         .unwrap_err();
     let external = error
-        .downcast_ref::<flow_coordinator::ExternalMutation>()
+        .downcast_ref::<ExternalMutation>()
         .expect("typed external mutation");
     assert_eq!(
         Some(external.snapshot_id),

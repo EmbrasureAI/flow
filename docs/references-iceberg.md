@@ -155,8 +155,11 @@ only to the binary and environment recorded in each [benchmark](performance.md).
 validated catalog publication, and index compare-and-swap. External snapshots
 are processed in ancestry order. Delete-file rewrites compare effective
 position sets; data rewrites additionally compare live keys, row fingerprints,
-and cardinality. Survivors' delete sets must remain unchanged. Unsupported
-logical changes leave publication paused.
+and cardinality. Survivors' delete sets must remain unchanged. A snapshot that
+adds or removes rows outside `replace`, or adds equality deletes, blocks only
+that table until a resync (`external_mutation`). Other unsupported logical
+changes, missing history, unknown service operations and schema or spec
+changes stop the connection.
 
 Full index rebuild scans ordinary Parquet and applies standard position deletes
 into a fresh RocksDB store, then verifies the catalog head before making the
