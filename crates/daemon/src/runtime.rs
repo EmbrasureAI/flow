@@ -27,7 +27,7 @@ use flow_coordinator::{
     PreparationWait, Priority, ReadyCompaction, ReplanRequired, Scheduler, SourceLedger,
     TableMaintenance, TablePublisher,
 };
-use flow_model::{PgLsn, SourceId, TableId, TableSchema};
+use flow_model::{OperationId, PgLsn, SourceId, TableId, TableSchema};
 use flow_pg_source::Acknowledgement;
 use flow_state_store::{ControlStore, OperationKind, StateStore};
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -518,6 +518,51 @@ fn remove_abandoned_scratch(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Applied operations whose source progress the runtime has yet to record.
+/// Only table actors apply operations and only completion paths retire them,
+/// so the bounded OPERATIONS scan reruns after those instead of every loop.
+struct AppliedOperations {
+    limit: usize,
+    cached: Option<Vec<AppliedOperation>>,
+}
+
+#[derive(Clone)]
+struct AppliedOperation {
+    id: OperationId,
+    table_id: TableId,
+    last_lsn: PgLsn,
+}
+
+impl AppliedOperations {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            cached: None,
+        }
+    }
+
+    fn get(&mut self, store: &StateStore) -> Result<&[AppliedOperation]> {
+        if self.cached.is_none() {
+            let operations = store.applied_operations(self.limit)?;
+            self.cached = Some(
+                operations
+                    .into_iter()
+                    .map(|record| AppliedOperation {
+                        id: record.operation.id,
+                        table_id: record.operation.table_id,
+                        last_lsn: record.operation.last_lsn,
+                    })
+                    .collect(),
+            );
+        }
+        Ok(self.cached.as_deref().unwrap_or_default())
+    }
+
+    fn invalidate(&mut self) {
+        self.cached = None;
+    }
+}
+
 struct PublishRuntime {
     work: TableWork,
     schemas: BTreeMap<TableId, TableSchema>,
@@ -634,6 +679,7 @@ impl PublishRuntime {
             .map(|id| (*id, first_maintenance))
             .collect();
         let mut periodic_due = maintenance_due.clone();
+        let mut applied = AppliedOperations::new(schemas.len().max(1));
         let mut periodic_active = false;
         let mut periodic_yield_to_cdc = false;
         let mut retry_yield_to_cdc = false;
@@ -647,10 +693,10 @@ impl PublishRuntime {
             // Liveness: every select arm is bounded and the health tick wakes
             // an idle loop every five seconds.
             crate::lifecycle::run_loop_progress();
-            recovering = store
-                .applied_operations(schemas.len().max(1))?
-                .into_iter()
-                .map(|operation| operation.operation.table_id)
+            recovering = applied
+                .get(store)?
+                .iter()
+                .map(|operation| operation.table_id)
                 .filter(|id| !busy.contains(id))
                 .collect();
             excluded = blocked
@@ -761,16 +807,17 @@ impl PublishRuntime {
                     ack.send(feedback(ledger))?;
                 }
                 _ = tokio::task::yield_now(), if !recovering.is_empty() || ledger.has_completed_prefix()? => {
-                    if let Some(operation) = store.applied_operations(schemas.len().max(1))?
-                        .into_iter().find(|operation| !busy.contains(&operation.operation.table_id)) {
-                        let id = operation.operation.table_id;
+                    if let Some(operation) = applied.get(store)?
+                        .iter().find(|operation| !busy.contains(&operation.table_id)).cloned() {
+                        applied.invalidate();
+                        let id = operation.table_id;
                         let transactions = ledger.pending_table_transactions_after(id, PgLsn(0))
                             .take(ledger.batch_capacity()).collect::<Result<Vec<_>>>()?;
                         let ends = transactions.iter()
-                            .take_while(|transaction| transaction.end_lsn <= operation.operation.last_lsn)
+                            .take_while(|transaction| transaction.end_lsn <= operation.last_lsn)
                             .map(|transaction| transaction.end_lsn).collect::<Vec<_>>();
                         if ends.is_empty() {
-                            store.forget_applied(&operation.operation.id)?;
+                            store.forget_applied(&operation.id)?;
                         } else {
                             ledger.table_materialized_batch(&ends, id,
                                 store.table_state(&id)?.snapshot_id.unwrap_or(0))?;
@@ -782,6 +829,8 @@ impl PublishRuntime {
                 }
                 Some(result) = running.next(), if !running.is_empty() => {
                     let TableCompletion { id, transactions, outcome, elapsed, reserved_build, finalization_lane, periodic_maintenance } = result?;
+                    // The actor may have applied, recovered or retired operations.
+                    applied.invalidate();
                     busy.remove(&id);
                     retrying.remove(&id);
                     if let Some(lane) = finalization_lane {
@@ -1345,6 +1394,7 @@ impl PublishRuntime {
                     }
                 }
                 _ = health.tick() => {
+                    applied.invalidate();
                     for id in schemas.keys().copied() {
                         let cause = crate::schema::capture_block(store, &SourceId(config.source.id.clone()), id)?;
                         let recorded = blocked.get(id).map(|record| record.error_code.clone());
@@ -1879,6 +1929,51 @@ mod startup_recovery_tests {
         ledger.reconcile_table_progress().unwrap();
         assert_eq!(ledger.acknowledgement(), end);
         assert_eq!(ledger.pending_count(), 0);
+    }
+
+    #[test]
+    fn applied_operations_rescan_only_after_invalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(root.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let mut applied = AppliedOperations::new(4);
+        assert!(applied.get(&store).unwrap().is_empty());
+        let id = OperationId("applied-epoch".into());
+        store
+            .prepare(
+                PreparedOperation {
+                    id: id.clone(),
+                    table_id: TableId(3),
+                    kind: OperationKind::Ingest,
+                    base_snapshot_id: None,
+                    last_lsn: PgLsn(30),
+                    schema_version: 1,
+                    artifacts: vec![],
+                    payload: vec![],
+                },
+                [],
+            )
+            .unwrap();
+        store.mark_committed(&id, 100, 1).unwrap();
+        assert!(store.apply_committed(&id).unwrap().complete);
+        // A table actor applied it; its completion invalidates the cache.
+        assert!(applied.get(&store).unwrap().is_empty());
+        applied.invalidate();
+        let operations = applied.get(&store).unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(
+            (
+                &operations[0].id,
+                operations[0].table_id,
+                operations[0].last_lsn
+            ),
+            (&id, TableId(3), PgLsn(30))
+        );
+        store.forget_applied(&id).unwrap();
+        applied.invalidate();
+        assert!(applied.get(&store).unwrap().is_empty());
     }
 
     fn dropped_table_fixture() -> (
