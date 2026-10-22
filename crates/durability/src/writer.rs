@@ -93,6 +93,9 @@ pub(crate) struct SegmentModel {
     pub length: u64,
     /// Parts named by the latest durable checkpoint, covering a prefix.
     pub parts: Vec<Part>,
+    /// Ordinal of the latest truncation, which invalidates parts uploaded
+    /// before it even once the segment grows back.
+    pub truncated: u64,
 }
 
 impl SegmentModel {
@@ -437,6 +440,7 @@ fn apply_to_model(state: &mut State, item: &Item, ordinal: u64) {
             if let Some(model) = state.journals.get_mut(journal) {
                 let entry = model.segments.entry(*segment).or_default();
                 entry.length = *length;
+                entry.truncated = ordinal;
                 if entry.covered() > *length {
                     entry.parts.clear();
                 }
