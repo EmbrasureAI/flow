@@ -714,16 +714,24 @@ async fn publish(
     for manifest in &view.manifests {
         let entries = &view.entries_by_manifest[&manifest.manifest_path];
         let live = entries.iter().filter(|entry| entry.is_alive());
-        let has_removed = live.clone().any(|entry| {
-            publication
-                .removed
-                .contains(&content_file_id(entry.data_file()))
-        });
-        let has_existing = live.clone().any(|entry| {
-            !publication
-                .removed
-                .contains(&content_file_id(entry.data_file()))
-        });
+        let (mut has_removed, mut has_existing) = (false, false);
+        if publication.removed.is_empty() {
+            has_existing = live.clone().next().is_some();
+        } else {
+            for entry in live.clone() {
+                if publication
+                    .removed
+                    .contains(&content_file_id(entry.data_file()))
+                {
+                    has_removed = true;
+                } else {
+                    has_existing = true;
+                }
+                if has_removed && has_existing {
+                    break;
+                }
+            }
+        }
         if !has_removed {
             if has_existing {
                 manifests.push(manifest.clone());
@@ -876,13 +884,9 @@ async fn publish(
     let mut totals = [0_u64; 6];
     for file in view
         .live_files
-        .values()
-        .filter(|entry| {
-            !publication
-                .removed
-                .contains(&content_file_id(entry.data_file()))
-        })
-        .map(|entry| &entry.data_file)
+        .iter()
+        .filter(|(id, _)| !publication.removed.contains(*id))
+        .map(|(_, entry)| &entry.data_file)
         .chain(publication.added_data)
         .chain(publication.added_deletes)
     {
