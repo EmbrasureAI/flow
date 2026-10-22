@@ -554,7 +554,7 @@ impl TableWork {
                 .run_once(
                     table,
                     schema.clone(),
-                    transactions.clone(),
+                    &transactions,
                     options,
                     &mut candidate,
                     &mut repair_cursor,
@@ -768,7 +768,7 @@ impl TableWork {
         self,
         table: Table,
         schema: TableSchema,
-        transactions: Vec<SourceTransaction>,
+        transactions: &[SourceTransaction],
         options: WorkOptions,
         candidate: &mut Option<CompactionCandidate>,
         repair_cursor: &mut DeleteRepairCursor,
@@ -802,8 +802,9 @@ impl TableWork {
             });
         }
         let transactions = transactions
-            .into_iter()
+            .iter()
             .filter(|transaction| transaction.end_lsn > indexed.materialized_lsn)
+            .cloned()
             .collect::<Vec<_>>();
         let source = SourceId(self.config.source.id.clone());
         let schema = crate::schema::latest_schema(&self.store, &source, id)?.unwrap_or(schema);
@@ -970,7 +971,7 @@ impl TableWork {
         let store = self.store.clone();
         let prepare_schema = schema.clone();
         let prepare_epoch = epoch.clone();
-        let prepare_transactions = transactions.clone();
+        let transaction_count = transactions.len();
         let prepare_table = current.clone();
         let reader = self.reader.clone();
         let collapse_limits = CollapseLimits {
@@ -985,7 +986,7 @@ impl TableWork {
                 &prepare_table,
                 &prepare_schema,
                 &prepare_epoch,
-                &prepare_transactions,
+                &transactions,
                 collapse_limits,
             )
         })
@@ -993,7 +994,7 @@ impl TableWork {
         let seconds = collapse_started.elapsed().as_secs_f64();
         metrics::histogram!("flow_table_local_phase_seconds", "table_id" => id.0.to_string(), "phase" => "collapse").record(seconds);
         tracing::debug!(target: "flow_events", event = "epoch_collapsed", operation_id = %epoch.id.0,
-            table_id = id.0, transactions = transactions.len(), elapsed_ms = seconds * 1000.0,
+            table_id = id.0, transactions = transaction_count, elapsed_ms = seconds * 1000.0,
             collapse_mode = collapsed.mode(),
             collapse_memory_limit_bytes = collapse_limits.memory_bytes,
             collapse_memory_peak_bytes = collapsed.memory_peak_bytes(),
