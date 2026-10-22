@@ -277,6 +277,7 @@ impl Durability {
         let (stop, stopped) = oneshot::channel::<()>();
         let (requests, receiver) = mpsc::channel(16);
         let tuning = config.tuning();
+        let lease = tuning.lease;
         let policy = checkpoint::Policy {
             interval: Duration::from_secs(config.checkpoint_interval_secs),
             batches: config.checkpoint_batches,
@@ -356,9 +357,9 @@ impl Durability {
                     }));
                     let _ = stopped.await;
                     shared.close();
-                    for task in tasks {
-                        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
-                    }
+                    // Queued records drain while the lease lasts; renewal
+                    // has stopped, so no write can start after it.
+                    let _ = tokio::time::timeout(lease, futures::future::join_all(tasks)).await;
                 });
                 runtime.shutdown_timeout(Duration::from_secs(1));
             })?;
@@ -637,29 +638,57 @@ impl Durability {
 
     /// Stop after a final barrier and a release record, so the next owner
     /// starts without waiting for this lease. Call after every user stopped.
+    /// Gives up after one lease, which is all a release saves the next owner,
+    /// so a clean shutdown does not hang while object storage is unavailable.
     pub async fn release(&self) -> Result<()> {
-        // A final checkpoint lets the next start replay almost no log. It is
-        // an optimisation; the log already holds everything appended.
-        if self.0.shared.lock().baseline {
-            let (reply, response) = oneshot::channel();
-            if self
-                .0
-                .requests
-                .send(checkpoint::Request::Now(reply))
-                .await
-                .is_ok()
-                && let Ok(Err(error)) = response.await
-            {
-                tracing::warn!(error = %format!("{error:#}"), "final durability checkpoint failed");
+        self.within_lease("release", async {
+            // A final checkpoint lets the next start replay almost no log. It
+            // is an optimisation; the log already holds everything appended.
+            if self.0.shared.lock().baseline {
+                let (reply, response) = oneshot::channel();
+                if self
+                    .0
+                    .requests
+                    .send(checkpoint::Request::Now(reply))
+                    .await
+                    .is_ok()
+                    && let Ok(Err(error)) = response.await
+                {
+                    tracing::warn!(error = %format!("{error:#}"), "final durability checkpoint failed");
+                }
             }
-        }
-        // No baseline is needed: without one this owner had no external effects.
-        let ordinal = self.0.shared.append(Item::Release {
-            epoch: self.0.shared.epoch,
-        })?;
-        self.0.shared.wait_durable(ordinal).await?;
+            // No baseline is needed: without one this owner had no external effects.
+            let ordinal = self.0.shared.append(Item::Release {
+                epoch: self.0.shared.epoch,
+            })?;
+            self.0.shared.wait_durable(ordinal).await
+        })
+        .await?;
         self.stop();
         Ok(())
+    }
+
+    /// Wait, for at most one lease, until every change appended so far is
+    /// durable. Before stopping after an error, this gives records written
+    /// just before it, such as a resync marker, a chance to replicate.
+    pub async fn flush(&self) -> Result<()> {
+        let ordinal = self.0.shared.position();
+        self.within_lease("flush", self.0.shared.wait_durable(ordinal))
+            .await
+    }
+
+    async fn within_lease(
+        &self,
+        what: &str,
+        work: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        let lease = self.0.shared.tuning.lease;
+        tokio::time::timeout(lease, work).await.with_context(|| {
+            format!(
+                "remote durability {what} did not complete within the {}s lease",
+                lease.as_secs()
+            )
+        })?
     }
 
     /// Stop replication without a release. The next owner waits one lease.

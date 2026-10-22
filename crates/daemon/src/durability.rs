@@ -111,6 +111,8 @@ pub(crate) async fn failed() -> anyhow::Error {
 }
 
 /// Release ownership after a clean exit so the next start need not wait.
+/// After an error, first let what was written before it replicate, such as
+/// a resync marker. Both wait at most one lease.
 pub(crate) async fn finish(result: &Result<std::process::ExitCode>) {
     let Some(durability) = active() else {
         return;
@@ -121,6 +123,11 @@ pub(crate) async fn finish(result: &Result<std::process::ExitCode>) {
             durability.stop();
         }
     } else {
+        if durability.failure().is_none()
+            && let Err(error) = durability.flush().await
+        {
+            tracing::warn!(error = %format!("{error:#}"), "remote durability could not replicate the final records");
+        }
         durability.stop();
     }
 }
