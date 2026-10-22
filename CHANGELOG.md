@@ -104,6 +104,11 @@ This will be the initial public release, `0.1.0`.
   [remote durability](docs/remote-durability.md).
 - A stale row-index checkpoint is advanced from Iceberg file changes instead of
   rebuilding every table, with or without `[durability]`.
+- Opt-in `storage.medium = "memory"` for a `state_dir` on tmpfs or ramfs
+  (Linux, with `[durability]`): startup verifies the filesystem, and free space
+  is also bounded by the memory left under the process's cgroup v2 limits, so
+  capture pauses before memory runs out. See
+  [memory-backed state](docs/operations.md#memory-backed-state).
 - Maintenance scans fetch small inputs whole, a bounded number ahead
   (`parquet_read.prefetch_files`, `parquet_read.prefetch_file_bytes`), and
   fresh publications reuse the catalog head and plan they already validated,

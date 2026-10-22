@@ -59,6 +59,9 @@ snapshot_max_count = 1000
 min_free_bytes = 4294967296
 # Verify every row index checksum on each start, not only after an unclean exit.
 verify_index_on_start = false
+# "memory" declares a state_dir on tmpfs or ramfs; it requires [durability].
+# See docs/operations.md#memory-backed-state.
+medium = "disk"
 
 [parquet_read]
 footer_bytes = 8388608
