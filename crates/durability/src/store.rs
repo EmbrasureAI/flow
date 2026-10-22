@@ -58,11 +58,20 @@ pub fn operator(
     ))
 }
 
-pub(crate) fn conflict(error: &opendal::Error) -> bool {
+/// The key already exists. S3 reports a conditional write racing another
+/// one as a temporary 409 conflict; that one is retried instead.
+fn conflict(error: &opendal::Error) -> bool {
     matches!(
         error.kind(),
         ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists
-    )
+    ) && !error.is_temporary()
+}
+
+/// Whether a failed request may succeed when retried.
+pub(crate) fn temporary(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<opendal::Error>()
+        .is_some_and(opendal::Error::is_temporary)
 }
 
 pub(crate) enum Created {
@@ -173,4 +182,20 @@ pub(crate) async fn delete_all(operator: &Operator, keys: Vec<String>) -> Result
             .context("delete retired durability objects")?;
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_racing_conditional_write_is_retried_not_resolved() {
+        let existing = opendal::Error::new(ErrorKind::ConditionNotMatch, "precondition failed");
+        assert!(conflict(&existing));
+        // S3 409 ConditionalRequestConflict: the other write may not exist yet.
+        let racing = opendal::Error::new(ErrorKind::ConditionNotMatch, "conflict").set_temporary();
+        assert!(!conflict(&racing));
+        let error = Err::<(), _>(racing).context("create key").unwrap_err();
+        assert!(temporary(&error));
+    }
 }

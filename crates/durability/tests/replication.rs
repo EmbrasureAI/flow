@@ -695,6 +695,19 @@ fn faulty() -> (faults::Faults, Operator) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn startup_writes_retry_transient_failures() {
+    let (faults, operator) = faulty();
+    for prefix in ["format.json", "owners/", "log/"] {
+        faults.fail(prefix, 2);
+    }
+    let state = tempfile::tempdir().unwrap();
+    let durability = open(&operator, state.path()).await;
+    assert_eq!(durability.mode(), Mode::Fresh);
+    assert_eq!(faults.remaining(), 0);
+    durability.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn baseline_checkpoints_retry_transient_write_failures() {
     let (faults, operator) = faulty();
     let state = tempfile::tempdir().unwrap();

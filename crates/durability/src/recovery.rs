@@ -29,6 +29,8 @@ use std::{
 
 /// Concurrent object reads while recovering.
 const READ_CONCURRENCY: usize = 32;
+/// Retries of a transient failure while creating a startup object.
+const STARTUP_RETRIES: u32 = 5;
 pub(crate) const MARKER: &str = "remote-durability.json";
 
 /// How this process obtained its local state.
@@ -133,6 +135,23 @@ pub fn write_durable(path: &Path, data: &[u8]) -> Result<()> {
     sync_dir(path.parent().context("file has a parent directory")?)
 }
 
+/// Conditionally create a startup object, retrying transient failures a few
+/// times. Every attempt is a conditional create, so a retry whose first
+/// response was lost still finds its own write.
+async fn create(operator: &Operator, key: &str, bytes: Bytes) -> Result<Created> {
+    let mut attempt = 0;
+    loop {
+        match store::create(operator, key, bytes.clone()).await {
+            Err(error) if attempt < STARTUP_RETRIES && store::temporary(&error) => {
+                attempt += 1;
+                tracing::warn!(key, attempt, error = %format!("{error:#}"), "remote durability write failed; retrying");
+                tokio::time::sleep(crate::writer::backoff(attempt)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn ensure_identity(operator: &Operator, source_id: &str) -> Result<()> {
     let expected = Identity {
         format: format::FORMAT.into(),
@@ -141,7 +160,7 @@ async fn ensure_identity(operator: &Operator, source_id: &str) -> Result<()> {
     };
     let existing = match store::read_optional(operator, IDENTITY_KEY).await? {
         Some(bytes) => bytes,
-        None => match store::create(
+        None => match create(
             operator,
             IDENTITY_KEY,
             Bytes::from(serde_json::to_vec(&expected)?),
@@ -222,7 +241,7 @@ async fn claim(operator: &Operator, lock: Option<LockIdentity>) -> Result<u64> {
         started_unix_ms: unix_ms(),
         lock,
     };
-    match store::create(
+    match create(
         operator,
         &owner_key(epoch),
         Bytes::from(serde_json::to_vec(&owner)?),
@@ -833,7 +852,7 @@ pub(crate) async fn recover(
         first_ordinal: scan.last_ordinal + 1,
         records: vec![Record::EpochStart { epoch }],
     };
-    match store::create(
+    match create(
         operator,
         &log_key(scan.next),
         Bytes::from(format::encode_batch(&start)?),
