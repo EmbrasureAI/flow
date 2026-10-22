@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail, ensure};
 use flow_compactor::{Debt, DeleteDependency, FileCandidate, Level, Policy};
 use flow_iceberg_ext::{
-    CommitBase, ManifestCache, OPERATION_ID_KEY, SnapshotView, write_artifact_plan,
+    ArtifactPlan, CommitBase, ManifestCache, OPERATION_ID_KEY, SnapshotView, write_artifact_plan,
 };
 use flow_materializer::{WriterConfig, iceberg_schema};
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId, TableSchema};
@@ -660,6 +660,10 @@ impl TableMaintenance {
             .ownership
             .finish(output.data_files.len(), output_delete_files)
             .await?;
+        let fresh = ArtifactPlan {
+            added_data: output.data_files.clone(),
+            added_deletes: output.delete_files.clone(),
+        };
         let store = self.store.clone();
         blocking(move || {
             if !context.deltas_staged {
@@ -692,7 +696,7 @@ impl TableMaintenance {
                 .record(elapsed_ms / 1000.0);
         }
         let publish_started = std::time::Instant::now();
-        let snapshot = self.recover(head, &id).await?;
+        let snapshot = self.recover_inner(head, &id, Some(fresh)).await?;
         let recovered_at = std::time::Instant::now();
         let publish_and_apply_ms =
             recovered_at.duration_since(publish_started).as_secs_f64() * 1000.0;
@@ -739,9 +743,20 @@ impl TableMaintenance {
     }
 
     pub async fn recover(&self, table: &Table, id: &OperationId) -> Result<Option<i64>> {
+        self.recover_inner(table, id, None).await
+    }
+
+    /// `fresh` holds the files of a data rewrite plan this process just
+    /// sealed, so publishing it does not read the plan back.
+    async fn recover_inner(
+        &self,
+        table: &Table,
+        id: &OperationId,
+        fresh: Option<ArtifactPlan>,
+    ) -> Result<Option<i64>> {
         let mut diagnostics = RecoveryDiagnostics::new();
         let result = self
-            .recover_with_diagnostics(table, id, &mut diagnostics)
+            .recover_with_diagnostics(table, id, fresh, &mut diagnostics)
             .await;
         diagnostics.emit_result(id, &result);
         result
@@ -751,6 +766,7 @@ impl TableMaintenance {
         &self,
         table: &Table,
         id: &OperationId,
+        fresh: Option<ArtifactPlan>,
         diagnostics: &mut RecoveryDiagnostics,
     ) -> Result<Option<i64>> {
         let lookup_started = Instant::now();
@@ -800,6 +816,7 @@ impl TableMaintenance {
             table,
             self.cache.clone(),
             tracker,
+            fresh,
         )
         .await;
         diagnostics.catalog_resolution_phase = catalog_resolution_started.elapsed();
