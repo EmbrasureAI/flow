@@ -183,12 +183,6 @@ impl CaptureAssembler {
         self.schemas.get(&table)
     }
 
-    /// Whether a source relation belongs to this capture set. Other tables in
-    /// the publication are ignored rather than treated as source errors.
-    pub fn is_captured(&self, table: TableId) -> bool {
-        self.schemas.contains_key(&table)
-    }
-
     pub fn is_blocked(&self, table: TableId) -> bool {
         self.blocked.contains(&table)
     }
@@ -1091,10 +1085,6 @@ fn quarantined_change(event: &SourceEvent, relation: &Relation) -> Result<(u32, 
         return Err(Error::Protocol("quarantine relation identity mismatch"));
     }
     Ok(change)
-}
-
-pub(crate) fn validate_relation(schema: &TableSchema, relation: &Relation) -> Result<()> {
-    crate::TypeRegistry::default().validate_relation(schema, relation)
 }
 
 /// pgoutput key tuples retain relation positions, with NULL placeholders for

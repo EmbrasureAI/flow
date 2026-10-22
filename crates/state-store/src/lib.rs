@@ -1142,22 +1142,6 @@ impl StateStore {
         self.write(batch)
     }
 
-    /// Reclaim completed delta payloads after source acknowledgement is durable.
-    /// Keep the tiny operation marker for replay detection until snapshot history
-    /// retention permits the caller to remove it with the checkpoint protocol.
-    pub fn prune_applied_deltas(&self, id: &OperationId) -> Result<()> {
-        let _guard = self.lock()?;
-        let record = self.require_operation(id)?;
-        if record.phase != OperationPhase::Applied {
-            return Err(Error::InvalidState(
-                "cannot prune an incomplete index transition".into(),
-            ));
-        }
-        let mut batch = StateBatch::default();
-        self.delete_prefix(&mut batch, DELTAS, &operation_prefix(id));
-        self.write(batch)
-    }
-
     pub fn source_transaction(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(control) = &self.0.control {
             return control.source_transaction(key);
