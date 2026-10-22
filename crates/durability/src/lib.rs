@@ -62,7 +62,8 @@ pub struct Config {
     /// Zero removes the limit.
     #[serde(default = "defaults::max_writes_per_second")]
     pub max_writes_per_second: f64,
-    /// Queued control and file payloads before appends block.
+    /// Memory for queued records before appends block. Journal extents count
+    /// only their descriptors; their bytes are read when batched.
     #[serde(default = "defaults::queue_memory_bytes")]
     pub queue_memory_bytes: u64,
     #[serde(default = "defaults::checkpoint_interval_secs")]
