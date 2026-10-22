@@ -891,8 +891,7 @@ impl Journal {
             self.segments.insert(self.segment, 0);
         }
         let header = frame::encode_header(kind, xid, self.sequence, payload);
-        self.writer.write_all(&header)?;
-        self.writer.write_all(payload)?;
+        write_frame(&mut self.writer, &header, payload)?;
         let reference = JournalChunkRef {
             segment: self.segment,
             offset: self.offset,
@@ -904,6 +903,29 @@ impl Journal {
         self.segments.insert(self.segment, self.offset);
         Ok(reference)
     }
+}
+
+/// One frame with a single vectored write in the common case.
+fn write_frame(file: &mut File, header: &[u8], payload: &[u8]) -> io::Result<()> {
+    let total = header.len() + payload.len();
+    let mut written = 0;
+    while written < total {
+        let result = if written < header.len() {
+            file.write_vectored(&[
+                io::IoSlice::new(&header[written..]),
+                io::IoSlice::new(payload),
+            ])
+        } else {
+            file.write(&payload[written - header.len()..])
+        };
+        match result {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn segment_path(root: &Path, id: u64) -> PathBuf {
