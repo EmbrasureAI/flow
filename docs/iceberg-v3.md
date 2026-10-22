@@ -38,8 +38,9 @@ that inherited metadata without treating it as a physical-file replacement.
 Vectors use the writer's row-group byte budget, capped at 64 MiB per blob, with a
 100-million-position cardinality limit. Puffin objects rotate between targets to
 bound both payload and footer size. Readers validate framing, CRC, cardinality,
-target, offsets and row bounds before applying deletes. Compressed LZ4 footers
-are supported with a separate decompression limit. Delete-input budgets charge
+target, offsets and row bounds before applying deletes. Each scan reads a shared
+object's footer once. Compressed LZ4 footers are supported with a separate
+decompression limit. Delete-input budgets charge
 DV blob ranges; metadata has its own read limit.
 
 Local integration tests use real journal frames, RocksDB, Parquet and Puffin with

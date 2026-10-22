@@ -70,6 +70,7 @@ row_group_uncompressed_bytes = 268435456
 batch_bytes = 134217728
 # Maintenance scans fetch this many small input files whole, ahead of use,
 # so object-store latency overlaps; 0 reads every file lazily by range.
+# Deletion-vector reads use the same bounds for concurrent Puffin reads.
 prefetch_files = 4
 prefetch_file_bytes = 4194304
 

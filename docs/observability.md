@@ -509,6 +509,11 @@ Compaction, external reconciliation, and index rebuild share `[parquet_read]`:
 | `row_group_uncompressed_bytes` | 256 MiB | Sum of selected uncompressed encoded column pages |
 | `batch_bytes` | 128 MiB | Conservative expanded values plus fixed slots, offsets, and validity |
 
+Deletion-vector reads observe each Puffin object's size and read its footer once
+per scan. They open up to `prefetch_files` objects (at least one) and fetch as
+many blobs at once, holding at most `prefetch_files × prefetch_file_bytes` of
+blob and tail bytes per batch; a larger single blob is still read alone.
+
 The scanner reads one rowgroup at a time and reduces batch row counts when the
 expanded payload requires it. It does not estimate variable values from average
 row width: dictionary repetition can expand far beyond encoded page size.
