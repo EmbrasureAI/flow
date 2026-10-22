@@ -47,7 +47,7 @@ impl Observation {
                 )?
                 .set_buckets_for_metric(
                     Matcher::Full("flow_journal_commit_group_transactions".into()),
-                    &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+                    &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0],
                 )?
                 .install_recorder()
                 // Test-only seam: `init` and `run` share one test process.

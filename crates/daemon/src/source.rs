@@ -19,7 +19,8 @@ use tokio::sync::watch;
 
 // Bound added low-load latency and the amount of terminal metadata held for one
 // durability barrier. An individual larger transaction still remains atomic.
-const JOURNAL_GROUP_TRANSACTIONS: usize = 32;
+// Under load, more small transactions share one sync; the delay bounds latency.
+const JOURNAL_GROUP_TRANSACTIONS: usize = 256;
 const JOURNAL_GROUP_BYTES: u64 = 4 << 20;
 const JOURNAL_GROUP_DELAY: Duration = Duration::from_millis(5);
 const SOURCE_SQL_TIMEOUT: Duration = Duration::from_secs(30);
