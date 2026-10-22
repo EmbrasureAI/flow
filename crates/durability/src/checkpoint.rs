@@ -3,9 +3,9 @@
 use crate::format::{
     self, Checkpoint, ControlImage, JournalImage, Part, SegmentImage, checkpoint_key, control_key,
 };
-use crate::store::{self, Created};
-use crate::writer::Shared;
-use anyhow::{Context, Result, bail, ensure};
+use crate::store;
+use crate::writer::{self, Shared};
+use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use flow_state_store::ControlStore;
 use futures::{StreamExt, TryStreamExt};
@@ -53,6 +53,7 @@ pub(crate) async fn checkpoint_loop(
     let mut last = Instant::now();
     let mut retention_pending = false;
     let mut count = 0;
+    let mut warned: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -114,7 +115,12 @@ pub(crate) async fn checkpoint_loop(
         };
         let started = Instant::now();
         count += 1;
-        let result = checkpoint(&shared, &operator, source, &history, count).await;
+        // Object writes retry until they land, so stop waiting on them once
+        // replication stops; the next pass answers any waiters.
+        let result = tokio::select! {
+            result = checkpoint(&shared, &operator, source, &history, count) => result,
+            () = shared.stopped() => continue,
+        };
         last = Instant::now();
         match result {
             Ok((key, checkpoint)) => {
@@ -130,6 +136,7 @@ pub(crate) async fn checkpoint_loop(
                     elapsed_ms = elapsed.as_millis() as u64,
                     "remote durability checkpoint written"
                 );
+                warned = None;
                 shared.set_baseline();
                 for waiter in waiters.drain(..) {
                     let _ = waiter.send(Ok(()));
@@ -140,10 +147,14 @@ pub(crate) async fn checkpoint_loop(
                     retention_pending = true;
                 }
             }
+            // Waiters keep waiting, as at a barrier: the next tick retries
+            // until a checkpoint lands or replication stops. The models are
+            // still unwritten, so an unchanged log must not satisfy them.
             Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "remote durability checkpoint failed; retrying");
-                for waiter in waiters.drain(..) {
-                    let _ = waiter.send(Err(anyhow::anyhow!("{error:#}")));
+                shared.lock().models_changed = true;
+                if warned.is_none_or(|at| at.elapsed() >= shared.tuning.stall_warning) {
+                    warned = Some(Instant::now());
+                    tracing::warn!(error = %format!("{error:#}"), waiting = waiters.len(), "remote durability checkpoint failed; retrying");
                 }
             }
         }
@@ -157,17 +168,6 @@ fn read_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
     file.read_exact(&mut data)
         .with_context(|| format!("{} changed while checkpointing", path.display()))?;
     Ok(data)
-}
-
-/// Write a checkpoint object while the lease outlasts the request, so a
-/// replaced owner does not keep adding objects.
-async fn put(shared: &Shared, operator: &Operator, object: &str, data: Vec<u8>) -> Result<()> {
-    shared.writable().await?;
-    operator
-        .write(object, data)
-        .await
-        .with_context(|| format!("write {object}"))?;
-    Ok(())
 }
 
 async fn upload_part(
@@ -186,10 +186,7 @@ async fn upload_part(
         "{}-{crc32:08x}.part",
         format::part_key(journal, segment, start, end).trim_end_matches(".part")
     );
-    let started = Instant::now();
-    put(shared, operator, &object, data).await?;
-    metrics::histogram!("flow_durability_put_seconds", "kind" => "part")
-        .record(started.elapsed().as_secs_f64());
+    writer::create(shared, operator, "part", &object, Bytes::from(data)).await?;
     Ok(Part {
         object,
         start,
@@ -238,10 +235,7 @@ async fn checkpoint(
                 tokio::task::spawn_blocking(move || format::encode_snapshot(&entries)).await??;
             let bytes = encoded.len() as u64;
             let object = control_key(control_ordinal, shared.epoch, crc32fast::hash(&encoded));
-            let started = Instant::now();
-            put(shared, operator, &object, encoded).await?;
-            metrics::histogram!("flow_durability_put_seconds", "kind" => "control")
-                .record(started.elapsed().as_secs_f64());
+            writer::create(shared, operator, "control", &object, Bytes::from(encoded)).await?;
             metrics::gauge!("flow_durability_control_snapshot_bytes").set(bytes as f64);
             ControlImage {
                 object,
@@ -331,26 +325,18 @@ async fn checkpoint(
             .as_millis() as u64,
     };
     let key = checkpoint_key(replay_from, ordinal, checkpoint.epoch, count);
-    shared.writable().await?;
-    match store::create(
-        operator,
-        &key,
-        Bytes::from(serde_json::to_vec(&checkpoint)?),
-    )
-    .await?
-    {
-        Created::New | Created::Same => {}
-        Created::Different(_) => bail!("checkpoint {key} was written by another owner"),
-    }
+    let bytes = Bytes::from(serde_json::to_vec(&checkpoint)?);
+    writer::create(shared, operator, "checkpoint", &key, bytes).await?;
     let mut state = shared.lock();
     for (name, image) in &checkpoint.journals {
-        if let Some(model) = state.journals.get_mut(name) {
-            for (segment, written) in &image.segments {
-                if let Some(current) = model.segments.get_mut(segment)
-                    && current.length >= written.length
-                {
-                    current.parts = written.parts.clone();
-                }
+        let Some(model) = state.journals.get_mut(name) else {
+            continue;
+        };
+        for (segment, written) in &image.segments {
+            if let Some(current) = model.segments.get_mut(segment)
+                && current.length >= written.length
+            {
+                current.parts = written.parts.clone();
             }
         }
     }
@@ -399,4 +385,49 @@ async fn retain(shared: &Arc<Shared>, operator: &Operator, history: &History) ->
         state.batches.pop_front();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writer::{self, Tuning};
+
+    fn tuning() -> Tuning {
+        Tuning {
+            max_batch_bytes: 8 << 20,
+            max_inflight: 4,
+            writes_per_second: 0.0,
+            queue_memory_bytes: 1 << 20,
+            lease: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(1),
+            stall_warning: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_objects_tolerate_lost_responses_but_not_another_owner() {
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let shared = Shared::new(tuning(), 1, 0, 1);
+        shared.renewed(Instant::now() + Duration::from_secs(60));
+        let ours = Bytes::from_static(b"ours");
+        operator.write("control/a", ours.clone()).await.unwrap();
+        // The same bytes are our own earlier attempt.
+        writer::create(&shared, &operator, "control", "control/a", ours)
+            .await
+            .unwrap();
+        assert!(writer::failure(&shared).is_none());
+        operator
+            .write("control/b", b"theirs".to_vec())
+            .await
+            .unwrap();
+        let bytes = Bytes::from_static(b"ours");
+        assert!(
+            writer::create(&shared, &operator, "control", "control/b", bytes)
+                .await
+                .is_err()
+        );
+        assert!(writer::failure(&shared).is_some(), "replication must stop");
+    }
 }
