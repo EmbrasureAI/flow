@@ -441,9 +441,16 @@ async fn restore_segment(
     segment: u64,
     image: &SegmentImage,
 ) -> Result<u64> {
-    let mut file = File::create(&path)?;
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(&path).await?;
     let mut expected = 0;
     for part in &image.parts {
+        let size = part.end.saturating_sub(part.start);
+        ensure!(
+            part.start == expected && part.end >= part.start && size <= format::MAX_OBJECT_BYTES,
+            "journal part {} is damaged or out of order",
+            part.object
+        );
         let mut stream = operator
             .reader(&part.object)
             .await
@@ -458,19 +465,19 @@ async fn restore_segment(
             .await
             .with_context(|| format!("read {}", part.object))?
         {
-            crc32.update(&chunk);
-            file.write_all(&chunk)?;
             length += chunk.len() as u64;
+            ensure!(length <= size, "journal part {} is damaged", part.object);
+            crc32.update(&chunk);
+            file.write_all(&chunk).await?;
         }
         ensure!(
-            part.start == expected
-                && length == part.end - part.start
-                && crc32.finalize() == part.crc32,
-            "journal part {} is damaged or out of order",
+            length == size && crc32.finalize() == part.crc32,
+            "journal part {} is damaged",
             part.object
         );
         expected = part.end;
     }
+    file.flush().await?;
     ensure!(
         expected == image.length,
         "journal segment {segment} image is incomplete"
