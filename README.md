@@ -99,7 +99,8 @@ docker run --env-file flow.env \
 
 The image runs `embrasure-flow --config /etc/flow.toml run` by default as an
 unprivileged user. Mount the configuration at `/etc/flow.toml`, set
-`state_dir = "/data"` in it and mount a persistent volume there, and pass the
+`state_dir = "/data"` in it and mount a persistent volume there (or configure
+[remote durability](docs/remote-durability.md)), and pass the
 environment variables your configuration names for credentials (here through
 `flow.env`).
 

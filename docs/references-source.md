@@ -168,10 +168,12 @@ coordinator must not reclaim a transaction while its readers still need it.
 
 `sync_data` establishes the operating system/filesystem durability contract. It
 does **not** establish independent durability against node or disk loss. Use
-materialized ACK by default. Journaled ACK requires separately provisioned and
-documented independent storage durability, plus recovery procedures for storage
-corruption. Neither capture nor the journal automatically drops slots, advances
-over missing transactions, or removes an existing source snapshot.
+materialized ACK by default. Journaled ACK requires either
+[remote durability](remote-durability.md), which replicates the journal to
+object storage, or separately provisioned and documented independent storage
+durability, plus recovery procedures for storage corruption. Neither capture
+nor the journal automatically drops slots, advances over missing transactions,
+or removes an existing source snapshot.
 
 ## Deliberate limits and performance choices
 
