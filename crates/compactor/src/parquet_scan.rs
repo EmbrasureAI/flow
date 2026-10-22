@@ -338,6 +338,8 @@ fn admit_group(
 pub(crate) enum Input {
     Fetched(Bytes),
     Lazy,
+    /// Read by range, with a size already observed from storage metadata.
+    Sized(u64),
 }
 
 impl Input {
@@ -345,13 +347,14 @@ impl Input {
         Ok(match self {
             Self::Fetched(bytes) => bytes.len() as u64,
             Self::Lazy => input.metadata().await?.size,
+            Self::Sized(size) => *size,
         })
     }
 
     async fn reader(&self, input: &iceberg::io::InputFile) -> Result<Box<dyn FileRead>> {
         Ok(match self {
             Self::Fetched(bytes) => Box::new(Fetched(bytes.clone())),
-            Self::Lazy => input.reader().await?,
+            Self::Lazy | Self::Sized(_) => input.reader().await?,
         })
     }
 }
