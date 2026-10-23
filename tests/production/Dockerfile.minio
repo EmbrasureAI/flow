@@ -1,12 +1,20 @@
 # Build the same qualification releases from upstream source. The corresponding
 # public registry images and binary downloads are no longer available.
+# Module downloads are retried: a transient checksum-database or proxy error
+# otherwise fails a whole CI run. Checksums are still verified.
 FROM golang:1.24.2-bookworm AS server-build
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go install github.com/minio/minio@RELEASE.2025-04-22T22-12-26Z
+    for attempt in 1 2 3; do \
+      CGO_ENABLED=0 go install github.com/minio/minio@RELEASE.2025-04-22T22-12-26Z && exit 0; \
+      sleep $((attempt * 15)); \
+    done; exit 1
 
 FROM golang:1.24.2-bookworm AS client-build
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go install github.com/minio/mc@RELEASE.2025-04-16T18-13-26Z
+    for attempt in 1 2 3; do \
+      CGO_ENABLED=0 go install github.com/minio/mc@RELEASE.2025-04-16T18-13-26Z && exit 0; \
+      sleep $((attempt * 15)); \
+    done; exit 1
 
 FROM debian:bookworm-slim AS base
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*

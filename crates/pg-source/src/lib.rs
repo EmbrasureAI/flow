@@ -44,6 +44,8 @@ pub enum Error {
     Postgres(#[from] tokio_postgres::Error),
     #[error("invalid pgoutput message: {0}")]
     Protocol(&'static str),
+    #[error("invalid pgoutput message: {0}")]
+    StreamAbort(String),
     #[error("unsupported pgoutput message tag: {0:#x}")]
     Unsupported(u8),
     #[error("table {0} requires REPLICA IDENTITY FULL for mutable replication")]

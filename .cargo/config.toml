@@ -1,0 +1,7 @@
+[env]
+# Built-in jemalloc options for builds with `--features jemalloc`; `MALLOC_CONF`
+# overrides them at run time. With transparent huge pages set to `always`, the
+# kernel backs jemalloc's memory with 2 MiB pages and process RSS keeps growing
+# past the pages jemalloc holds; `thp:never` marks its mappings
+# MADV_NOHUGEPAGE. See "Allocator memory" in docs/observability.md.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "thp:never"

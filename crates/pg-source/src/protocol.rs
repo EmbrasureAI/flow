@@ -248,11 +248,34 @@ impl Decoder {
             b'A' => {
                 let xid = cursor.u32()?;
                 let subxid = cursor.u32()?;
-                if self.stream_xid.is_some()
-                    || self.normal_xid.is_some()
-                    || !self.streamed.contains(&xid)
+                if let Some((kind, open)) = self
+                    .stream_xid
+                    .map(|open| ("streamed", open))
+                    .or(self.normal_xid.map(|open| ("non-streamed", open)))
                 {
-                    return Err(Error::Protocol("abort outside stopped stream"));
+                    return Err(Error::StreamAbort(format!(
+                        "abort of transaction {xid} (subtransaction {subxid}) inside open {kind} transaction {open}"
+                    )));
+                }
+                if !self.streamed.contains(&xid) {
+                    if xid != subxid {
+                        // Nothing of this transaction was streamed on this
+                        // connection, so the rolled-back subtransaction has
+                        // nothing to discard. PostgreSQL's apply worker treats
+                        // it the same way, as an empty subtransaction.
+                        tracing::warn!(
+                            event = "stream_abort_without_stream",
+                            xid,
+                            subxid,
+                            streamed = self.streamed.len(),
+                            "subtransaction abort for a transaction not streamed on this connection; nothing to discard"
+                        );
+                        return Ok(SourceEvent::Metadata);
+                    }
+                    return Err(Error::StreamAbort(format!(
+                        "abort of streamed transaction {xid} that was not started on this connection ({} streamed transactions open)",
+                        self.streamed.len()
+                    )));
                 }
                 if xid == subxid {
                     self.streamed.remove(&xid);
