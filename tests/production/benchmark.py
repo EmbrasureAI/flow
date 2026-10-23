@@ -168,12 +168,14 @@ chunk_bytes = {self.args.chunk_bytes}
 batch_bytes = {self.args.batch_bytes}
 pending_transactions = {self.args.pending_transactions}
 commits_per_second = {self.args.commits_per_second}
-collapse_memory_bytes = {self.args.collapse_memory_bytes}
 journal_bytes = 8589934592
 spool_bytes = 4294967296
 wal_soft_bytes = 8589934592
 wal_hard_bytes = 17179869184
 snapshot_retention_secs = 3600
+'''
+        if self.args.collapse_memory_bytes is not None:
+            text += f'''collapse_memory_bytes = {self.args.collapse_memory_bytes}
 '''
         for name in self.names:
             text += f'''\n[[tables]]
@@ -1114,7 +1116,8 @@ def main():
     parser.add_argument("--commits-per-second", type=int, default=100)
     parser.add_argument("--chunk-bytes", type=int, default=1048576)
     parser.add_argument("--batch-bytes", type=int, default=8388608)
-    parser.add_argument("--collapse-memory-bytes", type=int, default=32 << 20)
+    # Unset keeps the engine default.
+    parser.add_argument("--collapse-memory-bytes", type=int)
     parser.add_argument("--reader-baseline-compactor", type=Path)
     parser.add_argument("--reader-baseline-max-input-files", type=int, default=256)
     parser.add_argument("--reader-baseline-max-input-bytes", type=int, default=512 << 20)
