@@ -171,7 +171,9 @@ fn lookup_many<'k>(
 ) -> Result<Vec<Option<RowLocation>>> {
     let cf = db.cf_handle(PK).expect("opened column family");
     let encoded: Vec<_> = keys.into_iter().map(|key| pk_key(table, key)).collect();
-    db.batched_multi_get_cf_opt(&cf, encoded.iter(), false, options)
+    // Callers usually pass canonical key order; RocksDB then skips its own sort.
+    let sorted = encoded.is_sorted();
+    db.batched_multi_get_cf_opt(&cf, encoded.iter(), sorted, options)
         .into_iter()
         .map(|item| {
             item.map_err(Error::from)?
