@@ -240,3 +240,32 @@ fn spilling_into_a_nonempty_spool_is_rejected() {
         .unwrap();
     assert!(store.spill_collapse_buffer("t", buffer).is_err());
 }
+
+#[test]
+fn an_ephemeral_store_keeps_its_data_across_a_clean_reopen() {
+    let temp = TempDir::new().unwrap();
+    let options = || StateStoreOptions {
+        apply_batch_rows: CHUNK,
+        ..StateStoreOptions::scratch()
+    };
+    assert!(options().ephemeral);
+    let store = StateStore::open(temp.path(), options()).unwrap();
+    let input = changes(&[], &[Step::Write(1, 1, false), Step::Write(2, 2, false)]);
+    store.collapse_changes("t", input.iter().cloned()).unwrap();
+    store.seal_transaction("t").unwrap();
+    let before: Vec<_> = store
+        .collapsed("t", &TABLE)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    drop(store);
+    // No write-ahead log: a clean close flushes the memtable instead.
+    let store = StateStore::open(temp.path(), options()).unwrap();
+    let after: Vec<_> = store
+        .collapsed("t", &TABLE)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!(before, after);
+}

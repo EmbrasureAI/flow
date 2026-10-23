@@ -113,6 +113,10 @@ pub struct StateStoreOptions {
     /// demand, so a large index cannot exhaust the process descriptor limit.
     /// `-1` keeps every table file open.
     pub max_open_files: i32,
+    /// Skip the write-ahead log and fsyncs. Only for scratch stores that are
+    /// deleted rather than reopened after a crash; they cannot have a control
+    /// store. A clean close still flushes, so reopening in-process is safe.
+    pub ephemeral: bool,
 }
 impl Default for StateStoreOptions {
     fn default() -> Self {
@@ -122,17 +126,20 @@ impl Default for StateStoreOptions {
             apply_batch_rows: 1024,
             apply_lookup_rows: 1024,
             max_open_files: 4096,
+            ephemeral: false,
         }
     }
 }
 impl StateStoreOptions {
-    /// A short-lived store that one build writes once and then reads, such as
-    /// compaction scratch. Larger memtables flush a quarter as often, so
-    /// RocksDB rewrites the staged mappings far fewer times before the build
-    /// ends. Each running build may hold up to two such memtables.
+    /// A short-lived store that one build writes once, reads and then
+    /// discards, such as compaction scratch, which startup deletes after a
+    /// crash. Larger memtables flush a quarter as often, so RocksDB rewrites
+    /// the staged mappings far fewer times before the build ends. Each running
+    /// build may hold up to two such memtables.
     pub fn scratch() -> Self {
         Self {
             write_buffer_bytes: 64 << 20,
+            ephemeral: true,
             ..Self::default()
         }
     }
@@ -284,6 +291,7 @@ struct Inner {
     control: Option<ControlStore>,
     revision: AtomicU64,
     failed: AtomicBool,
+    ephemeral: bool,
 }
 #[derive(Clone)]
 pub struct StateStore(Arc<Inner>);
@@ -317,6 +325,11 @@ impl StateStore {
         {
             return Err(Error::InvalidState(
                 "state store budgets must be positive".into(),
+            ));
+        }
+        if config.ephemeral && control.is_some() {
+            return Err(Error::InvalidState(
+                "a controlled index cannot skip its write-ahead log".into(),
             ));
         }
         if let Some(authority) = &control {
@@ -399,6 +412,7 @@ impl StateStore {
             control,
             revision: AtomicU64::new(revision),
             failed: AtomicBool::new(false),
+            ephemeral: config.ephemeral,
         })))
     }
 
@@ -1275,7 +1289,7 @@ impl StateStore {
             control.commit_index(self, &mut batch)
         } else {
             let observation = WriteObservation::capture(&batch.index);
-            self.0.db.write_opt(batch.index, &durable_write())?;
+            self.0.db.write_opt(batch.index, &self.durable_write())?;
             Ok(observation)
         }
     }
@@ -1283,14 +1297,29 @@ impl StateStore {
     /// The next revision-bearing write syncs the index WAL, including this
     /// prefix, before any control revision names it. Staged batches after the
     /// last such write may be lost and are replayed or discarded under their
-    /// durable publication fence. Never disable the WAL here.
+    /// durable publication fence. Never disable the WAL here, except for an
+    /// ephemeral scratch store, which is deleted instead of recovered.
     fn write_staged(&self, batch: StateBatch) -> Result<()> {
         self.write_staged_observed(batch).map(|_| ())
     }
     fn write_staged_observed(&self, batch: StateBatch) -> Result<WriteObservation> {
         let observation = WriteObservation::capture(&batch.index);
-        self.0.db.write_opt(batch.index, &WriteOptions::default())?;
+        self.0.db.write_opt(batch.index, &self.staged_write())?;
         Ok(observation)
+    }
+
+    fn durable_write(&self) -> WriteOptions {
+        if self.0.ephemeral {
+            self.staged_write()
+        } else {
+            durable_write()
+        }
+    }
+
+    fn staged_write(&self) -> WriteOptions {
+        let mut options = WriteOptions::default();
+        options.disable_wal(self.0.ephemeral);
+        options
     }
 
     fn scan(&self, cf: &str, prefix: Vec<u8>) -> impl Iterator<Item = Result<RawEntry>> + '_ {

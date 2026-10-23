@@ -844,6 +844,9 @@ impl TableWork {
                 StateStoreOptions {
                     apply_batch_rows: self.config.limits.batch_rows,
                     max_open_files: crate::disk::index_max_open_files(),
+                    // Deleted after a crash like compaction scratch, but keeps
+                    // the default memtables the memory guide accounts for.
+                    ephemeral: true,
                     ..Default::default()
                 },
             )?;
