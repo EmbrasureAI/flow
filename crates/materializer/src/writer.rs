@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, ensure};
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray, cast::AsArray,
+};
 use flow_iceberg_ext::{ArtifactSet, ArtifactTracker};
 use flow_model::{
     ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableSchema, Value, fingerprint,
@@ -86,33 +88,70 @@ impl WriterConfig {
 /// Charge fixed-width slots even for nulls, one validity byte per field, and
 /// two i32 offsets per variable-width value. The offset allowance also covers
 /// the final offset of a one-row Arrow array. Allocator capacity is excluded.
+fn fixed_bytes(data_type: &ColumnType) -> usize {
+    1 + match data_type {
+        ColumnType::Bool => 1,
+        ColumnType::Int32 | ColumnType::Date => 4,
+        ColumnType::Int64
+        | ColumnType::Float64
+        | ColumnType::TimestampMicros
+        | ColumnType::TimestampTzMicros
+        | ColumnType::String
+        | ColumnType::Binary => 8,
+        ColumnType::Uuid | ColumnType::Decimal { .. } => 16,
+    }
+}
+
 fn row_bytes(schema: &TableSchema, row: &Row) -> Result<usize> {
     schema
         .columns
         .iter()
         .zip(row)
         .try_fold(0usize, |bytes, (column, value)| {
-            let fixed = match column.data_type {
-                ColumnType::Bool => 1,
-                ColumnType::Int32 | ColumnType::Date => 4,
-                ColumnType::Int64
-                | ColumnType::Float64
-                | ColumnType::TimestampMicros
-                | ColumnType::TimestampTzMicros
-                | ColumnType::String
-                | ColumnType::Binary => 8,
-                ColumnType::Uuid | ColumnType::Decimal { .. } => 16,
-            };
             let variable = match value {
                 Value::String(value) => value.len(),
                 Value::Binary(value) => value.len(),
                 _ => 0,
             };
             bytes
-                .checked_add(fixed + 1)
+                .checked_add(fixed_bytes(&column.data_type))
                 .and_then(|bytes| bytes.checked_add(variable))
                 .context("row logical payload size overflow")
         })
+}
+
+/// [`row_bytes`] for each row of a batch in the writer's Arrow schema.
+fn batch_row_bytes(schema: &TableSchema, batch: &RecordBatch) -> Result<Vec<usize>> {
+    let fixed: usize = schema
+        .columns
+        .iter()
+        .map(|column| fixed_bytes(&column.data_type))
+        .sum();
+    let mut bytes = vec![fixed; batch.num_rows()];
+    for (column, array) in schema.columns.iter().zip(batch.columns()) {
+        // Offsets give each value's length without touching its payload.
+        let offsets: Vec<usize> = match column.data_type {
+            ColumnType::String => array
+                .as_string_opt::<i32>()
+                .map(|array| array.offsets().windows(2).map(|r| (r[1] - r[0]) as usize))
+                .context("string type mismatch")?
+                .collect(),
+            ColumnType::Binary => array
+                .as_binary_opt::<i64>()
+                .map(|array| array.offsets().windows(2).map(|r| (r[1] - r[0]) as usize))
+                .context("binary type mismatch")?
+                .collect(),
+            _ => continue,
+        };
+        for (index, (bytes, length)) in bytes.iter_mut().zip(offsets).enumerate() {
+            if array.is_valid(index) {
+                *bytes = bytes
+                    .checked_add(length)
+                    .context("row logical payload size overflow")?;
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 fn delete_bytes(position: &RowLocation) -> Result<usize> {
@@ -287,9 +326,13 @@ impl DataWriter {
             })?;
             let rows = &remaining[..count];
             let offset = locations.len();
+            // Rows were validated when the write call was admitted.
+            let fingerprints: Vec<_> = rows.iter().map(|row| fingerprint(row.borrow())).collect();
             self.write_batch(
-                rows,
+                validated_columns(&self.schema, rows, true)?,
+                count,
                 lineage.map(|values| &values[offset..offset + count]),
+                &fingerprints,
                 bytes,
                 source_lsn,
                 &mut locations,
@@ -300,10 +343,80 @@ impl DataWriter {
         Ok(WrittenBatch { locations })
     }
 
+    /// Write rows already in [`crate::writer_arrow_schema`], such as rewritten scan
+    /// output, without converting them through [`Row`]. Applies the same
+    /// validation and admission limits as [`Self::write_with_lineage`].
+    /// `fingerprints` are the caller's [`flow_model::fingerprint`] per row.
+    pub async fn write_arrow(
+        &mut self,
+        batch: &RecordBatch,
+        lineage: Option<&[crate::RowLineage]>,
+        fingerprints: &[[u8; 16]],
+        source_lsn: PgLsn,
+    ) -> Result<WrittenBatch> {
+        let rows = batch.num_rows();
+        ensure!(
+            lineage.is_none_or(|values| values.len() == rows) && fingerprints.len() == rows,
+            "row lineage or fingerprint length mismatch"
+        );
+        ensure!(
+            lineage.is_none() || self.lineage_schema.is_some(),
+            "writer is not configured for row lineage"
+        );
+        ensure!(
+            batch.schema().fields() == self.arrow_schema.fields(),
+            "batch is not in the writer's Arrow schema"
+        );
+        if rows == 0 {
+            return Ok(WrittenBatch { locations: vec![] });
+        }
+        // The Arrow schema already fixes types and required fields. Decimal
+        // precision is the remaining check `validate_row` would apply.
+        for (column, array) in self.schema.columns.iter().zip(batch.columns()) {
+            if let ColumnType::Decimal { precision, .. } = column.data_type {
+                array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .context("decimal type mismatch")?
+                    .validate_decimal_precision(precision)
+                    .with_context(|| format!("type or nullability mismatch for {}", column.name))?;
+            }
+        }
+        let lineage_bytes = usize::from(self.lineage_schema.is_some()) * 18;
+        let sizes: Vec<_> = batch_row_bytes(&self.schema, batch)?
+            .into_iter()
+            .map(|bytes| bytes + lineage_bytes)
+            .collect();
+        // Admit the whole call before opening any output, as the row path does.
+        for bytes in &sizes {
+            self.config.admit_row(*bytes)?;
+        }
+        let mut locations = Vec::with_capacity(rows);
+        let mut offset = 0;
+        while offset < rows {
+            let (count, bytes) = bounded_batch(&sizes[offset..], &self.config, |bytes| Ok(*bytes))?;
+            self.write_batch(
+                batch.slice(offset, count).columns().to_vec(),
+                count,
+                lineage.map(|values| &values[offset..offset + count]),
+                &fingerprints[offset..offset + count],
+                bytes,
+                source_lsn,
+                &mut locations,
+            )
+            .await?;
+            offset += count;
+        }
+        Ok(WrittenBatch { locations })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn write_batch(
         &mut self,
-        rows: &[impl Borrow<Row>],
+        mut columns: Vec<ArrayRef>,
+        rows: usize,
         lineage: Option<&[crate::RowLineage]>,
+        fingerprints: &[[u8; 16]],
         bytes: usize,
         source_lsn: PgLsn,
         locations: &mut Vec<RowLocation>,
@@ -334,13 +447,11 @@ impl DataWriter {
         }
         let writer = self.current.as_mut().expect("writer opened above");
         self.row_group
-            .prepare(writer, rows.len(), bytes, &self.config)
+            .prepare(writer, rows, bytes, &self.config)
             .await?;
-        // Rows were validated when the write call was admitted.
-        let mut columns = validated_columns(&self.schema, rows, true)?;
         let batch = if let Some(schema) = &self.lineage_schema {
             for row_id in [true, false] {
-                let values = (0..rows.len()).map(|index| {
+                let values = (0..rows).map(|index| {
                     lineage.and_then(|values| {
                         if row_id {
                             values[index].row_id
@@ -358,8 +469,8 @@ impl DataWriter {
         let path = writer.current_file_path();
         let offset = writer.current_row_num() as u64;
         writer.write(&batch).await?;
-        self.row_group.written(rows.len(), bytes, &self.config);
-        for (i, row) in rows.iter().enumerate() {
+        self.row_group.written(rows, bytes, &self.config);
+        for (i, fingerprint) in fingerprints.iter().enumerate() {
             locations.push(RowLocation {
                 data_file_id: FileId(path.clone()),
                 row_position: offset + i as u64,
@@ -368,7 +479,7 @@ impl DataWriter {
                 partition: vec![],
                 source_commit_lsn: source_lsn,
                 row_version: 0,
-                row_fingerprint: fingerprint(row.borrow()),
+                row_fingerprint: *fingerprint,
             });
         }
         Ok(())

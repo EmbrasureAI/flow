@@ -469,6 +469,7 @@ impl Policy {
     }
 }
 
+mod columnar;
 mod parquet_scan;
 pub use parquet_scan::{ReadLimits, read_positions};
 mod catchup;

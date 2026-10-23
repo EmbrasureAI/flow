@@ -1393,7 +1393,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-schema",
+ "arrow-select",
  "async-trait",
+ "blake3",
  "bytes",
  "flow-iceberg-ext",
  "flow-materializer",
