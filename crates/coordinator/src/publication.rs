@@ -4,8 +4,10 @@
 //! captured head again before publishing and retains fences on ambiguous commits.
 
 mod collapse;
+mod deletes;
 use collapse::CollapsedRows;
 pub use collapse::{CollapseLimits, CollapsedEpoch, Epoch, collapse_epoch};
+use deletes::EpochDeletes;
 
 use crate::artifacts::{MetadataRegistration, WriterRegistration};
 use crate::blocking;
@@ -508,6 +510,10 @@ impl TablePublisher {
             writer_config.clone(),
         )?);
         let mut referenced = BTreeSet::new();
+        // Deleted originals stay in memory, sorted at the end, unless they
+        // outgrow the batch budget; the spool then stages them as before.
+        let mut deletes = EpochDeletes::new(self.batch_bytes);
+        let mut deletes_spilled = false;
         let mut first = Some(first);
         let mut stage = None;
         let data_files = loop {
@@ -557,13 +563,13 @@ impl TablePublisher {
             };
             let mut locations = written.locations.into_iter();
             let mut deltas = Vec::with_capacity(mutations.len());
-            let mut deletes = Vec::new();
+            let mut over_budget = false;
             for mutation in mutations {
                 if let Some(old) = &mutation.original {
                     if !referenced.contains(&old.data_file_id.0) {
                         referenced.insert(old.data_file_id.0.clone());
                     }
-                    deletes.push(old.clone());
+                    over_budget |= !deletes.push(old);
                 }
                 let replacement = if mutation.row.is_some() {
                     let mut location = locations
@@ -584,11 +590,18 @@ impl TablePublisher {
                     replacement,
                 });
             }
+            let spill = (deletes_spilled || over_budget).then(|| {
+                deletes_spilled = true;
+                std::mem::replace(&mut deletes, EpochDeletes::new(self.batch_bytes))
+            });
             let store = self.store.clone();
             let epoch = epoch.clone();
+            let batch_rows = self.batch_rows;
             stage = Some(DataStage::spawn(move || {
                 store.stage_deltas(&epoch.id, deltas)?;
-                store.put_position_deletes(&epoch.id.0, &epoch.table, deletes)?;
+                if let Some(mut spill) = spill {
+                    spill.spill(&store, &epoch.id.0, &epoch.table, batch_rows)?;
+                }
                 Ok(())
             }));
         };
@@ -603,11 +616,38 @@ impl TablePublisher {
             writer_config.clone(),
             table.metadata().format_version(),
         )?;
-        let mut deletes = self.delete_batches(epoch);
-        while let Some(batch) = deletes.recv().await.transpose()? {
-            let write_started = Instant::now();
-            delete_writer.write_with_priors(&batch, &mut priors).await?;
-            delete_write += write_started.elapsed();
+        // Prior deletes staged on disk must merge with the epoch's own.
+        if !deletes_spilled {
+            let store = self.store.clone();
+            let id = epoch.id.0.clone();
+            let table_id = epoch.table;
+            let batch_rows = self.batch_rows;
+            let memory = std::mem::replace(&mut deletes, EpochDeletes::new(0));
+            let (memory, spilled) = blocking(move || {
+                let mut memory = memory;
+                if store.position_deletes(&id, &table_id).next().is_none() {
+                    return Ok((memory, false));
+                }
+                memory.spill(&store, &id, &table_id, batch_rows)?;
+                Ok((memory, true))
+            })
+            .await?;
+            deletes = memory;
+            deletes_spilled = spilled;
+        }
+        if deletes_spilled {
+            let mut staged = self.delete_batches(epoch);
+            while let Some(batch) = staged.recv().await.transpose()? {
+                let write_started = Instant::now();
+                delete_writer.write_with_priors(&batch, &mut priors).await?;
+                delete_write += write_started.elapsed();
+            }
+        } else if !deletes.is_empty() {
+            for batch in deletes.into_sorted(self.batch_rows) {
+                let write_started = Instant::now();
+                delete_writer.write_with_priors(&batch, &mut priors).await?;
+                delete_write += write_started.elapsed();
+            }
         }
         ensure!(
             priors.is_empty(),
