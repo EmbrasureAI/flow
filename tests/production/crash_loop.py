@@ -489,8 +489,24 @@ class CrashLoop(Run):
             return self.run_cycle(number, window, fault, details)
         except BaseException:
             # A failed cycle is otherwise lost: only successful cycles are kept.
-            self.report["failed_cycle"] = {**details, "traceback": traceback.format_exc()}
+            self.report["failed_cycle"] = {**details, "traceback": traceback.format_exc(),
+                                           "daemon_fatal": self.daemon_fatal()}
             raise
+
+    def daemon_fatal(self):
+        """The current daemon generation's fatal error event, if it logged one."""
+        path = self.directory / f"daemon-{self.generation}.log"
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            return None
+        for line in reversed(lines):
+            if '"event":"fatal"' in line:
+                try:
+                    return json.loads(line)["fields"]
+                except (ValueError, KeyError):
+                    return line[:2000]
+        return None
 
     def run_cycle(self, number, window, fault, details):
         at = details["at_ms"]

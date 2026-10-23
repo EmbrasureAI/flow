@@ -1,7 +1,9 @@
 """Offline checks for the crash-loop ACK evidence, failure evidence and the soak growth rule."""
 
 import argparse
+from pathlib import Path
 import random
+import tempfile
 import unittest
 
 from crash_loop import CrashLoop, TransactionLog, row_difference
@@ -70,6 +72,12 @@ class FailedCycleTests(unittest.TestCase):
         loop.rng = random.Random(1)
         loop.report = {}
         loop.arm = lambda fault, window: {"fault": fault}
+        loop.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        loop.generation = 76
+        (loop.directory / "daemon-76.log").write_text(
+            '{"level":"INFO","fields":{"message":"starting"}}\n'
+            '{"level":"ERROR","fields":{"message":"embrasure-flow stopped","event":"fatal",'
+            '"error":"source capture stopped"}}\n')
 
         def run_cycle(number, window, fault, details):
             details["at_ms"]["killed"] = details["at_ms"]["armed"] + 1
@@ -81,6 +89,7 @@ class FailedCycleTests(unittest.TestCase):
         failed = loop.report["failed_cycle"]
         self.assertEqual(failed["cycle"], 61)
         self.assertEqual(set(failed["at_ms"]), {"armed", "killed"})
+        self.assertEqual(failed["daemon_fatal"]["error"], "source capture stopped")
         self.assertIn("orders differs", failed["traceback"])
 
 

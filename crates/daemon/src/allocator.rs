@@ -8,6 +8,9 @@ pub(crate) struct MemoryUsage {
     pub(crate) allocated_bytes: u64,
     pub(crate) active_bytes: u64,
     pub(crate) resident_bytes: u64,
+    pub(crate) mapped_bytes: u64,
+    pub(crate) retained_bytes: u64,
+    pub(crate) metadata_bytes: u64,
 }
 
 /// These fields overlap; they are not additive and resident is not process RSS.
@@ -17,6 +20,9 @@ pub(crate) fn memory_usage() -> Result<MemoryUsage> {
         allocated_bytes: stats::allocated::read()? as u64,
         active_bytes: stats::active::read()? as u64,
         resident_bytes: stats::resident::read()? as u64,
+        mapped_bytes: stats::mapped::read()? as u64,
+        retained_bytes: stats::retained::read()? as u64,
+        metadata_bytes: stats::metadata::read()? as u64,
     })
 }
 

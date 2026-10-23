@@ -103,6 +103,35 @@ def mapping_summary(pid, proc=Path("/proc")):
     return classes
 
 
+def largest_anonymous_mappings(pid, limit=12, proc=Path("/proc")):
+    """The unnamed anonymous mappings with the most resident bytes: size,
+    resident and huge-page bytes, and whether transparent huge pages are
+    allowed (THPeligible) or excluded (VmFlags nh) for each."""
+    try:
+        text = (proc / str(pid) / "smaps").read_text()
+    except OSError:
+        return []
+    mappings = []
+    entry = None
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and "-" in fields[0] and not fields[0].endswith(":"):
+            start, end = (int(bound, 16) for bound in fields[0].split("-"))
+            entry = None
+            if len(fields) <= 5:
+                entry = {"size_bytes": end - start, "rss_bytes": 0, "anon_huge_page_bytes": 0}
+                mappings.append(entry)
+        elif entry is not None and fields[:1] == ["Rss:"]:
+            entry["rss_bytes"] = int(fields[1]) * 1024
+        elif entry is not None and fields[:1] == ["AnonHugePages:"]:
+            entry["anon_huge_page_bytes"] = int(fields[1]) * 1024
+        elif entry is not None and fields[:1] == ["THPeligible:"]:
+            entry["thp_eligible"] = fields[1] == "1"
+        elif entry is not None and fields[:1] == ["VmFlags:"]:
+            entry["no_huge_pages"] = "nh" in fields[1:]
+    return sorted(mappings, key=lambda mapping: -mapping["rss_bytes"])[:limit]
+
+
 def mapping_scan_points(duration, sample_seconds, warmup_fraction):
     """1-based sample numbers after which to scan mappings: the first sample
     the growth rule keeps for the expected sample count, and the midpoint of
@@ -138,6 +167,8 @@ def reproduction(args):
                  "--warmup-fraction", f"{args.warmup_fraction:g}", "--rss-tolerance", f"{args.rss_tolerance:g}",
                  "--state-tolerance", f"{args.state_tolerance:g}",
                  "--metadata-tolerance", f"{args.metadata_tolerance:g}"]
+    if args.malloc_conf:
+        arguments += ["--malloc-conf", args.malloc_conf]
     return shlex.join(arguments) + " --catalog-uri ... --s3-endpoint ... --artifacts NEW_DIRECTORY"
 
 
@@ -149,6 +180,10 @@ class Soak(CrashLoop):
 
     def configure(self):
         super().configure()
+        if self.args.malloc_conf:
+            # Read by the daemon's jemalloc when it initializes.
+            self.environment["MALLOC_CONF"] = self.args.malloc_conf
+            self.report["malloc_conf"] = self.args.malloc_conf
         text = self.config.read_text().replace(
             "snapshot_retention_secs = 3600",
             f"snapshot_retention_secs = {self.args.retention_secs}\n"
@@ -191,7 +226,8 @@ class Soak(CrashLoop):
         def scan(label):
             mappings.append({"label": label, "sample": len(samples),
                              "elapsed_seconds": round(time.monotonic() - self.started, 1),
-                             "classes": mapping_summary(self.process.pid)})
+                             "classes": mapping_summary(self.process.pid),
+                             "largest_anonymous": largest_anonymous_mappings(self.process.pid)})
 
         scan("start")
         checks = self.report.setdefault("row_checks", [])
@@ -284,6 +320,8 @@ def main():
     arguments.add_argument("--rss-tolerance", type=float, default=0.25)
     arguments.add_argument("--state-tolerance", type=float, default=0.5)
     arguments.add_argument("--metadata-tolerance", type=float, default=0.25)
+    arguments.add_argument("--malloc-conf", default=os.environ.get("FLOW_SOAK_MALLOC_CONF"),
+                           help="MALLOC_CONF for the daemon's jemalloc, for allocator experiments")
     args = arguments.parse_args()
     if not args.postgres_url:
         arguments.error("provide --postgres-url or FLOW_POSTGRES_URL")

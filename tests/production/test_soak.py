@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from soak import Soak, mapping_scan_points, mapping_summary, process_memory, reproduction
+from soak import Soak, largest_anonymous_mappings, mapping_scan_points, mapping_summary, process_memory, reproduction
 
 GROWTH = {"rss_bytes": {"window_medians": [100.0, 130.0, 160.0], "limit": 125.0}}
 
@@ -104,13 +104,16 @@ class ReproductionTests(unittest.TestCase):
                                   format_version=2, binary=Path("target/debug/embrasure-flow"), timeout=600,
                                   sample_seconds=30, verify_every=600, retention_secs=120,
                                   warmup_fraction=0.5, rss_tolerance=0.4, state_tolerance=0.5,
-                                  metadata_tolerance=0.25)
+                                  metadata_tolerance=0.25, malloc_conf=None)
         command = reproduction(args)
         self.assertTrue(command.startswith("uv run tests/production/soak.py --seed 2245799672 "))
         for option in ("--duration 1800", "--warmup-fraction 0.5", "--rss-tolerance 0.4",
                        "--state-tolerance 0.5", "--metadata-tolerance 0.25", "--retention-secs 120",
                        "--binary target/debug/embrasure-flow", "--timeout 600"):
             self.assertIn(option, command)
+        self.assertNotIn("--malloc-conf", command)
+        args.malloc_conf = "thp:never"
+        self.assertIn("--malloc-conf thp:never", reproduction(args))
 
 
 class ProcessMemoryTests(unittest.TestCase):
@@ -148,6 +151,24 @@ class ProcessMemoryTests(unittest.TestCase):
             "[stack]": {"mappings": 1, "rss_bytes": 32 * 1024, "anon_huge_page_bytes": 0},
         })
         self.assertEqual(mapping_summary(43, proc), {})
+
+    def test_largest_anonymous_mappings_report_huge_page_eligibility(self):
+        proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (proc / "42").mkdir()
+        (proc / "42" / "smaps").write_text(
+            "7f0000000000-7f0004000000 rw-p 00000000 00:00 0 \n"
+            "Rss:               65536 kB\nAnonHugePages:     61440 kB\nTHPeligible:    1\nVmFlags: rd wr mr mw me ac\n"
+            "7f1000000000-7f1000400000 rw-p 00000000 00:00 0 \n"
+            "Rss:                4096 kB\nAnonHugePages:         0 kB\nTHPeligible:    0\nVmFlags: rd wr mr mw me nh\n"
+            "55d0a0000000-55d0a8000000 r-xp 00000000 08:01 1234 /runner/target/debug/embrasure-flow\n"
+            "Rss:              131072 kB\nAnonHugePages:         0 kB\n")
+        self.assertEqual(largest_anonymous_mappings(42, proc=proc), [
+            {"size_bytes": 64 << 20, "rss_bytes": 64 << 20, "anon_huge_page_bytes": 60 << 20,
+             "thp_eligible": True, "no_huge_pages": False},
+            {"size_bytes": 4 << 20, "rss_bytes": 4 << 20, "anon_huge_page_bytes": 0,
+             "thp_eligible": False, "no_huge_pages": True},
+        ])
+        self.assertEqual(largest_anonymous_mappings(43, proc=proc), [])
 
     def test_mapping_scans_align_with_the_growth_rules_steady_samples(self):
         # 1800 s at 30 s: 60 samples, the first 18 are warm-up.

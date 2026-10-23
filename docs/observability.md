@@ -531,6 +531,9 @@ and `/metrics`:
 | `flow_allocator_allocated_bytes` | Bytes currently allocated to application objects |
 | `flow_allocator_active_bytes` | Active allocation pages, including unused space within them |
 | `flow_allocator_resident_bytes` | Allocator resident pages, including allocator metadata and dirty pages |
+| `flow_allocator_mapped_bytes` | Active extents the allocator has mapped, a multiple of the page size |
+| `flow_allocator_retained_bytes` | Virtual memory the allocator retains unmapped for reuse; not resident |
+| `flow_allocator_metadata_bytes` | Allocator metadata, including any backed by transparent huge pages |
 
 The values overlap and must not be added together. Allocator resident memory is
 not process RSS: mapped files, thread stacks and other mappings are measured

@@ -407,3 +407,54 @@ fn a_damaged_spool_subtransaction_tag_fails_its_checksum() {
         "{error}"
     );
 }
+
+#[test]
+fn stream_aborts_are_checked_against_this_connections_streams() {
+    let start = |xid: u32, first: bool| {
+        message(b'S', |b| {
+            b.put_u32(xid);
+            b.put_u8(u8::from(first));
+        })
+    };
+    let abort = |xid: u32, subxid: u32| {
+        message(b'A', |b| {
+            b.put_u32(xid);
+            b.put_u32(subxid);
+        })
+    };
+    let mut decoder = Decoder::new(1024);
+    // A rolled-back subtransaction of a transaction never streamed here has
+    // nothing to discard, as in PostgreSQL's apply worker.
+    assert_eq!(
+        decoder.decode(abort(42, 43)).unwrap(),
+        SourceEvent::Metadata
+    );
+    // A top-level abort of a stream this connection never started is not.
+    let unknown = decoder.decode(abort(42, 42)).unwrap_err();
+    assert!(
+        matches!(&unknown, Error::StreamAbort(message) if message.contains("42") && message.contains("not started")),
+        "{unknown}"
+    );
+    // Nor is an abort inside an open stream block.
+    decoder.decode(start(42, true)).unwrap();
+    let inside = decoder.decode(abort(42, 43)).unwrap_err();
+    assert!(
+        matches!(&inside, Error::StreamAbort(message) if message.contains("inside open streamed transaction 42")),
+        "{inside}"
+    );
+    decoder.decode(message(b'E', |_| {})).unwrap();
+    assert_eq!(
+        decoder.decode(abort(42, 43)).unwrap(),
+        SourceEvent::Abort {
+            xid: 42,
+            subxid: 43
+        }
+    );
+    assert_eq!(
+        decoder.decode(abort(42, 42)).unwrap(),
+        SourceEvent::Abort {
+            xid: 42,
+            subxid: 42
+        }
+    );
+}
