@@ -209,7 +209,7 @@ impl Default for Limits {
             source_message_bytes: 32 << 20,
             batch_rows: 1024,
             batch_bytes: 8 << 20,
-            collapse_memory_bytes: 32 << 20,
+            collapse_memory_bytes: 128 << 20,
             parquet_row_group_bytes: 32 << 20,
             pending_transactions: 256,
             epoch_max_transactions: None,
