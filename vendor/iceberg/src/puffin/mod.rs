@@ -29,6 +29,7 @@ mod deletion_vector;
 pub use crate::delete_vector::DeleteVector;
 pub use deletion_vector::{
     DeletionVectorLimits, decode_deletion_vector, encode_deletion_vector, read_deletion_vector,
+    read_deletion_vector_with_size,
 };
 
 pub use crate::compression::CompressionCodec;

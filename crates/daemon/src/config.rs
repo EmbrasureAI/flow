@@ -31,6 +31,10 @@ pub struct Config {
     /// Local state volume safety.
     #[serde(default)]
     pub storage: Storage,
+    /// Replicate the journal and control state to object storage, so a worker
+    /// and its local disk can be replaced without losing acknowledged changes.
+    #[serde(default)]
+    pub durability: Option<flow_durability::Config>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -41,14 +45,27 @@ pub struct Storage {
     /// Verify every index checksum on each start. Otherwise the full scan runs
     /// only after an unclean exit or `check --storage`.
     pub verify_index_on_start: bool,
+    /// What backs `state_dir`. `memory` declares a tmpfs or ramfs mount.
+    pub medium: Medium,
 }
 impl Default for Storage {
     fn default() -> Self {
         Self {
             min_free_bytes: 4 << 30,
             verify_index_on_start: false,
+            medium: Medium::Disk,
         }
     }
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Medium {
+    #[default]
+    Disk,
+    /// A memory-backed filesystem: free space is also bounded by the memory
+    /// left to this process, and the contents do not survive a reboot, so
+    /// object storage must be the authority.
+    Memory,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,7 +209,7 @@ impl Default for Limits {
             source_message_bytes: 32 << 20,
             batch_rows: 1024,
             batch_bytes: 8 << 20,
-            collapse_memory_bytes: 32 << 20,
+            collapse_memory_bytes: 128 << 20,
             parquet_row_group_bytes: 32 << 20,
             pending_transactions: 256,
             epoch_max_transactions: None,
@@ -310,6 +327,15 @@ impl Config {
         self.validate_source()
     }
 
+    /// Replicated state is independent of this machine's disk by construction.
+    pub fn journal_durability(&self) -> JournalDurability {
+        if self.durability.is_some() {
+            JournalDurability::IndependentStorage
+        } else {
+            self.source.journal_durability
+        }
+    }
+
     fn validate_source(&self) -> Result<()> {
         ensure!(
             !self.source.id.is_empty()
@@ -319,8 +345,15 @@ impl Config {
         );
         ensure!(
             self.source.ack_mode != AckMode::Journaled
-                || self.source.journal_durability == JournalDurability::IndependentStorage,
+                || self.journal_durability() == JournalDurability::IndependentStorage,
             "journaled acknowledgement requires independently durable storage"
+        );
+        if let Some(durability) = &self.durability {
+            durability.validate()?;
+        }
+        ensure!(
+            self.storage.medium != Medium::Memory || self.durability.is_some(),
+            "storage.medium = \"memory\" requires [durability]: a memory-backed state_dir does not survive a reboot"
         );
         ensure!(self.catalog.contains_key("uri"), "catalog.uri is required");
         for key in ["token", "credential"] {
@@ -586,5 +619,18 @@ mod tests {
                 "{case} returned {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn memory_backed_state_requires_remote_durability() {
+        let mut config = valid_config();
+        assert_eq!(config.storage.medium, Medium::Disk);
+        config.storage.medium = Medium::Memory;
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("requires [durability]"));
+        config.durability = Some(flow_durability::Config::new("memory://state"));
+        config.validate().unwrap();
+        let parsed: Storage = toml::from_str("medium = \"memory\"").unwrap();
+        assert_eq!(parsed.medium, Medium::Memory);
     }
 }

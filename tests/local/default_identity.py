@@ -39,7 +39,8 @@ class DefaultRun(Run):
         text = text.replace('chunk_bytes = 65536', 'chunk_bytes = 1048576').replace('batch_bytes = 262144', 'batch_bytes = 2097152')
         tables = [('orders', [('tenant', 'Int32', False), ('body', 'Int32', True), ('id', 'Int64', False)], [2, 0]),
                   ('accounts', [('id', 'Int64', False), ('body', 'String', False)], [0]),
-                  ('projected', [('id', 'Int64', False), ('body', 'Int32', True)], [0])]
+                  ('projected', [('id', 'Int64', False), ('body', 'Int32', True)], [0]),
+                  ('documents', [('id', 'Int64', False), ('body', 'String', False), ('version', 'Int32', False)], [0])]
         for name, columns, key in tables:
             text += f'\n[[tables]]\nsource_namespace = "{self.name}"\nsource_table = "{name}"\ntarget_namespace = ["{self.name}"]\ntarget_table = "{name}"\nprimary_key = {key}\n'
             if name == 'projected':
@@ -57,17 +58,22 @@ class DefaultRun(Run):
         self.pg.execute('ALTER TABLE accounts REPLICA IDENTITY FULL')
         self.pg.execute('ALTER TABLE accounts ALTER COLUMN body SET STORAGE EXTERNAL')
         self.pg.execute('CREATE TABLE projected (id bigint PRIMARY KEY, body int, excluded text)')
-        self.pg.execute('CREATE TABLE rejected (id bigint PRIMARY KEY, body varchar(8))')
+        # DEFAULT identity with externally stored text: updates that leave the
+        # body unchanged carry it forward from the previous row.
+        self.pg.execute('CREATE TABLE documents (id bigint PRIMARY KEY, body text NOT NULL, version int NOT NULL)')
+        self.pg.execute('ALTER TABLE documents ALTER COLUMN body SET STORAGE EXTERNAL')
         self.pg.execute('INSERT INTO orders SELECT i % 13, i, i FROM generate_series(1,10000) i')
         # Incompressible, externally stored values; updates leave the value unchanged.
         self.pg.execute("INSERT INTO accounts SELECT i, (SELECT string_agg(md5(v::text), '') FROM generate_series(1,4096) v) FROM generate_series(1,3) i")
         self.pg.execute("INSERT INTO projected VALUES (1,10,repeat('excluded',10000))")
-        self.pg.execute(f'CREATE PUBLICATION {self.name} FOR TABLE orders, accounts, projected')
+        self.pg.execute("INSERT INTO documents SELECT i, (SELECT string_agg(md5((v * i)::text), '') FROM generate_series(1,4096) v), 0 FROM generate_series(1,3) i")
+        self.pg.execute(f'CREATE PUBLICATION {self.name} FOR TABLE orders, accounts, projected, documents')
         return {'server_version_num': self.pg.execute("SHOW server_version_num").fetchone()[0]}
 
     def compare(self, phase):
         results = {}
-        for table, projection, order in [('orders','*','id,tenant'), ('accounts','*','id'), ('projected','id,body','id')]:
+        for table, projection, order in [('orders','*','id,tenant'), ('accounts','*','id'), ('projected','id,body','id'),
+                                         ('documents','*','id')]:
             expected = self.pg.execute(f'SELECT {projection} FROM {table} ORDER BY {order}').fetchall()
             metadata = self.table(table)
             actual = self.duck.execute(f'SELECT * FROM iceberg_scan(?) ORDER BY {order}', [metadata['metadata-location']]).fetchall()
@@ -77,7 +83,7 @@ class DefaultRun(Run):
 
     def initialize(self):
         baseline = {table: self.pg.execute(f'SELECT {projection} FROM {table} ORDER BY id').fetchall()
-                    for table, projection in [('orders','*'), ('accounts','*'), ('projected','id,body')]}
+                    for table, projection in [('orders','*'), ('accounts','*'), ('projected','id,body'), ('documents','*')]}
         with (self.directory/'init.log').open('wb') as log:
             process = subprocess.Popen(self.command('init'), env=self.environment, stdout=log, stderr=subprocess.STDOUT)
             try:
@@ -87,7 +93,8 @@ class DefaultRun(Run):
                 self.until('slot not created', ready)
                 self.handoff_barrier = self.transaction(['INSERT INTO orders VALUES (99,7,20001)',
                     'UPDATE orders SET body=body+1 WHERE id<100', 'DELETE FROM orders WHERE id=100',
-                    'UPDATE accounts SET id=11 WHERE id=1', 'UPDATE projected SET body=20 WHERE id=1'])
+                    'UPDATE accounts SET id=11 WHERE id=1', 'UPDATE projected SET body=20 WHERE id=1',
+                    'UPDATE documents SET version=1 WHERE id=1'])
                 assert process.wait(timeout=self.args.timeout) == 0, 'initialization failed; see init.log'
             finally:
                 if process.poll() is None:
@@ -109,6 +116,13 @@ class DefaultRun(Run):
             'UPDATE accounts SET id=21 WHERE id=2',
             'DELETE FROM accounts WHERE id=3',
             'UPDATE projected SET body=NULL WHERE id=1',
+            'UPDATE documents SET version=version+1 WHERE id=2',
+            'UPDATE documents SET version=version+1 WHERE id=2',
+        ]))
+        self.wait_materialized(self.transaction([
+            "INSERT INTO documents VALUES (4, (SELECT string_agg(md5((v * 4)::text), '') FROM generate_series(1,4096) v), 0)",
+            'UPDATE documents SET version=9 WHERE id=4',
+            'UPDATE documents SET version=version+1 WHERE id=1',
         ]))
         self.wait_materialized(self.transaction(['DELETE FROM orders WHERE id=30002',
             'INSERT INTO orders VALUES (99,42,30002)', 'UPDATE orders SET body=43 WHERE id=30002']))
@@ -133,7 +147,8 @@ class DefaultRun(Run):
         self.proxy.hold_commits(table='orders')
         try:
             batch_lsn = self.transaction(['UPDATE orders SET body=body+1000',
-                                         'UPDATE accounts SET id=id+100', 'UPDATE projected SET body=88'])
+                                         'UPDATE accounts SET id=id+100', 'UPDATE projected SET body=88',
+                                         'UPDATE documents SET version=version+100'])
             batch_fence = source_fence()
             self.until('no prepared orders commit reached the catalog gate', self.proxy.commit_held.is_set)
             # Prove this committed batch is durably captured, but not applied.
@@ -181,7 +196,8 @@ class DefaultRun(Run):
         self.stop(crash=True)
         backlog_lsn = self.transaction(['DELETE FROM orders WHERE id%11=0',
                                        'UPDATE orders SET id=id+50000 WHERE id%5=0',
-                                       'INSERT INTO orders VALUES (1,700,90000)'])
+                                       'INSERT INTO orders VALUES (1,700,90000)',
+                                       'UPDATE documents SET version=version+1'])
         self.start(); self.wait_materialized(backlog_lsn)
         result = self.compare('backlog-recovery')
         return {'pending_before_kill': evidence, 'held_commit': completed[0],
@@ -194,27 +210,6 @@ class DefaultRun(Run):
         self.wait_materialized(self.transaction(['UPDATE orders SET extra=17 WHERE id=1']))
         return self.compare('nullable-fixed-addition')
 
-    def rejected_init(self):
-        original = self.config.read_text()
-        path = self.directory/'rejected.toml'
-        text = original.split('[[tables]]')[0].replace(str(self.directory/'state'), str(self.directory/'rejected-state'))
-        text = text.replace(f'slot = "{self.name}"', f'slot = "{self.name}_reject"')
-        text += f'''[[tables]]
-source_namespace = "{self.name}"
-source_table = "rejected"
-target_namespace = ["{self.name}"]
-target_table = "rejected"
-primary_key = [0]
-columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=2,name="body",data_type="String",nullable=true}}]
-'''
-        path.write_text(text)
-        result = subprocess.run([str(self.args.binary),'--config',str(path),'init'],env=self.environment,capture_output=True,text=True,timeout=60)
-        output = result.stdout+result.stderr
-        (self.directory/'rejected-init.log').write_text(output)
-        # A daemon command reports its fatal error as a JSON log event on stdout.
-        assert result.returncode != 0 and 'rejected' in output and 'REPLICA IDENTITY FULL' in output
-        return {'exit':result.returncode, 'message':output}
-
     def unsupported_change(self, identity=False):
         # On a new run, fail one table after initial progress. Neither its target
         # nor the source-wide materialized/slot checkpoint may cross this batch.
@@ -222,7 +217,8 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
         if identity:
             self.pg.execute('ALTER TABLE orders REPLICA IDENTITY NOTHING')
         else:
-            self.pg.execute('ALTER TABLE orders ADD COLUMN unsafe text')
+            # Nullable additions now evolve; a non-null backfill remains unsupported.
+            self.pg.execute("ALTER TABLE orders ADD COLUMN unsafe text NOT NULL DEFAULT 'backfilled'")
         barrier = self.transaction(['INSERT INTO orders (tenant,body,id) VALUES (33,77,999999)'])
         table_id = self.pg.execute("SELECT 'orders'::regclass::oid").fetchone()[0]
         self.until('table did not quarantine', lambda: any(t['table_id'] == table_id
@@ -242,7 +238,6 @@ columns = [{{field_id=1,name="id",data_type="Int64",nullable=false}},{{field_id=
     def execute(self):
         try:
             self.phase('seed',self.seed)
-            self.phase('native-rejection',self.rejected_init)
             self.phase('snapshot-with-concurrent-writes',self.initialize)
             self.start()
             self.phase('handoff',self.handoff)

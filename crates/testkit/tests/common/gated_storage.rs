@@ -71,9 +71,40 @@ impl Storage for GatedStorage {
             .unwrap()
             .entry(p.to_owned())
             .or_default() += 1;
+        // Maintenance fetches small inputs whole; hold them like range reads.
+        self.hold(p).await?;
         LocalFsStorage.read(p).await
     }
     async fn reader(&self, p: &str) -> Result<Box<dyn FileRead>> {
+        self.hold(p).await?;
+        LocalFsStorage.reader(p).await
+    }
+    async fn write(&self, p: &str, b: Bytes) -> Result<()> {
+        LocalFsStorage.write(p, b).await
+    }
+    async fn writer(&self, p: &str) -> Result<Box<dyn FileWrite>> {
+        LocalFsStorage.writer(p).await
+    }
+    async fn delete(&self, p: &str) -> Result<()> {
+        LocalFsStorage.delete(p).await
+    }
+    async fn delete_prefix(&self, p: &str) -> Result<()> {
+        LocalFsStorage.delete_prefix(p).await
+    }
+    async fn delete_stream(&self, p: BoxStream<'static, String>) -> Result<()> {
+        LocalFsStorage.delete_stream(p).await
+    }
+    fn new_input(&self, p: &str) -> Result<InputFile> {
+        Ok(InputFile::new(Arc::new(self.clone()), p.into()))
+    }
+    fn new_output(&self, p: &str) -> Result<OutputFile> {
+        LocalFsStorage.new_output(p)
+    }
+}
+
+impl GatedStorage {
+    /// Hold a read of the owner or sibling path until the test releases it.
+    async fn hold(&self, p: &str) -> Result<()> {
         if (p == self.owner_path || p == self.sibling_path) && !self.gate.release.is_closed() {
             self.gate.active.fetch_add(1, Ordering::SeqCst);
             let _active = ActiveRead(self.gate.clone());
@@ -99,27 +130,6 @@ impl Storage for GatedStorage {
                 ));
             }
         }
-        LocalFsStorage.reader(p).await
-    }
-    async fn write(&self, p: &str, b: Bytes) -> Result<()> {
-        LocalFsStorage.write(p, b).await
-    }
-    async fn writer(&self, p: &str) -> Result<Box<dyn FileWrite>> {
-        LocalFsStorage.writer(p).await
-    }
-    async fn delete(&self, p: &str) -> Result<()> {
-        LocalFsStorage.delete(p).await
-    }
-    async fn delete_prefix(&self, p: &str) -> Result<()> {
-        LocalFsStorage.delete_prefix(p).await
-    }
-    async fn delete_stream(&self, p: BoxStream<'static, String>) -> Result<()> {
-        LocalFsStorage.delete_stream(p).await
-    }
-    fn new_input(&self, p: &str) -> Result<InputFile> {
-        Ok(InputFile::new(Arc::new(self.clone()), p.into()))
-    }
-    fn new_output(&self, p: &str) -> Result<OutputFile> {
-        LocalFsStorage.new_output(p)
+        Ok(())
     }
 }

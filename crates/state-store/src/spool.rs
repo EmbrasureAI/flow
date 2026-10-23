@@ -1,13 +1,17 @@
 use crate::StateBatch as WriteBatch;
 use crate::{Error, PK, Result, SPOOL, StateStore, append_component, decode, pk_key};
-use flow_model::{PrimaryKey, Row, RowLocation, TableId};
+use flow_model::{
+    PrimaryKey, Row, RowLocation, TableId, carry_forward_unchanged, row_has_unchanged,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     time::Instant,
 };
 
-/// A complete row image; unchanged-TOAST markers must be rejected upstream.
+/// A row image. Only an update may contain [`flow_model::Value::Unchanged`];
+/// collapse carries the key's previous image into those positions when one is
+/// available, and publication resolves the rest from the indexed original row.
 #[derive(Debug, Clone)]
 pub enum Change {
     Insert(Row),
@@ -35,22 +39,47 @@ impl PendingRow {
         let required_present = !matches!(change, Change::Insert(_));
         Ok(Self {
             required_present,
-            row: Self::transition(change, required_present)?,
+            row: Self::transition(change, required_present, None)?,
         })
     }
 
     pub(crate) fn push(&mut self, change: Change) -> Result<()> {
-        self.row = Self::transition(change, self.row.is_some())?;
+        let previous = self.row.take();
+        self.row = Self::transition(change, previous.is_some(), previous)?;
         Ok(())
     }
 
-    fn transition(change: Change, present: bool) -> Result<Option<Row>> {
+    /// `previous` is the key's current image within this epoch, when known.
+    fn transition(change: Change, present: bool, previous: Option<Row>) -> Result<Option<Row>> {
         match change {
+            Change::Insert(row) if row_has_unchanged(&row) => Err(Error::InvalidState(
+                "an inserted row cannot omit unchanged values".into(),
+            )),
             Change::Insert(row) if !present => Ok(Some(row)),
-            Change::Update(row) if present => Ok(Some(row)),
+            Change::Update(mut row) if present => {
+                if let Some(previous) = previous.filter(|_| row_has_unchanged(&row)) {
+                    carry_forward_unchanged(&mut row, &previous)
+                        .map_err(|error| Error::InvalidState(error.to_string()))?;
+                }
+                Ok(Some(row))
+            }
             Change::Delete if present => Ok(None),
             _ => Err(Self::conflict()),
         }
+    }
+
+    /// Whether the final image still needs values from before this fold.
+    pub(crate) fn is_partial(&self) -> bool {
+        self.row.as_ref().is_some_and(row_has_unchanged)
+    }
+
+    /// Fill unchanged values from the key's image before this fold.
+    pub(crate) fn carry_forward(&mut self, previous: &Row) -> Result<()> {
+        if let Some(row) = &mut self.row {
+            carry_forward_unchanged(row, previous)
+                .map_err(|error| Error::InvalidState(error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_initial(&self, present: bool) -> Result<()> {
@@ -123,15 +152,22 @@ impl StateStore {
         let spool_cf = self.0.db.cf_handle(SPOOL).expect("opened column family");
         let mut existing = Vec::with_capacity(pending.len());
         let mut keys = Vec::new();
-        for (key, (table_id, primary_key, _)) in &pending {
+        for (key, (table_id, primary_key, folded)) in &mut pending {
             // Read old row images one at a time: a wide previous image must
             // not multiply the memory required by a small replacement chunk.
+            // A still-partial fold takes its unchanged values immediately; a
+            // fold that does not require the key fails validation below.
             let previous = self
                 .0
                 .db
                 .get_pinned_cf(&spool_cf, key)?
                 .map(|value| decode::<CollapsedMutation>(&value))
                 .transpose()?;
+            if let Some(Some(row)) = previous.as_ref().map(|value| value.row.as_ref())
+                && folded.is_partial()
+            {
+                folded.carry_forward(row)?;
+            }
             existing.push(previous.map(|value| (value.original, value.row.is_some())));
             if existing.last().is_some_and(Option::is_none) {
                 keys.push(pk_key(table_id, primary_key));

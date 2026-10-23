@@ -1,6 +1,6 @@
 # Production-oriented local tests
 
-Use the [fault suite](FAULTS.md) for recovery and outage checks, and `benchmark.py` for measured load and latency. These use real PostgreSQL, S3-compatible storage, an Iceberg REST catalog, and stock DuckDB. The native ingestion daemon and optional independent compactor run as separate processes. The benchmark creates its own uniquely named schema, publication, slot, and target namespace; supply disposable services.
+Use the [fault suite](FAULTS.md) for recovery and outage checks, `benchmark.py` for measured load and latency, and `durability_bench.py` for [remote durability](../../docs/benchmarks/remote-durability.md) freshness and fault trials. These use real PostgreSQL, S3-compatible storage, an Iceberg REST catalog, and stock DuckDB. The native ingestion daemon and optional independent compactor run as separate processes. The benchmark creates its own uniquely named schema, publication, slot, and target namespace; supply disposable services.
 
 This is a reproducible local qualification harness, not a claim that one machine reproduces a cloud region. Docker services, the daemon, the producer, and DuckDB share the host's CPU, disk, network stack, and memory. Run the suites serially, record the host and service resource limits, and repeat representative results before comparing changes.
 

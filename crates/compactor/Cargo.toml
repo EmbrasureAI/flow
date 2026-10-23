@@ -16,10 +16,15 @@ flow-iceberg-ext.workspace = true
 iceberg.workspace = true
 parquet.workspace = true
 arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 serde.workspace = true
 tracing.workspace = true
 
@@ -29,3 +34,9 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+# Exercise the production S3 adapter against a request-counting local endpoint.
+[dev-dependencies.iceberg-storage-opendal]
+version = "=0.10.1"
+default-features = false
+features = ["opendal-s3"]

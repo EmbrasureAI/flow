@@ -25,17 +25,22 @@ pub async fn write_artifact_plan(
     added_deletes: &[DataFile],
 ) -> Result<()> {
     CommitBase::new(table).validate(table)?;
-    for candidate in [
+    let candidates = [
         path.to_owned(),
         format!("{path}-m0.avro"),
         format!("{path}-m1.avro"),
-    ] {
-        if table.file_io().exists(&candidate).await? {
-            return Err(invalid("artifact plan attempt already exists"));
-        }
+    ];
+    let existing = futures::future::try_join_all(
+        candidates
+            .iter()
+            .map(|candidate| table.file_io().exists(candidate)),
+    )
+    .await?;
+    if existing.into_iter().any(|exists| exists) {
+        return Err(invalid("artifact plan attempt already exists"));
     }
     let root = path;
-    let mut manifests = Vec::new();
+    let mut writers = Vec::new();
     for (number, (files, content)) in [
         (added_data, ManifestContentType::Data),
         (added_deletes, ManifestContentType::Deletes),
@@ -50,8 +55,15 @@ pub async fn write_artifact_plan(
         for file in files {
             writer.add_file(file.clone(), -1)?;
         }
-        manifests.push(writer.write_manifest_file().await?);
+        writers.push(writer);
     }
+    // The list is the completion marker; its manifests can be written together.
+    let manifests = futures::future::try_join_all(
+        writers
+            .into_iter()
+            .map(|writer| writer.write_manifest_file()),
+    )
+    .await?;
     let output = table.file_io().new_output(path)?.writer().await?;
     // Prepared plans deliberately leave lineage unassigned until publication.
     let mut writer = if table.metadata().format_version() == FormatVersion::V3 {

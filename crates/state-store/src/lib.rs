@@ -13,7 +13,7 @@ mod spool;
 #[path = "../tests/profiles/sst_staging.rs"]
 mod sst_staging_profile;
 pub use buffer::{BufferResult, CollapseBuffer, MemoryRows};
-pub use control::{CheckpointRecord, ControlStore, GenerationState};
+pub use control::{CheckpointRecord, ControlMirror, ControlRestore, ControlStore, GenerationState};
 pub use reader::{IndexSnapshot, RowIndex};
 pub use spool::{Change, CollapsedMutation};
 
@@ -122,6 +122,18 @@ impl Default for StateStoreOptions {
             apply_batch_rows: 1024,
             apply_lookup_rows: 1024,
             max_open_files: 4096,
+        }
+    }
+}
+impl StateStoreOptions {
+    /// A short-lived store that one build writes once and then reads, such as
+    /// compaction scratch. Larger memtables flush a quarter as often, so
+    /// RocksDB rewrites the staged mappings far fewer times before the build
+    /// ends. Each running build may hold up to two such memtables.
+    pub fn scratch() -> Self {
+        Self {
+            write_buffer_bytes: 64 << 20,
+            ..Self::default()
         }
     }
 }

@@ -138,23 +138,6 @@ impl TypeRegistry {
         for (index, (expected, actual)) in schema.columns.iter().zip(&relation.columns).enumerate()
         {
             let (oid, _) = self.base(actual.type_oid, actual.type_modifier)?;
-            // Fixed-width builtins and enums cannot contain external TOAST pointers.
-            // Domains inherit their base's representation. Deliberately exclude all
-            // varlena types, including bounded varchar and columns SET STORAGE PLAIN:
-            // a storage change does not rewrite previously toasted values.
-            if !schema.append_only
-                && relation.replica_identity == b'd'
-                && !matches!(
-                    oid,
-                    16 | 20 | 21 | 23 | 700 | 701 | 1082 | 1083 | 1114 | 1184 | 2950
-                )
-                && !matches!(self.0.get(&oid), Some(SourceType::Enum))
-            {
-                return Err(Error::DefaultIdentity(format!(
-                    "table {}.{} column {} has a variable-width or unproven storage representation; REPLICA IDENTITY FULL is required (DEFAULT supports only fixed-width replicated columns and a primary key)",
-                    relation.namespace, relation.name, actual.name
-                )));
-            }
             let inferred = self.column_type(actual)?;
             let string_override =
                 expected.data_type == ColumnType::String && matches!(oid, 2950 | 1700);
@@ -400,6 +383,7 @@ fn value_error(error: impl std::fmt::Display) -> Error {
 fn json_value(value: Value, oid: u32) -> Result<serde_json::Value> {
     use serde_json::{Value as J, json};
     Ok(match value {
+        Value::Unchanged => return Err(Error::Protocol("array element cannot be unchanged")),
         Value::Null => J::Null,
         Value::Bool(v) => json!(v),
         Value::Int32(v) => json!(v),

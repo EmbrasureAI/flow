@@ -238,6 +238,9 @@ impl Observation {
                     ("flow_allocator_allocated_bytes", usage.allocated_bytes),
                     ("flow_allocator_active_bytes", usage.active_bytes),
                     ("flow_allocator_resident_bytes", usage.resident_bytes),
+                    ("flow_allocator_mapped_bytes", usage.mapped_bytes),
+                    ("flow_allocator_retained_bytes", usage.retained_bytes),
+                    ("flow_allocator_metadata_bytes", usage.metadata_bytes),
                 ] {
                     writeln!(text, "# TYPE {name} gauge\n{name} {value}")?;
                 }
