@@ -45,14 +45,27 @@ pub struct Storage {
     /// Verify every index checksum on each start. Otherwise the full scan runs
     /// only after an unclean exit or `check --storage`.
     pub verify_index_on_start: bool,
+    /// What backs `state_dir`. `memory` declares a tmpfs or ramfs mount.
+    pub medium: Medium,
 }
 impl Default for Storage {
     fn default() -> Self {
         Self {
             min_free_bytes: 4 << 30,
             verify_index_on_start: false,
+            medium: Medium::Disk,
         }
     }
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Medium {
+    #[default]
+    Disk,
+    /// A memory-backed filesystem: free space is also bounded by the memory
+    /// left to this process, and the contents do not survive a reboot, so
+    /// object storage must be the authority.
+    Memory,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,6 +351,10 @@ impl Config {
         if let Some(durability) = &self.durability {
             durability.validate()?;
         }
+        ensure!(
+            self.storage.medium != Medium::Memory || self.durability.is_some(),
+            "storage.medium = \"memory\" requires [durability]: a memory-backed state_dir does not survive a reboot"
+        );
         ensure!(self.catalog.contains_key("uri"), "catalog.uri is required");
         for key in ["token", "credential"] {
             if let Some(name) = self.catalog.get(&format!("{key}_env")) {
@@ -602,5 +619,18 @@ mod tests {
                 "{case} returned {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn memory_backed_state_requires_remote_durability() {
+        let mut config = valid_config();
+        assert_eq!(config.storage.medium, Medium::Disk);
+        config.storage.medium = Medium::Memory;
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("requires [durability]"));
+        config.durability = Some(flow_durability::Config::new("memory://state"));
+        config.validate().unwrap();
+        let parsed: Storage = toml::from_str("medium = \"memory\"").unwrap();
+        assert_eq!(parsed.medium, Medium::Memory);
     }
 }

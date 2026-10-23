@@ -215,6 +215,7 @@ async fn command(cli: Cli) -> Result<ExitCode> {
         }
         Command::Init => {
             hardening::secure_state_dir(&config.state_dir)?;
+            disk::verify_medium(&config)?;
             source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
             replicated(&config, runtime::initialize(config.clone())).await
@@ -233,6 +234,7 @@ async fn command(cli: Cli) -> Result<ExitCode> {
                 )
             );
             hardening::secure_state_dir(&config.state_dir)?;
+            disk::verify_medium(&config)?;
             source_tls::warn_if_unauthenticated(&config);
             let _http = http::start(&config).await?;
             let compaction = roles.iter().any(|r| r == "compactor");

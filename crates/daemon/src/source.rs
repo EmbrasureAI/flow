@@ -380,7 +380,7 @@ pub(crate) async fn capture_loop(
                         // Do not hold a validated group across SQL/network waits.
                         flush_capture(&mut assembler, &mut journal, &send)?;
                         group_deadline = None;
-                        if crate::disk::capture_should_pause(&crate::disk::available_space, &config.state_dir, config.storage.min_free_bytes) {
+                        if crate::disk::capture_should_pause(crate::disk::space_probe(&config), &config.state_dir, config.storage.min_free_bytes) {
                             disk_low = true;
                             break;
                         }
@@ -596,7 +596,7 @@ pub(crate) async fn capture_loop(
                     &send,
                     &config.state_dir,
                     config.storage.min_free_bytes,
-                    &crate::disk::available_space,
+                    crate::disk::space_probe(&config),
                 )
                 .await?
                 {

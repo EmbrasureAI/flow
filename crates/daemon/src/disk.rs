@@ -1,6 +1,7 @@
-//! Local state volume safety: the free-space budget, the capture watermark, and
-//! RocksDB file descriptor limits.
-use crate::config::Config;
+//! Local state volume safety: the free-space budget, the capture watermark, the
+//! memory-backed state check, and RocksDB file descriptor limits.
+use crate::config::{Config, Medium};
+use anyhow::{Result, bail};
 use std::{
     collections::BTreeSet,
     fs, io,
@@ -34,6 +35,139 @@ pub(crate) fn available_space(path: &Path) -> io::Result<u64> {
     }
 }
 
+/// Free bytes for state on `config.storage.medium`.
+pub(crate) fn space_probe(config: &Config) -> &'static SpaceProbe {
+    match config.storage.medium {
+        Medium::Disk => &available_space,
+        Medium::Memory => &memory_space,
+    }
+}
+
+/// A memory-backed filesystem reports its own size limit, but each byte
+/// written also consumes memory, so the memory left to this process bounds it
+/// too. Running out of memory kills the process instead of failing a write.
+fn memory_space(path: &Path) -> io::Result<u64> {
+    let filesystem = available_space(path)?;
+    Ok(memory_headroom().map_or(filesystem, |memory| filesystem.min(memory)))
+}
+
+/// The smallest headroom under any cgroup v2 memory limit of this process and
+/// the host's available memory. `None` where neither can be read.
+fn memory_headroom() -> Option<u64> {
+    let cgroup = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|membership| {
+            let relative = membership
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))?;
+            cgroup_headroom(
+                Path::new("/sys/fs/cgroup"),
+                Path::new(relative.trim_start_matches('/')),
+            )
+        });
+    let host = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| meminfo_available(&meminfo));
+    [cgroup, host].into_iter().flatten().min()
+}
+
+/// Walk from the process's cgroup to the root. Reclaimable file cache does not
+/// count as used; tmpfs pages are not file cache, so they do.
+fn cgroup_headroom(root: &Path, relative: &Path) -> Option<u64> {
+    relative
+        .ancestors()
+        .filter_map(|ancestor| {
+            let directory = root.join(ancestor);
+            let limit = fs::read_to_string(directory.join("memory.max")).ok()?;
+            let limit = limit.trim().parse::<u64>().ok()?;
+            let current: u64 = fs::read_to_string(directory.join("memory.current"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            let reclaimable = fs::read_to_string(directory.join("memory.stat"))
+                .ok()
+                .and_then(|stat| stat_value(&stat, "inactive_file"))
+                .unwrap_or(0);
+            Some(limit.saturating_sub(current.saturating_sub(reclaimable)))
+        })
+        .min()
+}
+
+fn stat_value(stat: &str, key: &str) -> Option<u64> {
+    stat.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == key).then(|| value.trim().parse().ok())?
+    })
+}
+
+fn meminfo_available(meminfo: &str) -> Option<u64> {
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+/// `init` and `run`: refuse a memory medium the state directory is not on, and
+/// warn about a memory-backed state directory configured as disk, whose free
+/// space would ignore the memory limit.
+pub(crate) fn verify_medium(config: &Config) -> Result<()> {
+    let memory_backed = memory_backed(&config.state_dir)?;
+    match config.storage.medium {
+        Medium::Memory if memory_backed != Some(true) => bail!(crate::exit::config(format!(
+            "storage.medium = \"memory\" but state_dir {} is not on tmpfs or ramfs{}",
+            config.state_dir.display(),
+            if memory_backed.is_none() {
+                " (memory-backed state is supported only on Linux)"
+            } else {
+                ""
+            }
+        ))),
+        Medium::Disk if memory_backed == Some(true) => tracing::warn!(
+            state_dir = %config.state_dir.display(),
+            "state_dir is on a memory-backed filesystem; set storage.medium = \"memory\" so capture pauses before memory runs out{}",
+            if config.durability.is_some() {
+                ""
+            } else {
+                ", and configure [durability] so the state survives a reboot"
+            }
+        ),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Whether the filesystem holding `path` is tmpfs or ramfs; `None` where Flow
+/// cannot tell.
+fn memory_backed(path: &Path) -> Result<Option<bool>> {
+    #[cfg(target_os = "linux")]
+    {
+        const TMPFS_MAGIC: u32 = 0x0102_1994;
+        const RAMFS_MAGIC: u32 = 0x8584_58f6;
+        let mut probe = path;
+        while !probe.exists() {
+            probe = probe.parent().unwrap_or(Path::new("."));
+        }
+        let kind = rustix::fs::statfs(probe)
+            .map_err(io::Error::from)
+            .map_err(|error| {
+                anyhow::Error::new(error).context(format!("statfs {}", probe.display()))
+            })?
+            .f_type as u32;
+        Ok(Some(matches!(kind, TMPFS_MAGIC | RAMFS_MAGIC)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
 /// Space the configured state still needs beyond what it already occupies.
 pub(crate) struct Budget {
     pub available: u64,
@@ -45,6 +179,7 @@ pub(crate) struct Budget {
     pub index: u64,
     /// `storage.min_free_bytes`, below which capture pauses.
     pub reserve: u64,
+    pub medium: Medium,
 }
 
 impl Budget {
@@ -72,6 +207,7 @@ impl Budget {
                 .saturating_sub(directory_bytes(&state.join("spool"))),
             index: largest_generation.max(INDEX_HEADROOM_MIN),
             reserve: config.storage.min_free_bytes,
+            medium: config.storage.medium,
         })
     }
 
@@ -88,8 +224,12 @@ impl Budget {
 
     pub fn describe(&self) -> String {
         format!(
-            "state volume has {:.1} GiB free; unused journal quota {:.1} GiB + spool quota {:.1} GiB + index rebuild headroom {:.1} GiB + storage.min_free_bytes {:.1} GiB = {:.1} GiB",
+            "state volume has {:.1} GiB free{}; unused journal quota {:.1} GiB + spool quota {:.1} GiB + index rebuild headroom {:.1} GiB + storage.min_free_bytes {:.1} GiB = {:.1} GiB",
             self.available as f64 / GIB,
+            match self.medium {
+                Medium::Disk => "",
+                Medium::Memory => " within this process's memory",
+            },
             self.journal as f64 / GIB,
             self.spool as f64 / GIB,
             self.index as f64 / GIB,
@@ -102,7 +242,7 @@ impl Budget {
 /// Startup warning only: quotas are ceilings, and capture pauses before the
 /// volume fills. Measurement failures never prevent a start.
 pub(crate) fn warn_if_insufficient(config: &Config) {
-    match Budget::measure(config, &available_space) {
+    match Budget::measure(config, space_probe(config)) {
         Ok(budget) => {
             metrics::gauge!("flow_state_volume_available_bytes").set(budget.available as f64);
             if budget.sufficient() {
@@ -119,9 +259,13 @@ pub(crate) fn warn_if_insufficient(config: &Config) {
     }
 }
 
-/// `check`: report the budget. A shortfall is a warning, not a failure.
+/// `check`: report the medium and budget. Problems are warnings, not failures,
+/// since `check` may run away from the deployed volume.
 pub(crate) fn check(config: &Config) {
-    match Budget::measure(config, &available_space) {
+    if let Err(error) = verify_medium(config) {
+        println!("warning: {error:#}");
+    }
+    match Budget::measure(config, space_probe(config)) {
         Ok(budget) if budget.sufficient() => println!("{}", budget.describe()),
         Ok(budget) => println!(
             "warning: {}; the volume may fill before the journal or spool quota is reached",
@@ -342,6 +486,82 @@ mod tests {
         let short = Budget::measure(&config, &|_: &Path| Ok(17 << 30)).unwrap();
         assert!(!short.sufficient());
         assert!(short.describe().contains("17.0 GiB free"));
+    }
+
+    #[test]
+    fn memory_headroom_subtracts_unreclaimable_usage_under_every_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |relative: &str, max: &str, current: u64, inactive_file: u64| {
+            let directory = root.path().join(relative);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("memory.max"), format!("{max}\n")).unwrap();
+            fs::write(directory.join("memory.current"), format!("{current}\n")).unwrap();
+            fs::write(
+                directory.join("memory.stat"),
+                format!("anon 1\ninactive_file {inactive_file}\nshmem 2\n"),
+            )
+            .unwrap();
+        };
+        write("pod", "8000", 5000, 1000);
+        write("pod/flow", "max", 4000, 1000);
+        assert_eq!(
+            cgroup_headroom(root.path(), Path::new("pod/flow")),
+            Some(4000)
+        );
+        write("pod/flow", "5000", 4000, 0);
+        assert_eq!(
+            cgroup_headroom(root.path(), Path::new("pod/flow")),
+            Some(1000)
+        );
+        write("pod/flow", "3000", 4000, 0);
+        assert_eq!(cgroup_headroom(root.path(), Path::new("pod/flow")), Some(0));
+        assert_eq!(cgroup_headroom(root.path(), Path::new("elsewhere")), None);
+        assert_eq!(
+            meminfo_available("MemTotal: 16 kB\nMemAvailable:    2048 kB\n"),
+            Some(2 << 20)
+        );
+        assert_eq!(meminfo_available("MemTotal: 16 kB\n"), None);
+    }
+
+    #[test]
+    fn memory_medium_bounds_free_space_and_describes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config(root.path().join("state"));
+        space_probe(&config)(root.path()).unwrap();
+        config.storage.medium = Medium::Memory;
+        space_probe(&config)(root.path()).unwrap();
+        let budget = Budget::measure(&config, &|_: &Path| Ok(18 << 30)).unwrap();
+        assert!(
+            budget
+                .describe()
+                .contains("18.0 GiB free within this process's memory")
+        );
+    }
+
+    #[test]
+    fn memory_medium_requires_a_memory_backed_state_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config(root.path().join("state"));
+        if memory_backed(root.path()).unwrap() != Some(true) {
+            verify_medium(&config).unwrap();
+            config.storage.medium = Medium::Memory;
+            let error = verify_medium(&config).unwrap_err();
+            assert!(format!("{error:#}").contains("is not on tmpfs or ramfs"));
+            assert_eq!(
+                crate::exit::classify(&error).0.code(),
+                crate::exit::classify(&crate::exit::config("x")).0.code()
+            );
+        }
+        #[cfg(target_os = "linux")]
+        if Path::new("/dev/shm").is_dir() {
+            let shm = tempfile::tempdir_in("/dev/shm").unwrap();
+            assert_eq!(memory_backed(shm.path()).unwrap(), Some(true));
+            let mut config = self::config(shm.path().join("state"));
+            config.storage.medium = Medium::Memory;
+            verify_medium(&config).unwrap();
+            config.storage.medium = Medium::Disk;
+            verify_medium(&config).unwrap();
+        }
     }
 
     #[test]

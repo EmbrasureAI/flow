@@ -5,8 +5,8 @@ captured journal and control state. A worker and its entire state volume can be
 lost: the next owner restores the latest checkpoint plus a short log tail and
 resumes, without losing any change acknowledged to the source. The local volume
 remains the working copy and holds the replaceable row index. It may be
-ephemeral, but it needs the same [capacity](operations.md#disk-capacity) as
-without remote durability: there is no mode without local disk.
+ephemeral, or [memory-backed](operations.md#memory-backed-state), but it needs
+the same [capacity](operations.md#disk-capacity) as without remote durability.
 
 Remote durability is opt-in. Without the section, local disk remains the
 authority exactly as before, and journaled acknowledgement still requires
