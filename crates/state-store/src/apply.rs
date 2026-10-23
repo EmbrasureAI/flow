@@ -206,7 +206,10 @@ impl StateStore {
                 .iter()
                 .map(|delta| pk_key(&record.operation.table_id, &delta.key))
                 .collect();
-            let current = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), false);
+            let current = self
+                .0
+                .db
+                .batched_multi_get_cf(&pk_cf, keys.iter(), keys.is_sorted());
             stats.pk_lookup += pk_lookup_started.elapsed();
 
             let reverse_lookup_started = Instant::now();
@@ -219,7 +222,7 @@ impl StateStore {
                 stats.reverse_owner_reads += targets.len();
                 self.0
                     .db
-                    .batched_multi_get_cf(&reverse_cf, targets.iter(), false)
+                    .batched_multi_get_cf(&reverse_cf, targets.iter(), targets.is_sorted())
                     .into_iter()
             });
             stats.reverse_lookup += reverse_lookup_started.elapsed();

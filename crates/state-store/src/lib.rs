@@ -350,6 +350,17 @@ impl StateStore {
             cf.set_write_buffer_size(config.write_buffer_bytes);
             cf.set_max_write_buffer_number(2);
             cf.set_compression_type(DBCompressionType::Lz4);
+            // L0 and L1 hold recent, short-lived data that compaction rewrites
+            // soon; compressing it costs flush and compaction CPU for little disk.
+            cf.set_compression_per_level(&[
+                DBCompressionType::None,
+                DBCompressionType::None,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+            ]);
             ColumnFamilyDescriptor::new(name, cf)
         });
         let db = DB::open_cf_descriptors(&options, path, columns)?;
