@@ -1111,7 +1111,7 @@ def main():
     # Engine limits; defaults keep earlier reports comparable. The managed
     # service uses --commits-per-second 1 --chunk-bytes 33554432
     # --batch-bytes 33554432 --pending-transactions 4096.
-    parser.add_argument("--commits-per-second", type=float, default=100)
+    parser.add_argument("--commits-per-second", type=int, default=100)
     parser.add_argument("--chunk-bytes", type=int, default=1048576)
     parser.add_argument("--batch-bytes", type=int, default=8388608)
     parser.add_argument("--collapse-memory-bytes", type=int, default=32 << 20)
