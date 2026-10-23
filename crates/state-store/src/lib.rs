@@ -125,6 +125,18 @@ impl Default for StateStoreOptions {
         }
     }
 }
+impl StateStoreOptions {
+    /// A short-lived store that one build writes once and then reads, such as
+    /// compaction scratch. Larger memtables flush a quarter as often, so
+    /// RocksDB rewrites the staged mappings far fewer times before the build
+    /// ends. Each running build may hold up to two such memtables.
+    pub fn scratch() -> Self {
+        Self {
+            write_buffer_bytes: 64 << 20,
+            ..Self::default()
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationKind {

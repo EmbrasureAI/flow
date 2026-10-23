@@ -291,6 +291,7 @@ pub async fn build_data(
     >;
     let mut reverse_rows: Option<ReverseRows<'_>> = None;
     let mut mapped_rows = 0u64;
+    let mut stager = Stager::spawn(scratch.clone(), operation_id.clone())?;
     scan_staged_live_columns(
         table,
         &schema,
@@ -381,7 +382,7 @@ pub async fn build_data(
                     }
                 },
             );
-            scratch.stage_deltas(&operation_id, deltas)?;
+            stager.stage(deltas.collect())?;
             mapped_rows += rows as u64;
             Ok(())
         },
@@ -393,6 +394,7 @@ pub async fn build_data(
             "unconsumed reverse rows in compaction input"
         );
     }
+    stager.finish()?;
     check_cancelled(Some(cancelled))?;
     let data_files = writer.close().await?;
     scratch.seal_prepare(
@@ -428,6 +430,63 @@ pub async fn build_data(
             table_id: schema.table_id,
         },
     })
+}
+
+/// Stages mapping batches in order on a dedicated thread, so scratch RocksDB
+/// writes overlap the next batch's decode, index lookups and Parquet encode.
+/// At most `STAGED_BATCHES` batches wait; a full queue blocks the worker as
+/// inline staging did. Dropping it waits for queued batches, so no scratch
+/// write outlives the build.
+struct Stager {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<IndexDelta>>>,
+    thread: Option<std::thread::JoinHandle<flow_state_store::Result<()>>>,
+}
+
+const STAGED_BATCHES: usize = 2;
+
+impl Stager {
+    fn spawn(scratch: StateStore, operation: OperationId) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<IndexDelta>>(STAGED_BATCHES);
+        let thread = std::thread::Builder::new()
+            .name("flow-compaction-stage".into())
+            .spawn(move || {
+                for deltas in receiver {
+                    scratch.stage_deltas(&operation, deltas)?;
+                }
+                Ok(())
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn stage(&mut self, deltas: Vec<IndexDelta>) -> Result<()> {
+        let sender = self.sender.as_ref().expect("stager is open");
+        if sender.send(deltas).is_err() {
+            // The thread stopped on an error; report it rather than the send.
+            self.finish()?;
+            bail!("compaction staging stopped");
+        }
+        Ok(())
+    }
+
+    /// Wait until every queued batch is staged, returning the first failure.
+    fn finish(&mut self) -> Result<()> {
+        self.sender.take();
+        match self.thread.take() {
+            Some(thread) => Ok(thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("compaction staging panicked"))??),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Stager {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
 }
 
 /// Shared v2 files retained after upgrade still protect surviving targets.
@@ -1191,4 +1250,88 @@ async fn load_deletes(
         );
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_model::PrimaryKey;
+    use flow_state_store::StateStoreOptions;
+
+    fn delta(key: u8, position: u64) -> IndexDelta {
+        IndexDelta {
+            key: PrimaryKey(vec![1, key]),
+            expected: None,
+            replacement: Some(RowLocation {
+                data_file_id: FileId("out.parquet".into()),
+                row_position: position,
+                data_sequence_number: 1,
+                spec_id: 0,
+                partition: Vec::new(),
+                source_commit_lsn: PgLsn(0),
+                row_version: 0,
+                row_fingerprint: [0; 16],
+            }),
+        }
+    }
+
+    fn building(name: &str) -> (tempfile::TempDir, StateStore, OperationId) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let operation = OperationId(name.into());
+        store
+            .begin_prepare(PreparedOperation {
+                id: operation.clone(),
+                table_id: TableId(1),
+                kind: OperationKind::Rewrite,
+                base_snapshot_id: None,
+                last_lsn: PgLsn(0),
+                schema_version: 0,
+                artifacts: Vec::new(),
+                payload: Vec::new(),
+            })
+            .unwrap();
+        (directory, store, operation)
+    }
+
+    #[test]
+    fn stager_keeps_batch_order() {
+        let (_directory, store, operation) = building("ordered");
+        let mut stager = Stager::spawn(store.clone(), operation.clone()).unwrap();
+        for batch in 0..5u8 {
+            let deltas = (0..3).map(|row| delta(batch * 3 + row, u64::from(batch * 3 + row)));
+            stager.stage(deltas.collect()).unwrap();
+        }
+        stager.finish().unwrap();
+        store
+            .seal_prepare(&operation, Vec::new(), Vec::new())
+            .unwrap();
+        let staged: Vec<_> = store
+            .prepared_deltas(&operation)
+            .unwrap()
+            .map(|delta| delta.unwrap().key.0[1])
+            .collect();
+        assert_eq!(staged, (0..15).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn stager_reports_the_staging_error() {
+        let (_directory, store, operation) = building("duplicate");
+        let mut stager = Stager::spawn(store, operation).unwrap();
+        stager.stage(vec![delta(1, 0)]).unwrap();
+        // The duplicate key fails on the staging thread; the worker sees it at
+        // a later send or when it waits for the queue to drain.
+        let mut result = stager.stage(vec![delta(1, 1)]);
+        for position in 2..10 {
+            if result.is_err() {
+                break;
+            }
+            result = stager.stage(vec![delta(100 + position as u8, position)]);
+        }
+        let error = result.and_then(|()| stager.finish()).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate primary key"),
+            "{error:#}"
+        );
+    }
 }

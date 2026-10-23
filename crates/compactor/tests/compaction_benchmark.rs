@@ -326,7 +326,7 @@ struct Sample {
 
 async fn run(fixture: &Fixture, iteration: usize) -> Sample {
     let scratch_dir = TempDir::new().unwrap();
-    let scratch = StateStore::open(scratch_dir.path(), StateStoreOptions::default()).unwrap();
+    let scratch = StateStore::open(scratch_dir.path(), StateStoreOptions::scratch()).unwrap();
     // Reset the peak-RSS watermark so it measures this compaction only.
     std::fs::write("/proc/self/clear_refs", "5").unwrap();
     let rss_before = status_kib("VmRSS:");
