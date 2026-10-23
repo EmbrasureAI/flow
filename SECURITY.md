@@ -55,7 +55,9 @@ Deployment choices are outside Flow's control but worth knowing:
   or other users can write to it. On shared volumes, point `state_dir` at a
   subdirectory Flow creates, such as `/data/state`, to avoid both. Readers of
   `metrics.prom` or `status` must run as the Flow user; otherwise use the HTTP
-  listener. Backups of `state_dir` contain row data.
+  listener. Backups of `state_dir` contain row data, as does a
+  [remote durability](docs/remote-durability.md) prefix; restrict access to it
+  like the warehouse.
 - **Container image.** The image built from the Dockerfile runs as UID 10001 and its `/data` is `0700`.
   Runtimes that assign an arbitrary UID (such as OpenShift) cannot use it; mount
   a volume writable by that UID and set `state_dir` inside it.

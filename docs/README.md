@@ -8,6 +8,7 @@
 - [Observability](observability.md): status, watermarks, metrics and operational diagnosis.
 - [Operations](operations.md): source preflight, resynchronization, adding tables, planned maintenance and capacity.
 - [Upgrading](upgrading.md): release compatibility policy and upgrade procedure.
+- [Remote durability](remote-durability.md): replicating the journal and control state to object storage, ownership, recovery and cost.
 - [Changelog](../CHANGELOG.md) and [security policy](../SECURITY.md).
 - [Iceberg v3](iceberg-v3.md): deletion vectors, upgrades and compatibility checks.
 - [Performance](performance.md): recorded throughput, publication latency and reader overhead.
@@ -21,6 +22,7 @@
 - [Compaction protocol](local-compaction.md): background builds, catch-up and activation.
 - [Local tests](../tests/local/README.md) and [service integration](../tests/production/README.md).
 - [V2/v3 benchmark](benchmarks/v3-deletion-vectors.md): workload, results, limitations and reproduction.
+- [Remote durability benchmark](benchmarks/remote-durability.md): freshness, recovery and fault results against emulated and real object storage.
 
 ## Dependencies and references
 

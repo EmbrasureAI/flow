@@ -151,13 +151,25 @@ impl RowDeltaAction {
     /// is searched before any new files or snapshots are published.
     pub async fn commit(&self, catalog: &dyn Catalog, table: &Table) -> Result<CommitResult> {
         let head = catalog.load_table(table.identifier()).await?;
+        self.commit_on_loaded_table(catalog, &head).await
+    }
+
+    /// Commit against a head the caller loaded and validated. The catalog still
+    /// checks UUID, snapshot, schema and spec requirements atomically, so a
+    /// stale head fails its compare-and-swap instead of publishing. After an
+    /// ambiguous result, load a fresh head before retrying.
+    pub async fn commit_on_loaded_table(
+        &self,
+        catalog: &dyn Catalog,
+        head: &Table,
+    ) -> Result<CommitResult> {
         if head.metadata().uuid() != self.base.uuid {
             return Err(conflict("table identity changed"));
         }
-        if let Some(committed) = recovered(&head, &self.operation_id, OPERATION_ID_KEY) {
+        if let Some(committed) = recovered(head, &self.operation_id, OPERATION_ID_KEY) {
             return Ok(committed);
         }
-        self.base.validate(&head)?;
+        self.base.validate(head)?;
         if self.require_base_snapshot
             && head.metadata().current_snapshot_id() != self.base.snapshot_id
         {
@@ -176,7 +188,7 @@ impl RowDeltaAction {
                 "position deletes require referenced-data-file validation",
             ));
         }
-        let view = SnapshotView::current_with_cache(&head, &self.cache).await?;
+        let view = SnapshotView::current_with_cache(head, &self.cache).await?;
         validate_inputs(&view, &self.referenced_data, DataContentType::Data)?;
         if let Some(base_id) = self
             .base
@@ -184,7 +196,7 @@ impl RowDeltaAction {
             .filter(|id| Some(*id) != view.snapshot_id)
             && !self.referenced_data.is_empty()
         {
-            let original = SnapshotView::load_with_cache(&head, base_id, &self.cache).await?;
+            let original = SnapshotView::load_with_cache(head, base_id, &self.cache).await?;
             validate_inputs(&original, &self.referenced_data, DataContentType::Data)?;
             for path in &self.referenced_data {
                 let before = &original.live_files[path];
@@ -203,7 +215,7 @@ impl RowDeltaAction {
             DataContentType::PositionDeletes,
         )?;
         validate_additions(
-            &head,
+            head,
             &view,
             &self.added_data,
             &self.added_deletes,
@@ -225,7 +237,7 @@ impl RowDeltaAction {
         };
         publish(
             catalog,
-            &head,
+            head,
             &view,
             Publication {
                 artifact_tracker: self.artifact_tracker.as_deref(),
@@ -744,6 +756,9 @@ async fn publish(
         );
         tracker.register(artifacts).await?;
     }
+    // Manifests are independent objects; write them concurrently, then the
+    // list that names them. Each object store round trip delays visibility.
+    let mut writers = Vec::new();
     let mut manifest_number = 0;
     for (manifest, entries) in rewritten {
         let mut writer =
@@ -773,7 +788,7 @@ async fn publish(
                 )?;
             }
         }
-        manifests.push(writer.write_manifest_file().await?);
+        writers.push(writer);
     }
     for (files, removed, content, sequence) in [
         (
@@ -806,8 +821,16 @@ async fn publish(
                 entry.file_sequence_number,
             )?;
         }
-        manifests.push(writer.write_manifest_file().await?);
+        writers.push(writer);
     }
+    manifests.extend(
+        futures::future::try_join_all(
+            writers
+                .into_iter()
+                .map(|writer| writer.write_manifest_file()),
+        )
+        .await?,
+    );
     let manifest_list = format!("{root}-list.avro");
     let mut writer = manifest_list_writer(
         table,

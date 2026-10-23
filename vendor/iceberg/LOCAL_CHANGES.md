@@ -65,6 +65,7 @@ patch -p1 < docs/patches/iceberg-uuid.patch
 patch -p1 < docs/patches/iceberg-v3.patch
 patch -p1 < docs/patches/iceberg-source-nullability.patch
 patch -p1 < docs/patches/iceberg-debug-redaction.patch
+patch -p1 < docs/patches/iceberg-dv-observed-size.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is
@@ -87,3 +88,11 @@ redacted values, since they carry object-store credentials; `FileIO` and
 
 `src/puffin/deletion_vector.rs` is new Embrasure Flow code added by the v3 patch,
 not Apache Software Foundation code; it carries its own Apache-2.0 header.
+
+The observed-size DV patch adds `read_deletion_vector_with_size`, allowing a
+caller that has already observed the immutable object's size in its current
+operation to reuse it. It preserves the original reader entry point and all
+range/footer/blob/bitmap validation. Flow's delete staging uses this to avoid
+repeating HEAD for descriptors sharing a Puffin file. Changed files:
+`src/puffin/deletion_vector.rs` and `src/puffin/mod.rs`. See
+`docs/patches/iceberg-dv-observed-size.patch`.

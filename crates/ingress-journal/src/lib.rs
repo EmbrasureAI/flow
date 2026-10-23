@@ -120,6 +120,47 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Receives locally durable journal bytes in write order, for replication to
+/// independent storage. Calls are made by the single journal owner after the
+/// corresponding local sync. Implementations must not wait for remote
+/// durability here; external effects wait on their own barrier instead.
+pub trait Mirror: Send + Sync {
+    /// Bytes `[offset, offset + len)` of `segment` are locally durable.
+    fn extent(&self, segment: u64, offset: u64, len: u64) -> io::Result<()>;
+    /// `reclaimed` is persisted locally and segments below `first_retained`
+    /// are no longer needed. Returns the first segment to keep for now: one
+    /// whose bytes the mirror has not copied yet stays until a later reclaim.
+    fn reclaim(&self, reclaimed: PgLsn, first_retained: u64) -> io::Result<u64>;
+}
+
+/// The files that make up a journal: its reclaim watermark and the current
+/// length of every retained segment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Layout {
+    pub root: PathBuf,
+    pub reclaimed: PgLsn,
+    pub segments: BTreeMap<u64, u64>,
+    /// Segment and offset where opening cut a damaged tail. Bytes from there
+    /// on may differ from any copy taken before the journal opened.
+    pub repaired: Option<(u64, u64)>,
+}
+
+/// File name of a segment below the journal root.
+pub fn segment_file_name(id: u64) -> String {
+    format!("{id:020}.segment")
+}
+
+/// Persist a reclaim watermark into a journal root that is not open, such as
+/// one being restored from replicated storage.
+pub fn write_reclaimed(root: &Path, lsn: PgLsn) -> Result<()> {
+    write_checkpoint(root, lsn)
+}
+
+/// Read the reclaim watermark of a journal root that is not open.
+pub fn read_reclaimed(root: &Path) -> Result<PgLsn> {
+    read_checkpoint(root)
+}
+
 pub trait ChunkReader {
     fn chunks(&self, chunks: &JournalChunks) -> Result<ChunkIter>;
     fn read_chunk(&self, reference: &JournalChunkRef) -> Result<Vec<u8>>;
@@ -200,6 +241,10 @@ pub struct Journal {
     staged_lsn: PgLsn,
     reclaimed_lsn: PgLsn,
     poisoned: bool,
+    mirror: Option<Arc<dyn Mirror>>,
+    /// Segment and offset through which bytes were handed to `mirror`.
+    shipped: (u64, u64),
+    repaired_tail: Option<(u64, u64)>,
 }
 
 impl Journal {
@@ -249,7 +294,7 @@ impl Journal {
         let mut sequence = None;
         let mut durable_lsn = reclaimed_lsn;
         let mut segment_pins = BTreeMap::new();
-        let mut truncated = false;
+        let mut repaired_tail = None;
         let mut repaired = BTreeMap::new();
         let last = segments.last_key_value().map(|(&id, _)| id);
         for (&id, &size) in &segments {
@@ -367,11 +412,11 @@ impl Journal {
                 truncated_bytes += size - offset;
                 file.set_len(offset)?;
                 file.sync_all()?;
-                truncated = true;
+                repaired_tail = Some((id, offset));
             }
             repaired.insert(id, offset);
         }
-        if truncated {
+        if repaired_tail.is_some() {
             sync_dir(&root)?;
         }
         // Incomplete transactions have no terminal marker and must be resent by
@@ -428,6 +473,9 @@ impl Journal {
             staged_lsn: durable_lsn,
             reclaimed_lsn,
             poisoned: false,
+            mirror: None,
+            shipped: (segment, offset),
+            repaired_tail,
         };
         // Terminal aborts separate orphan chunks from a future transaction that
         // reuses the same XID. Without them the next recovery could join both.
@@ -446,6 +494,51 @@ impl Journal {
 
     pub fn durable_lsn(&self) -> PgLsn {
         self.durable_lsn
+    }
+
+    /// Current files of this journal. Every byte is locally durable once
+    /// `open` returns or `flush_commits` succeeds.
+    pub fn layout(&self) -> Layout {
+        Layout {
+            root: self.root.clone(),
+            reclaimed: self.reclaimed_lsn,
+            segments: self.segments.clone(),
+            repaired: self.repaired_tail,
+        }
+    }
+
+    /// Replicate every byte made durable after this call. The caller covers
+    /// the current `layout` separately, for example with a full copy.
+    pub fn attach_mirror(&mut self, mirror: Arc<dyn Mirror>) {
+        self.shipped = (self.segment, self.offset);
+        self.mirror = Some(mirror);
+    }
+
+    /// Hand every locally synchronized byte to the mirror, oldest first.
+    /// Rollover synced earlier segments; the caller synced the active one.
+    fn ship(&mut self) -> Result<()> {
+        let Some(mirror) = &self.mirror else {
+            return Ok(());
+        };
+        let (mut segment, mut offset) = self.shipped;
+        while segment <= self.segment {
+            let end = if segment == self.segment {
+                self.offset
+            } else {
+                self.segments.get(&segment).copied().unwrap_or(offset)
+            };
+            if end > offset {
+                mirror.extent(segment, offset, end - offset)?;
+            }
+            if segment == self.segment {
+                offset = end;
+                break;
+            }
+            segment += 1;
+            offset = 0;
+        }
+        self.shipped = (segment, offset);
+        Ok(())
     }
     /// Last complete terminal written by this owner, possibly not yet durable.
     /// This is an ordering/replay guard, never an acknowledgement frontier.
@@ -572,6 +665,10 @@ impl Journal {
             self.poisoned = true;
             return Err(error.into());
         }
+        if let Err(error) = self.ship() {
+            self.poisoned = true;
+            return Err(error);
+        }
         self.durable_lsn = self.staged_lsn;
         let mut catalog = self
             .catalog
@@ -655,6 +752,7 @@ impl Journal {
                 return Err(Error::Corrupt);
             }
         }
+        let previous_lsn = self.reclaimed_lsn;
         if materialized_lsn > self.reclaimed_lsn {
             write_checkpoint(&self.root, materialized_lsn)?;
         }
@@ -685,11 +783,22 @@ impl Journal {
             )
             .min()
             .unwrap_or(self.segment);
-        let removable: Vec<_> = self
+        let mut removable: Vec<_> = self
             .segments
             .range(..oldest)
             .map(|(&id, &size)| (id, size))
             .collect();
+        if let Some(mirror) = &self.mirror
+            && (materialized_lsn > previous_lsn || !removable.is_empty())
+        {
+            match mirror.reclaim(materialized_lsn, oldest) {
+                Ok(kept) => removable.retain(|(id, _)| *id < kept),
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
+            }
+        }
         let mut removed = 0;
         for (id, size) in removable {
             transactions::remove(&self.root, id)?;
@@ -798,7 +907,7 @@ impl Journal {
 }
 
 fn segment_path(root: &Path, id: u64) -> PathBuf {
-    root.join(format!("{id:020}.segment"))
+    root.join(segment_file_name(id))
 }
 // Persist each new directory's entry in its parent before creating descendants.
 fn create_dir_all_durable(

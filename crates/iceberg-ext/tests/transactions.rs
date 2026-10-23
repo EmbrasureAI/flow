@@ -870,3 +870,35 @@ async fn discarded_data_singletons_leave_budget_for_delete_manifest_merge() {
         assert_eq!(current.file_sequence_number, original.file_sequence_number);
     }
 }
+
+#[tokio::test]
+async fn loaded_head_publication_still_fences_a_concurrent_snapshot() {
+    let (catalog, empty) = setup().await;
+    let stale = RowDeltaAction::new(&empty, "stale-loaded-head")
+        .require_base_snapshot()
+        .add_data_files(vec![data("stale-loaded-output")]);
+    let committed = RowDeltaAction::new(&empty, "concurrent-winner")
+        .add_data_files(vec![data("concurrent-output")])
+        .commit(&catalog, &empty)
+        .await
+        .unwrap();
+    assert!(
+        stale
+            .commit_on_loaded_table(&catalog, &empty)
+            .await
+            .is_err()
+    );
+    let current = catalog.load_table(empty.identifier()).await.unwrap();
+    assert_eq!(
+        current.metadata().current_snapshot_id(),
+        Some(committed.snapshot_id)
+    );
+    assert!(find_operation(current.metadata(), "stale-loaded-head").is_none());
+    let replay = RowDeltaAction::new(&empty, "concurrent-winner")
+        .add_data_files(vec![data("concurrent-output")])
+        .commit_on_loaded_table(&catalog, &current)
+        .await
+        .unwrap();
+    assert!(replay.already_committed);
+    assert_eq!(replay.snapshot_id, committed.snapshot_id);
+}

@@ -169,6 +169,49 @@ fn reclamation_preserves_slow_transactions_and_recovery_watermark() {
 }
 
 #[test]
+fn a_mirror_keeps_segments_it_has_not_copied_until_a_later_reclaim() {
+    struct Lagging(
+        std::sync::Mutex<Vec<(PgLsn, u64)>>,
+        std::sync::atomic::AtomicU64,
+    );
+    impl flow_ingress_journal::Mirror for Lagging {
+        fn extent(&self, _: u64, _: u64, _: u64) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn reclaim(&self, reclaimed: PgLsn, first_retained: u64) -> std::io::Result<u64> {
+            self.0.lock().unwrap().push((reclaimed, first_retained));
+            Ok(first_retained.min(self.1.load(std::sync::atomic::Ordering::SeqCst)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut journal, _) = Journal::open(dir.path(), config()).unwrap();
+    let mirror = std::sync::Arc::new(Lagging(Default::default(), 1.into()));
+    journal.attach_mirror(mirror.clone());
+    for xid in 1..=6 {
+        let reference = journal.append_chunk(xid, &[xid as u8; 300]).unwrap();
+        journal
+            .commit(transaction(xid, u64::from(xid) * 10, vec![reference]))
+            .unwrap();
+    }
+    let before = journal.layout().segments.len();
+    assert!(journal.reclaim(PgLsn(41)).unwrap() > 0);
+    // Only segments below the one the mirror still needs were removed.
+    let kept = journal.layout().segments;
+    assert_eq!(kept.keys().next(), Some(&1));
+    assert!(kept.len() < before);
+    // Once the mirror caught up, a later reclaim removes the rest.
+    mirror
+        .1
+        .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+    journal.reclaim(PgLsn(41)).unwrap();
+    let calls = mirror.0.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(journal.layout().segments.keys().next(), Some(&calls[1].1));
+    assert!(calls[1].1 > 1);
+}
+
+#[test]
 fn quota_and_exclusive_ownership_do_not_advance_durability() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config();

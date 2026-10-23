@@ -56,7 +56,10 @@ async fn run(config: &Config, report: &mut Report) {
         Err(error) => return report.add(Level::Fail, "connection", format!("{error:#}")),
     };
     report.add(Level::Ok, "connection", "SQL login connected");
-    let initialized = config.state_dir.join("source-identity.json").exists();
+    let initialized = config
+        .state_dir
+        .join(crate::source::SOURCE_IDENTITY)
+        .exists();
     let version = match server(&sql, config, report).await {
         Ok(version) => version,
         Err(error) => {

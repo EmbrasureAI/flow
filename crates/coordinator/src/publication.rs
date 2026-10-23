@@ -11,11 +11,13 @@ use crate::artifacts::{MetadataRegistration, WriterRegistration};
 use crate::blocking;
 use anyhow::{Result, ensure};
 use flow_iceberg_ext::{
-    ArtifactTracker, CommitBase, ManifestCache, RowDeltaAction, find_operation, read_artifact_plan,
-    write_artifact_plan,
+    ArtifactPlan, ArtifactTracker, CommitBase, ManifestCache, RowDeltaAction, find_operation,
+    read_artifact_plan, write_artifact_plan,
 };
-use flow_materializer::{DataWriter, DeleteWriter, WriterConfig, WrittenBatch, iceberg_schema};
-use flow_model::{OperationId, TableSchema};
+use flow_materializer::{
+    DataWriter, DeleteWriter, WriterConfig, WrittenBatch, iceberg_schema, rows_from_batch,
+};
+use flow_model::{OperationId, TableSchema, carry_forward_unchanged, row_has_unchanged};
 use flow_state_store::{
     CollapsedMutation, ControlStore, IndexDelta, MemoryRows, OperationKind, OperationPhase,
     OperationRecord, PreparedOperation, StateStore,
@@ -23,7 +25,7 @@ use flow_state_store::{
 use iceberg::{Catalog, spec::DataFile, table::Table};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -37,6 +39,15 @@ struct RecoveryPlan {
     #[serde(default)]
     removed_deletes: BTreeSet<String>,
     properties: HashMap<String, String>,
+}
+
+/// The head this publish call validated before writing artifacts, and the exact
+/// files it sealed. Only that call constructs it; restarts always read the
+/// persisted plan and a fresh catalog head. The catalog compare-and-swap still
+/// rejects a head that changed meanwhile.
+struct FreshPublication {
+    head: Table,
+    files: ArtifactPlan,
 }
 
 /// Resolve a persisted catalog action without relying on the replaceable index.
@@ -61,6 +72,7 @@ pub async fn resolve_catalog_operation(
             table,
             ManifestCache::default(),
             tracker,
+            None,
         )
         .await?
         .map(|(snapshot, sequence, _)| (snapshot, sequence))),
@@ -82,12 +94,16 @@ async fn resolve_ingest_catalog_operation(
     table: &Table,
     cache: ManifestCache,
     tracker: Option<Arc<dyn ArtifactTracker>>,
+    fresh: Option<FreshPublication>,
 ) -> Result<Option<(i64, i64, bool)>> {
     if record.phase == OperationPhase::Building {
         return Ok(None);
     }
     let plan: RecoveryPlan = serde_json::from_slice(&record.operation.payload)?;
-    let head = catalog.load_table(table.identifier()).await?;
+    let (head, fresh_files) = match fresh {
+        Some(fresh) => (fresh.head, Some(fresh.files)),
+        None => (catalog.load_table(table.identifier()).await?, None),
+    };
     ensure!(
         head.metadata().uuid() == plan.base.uuid,
         "table incarnation changed during recovery"
@@ -122,7 +138,10 @@ async fn resolve_ingest_catalog_operation(
     if head.metadata().current_snapshot_id() != plan.base.snapshot_id {
         return Ok(None);
     }
-    let files = read_artifact_plan(head.file_io(), &plan.manifest_list).await?;
+    let files = match fresh_files {
+        Some(files) => files,
+        None => read_artifact_plan(head.file_io(), &plan.manifest_list).await?,
+    };
     let outcome = RowDeltaAction::from_base(plan.base.clone(), record.operation.id.0.clone())
         .require_base_snapshot()
         .add_data_files(files.added_data)
@@ -132,7 +151,7 @@ async fn resolve_ingest_catalog_operation(
         .with_properties(plan.properties)
         .with_manifest_cache(cache)
         .with_artifact_tracker(tracker)
-        .commit(catalog, &head)
+        .commit_on_loaded_table(catalog, &head)
         .await;
     match outcome {
         Ok(committed) => Ok(Some((
@@ -180,6 +199,7 @@ pub struct TablePublisher {
     batch_rows: usize,
     batch_bytes: usize,
     manifest_cache: ManifestCache,
+    read_limits: flow_compactor::ReadLimits,
 }
 impl TablePublisher {
     pub fn new(
@@ -204,7 +224,16 @@ impl TablePublisher {
             batch_rows,
             batch_bytes,
             manifest_cache: ManifestCache::default(),
+            read_limits: flow_compactor::ReadLimits::default(),
         })
+    }
+
+    /// Bounds for reading indexed original rows whose unchanged values an
+    /// update carries forward.
+    pub fn with_read_limits(mut self, limits: flow_compactor::ReadLimits) -> Result<Self> {
+        limits.validate()?;
+        self.read_limits = limits;
+        Ok(self)
     }
     /// Parsed manifests shared by every table's publications.
     pub fn manifest_cache(&self) -> &ManifestCache {
@@ -391,7 +420,7 @@ impl TablePublisher {
                     Some(first) => Some(first),
                     None => batches.next().await?,
                 };
-                let Some(mutations) = mutations else {
+                let Some(mut mutations) = mutations else {
                     let started = Instant::now();
                     let files = data_writer
                         .take()
@@ -400,6 +429,8 @@ impl TablePublisher {
                         .await?;
                     return Ok((DataOutput::Complete(files), started, Instant::now()));
                 };
+                self.carry_forward_unchanged(&table, schema, &mut mutations)
+                    .await?;
                 let rows = mutations
                     .iter()
                     .filter_map(|m| m.row.as_ref())
@@ -574,12 +605,28 @@ impl TablePublisher {
             other_prepare_ms = other_prepare.as_secs_f64() * 1000.0,
             "ingest artifacts and index deltas prepared"
         );
-        self.recover(&table, &epoch.id).await
+        let fresh = FreshPublication {
+            head: table.clone(),
+            files: ArtifactPlan {
+                added_data: data_files,
+                added_deletes: delete_files,
+            },
+        };
+        self.recover_inner(&table, &epoch.id, Some(fresh)).await
     }
 
     /// Resume Prepared/Committed operations. Building outputs were never eligible
     /// for publication and require deliberate discard/rebuild with new artifact IDs.
     pub async fn recover(&self, table: &Table, id: &OperationId) -> Result<Option<i64>> {
+        self.recover_inner(table, id, None).await
+    }
+
+    async fn recover_inner(
+        &self,
+        table: &Table,
+        id: &OperationId,
+        fresh: Option<FreshPublication>,
+    ) -> Result<Option<i64>> {
         let store = self.store.clone();
         let op = id.clone();
         let record = blocking(move || Ok(store.operation(&op)?))
@@ -601,6 +648,7 @@ impl TablePublisher {
                     self.catalog.as_ref(),
                     table,
                     self.manifest_cache.clone(),
+                    None,
                     None,
                 )
                 .await?;
@@ -630,6 +678,7 @@ impl TablePublisher {
                             record.operation.table_id,
                             record.operation.id.clone(),
                         )?),
+                        fresh,
                     )
                     .await?
                 else {
@@ -700,6 +749,80 @@ impl TablePublisher {
         metrics::histogram!("flow_index_apply_seconds", "table_id" => table_label)
             .record(apply_started.elapsed().as_secs_f64());
         Ok(snapshot)
+    }
+
+    /// Complete updates that omitted unchanged values, such as out-of-line
+    /// PostgreSQL TOAST columns under DEFAULT replica identity. Each value comes
+    /// from the key's indexed original row at the exact bound head; that row's
+    /// recorded fingerprint must match before any value is reused.
+    async fn carry_forward_unchanged(
+        &self,
+        table: &Table,
+        schema: &TableSchema,
+        mutations: &mut [CollapsedMutation],
+    ) -> Result<()> {
+        let mut files = BTreeMap::<&str, Vec<(u64, usize)>>::new();
+        for (index, mutation) in mutations.iter().enumerate() {
+            if !mutation.row.as_ref().is_some_and(row_has_unchanged) {
+                continue;
+            }
+            let original = mutation.original.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("an update omitting unchanged values has no indexed original row")
+            })?;
+            files
+                .entry(&original.data_file_id.0)
+                .or_default()
+                .push((original.row_position, index));
+        }
+        if files.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut targets = Vec::with_capacity(files.len());
+        for (path, mut rows) in files {
+            rows.sort_unstable();
+            ensure!(
+                rows.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "two keys reference the same indexed physical row"
+            );
+            targets.push((path.to_owned(), rows));
+        }
+        let mut resolved = 0u64;
+        for (path, rows) in targets {
+            let positions: Vec<_> = rows.iter().map(|(position, _)| *position).collect();
+            let batches = flow_compactor::read_positions(
+                table.file_io(),
+                &path,
+                &positions,
+                self.batch_rows,
+                &self.read_limits,
+            )
+            .await?;
+            let mut next = rows.iter();
+            for batch in &batches {
+                for previous in rows_from_batch(schema, batch)? {
+                    let (_, index) = next
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("unexpected original row"))?;
+                    let mutation = &mut mutations[*index];
+                    let original = mutation.original.as_ref().expect("selected above");
+                    ensure!(
+                        schema.fingerprint(&previous)? == original.row_fingerprint,
+                        "indexed original row differs from its recorded fingerprint"
+                    );
+                    let row = mutation.row.as_mut().expect("selected above");
+                    carry_forward_unchanged(row, &previous)?;
+                    schema.validate_row(row)?;
+                    resolved += 1;
+                }
+            }
+            ensure!(next.next().is_none(), "original row was not read");
+        }
+        metrics::counter!("flow_unchanged_rows_resolved_total", "table_id" => schema.table_id.0.to_string())
+            .increment(resolved);
+        metrics::histogram!("flow_unchanged_resolution_seconds", "table_id" => schema.table_id.0.to_string())
+            .record(started.elapsed().as_secs_f64());
+        Ok(())
     }
 
     fn collapsed_batches(

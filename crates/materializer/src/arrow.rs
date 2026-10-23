@@ -52,6 +52,16 @@ pub fn iceberg_schema(schema: &TableSchema) -> Result<iceberg::spec::Schema> {
 }
 
 pub fn arrow_schema(schema: &TableSchema) -> SchemaRef {
+    arrow_schema_with(schema, false)
+}
+
+/// Iceberg's Arrow mapping, which the Parquet writer uses, reads binary as
+/// LargeBinary. Building writer batches with it avoids converting each batch.
+pub fn writer_arrow_schema(schema: &TableSchema) -> SchemaRef {
+    arrow_schema_with(schema, true)
+}
+
+fn arrow_schema_with(schema: &TableSchema, large_binary: bool) -> SchemaRef {
     Arc::new(Schema::new(
         schema
             .columns
@@ -63,6 +73,7 @@ pub fn arrow_schema(schema: &TableSchema) -> SchemaRef {
                     ColumnType::Int64 => DataType::Int64,
                     ColumnType::Float64 => DataType::Float64,
                     ColumnType::String => DataType::Utf8,
+                    ColumnType::Binary if large_binary => DataType::LargeBinary,
                     ColumnType::Binary => DataType::Binary,
                     ColumnType::Date => DataType::Date32,
                     ColumnType::TimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -92,6 +103,18 @@ pub fn rows_to_batch(schema: &TableSchema, rows: &[impl Borrow<Row>]) -> Result<
     for row in rows {
         schema.validate_row(row.borrow())?;
     }
+    Ok(RecordBatch::try_new(
+        arrow_schema(schema),
+        validated_columns(schema, rows, false)?,
+    )?)
+}
+
+/// Columns for rows the caller has already validated against `schema`.
+pub(crate) fn validated_columns(
+    schema: &TableSchema,
+    rows: &[impl Borrow<Row>],
+    large_binary: bool,
+) -> Result<Vec<ArrayRef>> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.columns.len());
     for (index, col) in schema.columns.iter().enumerate() {
         macro_rules! primitive {
@@ -130,14 +153,17 @@ pub fn rows_to_batch(schema: &TableSchema, rows: &[impl Borrow<Row>]) -> Result<
                     })
                     .collect::<StringArray>(),
             ),
-            ColumnType::Binary => Arc::new(
-                rows.iter()
-                    .map(|r| match &r.borrow()[index] {
-                        Value::Binary(v) => Some(v.as_slice()),
-                        _ => None,
-                    })
-                    .collect::<BinaryArray>(),
-            ),
+            ColumnType::Binary => {
+                let values = rows.iter().map(|r| match &r.borrow()[index] {
+                    Value::Binary(v) => Some(v.as_slice()),
+                    _ => None,
+                });
+                if large_binary {
+                    Arc::new(values.collect::<LargeBinaryArray>()) as ArrayRef
+                } else {
+                    Arc::new(values.collect::<BinaryArray>())
+                }
+            }
             ColumnType::Uuid => Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                 rows.iter().map(|r| match &r.borrow()[index] {
                     Value::Uuid(v) => Some(v.as_slice()),
@@ -157,7 +183,7 @@ pub fn rows_to_batch(schema: &TableSchema, rows: &[impl Borrow<Row>]) -> Result<
         };
         arrays.push(array);
     }
-    Ok(RecordBatch::try_new(arrow_schema(schema), arrays)?)
+    Ok(arrays)
 }
 
 /// Decode a scan batch by stable field ID. Missing additive nullable fields become null.

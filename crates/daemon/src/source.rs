@@ -57,11 +57,13 @@ pub(crate) fn open_source_journal(
     config: &Config,
     ledger: &flow_coordinator::SourceLedger,
 ) -> Result<(Journal, flow_ingress_journal::Recovery)> {
-    Ok(Journal::open_with_floor(
+    let (mut journal, recovery) = Journal::open_with_floor(
         config.state_dir.join("journal"),
         crate::services::journal_config(config),
         ledger.watermarks().journal_durable_lsn,
-    )?)
+    )?;
+    crate::durability::attach_journal(&mut journal)?;
+    Ok((journal, recovery))
 }
 
 /// FULL replica identity describes row images, not the uniqueness contract.
@@ -224,6 +226,8 @@ pub(crate) async fn capture_loop(
         let mut journal_drained_at = None;
         metrics::gauge!("flow_capture_journal_full").set(0.0);
         loop {
+            // Progress admitted on one connection is never replayed to another.
+            let mut gate = crate::durability::AckGate::default();
             let connected = tokio::select! {
                 _ = send.closed() => return Ok(()),
                 result = connect_owned(&config, true) => result,
@@ -268,7 +272,7 @@ pub(crate) async fn capture_loop(
                 .await?;
                 source.set_max_streamed_transactions(config.limits.spool_transactions);
                 let initial_progress = *ack.borrow_and_update();
-                acknowledge_and_reclaim(&mut source, &mut journal, initial_progress).await?;
+                acknowledge_and_reclaim(&mut source, &mut journal, &mut gate, initial_progress).await?;
                 Ok((source, sql, sql_connection, effective_schemas))
             })
             .await;
@@ -336,7 +340,17 @@ pub(crate) async fn capture_loop(
                         // Feedback covers an already durable prefix. Let the
                         // next group fill instead of sealing it for its own ACK.
                         let progress = *ack.borrow_and_update();
-                        match acknowledge_and_reclaim(&mut source, &mut journal, progress).await {
+                        match acknowledge_and_reclaim(&mut source, &mut journal, &mut gate, progress).await {
+                            Ok(()) => {},
+                            Err(error) if retryable_connection(&error) => {
+                                tracing::warn!(%error, "source feedback disconnected"); break;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    durable = gate.ready_signal(), if gate.is_pending() => {
+                        durable?;
+                        match acknowledge(&mut source, gate.ready()).await {
                             Ok(()) => {},
                             Err(error) if retryable_connection(&error) => {
                                 tracing::warn!(%error, "source feedback disconnected"); break;
@@ -366,7 +380,7 @@ pub(crate) async fn capture_loop(
                         // Do not hold a validated group across SQL/network waits.
                         flush_capture(&mut assembler, &mut journal, &send)?;
                         group_deadline = None;
-                        if crate::disk::capture_should_pause(&crate::disk::available_space, &config.state_dir, config.storage.min_free_bytes) {
+                        if crate::disk::capture_should_pause(crate::disk::space_probe(&config), &config.state_dir, config.storage.min_free_bytes) {
                             disk_low = true;
                             break;
                         }
@@ -405,7 +419,7 @@ pub(crate) async fn capture_loop(
                         // Feedback is independent of publication notifications;
                         // the journal quota bounds capture during a long backlog.
                         let progress = *ack.borrow();
-                        match acknowledge_and_reclaim(&mut source, &mut journal, progress).await {
+                        match acknowledge_and_reclaim(&mut source, &mut journal, &mut gate, progress).await {
                             Ok(()) => {},
                             Err(error) if retryable_connection(&error) => {
                                 tracing::warn!(%error, "source heartbeat disconnected"); break;
@@ -582,7 +596,7 @@ pub(crate) async fn capture_loop(
                     &send,
                     &config.state_dir,
                     config.storage.min_free_bytes,
-                    &crate::disk::available_space,
+                    crate::disk::space_probe(&config),
                 )
                 .await?
                 {
@@ -627,17 +641,31 @@ pub(crate) async fn capture_loop(
 
 // Startup and later notifications must reclaim the same proven prefix before
 // capture can append more WAL, including when no new watch notification arrives.
+// With remote durability, the source sees only progress whose local state is
+// already replicated; publishing it required a barrier, so reclaim needs none.
 async fn acknowledge_and_reclaim(
     source: &mut impl PostgresSource,
     journal: &mut Journal,
+    gate: &mut crate::durability::AckGate,
     progress: Acknowledgement,
 ) -> Result<()> {
-    source_deadline(async {
-        source.acknowledge(progress).await?;
-        Ok(())
-    })
-    .await?;
+    acknowledge(source, gate.admit(progress)).await?;
     journal.reclaim(progress.materialized)?;
+    Ok(())
+}
+
+/// Send progress the acknowledgement gate released, if any.
+async fn acknowledge(
+    source: &mut impl PostgresSource,
+    durable: Option<Acknowledgement>,
+) -> Result<()> {
+    if let Some(durable) = durable {
+        source_deadline(async {
+            source.acknowledge(durable).await?;
+            Ok(())
+        })
+        .await?;
+    }
     Ok(())
 }
 
@@ -978,7 +1006,6 @@ fn table_scoped(error: &flow_pg_source::Error) -> bool {
         Error::Row(_)
             | Error::Value(_)
             | Error::ReplicaIdentity(_)
-            | Error::DefaultIdentity(_)
             | Error::UnchangedToast(_)
             | Error::AppendOnly { .. }
             | Error::RowLimit { .. }
@@ -1181,13 +1208,15 @@ struct SourceIdentity {
     timeline: u32,
 }
 
+/// Proof of the source incarnation this state directory is bound to.
+pub(crate) const SOURCE_IDENTITY: &str = "source-identity.json";
+
 pub(crate) async fn verify_source_identity(
     client: &Client,
     config: &Config,
     initialize: bool,
 ) -> Result<()> {
     use flow_pg_source::tokio_postgres::SimpleQueryMessage;
-    use std::io::Write;
     let response = client.simple_query("IDENTIFY_SYSTEM").await?;
     let row = response
         .iter()
@@ -1212,19 +1241,19 @@ pub(crate) async fn verify_source_identity(
             .context("source timeline is missing")?
             .parse()?,
     };
-    let path = config.state_dir.join("source-identity.json");
-    match std::fs::read(&path) {
+    match std::fs::read(config.state_dir.join(SOURCE_IDENTITY)) {
         Ok(bytes) => {
             let expected: SourceIdentity = serde_json::from_slice(&bytes).context("invalid saved source identity")?;
             ensure!(identity == expected, crate::exit::resync("PostgreSQL source system, database, timeline, or slot lineage changed; coordinated failover/resynchronization is required"));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && initialize => {
-            let temporary = path.with_extension("json.tmp");
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&serde_json::to_vec(&identity)?)?;
-            file.sync_all()?;
-            std::fs::rename(temporary, path)?;
-            std::fs::File::open(&config.state_dir)?.sync_all()?;
+            // The source incarnation proof must survive losing this disk, or
+            // recovery would correctly refuse to resume from replicated state.
+            crate::durability::write_authority_file(
+                &config.state_dir,
+                SOURCE_IDENTITY,
+                &serde_json::to_vec(&identity)?,
+            )?;
         }
         Err(error) => return Err(error).context("source identity proof is missing or unreadable; do not bind existing state to an unverified source"),
     }
@@ -1305,7 +1334,7 @@ pub(crate) async fn source_identity_matches(client: &Client, config: &Config) ->
         Err(error) => return Err(error.into()),
     };
     let expected: SourceIdentity = serde_json::from_slice(
-        &std::fs::read(config.state_dir.join("source-identity.json"))
+        &std::fs::read(config.state_dir.join(SOURCE_IDENTITY))
             .context("source identity proof is missing or unreadable")?,
     )
     .context("invalid saved source identity")?;
@@ -1988,9 +2017,14 @@ mod tests {
             materialized: PgLsn(41),
         });
         let progress = *ack.borrow_and_update();
-        acknowledge_and_reclaim(&mut Feedback, &mut journal, progress)
-            .await
-            .unwrap();
+        acknowledge_and_reclaim(
+            &mut Feedback,
+            &mut journal,
+            &mut crate::durability::AckGate::default(),
+            progress,
+        )
+        .await
+        .unwrap();
         assert!(!ack.has_changed().unwrap());
         assert_eq!(
             journal

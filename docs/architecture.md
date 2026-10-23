@@ -32,13 +32,31 @@ The source ledger has one owner. Its complete SOURCE-only write batches use the 
 
 The durable control store owns bootstrap and source-ledger records, table watermarks, and pending operation headers, artifacts and prepared payloads. Row locations, inverse mappings, per-file live-row counts, mutation spools and apply cursors belong to a replaceable index generation. Each durable transition synchronizes an atomic index batch with its revision, then synchronizes the control batch with the same revision. Syncing the index first means a host crash or power loss leaves equal revisions except inside the window between the two syncs, so it does not ordinarily force a rebuild. Intermediate index apply batches retain atomic cursors and WAL protection without their own fsync; the next revision-bearing sync covers them. A crash can leave either database ahead, but reopening requires equal revisions before ordinary publication or source acknowledgement. Any mismatch fences the index and requires recovery from control authority and the catalog.
 
-Recovery resolves pending catalog operations before scanning current data and position deletes into a fresh generation. It preserves published LSNs and schema versions, checks target UUIDs, and rechecks catalog heads before activation. Physical checkpoint files and their directory entries are synced before registration; activation syncs the replacement generation before atomically switching the control pointer. A checkpoint is usable only when its watermarks and catalog snapshots still match. Stale, missing or unusable checkpoints fall back to a full scan. Index loss never substitutes zero watermarks for missing authority; loss of the control store requires restoring that authority. The row index uses format 3, which stores derived live-row counts. An index in an earlier format is rebuilt from control authority and Iceberg without recreating the source slot or control store.
+Recovery resolves pending catalog operations before scanning current data and position deletes into a fresh generation. It preserves published LSNs and schema versions, checks target UUIDs, and rechecks catalog heads before activation. Physical checkpoint files and their directory entries are synced before registration; activation syncs the replacement generation before atomically switching the control pointer. A checkpoint whose watermarks and catalog snapshots still match restores directly. A stale checkpoint is advanced from Iceberg file changes; missing or unusable checkpoints, or a failed catch-up, fall back to a full scan. Index loss never substitutes zero watermarks for missing authority; loss of the control store requires restoring that authority. The row index uses format 3, which stores derived live-row counts. An index in an earlier format is rebuilt from control authority and Iceberg without recreating the source slot or control store.
+
+## Remote durability
+
+Optional `[durability]` makes object storage the authority for the journal,
+control store and source identity; see [remote durability](remote-durability.md).
+Local files stay the working copy. Every locally durable change is appended to
+an ordered, write-behind log, and every effect outside the process (catalog
+change, object deletion, source acknowledgement) first waits for a barrier that
+proves the state it depends on is replicated and that this process still owns
+it. Appends never wait for object storage, so capture and publication are not
+serialized behind remote latency. A replaced owner fails its barriers. After the
+loss of local state, the next owner restores the latest checkpoint and log tail,
+then downloads the newest replicated row-index checkpoint.
+
+Index recovery advances a stale checkpoint from Iceberg file changes rather than
+rescanning every table: it removes entries in data files the head no longer
+contains and at positions newly deleted in shared files, then inserts the rows
+of added files. Any disagreement falls back to the full rebuild.
 
 ## Row identity
 
 Primary keys use a versioned typed encoding with explicit variable-length framing. Keys cannot contain nulls or floating-point values in the initial profile. Float zero and NaN representations are canonicalized for row fingerprints. Trailing nulls do not change a fingerprint, allowing an additive nullable field to preserve old row identity.
 
-Unknown mutable keys are errors. An unchanged TOAST marker can be resolved from the same update's complete FULL old tuple; unavailable or incomplete old values are errors. Neither path emits equality deletes or placeholders. Key changes collapse as delete-old plus insert-new, including when both keys are touched repeatedly within one transaction.
+Unknown mutable keys are errors. Under FULL, capture resolves an unchanged TOAST marker from the same update's complete old tuple. Under DEFAULT, capture journals the update with an explicit unchanged value. Collapse fills it from the key's earlier image in the epoch; publication fills the rest from the key's indexed row in the bound snapshot, after its recorded fingerprint matches, before writing any artifact. Updates that change the key cannot carry values forward and stop instead. No path queries the source, emits equality deletes or publishes placeholders. Key changes collapse as delete-old plus insert-new, including when both keys are touched repeatedly within one transaction.
 
 Current-epoch collapse uses a bounded ordered memory map for ordinary source
 prefixes. It shares the disk path's mutation transitions and initial-presence
@@ -105,7 +123,9 @@ protection retain their existing ownership rules.
 Checkpoint rotation does not wait for all tables to become idle. A checkpoint
 records pending operations consistently with its index and keeps their base and
 successor snapshots protected. Direct restore requires a matching checkpoint
-without pending operations; other checkpoints use the existing catalog-scan
-recovery path. Rotation advances the protected history floor during active writes.
+without pending operations. Other checkpoints first finish recorded applies and
+discard uncommitted operations, then catch up from the catalog's file changes;
+the catalog scan remains the fallback. Rotation advances the protected history
+floor during active writes.
 
 The scheduler uses observed per-table service times, including preparation and maintenance, to adjust publication deadlines. Periodic visits and build probes do not enter CDC service-time estimates. These estimates do not establish an SLO: the measured runs still fail latency qualification. Longer workloads, reader amplification and provider-level cost qualification remain open; FileIO and REST diagnostics record API operations rather than billed requests.
