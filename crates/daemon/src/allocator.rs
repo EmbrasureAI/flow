@@ -26,6 +26,14 @@ pub(crate) fn memory_usage() -> Result<MemoryUsage> {
     })
 }
 
+/// Built-in options; `MALLOC_CONF` in the environment overrides them.
+fn built_in_options() -> &'static str {
+    // The control returns the C string with its terminating NUL.
+    config::malloc_conf::read()
+        .unwrap_or_default()
+        .trim_end_matches('\0')
+}
+
 pub(crate) fn initialize() {
     // Enable after process initialization, avoiding allocator bootstrap's
     // circular dependencies. Reclamation failure must not stop ingestion.
@@ -35,8 +43,7 @@ pub(crate) fn initialize() {
     }
     match memory_usage() {
         Ok(usage) => tracing::info!(
-            // Built-in options; `MALLOC_CONF` in the environment overrides them.
-            malloc_conf = config::malloc_conf::read().unwrap_or_default(),
+            malloc_conf = built_in_options(),
             allocated_bytes = usage.allocated_bytes,
             active_bytes = usage.active_bytes,
             resident_bytes = usage.resident_bytes,
@@ -59,10 +66,10 @@ mod tests {
 
     #[test]
     fn jemalloc_keeps_transparent_huge_pages_off_its_memory() {
-        let options = config::malloc_conf::read().expect("jemalloc built-in options");
+        let options = built_in_options();
         assert!(
             options.split(',').any(|option| option == "thp:never"),
-            "{options}"
+            "{options:?}"
         );
         // Where the kernel has transparent huge pages and no override is set,
         // a fresh large allocation's mapping must exclude them.
