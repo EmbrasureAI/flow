@@ -8,9 +8,14 @@ use std::{
     },
 };
 
-use arrow_array::{Int64Array, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, Int64Array, LargeBinaryArray, RecordBatch, StringArray,
+};
+use arrow_schema::DataType;
 use flow_iceberg_ext::{ArtifactSet, ArtifactTracker, position_delete_may_apply};
-use flow_materializer::{DataWriter, DeleteWriter, WriterConfig, rows_from_batch};
+use flow_materializer::{
+    DataWriter, DeleteWriter, WriterConfig, rows_from_batch, rows_to_batch, writer_arrow_schema,
+};
 use flow_model::{
     Column, ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value,
 };
@@ -144,6 +149,135 @@ async fn wide_dictionary_rows_obey_logical_group_limits_and_keep_file_positions(
         }
         assert_eq!(recovered, rows);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn arrow_writes_match_row_writes_byte_for_byte() -> anyhow::Result<()> {
+    let schema = schema();
+    let rows: Vec<Row> = (0..29)
+        .map(|id| {
+            vec![
+                Value::Int64(id),
+                if id % 4 == 0 {
+                    Value::Null
+                } else {
+                    Value::String("x".repeat(100 * id as usize))
+                },
+                Value::Binary(vec![id as u8; 64]),
+            ]
+        })
+        .collect();
+    // The writer takes Iceberg's Arrow mapping, which reads binary as LargeBinary.
+    let target = writer_arrow_schema(&schema);
+    let written = rows_to_batch(&schema, &rows)?;
+    let columns = written
+        .columns()
+        .iter()
+        .zip(target.fields())
+        .map(
+            |(column, field)| match column.as_any().downcast_ref::<BinaryArray>() {
+                Some(binary) if field.data_type() == &DataType::LargeBinary => {
+                    Arc::new(binary.iter().collect::<LargeBinaryArray>()) as ArrayRef
+                }
+                _ => column.clone(),
+            },
+        )
+        .collect();
+    let batch = RecordBatch::try_new(target, columns)?;
+    let fingerprints = rows
+        .iter()
+        .map(|row| schema.fingerprint(row))
+        .collect::<Result<Vec<_>, _>>()?;
+    for target_file_bytes in [usize::MAX, 1] {
+        let config = WriterConfig {
+            target_file_bytes,
+            batch_bytes: 4096,
+            row_group_bytes: 8192,
+            row_group_rows: 7,
+            ..WriterConfig::default()
+        };
+        let mut outputs = Vec::new();
+        for arrow in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let mut writer = DataWriter::new(
+                io(),
+                directory.path().to_str().unwrap(),
+                &OperationId("same".into()),
+                schema.clone(),
+                0,
+                config.clone(),
+            )?;
+            let locations = if arrow {
+                // Uneven calls exercise slicing inside and across batches.
+                let mut locations = Vec::new();
+                for (offset, length) in [(0, 3), (3, 26)] {
+                    locations.extend(
+                        writer
+                            .write_arrow(
+                                &batch.slice(offset, length),
+                                None,
+                                &fingerprints[offset..offset + length],
+                                PgLsn(10),
+                            )
+                            .await?
+                            .locations,
+                    );
+                }
+                locations
+            } else {
+                let mut locations = writer.write(&rows[..3], PgLsn(10)).await?.locations;
+                locations.extend(writer.write(&rows[3..], PgLsn(10)).await?.locations);
+                locations
+            };
+            let files = writer.close().await?;
+            assert_eq!(files.len() > 1, target_file_bytes == 1);
+            let contents = files
+                .iter()
+                .map(|file| std::fs::read(file.file_path()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let locations = locations
+                .into_iter()
+                .map(|location| {
+                    let path = location.data_file_id.0;
+                    let name = path.rsplit('/').next().unwrap().to_owned();
+                    (name, location.row_position, location.row_fingerprint)
+                })
+                .collect::<Vec<_>>();
+            outputs.push((contents, locations));
+        }
+        assert_eq!(outputs[0], outputs[1]);
+    }
+
+    let directory = tempfile::tempdir()?;
+    let mut writer = DataWriter::new(
+        io(),
+        directory.path().to_str().unwrap(),
+        &OperationId("rejected".into()),
+        schema.clone(),
+        0,
+        WriterConfig {
+            batch_bytes: 1024,
+            ..WriterConfig::default()
+        },
+    )?;
+    let error = writer
+        .write_arrow(&batch, None, &fingerprints, PgLsn(10))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds writer admission limit"));
+    let projected = batch.project(&[0, 1])?;
+    let error = writer
+        .write_arrow(&projected, None, &fingerprints, PgLsn(10))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not in the writer's Arrow schema")
+    );
+    assert!(writer.close().await?.is_empty());
+    assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
     Ok(())
 }
 

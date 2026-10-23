@@ -57,7 +57,7 @@ pub fn arrow_schema(schema: &TableSchema) -> SchemaRef {
 
 /// Iceberg's Arrow mapping, which the Parquet writer uses, reads binary as
 /// LargeBinary. Building writer batches with it avoids converting each batch.
-pub(crate) fn writer_arrow_schema(schema: &TableSchema) -> SchemaRef {
+pub fn writer_arrow_schema(schema: &TableSchema) -> SchemaRef {
     arrow_schema_with(schema, true)
 }
 

@@ -58,6 +58,16 @@ around a confirmed shared-Puffin reader bug. The record links the upstream
 fix and gives the exact reader settings. V3 preparation read amplification
 remains the measured high-load bottleneck.
 
+## Arrow-only compaction rewrite
+
+A compaction worker no longer converts scanned Arrow batches into rows and back
+to rewrite them. The [focused worker benchmark](benchmarks/arrow-compaction-rewrite.md)
+compacted 16 files of 32,768 ten-column rows on one and two vCPUs. Median
+worker latency fell 22–29% on two vCPUs and 23–25% on one, with 17–25% less CPU
+per compaction and no consistent change in peak memory. These are worker
+timings on local disk, not publication latency or service throughput; the
+numbers above were not rerun.
+
 ## Reproducibility
 
 The [benchmark report](benchmarks/v3-deletion-vectors.md) gives the environment,
