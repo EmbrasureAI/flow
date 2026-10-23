@@ -3,13 +3,113 @@
 //! already folded is replayed.
 
 use crate::{Change, CollapsedMutation, Error, Result, StateStore, TableState, spool::PendingRow};
-use flow_model::{PrimaryKey, Row, RowLocation, TableId, Value};
-use std::collections::{BTreeMap, btree_map};
+use flow_model::{FileId, PgLsn, PrimaryKey, Row, RowLocation, TableId, Value};
+use std::collections::{BTreeMap, HashMap, btree_map};
 
 // Originals exist only after binding, and only for keys already indexed. Boxing
 // keeps the inline entry small, which the per-entry allowance below multiplies.
-type Entry = (PendingRow, Option<Box<RowLocation>>);
+type Entry = (PendingRow, Option<Box<Original>>);
 const MAP_ALLOWANCE: usize = 4096;
+// One interned path or partition: its hash-map bucket and index at up to twice
+// their occupied size. The value itself is charged once, by capacity.
+const INTERN_ALLOWANCE: usize = 2 * (size_of::<Vec<u8>>() + size_of::<u32>() + 8) + 32;
+
+/// A bound original. An epoch's keys share few data files, so the path and
+/// partition are interned per buffer instead of copied into every key.
+#[derive(Debug)]
+struct Original {
+    file: u32,
+    partition: u32,
+    row_position: u64,
+    data_sequence_number: i64,
+    spec_id: i32,
+    source_commit_lsn: PgLsn,
+    row_version: u64,
+    row_fingerprint: [u8; 16],
+}
+
+/// Paths and partitions seen while binding, each stored once.
+#[derive(Debug, Default)]
+struct Interned {
+    files: HashMap<FileId, u32>,
+    partitions: HashMap<Vec<u8>, u32>,
+}
+
+/// Interned values indexed by id, for expanding originals after binding.
+#[derive(Debug, Default)]
+struct Expanded {
+    files: Vec<FileId>,
+    partitions: Vec<Vec<u8>>,
+}
+
+fn intern<T: std::hash::Hash + Eq>(
+    ids: &mut HashMap<T, u32>,
+    value: T,
+    bytes: usize,
+) -> Result<(u32, usize)> {
+    let next = u32::try_from(ids.len())
+        .map_err(|_| Error::InvalidState("too many interned original locations".into()))?;
+    match ids.entry(value) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok((*entry.get(), 0)),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(next);
+            Ok((next, bytes + INTERN_ALLOWANCE))
+        }
+    }
+}
+
+fn by_id<T>(ids: HashMap<T, u32>) -> Vec<T> {
+    let mut values: Vec<_> = ids.into_iter().collect();
+    values.sort_unstable_by_key(|(_, id)| *id);
+    values.into_iter().map(|(value, _)| value).collect()
+}
+
+impl Interned {
+    /// The compact original and the bytes newly retained to bind it.
+    fn bind(&mut self, location: RowLocation) -> Result<(Original, usize)> {
+        let file_bytes = location.data_file_id.0.capacity();
+        let (file, file_added) = intern(&mut self.files, location.data_file_id, file_bytes)?;
+        let partition_bytes = location.partition.capacity();
+        let (partition, partition_added) =
+            intern(&mut self.partitions, location.partition, partition_bytes)?;
+        Ok((
+            Original {
+                file,
+                partition,
+                row_position: location.row_position,
+                data_sequence_number: location.data_sequence_number,
+                spec_id: location.spec_id,
+                source_commit_lsn: location.source_commit_lsn,
+                row_version: location.row_version,
+                row_fingerprint: location.row_fingerprint,
+            },
+            file_added + partition_added + size_of::<Original>(),
+        ))
+    }
+
+    fn finish(self) -> Expanded {
+        Expanded {
+            files: by_id(self.files),
+            partitions: by_id(self.partitions),
+        }
+    }
+}
+
+impl Expanded {
+    fn location(&self, original: &Original) -> RowLocation {
+        RowLocation {
+            data_file_id: self.files[original.file as usize].clone(),
+            row_position: original.row_position,
+            data_sequence_number: original.data_sequence_number,
+            spec_id: original.spec_id,
+            partition: self.partitions[original.partition as usize].clone(),
+            source_commit_lsn: original.source_commit_lsn,
+            row_version: original.row_version,
+            row_fingerprint: original.row_fingerprint,
+        }
+    }
+}
+
 // Account conservatively for partially occupied tree nodes and their links.
 // This is an owned-working-set allowance, not an allocator or process RSS limit.
 const ENTRY_ALLOWANCE: usize = 3 * size_of::<(PrimaryKey, Entry)>() + 64;
@@ -99,6 +199,7 @@ pub struct MemoryRows {
     table: TableId,
     state: TableState,
     rows: btree_map::IntoIter<PrimaryKey, Entry>,
+    interned: Expanded,
     peak: usize,
 }
 
@@ -121,7 +222,8 @@ impl Iterator for MemoryRows {
             if original.is_none() && pending.row.is_none() {
                 None
             } else {
-                Some(pending.into_mutation(self.table, key, original.map(|original| *original)))
+                let original = original.map(|original| self.interned.location(&original));
+                Some(pending.into_mutation(self.table, key, original))
             }
         })
     }
@@ -149,6 +251,7 @@ impl StateStore {
                 "table state changed before binding collapsed source rows".into(),
             ));
         }
+        let mut interned = Interned::default();
         let overflow = 'bind: {
             let mut entries = buffer.rows.iter_mut();
             loop {
@@ -160,23 +263,23 @@ impl StateStore {
                     snapshot.lookup_keys(&buffer.table, batch.iter().map(|(key, _)| *key))?;
                 for ((_, (pending, bound)), original) in batch.into_iter().zip(originals) {
                     pending.validate_initial(original.is_some())?;
-                    let extra = original.as_ref().map_or(Some(0), |location| {
-                        location
-                            .data_file_id
-                            .0
-                            .capacity()
-                            .checked_add(location.partition.capacity())
-                            .and_then(|heap| heap.checked_add(size_of::<RowLocation>()))
-                    });
-                    let Some(bytes) = extra
-                        .and_then(|extra| buffer.bytes.checked_add(extra))
+                    let (original, extra) = match original {
+                        Some(location) => {
+                            let (original, extra) = interned.bind(location)?;
+                            (Some(Box::new(original)), extra)
+                        }
+                        None => (None, 0),
+                    };
+                    let Some(bytes) = buffer
+                        .bytes
+                        .checked_add(extra)
                         .filter(|bytes| *bytes <= buffer.limit)
                     else {
                         break 'bind true;
                     };
                     buffer.bytes = bytes;
                     buffer.peak = buffer.peak.max(bytes);
-                    *bound = original.map(Box::new);
+                    *bound = original;
                 }
             }
         };
@@ -189,6 +292,7 @@ impl StateStore {
             table: buffer.table,
             state: snapshot.table_state().clone(),
             rows: buffer.rows.into_iter(),
+            interned: interned.finish(),
             peak: buffer.peak,
         }))
     }
