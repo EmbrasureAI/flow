@@ -2,7 +2,9 @@
 mod arrow;
 mod deletion_vector;
 mod writer;
-pub use arrow::{arrow_schema, iceberg_schema, rows_from_batch, rows_to_batch};
+pub use arrow::{
+    arrow_schema, iceberg_schema, rows_from_batch, rows_to_batch, writer_arrow_schema,
+};
 pub use writer::{DataWriter, WriterConfig, WrittenBatch};
 
 pub use deletion_vector::DeleteWriter;

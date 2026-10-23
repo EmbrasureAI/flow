@@ -31,6 +31,9 @@ pub(crate) struct Status {
     /// Why the last process stopped; kept until a later process is running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error: Option<LastError>,
+    /// Replication to object storage, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    durability: Option<flow_durability::Status>,
 }
 
 impl Status {
@@ -284,7 +287,7 @@ pub(crate) fn record_publication_changed<T>(config: &Config, result: Result<T>) 
     result
 }
 
-const RESYNC_MARKER: &str = "publication-resync-required.json";
+pub(crate) const RESYNC_MARKER: &str = "publication-resync-required.json";
 
 /// Durable proof that this slot's capture may have skipped changes. Restoring
 /// the publication cannot recover them, so only a resync may replace it.
@@ -320,14 +323,11 @@ pub(crate) fn require_resync(config: &Config, reason: &str) {
             publication: postgres.publication.clone(),
             reason: reason.to_owned(),
         };
-        let path = config.state_dir.join(RESYNC_MARKER);
-        let temporary = path.with_extension("json.tmp");
-        let mut file = std::fs::File::create(&temporary)?;
-        std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&marker)?)?;
-        file.sync_all()?;
-        std::fs::rename(temporary, path)?;
-        std::fs::File::open(&config.state_dir)?.sync_all()?;
-        Ok(())
+        crate::durability::write_authority_file(
+            &config.state_dir,
+            RESYNC_MARKER,
+            &serde_json::to_vec_pretty(&marker)?,
+        )
     })();
     if let Err(error) = result {
         tracing::error!(%error, "could not persist the resync-required marker");
@@ -425,8 +425,10 @@ fn update(config: &Config, change: impl FnOnce(&mut Status)) -> Result<()> {
         table_progress: Vec::new(),
         state: ProcessState::Unknown,
         last_error: None,
+        durability: None,
     });
     change(&mut status);
+    status.durability = crate::durability::status();
     status.process_id = std::process::id();
     status.updated_at_ms = now_ms()?;
     write_observation(

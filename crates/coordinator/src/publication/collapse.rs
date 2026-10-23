@@ -317,6 +317,20 @@ fn replay_epoch(
                         }
                     }
                 };
+                // Only an update may omit unchanged values. Its key is always
+                // present, and a key change would need another key's image.
+                let project_update = |row: flow_model::Row| -> Result<_> {
+                    if !flow_model::row_has_unchanged(&row) {
+                        return project(row);
+                    }
+                    match &source_schema {
+                        Some(source) => Ok(source.project_partial_row(row, schema)?),
+                        None => {
+                            schema.validate_partial_row(&row)?;
+                            Ok(row)
+                        }
+                    }
+                };
                 let (first, second) = match mutation.kind {
                     MutationKind::Quarantined { .. } => {
                         return Err(flow_model::SourceTableBlocked.into());
@@ -334,9 +348,13 @@ fn replay_epoch(
                         ((key, Change::Insert(row)), None)
                     }
                     MutationKind::Update { old_key, row } => {
-                        let row = project(row)?;
                         ensure!(!schema.append_only, "update on append-only table");
-                        let key = schema.encode_key(&row)?;
+                        let row = project_update(row)?;
+                        let key = schema.encode_partial_key(&row)?;
+                        ensure!(
+                            key == old_key || !flow_model::row_has_unchanged(&row),
+                            "a primary-key change cannot omit unchanged values"
+                        );
                         if key == old_key {
                             ((key, Change::Update(row)), None)
                         } else {

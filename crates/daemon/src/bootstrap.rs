@@ -1,7 +1,7 @@
 //! Concurrent initial COPY, durable per-table staging, and restartable handoff.
 use crate::{
     config::Config,
-    services::{catalog, journal_config, ledger, state, target},
+    services::{catalog, journal_config, ledger, target},
     source::{
         CaptureProgress, capture_loop, connect, connect_owned, validate_publication,
         validate_source_table,
@@ -201,15 +201,14 @@ pub async fn initialize(config: Config) -> Result<()> {
 // COPY can be interrupted between the index and control writes just like CDC.
 // Reuse the normal generation rebuild before any source ACK or publication.
 async fn open_bootstrap_state(config: &Config, catalog: Arc<dyn Catalog>) -> Result<StateStore> {
-    match state(config) {
+    let control = crate::services::open_control(config).await?;
+    match crate::generation::open(config, control.clone()) {
         Ok(store) => Ok(store),
         Err(error)
             if error
                 .downcast_ref::<flow_state_store::Error>()
                 .is_some_and(flow_state_store::Error::requires_index_rebuild) =>
         {
-            let control = ControlStore::open(config.state_dir.join("control"))?;
-            crate::lifecycle::state_lock_acquired();
             let boot = bootstrap(&control, config)?;
             validate_config(config, &boot)?;
             ensure!(
@@ -521,6 +520,9 @@ pub(crate) async fn resume(
         let cut = if let Some(cut) = slot_cut(&sql, &config.source.slot).await? {
             cut
         } else {
+            // The persisted creation intent must survive losing this disk, or
+            // a restored owner would refuse the slot it cannot recognise.
+            crate::durability::barrier().await?;
             let snapshot =
                 export_snapshot(&replication, &mut keeper_sql, &config.source.slot).await?;
             let cut = snapshot.consistent_lsn;
@@ -1118,7 +1120,7 @@ mod tests {
                 .build()
         };
         let table = catalog.create_table(&namespace, creation()).await.unwrap();
-        let store = state(&config).unwrap();
+        let store = crate::services::state(&config).await.unwrap();
         store
             .complete_noop(&schema.table_id, PgLsn(0), schema.version)
             .unwrap();
@@ -1147,7 +1149,10 @@ mod tests {
         let original = config.state_dir.join("index");
         std::fs::rename(&original, root.path().join("newer-index")).unwrap();
         std::fs::rename(stale, &original).unwrap();
-        let error = state(&config).err().expect("stale index must be rejected");
+        let error = crate::services::state(&config)
+            .await
+            .err()
+            .expect("stale index must be rejected");
         assert!(error.to_string().contains("index/control revision differs"));
 
         let rebuilt = open_bootstrap_state(&config, catalog.clone())

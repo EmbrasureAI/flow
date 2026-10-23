@@ -645,11 +645,12 @@ impl CaptureAssembler {
                         operation: "UPDATE",
                     });
                 }
-                if row.iter().any(|cell| matches!(cell, Cell::UnchangedToast)) {
+                let mut partial = row.iter().any(|cell| matches!(cell, Cell::UnchangedToast));
+                if partial && metadata.replica_identity == b'f' {
                     // pgoutput omits unchanged TOAST values from the new tuple,
                     // even with FULL identity. Its complete old tuple supplies
                     // those values without consulting mutable source state.
-                    if metadata.replica_identity != b'f' || old_is_key {
+                    if old_is_key {
                         return Err(Error::UnchangedToast(relation));
                     }
                     let previous = old.as_ref().ok_or(Error::UnchangedToast(relation))?;
@@ -662,12 +663,25 @@ impl CaptureAssembler {
                             *cell = previous.clone();
                         }
                     }
+                    partial = false;
+                } else if partial && old.is_some() {
+                    // DEFAULT sends a key-only old tuple only when the key
+                    // changed. The new key's row has no prior image to carry.
+                    return Err(Error::UnchangedToast(relation));
                 }
-                let row = decode_row_with_types(schema, metadata, &row, &self.types)?;
+                // Under DEFAULT, the omitted values stay explicitly unchanged.
+                // Collapse and publication carry the key's previous values forward.
+                let row = if partial {
+                    decode_update_row_with_types(schema, metadata, &row, &self.types)?
+                } else {
+                    decode_row_with_types(schema, metadata, &row, &self.types)?
+                };
                 let old_key = if let Some(old) = old {
                     decode_key(schema, metadata, &old, &self.types)?
                 } else {
-                    schema.encode_key(&row)?
+                    // Without an old tuple the key is unchanged; omitted values
+                    // are never key columns.
+                    schema.encode_partial_key(&row)?
                 };
                 let mutation = Mutation {
                     table_id: schema.table_id,
@@ -1077,6 +1091,38 @@ fn decode_key(
     Ok(key_schema.encode_key(&values)?)
 }
 
+/// Decode an update image whose non-key unchanged TOAST values remain
+/// [`Value::Unchanged`]. Only DEFAULT-identity updates without a key change
+/// produce such images.
+fn decode_update_row_with_types(
+    schema: &TableSchema,
+    relation: &Relation,
+    tuple: &Tuple,
+    types: &crate::TypeRegistry,
+) -> Result<Row> {
+    types.validate_relation(schema, relation)?;
+    if tuple.len() != relation.columns.len() {
+        return Err(Error::Protocol("tuple column count differs from relation"));
+    }
+    let mut row = Vec::with_capacity(tuple.len());
+    for (index, ((cell, column), pg)) in tuple
+        .iter()
+        .zip(&schema.columns)
+        .zip(&relation.columns)
+        .enumerate()
+    {
+        row.push(match cell {
+            Cell::Null => Value::Null,
+            Cell::UnchangedToast if !schema.primary_key.contains(&index) => Value::Unchanged,
+            Cell::UnchangedToast => return Err(Error::UnchangedToast(relation.id)),
+            Cell::Text(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, false)?,
+            Cell::Binary(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, true)?,
+        });
+    }
+    schema.validate_partial_row(&row)?;
+    Ok(row)
+}
+
 pub fn decode_row(schema: &TableSchema, relation: &Relation, tuple: &Tuple) -> Result<Row> {
     decode_row_with_types(schema, relation, tuple, &crate::TypeRegistry::default())
 }
@@ -1109,6 +1155,10 @@ fn postgres_era(text: &str) -> (&str, bool) {
     text.strip_suffix(" BC")
         .map_or((text, false), |date| (date, true))
 }
+
+const DAYS_PER_ERA: i64 = 146_097;
+const POSTGRES_EPOCH_DAY: i64 = 730_425;
+const UNIX_EPOCH_DAY: i64 = POSTGRES_EPOCH_DAY - 10_957;
 
 // PostgreSQL emits unsigned wide years and a BC suffix. Integer Gregorian
 // arithmetic covers its full finite range, beyond chrono's calendar range.
@@ -1152,9 +1202,30 @@ fn postgres_days(date: &str, bc: bool) -> Option<i64> {
     let month = i64::from(month) + if month > 2 { -3 } else { 9 };
     let day_of_year = (153 * month + 2) / 5 + i64::from(day) - 1;
     Some(
-        era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
-            - 730_425,
+        era * DAYS_PER_ERA + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+            - POSTGRES_EPOCH_DAY,
     )
+}
+
+/// Invert the March-based Gregorian conversion above for model (Unix) days.
+/// Keep the array JSON convention: astronomical years and a sign outside 0000..9999.
+pub(crate) fn date_string(days: i32) -> String {
+    let days = i64::from(days) + UNIX_EPOCH_DAY;
+    let era = days.div_euclid(DAYS_PER_ERA);
+    let day_of_era = days.rem_euclid(DAYS_PER_ERA);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year = era * 400 + year_of_era;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month + 2) / 5 + 1;
+    let month = month + if month < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    if (0..=9999).contains(&year) {
+        format!("{year:04}-{month:02}-{day:02}")
+    } else {
+        format!("{year:+05}-{month:02}-{day:02}")
+    }
 }
 
 fn postgres_offset(offset: &str) -> Option<i64> {
@@ -1190,7 +1261,7 @@ fn date_value(days: i64, kind: &ColumnType) -> Result<Value> {
         return Err(invalid(kind));
     }
     Ok(Value::Date(
-        i32::try_from(days + 10_957).map_err(|_| invalid(kind))?,
+        i32::try_from(days + POSTGRES_EPOCH_DAY - UNIX_EPOCH_DAY).map_err(|_| invalid(kind))?,
     ))
 }
 

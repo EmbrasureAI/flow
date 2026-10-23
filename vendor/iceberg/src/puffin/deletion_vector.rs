@@ -22,7 +22,7 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 
 use super::{CompressionCodec, DELETION_VECTOR_V1, FileMetadata};
 use crate::delete_vector::DeleteVector;
-use crate::io::FileIO;
+use crate::io::{FileIO, InputFile};
 use crate::{Error, ErrorKind, Result};
 
 const MAGIC: [u8; 4] = [0xd1, 0xd3, 0x39, 0x64];
@@ -211,6 +211,28 @@ pub async fn read_deletion_vector(
     expected_cardinality: u64,
     limits: DeletionVectorLimits,
 ) -> Result<DeleteVector> {
+    // Preserve validation before any I/O for callers without an observed size.
+    checked_blob_end(offset, length, expected_cardinality, limits)?;
+    let input = file_io.new_input(path)?;
+    let size = input.metadata().await?.size;
+    read_deletion_vector_with_size(
+        &input,
+        size,
+        offset,
+        length,
+        referenced_data_file,
+        expected_cardinality,
+        limits,
+    )
+    .await
+}
+
+fn checked_blob_end(
+    offset: u64,
+    length: u64,
+    expected_cardinality: u64,
+    limits: DeletionVectorLimits,
+) -> Result<u64> {
     check_limits(length, expected_cardinality, limits)?;
     let end = offset
         .checked_add(length)
@@ -218,8 +240,25 @@ pub async fn read_deletion_vector(
     if offset < 4 {
         return Err(invalid("Deletion vector overlaps Puffin header"));
     }
-    let input = file_io.new_input(path)?;
-    let size = input.metadata().await?.size;
+    Ok(end)
+}
+
+/// Read a deletion vector using an already observed physical object size.
+///
+/// `size` must come from storage metadata for this immutable input in the current
+/// operation, not just a manifest's declared size. This skips only the metadata
+/// request; all range, footer, blob and bitmap validation is identical to
+/// [`read_deletion_vector`].
+pub async fn read_deletion_vector_with_size(
+    input: &InputFile,
+    size: u64,
+    offset: u64,
+    length: u64,
+    referenced_data_file: &str,
+    expected_cardinality: u64,
+    limits: DeletionVectorLimits,
+) -> Result<DeleteVector> {
+    let end = checked_blob_end(offset, length, expected_cardinality, limits)?;
     if size < 20 || end > size - 16 {
         return Err(invalid("Deletion vector byte range exceeds Puffin file"));
     }

@@ -68,8 +68,7 @@ async fn run_service(
     witness: &crate::generation::ShutdownWitness,
 ) -> Result<()> {
     let mut observation = crate::observation::Observation::install()?;
-    let control = ControlStore::open(config.state_dir.join("control"))?;
-    crate::lifecycle::state_lock_acquired();
+    let control = crate::services::open_control(&config).await?;
     let opened = crate::generation::open(&config, control.clone());
     if let Ok(store) = &opened {
         witness.observe(store);
@@ -228,13 +227,16 @@ async fn run_service(
         }
     })
     .await?;
-    let publisher = Arc::new(TablePublisher::new(
-        store.clone(),
-        catalog.clone(),
-        crate::services::writer_config(&config),
-        config.limits.batch_rows,
-        config.limits.batch_bytes,
-    )?);
+    let publisher = Arc::new(
+        TablePublisher::new(
+            store.clone(),
+            catalog.clone(),
+            crate::services::writer_config(&config),
+            config.limits.batch_rows,
+            config.limits.batch_bytes,
+        )?
+        .with_read_limits(config.parquet_read.clone())?,
+    );
     let maintenance = Arc::new(
         TableMaintenance::new(
             store.clone(),
@@ -1499,9 +1501,19 @@ impl CheckpointTask {
                     break;
                 }
                 control.forget_checkpoint(&obsolete)?;
-                std::fs::remove_dir_all(obsolete.path)?;
+                // A generation restored from replicated authority never had
+                // this machine's checkpoint files.
+                match std::fs::remove_dir_all(&obsolete.path) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error.into());
+                    }
+                    _ => {}
+                }
             }
             remove_unregistered_checkpoints(&control, &directory, &cancellation)?;
+            if !cancellation.load(Ordering::Acquire) {
+                crate::durability::replicate_index_checkpoint(&control, &checkpoint);
+            }
             Ok(())
         });
         Self { task, canceled }

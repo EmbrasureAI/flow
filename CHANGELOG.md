@@ -23,8 +23,12 @@ This will be the initial public release, `0.1.0`.
   external maintenance.
 - Independent per-table publication, so a failing table does not stop the
   others.
-- `REPLICA IDENTITY DEFAULT` for primary-key tables whose replicated columns
-  are all fixed-width.
+- `REPLICA IDENTITY DEFAULT` for primary-key tables. Out-of-line (TOAST)
+  values an update leaves unchanged are carried forward from the key's earlier
+  row image in the epoch or its indexed Iceberg row, so variable-width tables no
+  longer need `FULL`. A primary-key change that leaves such a value unchanged
+  blocks the table; keep `FULL` for tables whose keys change.
+  A live table can switch between `DEFAULT` and `FULL` without blocking.
 - Administrator-managed publications, including `FOR ALL TABLES` and
   `FOR TABLES IN SCHEMA`; Flow ignores tables it does not capture. A contract
   change to one configured table blocks only that table.
@@ -92,6 +96,28 @@ This will be the initial public release, `0.1.0`.
 - PostgreSQL TLS modes and configured CA bundles; `sslmode=verify-ca` requires
   `sslrootcert`, as in libpq.
 
+**Remote durability**
+
+- Optional `[durability]` makes object storage (`s3://`, S3-compatible
+  endpoints or `file://`) the authority for the journal, control state and
+  source identity, so a worker and its whole state volume can be replaced
+  without losing changes acknowledged to the source. Appends are written behind;
+  catalog changes, object deletions, source acknowledgements and slot creation
+  wait until the state they depend on is replicated and the owner's lease is
+  valid. Row-index checkpoints are replicated too. See
+  [remote durability](docs/remote-durability.md).
+- A stale row-index checkpoint is advanced from Iceberg file changes instead of
+  rebuilding every table, with or without `[durability]`.
+- Opt-in `storage.medium = "memory"` for a `state_dir` on tmpfs or ramfs
+  (Linux, with `[durability]`): startup verifies the filesystem, and free space
+  is also bounded by the memory left under the process's cgroup v2 limits, so
+  capture pauses before memory runs out. See
+  [memory-backed state](docs/operations.md#memory-backed-state).
+- Maintenance scans fetch small inputs whole, a bounded number ahead
+  (`parquet_read.prefetch_files`, `parquet_read.prefetch_file_bytes`), and
+  fresh publications reuse the catalog head and plan they already validated,
+  removing multi-second maintenance stalls from publication latency.
+
 **Operations and observability**
 
 - Exit codes for supervisors: 78 = configuration invalid or incompatible with
@@ -130,12 +156,25 @@ This will be the initial public release, `0.1.0`.
 
 ### Fixed
 
+- Reuse observed Puffin object sizes within a delete scan, avoiding repeated
+  metadata requests for shared v3 deletion vectors while preserving validation.
+- PostgreSQL date and timestamp arrays accept finite values beyond Chrono's
+  calendar range whenever scalar decoding supports them, preserving the existing
+  JSON string representation and rejection of infinite dates and timestamps.
 - A streamed transaction could publish the changes of a savepoint it had
   rolled back. When PostgreSQL spills a transaction and later streams a
   savepoint with more than 4096 changes from the spill, it sends no abort for
   that savepoint's rollback. Capture now checks the status of each
   subtransaction with surviving changes in PostgreSQL's commit log at the
   commit and drops those that rolled back.
+- jemalloc builds keep transparent huge pages off the allocator's memory
+  (built-in `thp:never`). With the kernel set to `always`, huge pages made RSS
+  keep growing past the memory jemalloc held; `MALLOC_CONF` overrides the
+  default.
+- A subtransaction abort for a transaction not streamed on the current
+  replication connection no longer stops capture; it has nothing to discard,
+  as in PostgreSQL's apply worker. Other unexpected stream aborts still stop
+  capture, now naming the check that failed and the transaction IDs.
 
 ### Security
 

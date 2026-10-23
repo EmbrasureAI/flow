@@ -99,7 +99,8 @@ docker run --env-file flow.env \
 
 The image runs `embrasure-flow --config /etc/flow.toml run` by default as an
 unprivileged user. Mount the configuration at `/etc/flow.toml`, set
-`state_dir = "/data"` in it and mount a persistent volume there, and pass the
+`state_dir = "/data"` in it and mount a persistent volume there (or configure
+[remote durability](docs/remote-durability.md)), and pass the
 environment variables your configuration names for credentials (here through
 `flow.env`).
 
@@ -157,10 +158,9 @@ see [upgrading](docs/upgrading.md).
 Supported today:
 
 - PostgreSQL 14–18 sources, with inserts, updates, deletes and primary-key
-  changes. Mutable tables need a primary key and either `REPLICA IDENTITY FULL`
-  or, when every replicated column is fixed-width, `DEFAULT`; see
-  [replica identity](docs/getting-started.md#replica-identity). Tables without
-  a primary key replicate append-only.
+  changes. Mutable tables need a primary key and `REPLICA IDENTITY DEFAULT` or
+  `FULL`; see [replica identity](docs/getting-started.md#replica-identity).
+  Tables without a primary key replicate append-only.
 - Unpartitioned Iceberg v2 (position deletes) and v3 (deletion vectors) tables
   through an Iceberg REST catalog on S3-compatible storage.
 - The [type mappings](docs/postgres-types.md); JSON and JSONB replicate as

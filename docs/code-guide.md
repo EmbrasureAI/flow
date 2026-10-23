@@ -14,6 +14,7 @@ their package names share the `flow-` prefix and expose their public API through
 | [`ingress-journal`](../crates/ingress-journal/src/lib.rs) | Durable transaction frames, segmented storage and bounded replay. |
 | [`pg-source`](../crates/pg-source/src/lib.rs) | PostgreSQL snapshot, replication protocol and transaction assembly. |
 | [`state-store`](../crates/state-store/src/lib.rs) | Durable control records, replaceable row index and atomic delta application. |
+| [`durability`](../crates/durability/src/lib.rs) | Optional object-storage authority: ordered write-behind log, checkpoints, owner leases and restore. |
 | [`iceberg-ext`](../crates/iceberg-ext/src/lib.rs) | Iceberg commit actions, manifests and artifact tracking used by Flow. |
 | [`materializer`](../crates/materializer/src/lib.rs) | Schema conversion and bounded Parquet data/delete writers. |
 | [`catalog-watch`](../crates/catalog-watch/src/lib.rs) | Classification and row-identity checks for external snapshot changes. Catalog polling belongs to the caller. |
@@ -43,6 +44,11 @@ See [Architecture](architecture.md) for the durable transition rules.
   transition sequencing.
 - The journal's `frame.rs` defines its disk format. The root owns writing,
   syncing and recovery; `chunks.rs` and `transactions.rs` provide replay readers.
+- Remote durability attaches through two narrow hooks, the journal's `Mirror`
+  and the control store's `ControlMirror`. In `crates/durability`, `writer.rs`
+  owns the ordered queue, batching and lease, `checkpoint.rs` checkpoints and
+  retention, `recovery.rs` ownership and restore, and `format.rs` the object
+  layout. The daemon's `durability.rs` places barriers before external effects.
 
 Keep modules named for the responsibility they own. Use private modules and
 narrow visibility for implementation details; moving a function does not make
