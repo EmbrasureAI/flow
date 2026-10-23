@@ -1,11 +1,15 @@
 use crate::{
     CompactionPlan, ReadLimits,
+    columnar::{RowEncoder, conform},
     parquet_scan::{Input, Prefetch, read_input_batches},
 };
 use anyhow::{Result, bail, ensure};
-use arrow_array::{Array, Int64Array, StringArray};
+use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
+use arrow_select::filter::filter_record_batch;
 use flow_iceberg_ext::SnapshotView;
-use flow_materializer::{DataWriter, DeleteWriter, WriterConfig, rows_from_batch};
+use flow_materializer::{
+    DataWriter, DeleteWriter, WriterConfig, rows_from_batch, writer_arrow_schema,
+};
 use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value};
 use flow_state_store::{IndexDelta, OperationKind, PreparedOperation, RowIndex, StateStore};
 use iceberg::{io::FileIO, spec::DataFile, table::Table};
@@ -287,7 +291,8 @@ pub async fn build_data(
     >;
     let mut reverse_rows: Option<ReverseRows<'_>> = None;
     let mut mapped_rows = 0u64;
-    scan_staged_live_files(
+    let mut stager = Stager::spawn(scratch.clone(), operation_id.clone())?;
+    scan_staged_live_columns(
         table,
         &schema,
         &view,
@@ -297,24 +302,26 @@ pub async fn build_data(
         batch_rows,
         read_limits,
         Some(cancelled),
-        async |batch| {
+        async |live| {
+            let rows = live.batch.num_rows();
+            let mut encoder = RowEncoder::new(&schema, &live.batch)?;
             let keys = if schema.primary_key.is_empty() {
                 ensure!(schema.append_only, "mutable compaction requires a key");
-                if reverse_file.as_ref() != Some(&batch.file_id) {
+                if reverse_file.as_ref() != Some(&live.file_id) {
                     if let Some(rows) = &mut reverse_rows {
                         ensure!(
                             rows.next().transpose()?.is_none(),
                             "unconsumed reverse rows in compaction input"
                         );
                     }
-                    reverse_file = Some(batch.file_id.clone());
+                    reverse_file = Some(live.file_id.clone());
                     reverse_rows = Some(Box::new(
-                        live_index.file_rows(&schema.table_id, &batch.file_id),
+                        live_index.file_rows(&schema.table_id, &live.file_id),
                     ));
                 }
-                let mut keys = Vec::with_capacity(batch.positions.len());
+                let mut keys = Vec::with_capacity(rows);
                 let rows = reverse_rows.as_mut().expect("reverse iterator initialized");
-                for position in &batch.positions {
+                for position in &live.positions {
                     let Some((indexed_position, key)) = rows.next().transpose()? else {
                         bail!("keyless compaction reverse index is incomplete");
                     };
@@ -326,33 +333,37 @@ pub async fn build_data(
                 }
                 keys
             } else {
-                batch
-                    .rows
-                    .iter()
-                    .map(|row| schema.encode_key(row))
-                    .collect::<std::result::Result<Vec<_>, _>>()?
+                (0..rows).map(|row| encoder.key(row)).collect()
             };
+            // A rewritten row keeps its values, so the original's fingerprint
+            // is also its replacement's.
+            let fingerprints: Vec<_> = (0..rows).map(|row| encoder.fingerprint(row)).collect();
             let old_locations = live_index.lookup_many(&schema.table_id, &keys)?;
-            let mut originals = Vec::with_capacity(batch.rows.len());
-            for ((key, old), (row, position)) in keys
+            let mut originals = Vec::with_capacity(rows);
+            for ((key, old), (position, fingerprint)) in keys
                 .iter()
                 .zip(old_locations)
-                .zip(batch.rows.iter().zip(batch.positions))
+                .zip(live.positions.iter().zip(&fingerprints))
             {
                 let Some(old) = old else {
                     bail!("compaction key {key:?} no longer exists; replan");
                 };
                 ensure!(
-                    old.data_file_id == batch.file_id
-                        && old.row_position == position
-                        && old.row_fingerprint == schema.fingerprint(row)?,
+                    old.data_file_id == live.file_id
+                        && old.row_position == *position
+                        && old.row_fingerprint == *fingerprint,
                     "compaction input row changed or index is stale; replan"
                 );
                 originals.push(old);
             }
             check_cancelled(Some(cancelled))?;
             let written = writer
-                .write_with_lineage(&batch.rows, batch.lineage.as_deref(), PgLsn(0))
+                .write_arrow(
+                    &live.batch,
+                    live.lineage.as_deref(),
+                    &fingerprints,
+                    PgLsn(0),
+                )
                 .await?;
             check_cancelled(Some(cancelled))?;
             let deltas = keys.into_iter().zip(originals).zip(written.locations).map(
@@ -371,8 +382,8 @@ pub async fn build_data(
                     }
                 },
             );
-            scratch.stage_deltas(&operation_id, deltas)?;
-            mapped_rows += batch.rows.len() as u64;
+            stager.stage(deltas.collect())?;
+            mapped_rows += rows as u64;
             Ok(())
         },
     )
@@ -383,6 +394,7 @@ pub async fn build_data(
             "unconsumed reverse rows in compaction input"
         );
     }
+    stager.finish()?;
     check_cancelled(Some(cancelled))?;
     let data_files = writer.close().await?;
     scratch.seal_prepare(
@@ -418,6 +430,63 @@ pub async fn build_data(
             table_id: schema.table_id,
         },
     })
+}
+
+/// Stages mapping batches in order on a dedicated thread, so scratch RocksDB
+/// writes overlap the next batch's decode, index lookups and Parquet encode.
+/// At most `STAGED_BATCHES` batches wait; a full queue blocks the worker as
+/// inline staging did. Dropping it waits for queued batches, so no scratch
+/// write outlives the build.
+struct Stager {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<IndexDelta>>>,
+    thread: Option<std::thread::JoinHandle<flow_state_store::Result<()>>>,
+}
+
+const STAGED_BATCHES: usize = 2;
+
+impl Stager {
+    fn spawn(scratch: StateStore, operation: OperationId) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<IndexDelta>>(STAGED_BATCHES);
+        let thread = std::thread::Builder::new()
+            .name("flow-compaction-stage".into())
+            .spawn(move || {
+                for deltas in receiver {
+                    scratch.stage_deltas(&operation, deltas)?;
+                }
+                Ok(())
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn stage(&mut self, deltas: Vec<IndexDelta>) -> Result<()> {
+        let sender = self.sender.as_ref().expect("stager is open");
+        if sender.send(deltas).is_err() {
+            // The thread stopped on an error; report it rather than the send.
+            self.finish()?;
+            bail!("compaction staging stopped");
+        }
+        Ok(())
+    }
+
+    /// Wait until every queued batch is staged, returning the first failure.
+    fn finish(&mut self) -> Result<()> {
+        self.sender.take();
+        match self.thread.take() {
+            Some(thread) => Ok(thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("compaction staging panicked"))??),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Stager {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
 }
 
 /// Shared v2 files retained after upgrade still protect surviving targets.
@@ -592,8 +661,8 @@ pub async fn scan_live_files(
     .await
 }
 
-/// Data scan after delete staging. The caller owns the scratch namespace and
-/// must stage every applicable delete before entering this loop.
+/// Row view of [`scan_staged_live_columns`], coalescing each file's live rows
+/// into batches bounded by rows and owned bytes.
 #[allow(clippy::too_many_arguments)]
 async fn scan_staged_live_files(
     table: &Table,
@@ -607,6 +676,95 @@ async fn scan_staged_live_files(
     cancelled: Option<&AtomicBool>,
     mut visit: impl AsyncFnMut(LiveBatch) -> Result<()>,
 ) -> Result<()> {
+    let v3 = table.metadata().format_version() == iceberg::spec::FormatVersion::V3;
+    let mut pending: Option<LiveBatch> = None;
+    let mut owned_bytes = 0u64;
+    scan_staged_live_columns(
+        table,
+        schema,
+        view,
+        files,
+        scratch,
+        scan_id,
+        batch_rows,
+        read_limits,
+        cancelled,
+        async |live| {
+            if let Some(batch) = pending.take_if(|batch| batch.file_id != live.file_id) {
+                visit(batch).await?;
+                owned_bytes = 0;
+            }
+            let rows = rows_from_batch(schema, &live.batch)?;
+            for (index, (row, position)) in rows.into_iter().zip(live.positions).enumerate() {
+                let row_bytes = live_row_bytes(&row)
+                    + if v3 {
+                        std::mem::size_of::<flow_materializer::RowLineage>() as u64
+                    } else {
+                        0
+                    };
+                ensure!(
+                    row_bytes <= read_limits.batch_bytes,
+                    "owned scan row exceeds batch byte limit"
+                );
+                if let Some(batch) = pending.take_if(|batch| {
+                    batch.rows.len() >= batch_rows
+                        || row_bytes > read_limits.batch_bytes - owned_bytes
+                }) {
+                    check_cancelled(cancelled)?;
+                    visit(batch).await?;
+                    owned_bytes = 0;
+                }
+                let batch = pending.get_or_insert_with(|| LiveBatch {
+                    file_id: live.file_id.clone(),
+                    rows: Vec::new(),
+                    positions: Vec::new(),
+                    lineage: v3.then(Vec::new),
+                });
+                owned_bytes += row_bytes;
+                batch.rows.push(row);
+                batch.positions.push(position);
+                if let (Some(output), Some(lineage)) = (&mut batch.lineage, &live.lineage) {
+                    output.push(lineage[index]);
+                }
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    if let Some(batch) = pending {
+        check_cancelled(cancelled)?;
+        visit(batch).await?;
+    }
+    Ok(())
+}
+
+/// One decoded batch's live rows, in the table's Arrow schema.
+struct LiveColumns {
+    file_id: FileId,
+    batch: RecordBatch,
+    /// Physical ordinals in the input file, before filtering position deletes.
+    positions: Vec<u64>,
+    lineage: Option<Vec<flow_materializer::RowLineage>>,
+}
+
+/// Data scan after delete staging. The caller owns the scratch namespace and
+/// must stage every applicable delete before entering this loop. Batches stay
+/// columnar: deleted rows are filtered out and the rest are not copied.
+#[allow(clippy::too_many_arguments)]
+async fn scan_staged_live_columns(
+    table: &Table,
+    schema: &TableSchema,
+    view: &SnapshotView,
+    files: &BTreeSet<FileId>,
+    scratch: &StateStore,
+    scan_id: &str,
+    batch_rows: usize,
+    read_limits: &ReadLimits,
+    cancelled: Option<&AtomicBool>,
+    mut visit: impl AsyncFnMut(LiveColumns) -> Result<()>,
+) -> Result<()> {
+    let target = writer_arrow_schema(schema);
+    let v3 = table.metadata().format_version() == iceberg::spec::FormatVersion::V3;
     let mut prefetch = Prefetch::new(
         table.file_io(),
         files.iter().map(|file| {
@@ -626,12 +784,7 @@ async fn scan_staged_live_files(
             .transpose()?
             .map(|location| location.row_position);
         let mut position = 0u64;
-        let mut rows = Vec::new();
-        let mut positions = Vec::new();
-        let v3 = table.metadata().format_version() == iceberg::spec::FormatVersion::V3;
         let entry = &view.live_files[&file.0];
-        let mut lineage = v3.then(Vec::new);
-        let mut owned_bytes = 0u64;
         read_input_batches(
             table.file_io(),
             &file.0,
@@ -641,8 +794,7 @@ async fn scan_staged_live_files(
             read_limits,
             async |batch| {
                 check_cancelled(cancelled)?;
-                let all_rows = rows_from_batch(schema, &batch)?;
-                let resolved = if v3 {
+                let mut lineage = if v3 {
                     Some(flow_materializer::read_row_lineage(
                         &batch,
                         position,
@@ -654,7 +806,10 @@ async fn scan_staged_live_files(
                 } else {
                     None
                 };
-                for (index, row) in all_rows.into_iter().enumerate() {
+                let batch = conform(schema, &target, &batch)?;
+                let mut live = Vec::with_capacity(batch.num_rows());
+                let mut positions = Vec::with_capacity(batch.num_rows());
+                for _ in 0..batch.num_rows() {
                     ensure!(
                         next_delete.is_none_or(|deleted| deleted >= position),
                         "position delete fell behind scan"
@@ -664,41 +819,33 @@ async fn scan_staged_live_files(
                             .next()
                             .transpose()?
                             .map(|location| location.row_position);
+                        live.push(false);
                     } else {
-                        let row_bytes = live_row_bytes(&row)
-                            + if v3 {
-                                std::mem::size_of::<flow_materializer::RowLineage>() as u64
-                            } else {
-                                0
-                            };
-                        ensure!(
-                            row_bytes <= read_limits.batch_bytes,
-                            "owned scan row exceeds batch byte limit"
-                        );
-                        if !rows.is_empty()
-                            && (rows.len() >= batch_rows
-                                || row_bytes > read_limits.batch_bytes - owned_bytes)
-                        {
-                            check_cancelled(cancelled)?;
-                            visit(LiveBatch {
-                                file_id: file.clone(),
-                                rows: std::mem::take(&mut rows),
-                                positions: std::mem::take(&mut positions),
-                                lineage: lineage.as_mut().map(std::mem::take),
-                            })
-                            .await?;
-                            owned_bytes = 0;
-                        }
-                        owned_bytes += row_bytes;
-                        rows.push(row);
                         positions.push(position);
-                        if let (Some(output), Some(resolved)) = (&mut lineage, &resolved) {
-                            output.push(resolved[index]);
-                        }
+                        live.push(true);
                     }
                     position += 1;
                 }
-                Ok(())
+                if positions.is_empty() {
+                    return Ok(());
+                }
+                let batch = if positions.len() == batch.num_rows() {
+                    batch
+                } else {
+                    if let Some(lineage) = &mut lineage {
+                        let mut live = live.iter();
+                        lineage.retain(|_| *live.next().expect("one flag per row"));
+                    }
+                    filter_record_batch(&batch, &BooleanArray::from(live))?
+                };
+                check_cancelled(cancelled)?;
+                visit(LiveColumns {
+                    file_id: file.clone(),
+                    batch,
+                    positions,
+                    lineage,
+                })
+                .await
             },
         )
         .await?;
@@ -707,19 +854,9 @@ async fn scan_staged_live_files(
             "position delete is outside input file"
         );
         ensure!(
-            position == view.live_files[&file.0].data_file.record_count(),
+            position == entry.data_file.record_count(),
             "data file row count differs from metadata"
         );
-        if !rows.is_empty() {
-            check_cancelled(cancelled)?;
-            visit(LiveBatch {
-                file_id: file.clone(),
-                rows,
-                positions,
-                lineage,
-            })
-            .await?;
-        }
     }
     Ok(())
 }
@@ -1113,4 +1250,88 @@ async fn load_deletes(
         );
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_model::PrimaryKey;
+    use flow_state_store::StateStoreOptions;
+
+    fn delta(key: u8, position: u64) -> IndexDelta {
+        IndexDelta {
+            key: PrimaryKey(vec![1, key]),
+            expected: None,
+            replacement: Some(RowLocation {
+                data_file_id: FileId("out.parquet".into()),
+                row_position: position,
+                data_sequence_number: 1,
+                spec_id: 0,
+                partition: Vec::new(),
+                source_commit_lsn: PgLsn(0),
+                row_version: 0,
+                row_fingerprint: [0; 16],
+            }),
+        }
+    }
+
+    fn building(name: &str) -> (tempfile::TempDir, StateStore, OperationId) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let operation = OperationId(name.into());
+        store
+            .begin_prepare(PreparedOperation {
+                id: operation.clone(),
+                table_id: TableId(1),
+                kind: OperationKind::Rewrite,
+                base_snapshot_id: None,
+                last_lsn: PgLsn(0),
+                schema_version: 0,
+                artifacts: Vec::new(),
+                payload: Vec::new(),
+            })
+            .unwrap();
+        (directory, store, operation)
+    }
+
+    #[test]
+    fn stager_keeps_batch_order() {
+        let (_directory, store, operation) = building("ordered");
+        let mut stager = Stager::spawn(store.clone(), operation.clone()).unwrap();
+        for batch in 0..5u8 {
+            let deltas = (0..3).map(|row| delta(batch * 3 + row, u64::from(batch * 3 + row)));
+            stager.stage(deltas.collect()).unwrap();
+        }
+        stager.finish().unwrap();
+        store
+            .seal_prepare(&operation, Vec::new(), Vec::new())
+            .unwrap();
+        let staged: Vec<_> = store
+            .prepared_deltas(&operation)
+            .unwrap()
+            .map(|delta| delta.unwrap().key.0[1])
+            .collect();
+        assert_eq!(staged, (0..15).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn stager_reports_the_staging_error() {
+        let (_directory, store, operation) = building("duplicate");
+        let mut stager = Stager::spawn(store, operation).unwrap();
+        stager.stage(vec![delta(1, 0)]).unwrap();
+        // The duplicate key fails on the staging thread; the worker sees it at
+        // a later send or when it waits for the queue to drain.
+        let mut result = stager.stage(vec![delta(1, 1)]);
+        for position in 2..10 {
+            if result.is_err() {
+                break;
+            }
+            result = stager.stage(vec![delta(100 + position as u8, position)]);
+        }
+        let error = result.and_then(|()| stager.finish()).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate primary key"),
+            "{error:#}"
+        );
+    }
 }

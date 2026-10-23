@@ -104,8 +104,15 @@ Logs are JSON lines on standard output, captured by the journal.
   state before the first stops; the lock makes it fail instead of corrupting
   state, but the rollout stalls.
 - Put `state_dir` on a PersistentVolumeClaim. It holds the journal and index
-  that recovery depends on; an `emptyDir` loses them on rescheduling. Set
-  `state_dir` to an absolute path on the mount.
+  that recovery depends on; an `emptyDir` loses them on rescheduling. With
+  [remote durability](remote-durability.md), an `emptyDir` (or other
+  ephemeral volume) is safe: a rescheduled pod restores the journal and
+  control state from object storage and downloads the row index, so it pays a
+  restore instead of losing data. It still needs the full
+  [disk capacity](#disk-capacity). An `emptyDir` with `medium: Memory` also
+  needs `storage.medium = "memory"`; see
+  [memory-backed state](#memory-backed-state). Set `state_dir` to an absolute
+  path on the mount.
 - Run `init` as a one-shot Job, or as an initContainer: `init` exits 0
   immediately once initialization has completed, and resumes an interrupted
   initialization otherwise. Both need the same volume, configuration and
@@ -203,7 +210,9 @@ the journal much larger than the largest source transaction and at least four
 ## Disk capacity
 
 Everything Flow keeps locally lives in `state_dir`, normally on one volume.
-Size that volume for the sum of:
+[Remote durability](remote-durability.md) makes that volume replaceable, not
+smaller: Flow still captures, indexes and stages locally. Size the volume for
+the sum of:
 
 - **Journal**: up to `limits.journal_bytes` (64 GiB by default) of captured,
   unpublished transactions.
@@ -244,6 +253,53 @@ before that point.
 
 The pause protects the volume only against Flow's own growth. Keep other
 writers off the state volume, or leave them their own margin.
+
+### Memory-backed state
+
+With [remote durability](remote-durability.md), `state_dir` can be on tmpfs or
+ramfs, such as a Kubernetes `emptyDir` with `medium: Memory`, so the deployment
+needs no volume. Declare it:
+
+```toml
+[storage]
+medium = "memory"
+min_free_bytes = 536870912 # memory headroom below which capture pauses
+```
+
+It is off by default and supported only on Linux. `init` and `run` refuse to
+start unless `[durability]` is configured and `state_dir` is on tmpfs or ramfs,
+and warn about a memory-backed `state_dir` still declared as `disk`.
+
+Every byte of state is then memory, so free space is the smallest of the
+filesystem's own free space, the headroom under every cgroup v2 memory limit of
+the process (the limit less current usage, not counting reclaimable file
+cache), and the host's available memory. The capture watermark, the startup
+budget and `flow_state_volume_available_bytes` all use that figure, so capture
+pauses at `storage.min_free_bytes` of memory headroom instead of the process
+being killed when memory runs out. cgroup v1 limits are not read; there only
+the filesystem's size and the host's available memory apply, so set the tmpfs
+`size` (or the `emptyDir` `sizeLimit`) below the container's memory limit.
+
+Size the memory limit for the process itself plus the same items as a disk
+volume:
+
+- The row index, its retained checkpoints, and a complete second copy during a
+  rebuild.
+- The journal and spool as far as they fill. Lower `limits.journal_bytes` and
+  `limits.spool_bytes` to what memory can hold; the journal grows toward its
+  quota whenever publication stalls, for example during a catalog outage.
+- Initial-copy staging during `init`, up to five times `journal_bytes`.
+
+The watermark protects memory only against the growth of state. Process memory
+(decoded batches, the row-index block cache, Parquet buffers, and up to 128 MiB
+of scratch memtables per running compaction build) needs its own margin under
+the limit, sized from the [memory metrics](observability.md).
+
+A container restart keeps an `emptyDir` and resumes immediately. A pod
+rescheduled to another node, or a host reboot, loses the state: the next start
+restores the journal and control store from object storage and downloads the
+row-index checkpoint, so it takes longer than a restart on disk but loses no
+acknowledged change. For a large index, disk is cheaper than memory.
 
 ### Index verification and rebuild space
 

@@ -314,3 +314,215 @@ async fn live_busy_slot_waits_and_row_errors_block_only_their_table() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// Under DEFAULT identity PostgreSQL omits out-of-line values an update leaves
+/// unchanged. The daemon publishes complete rows by carrying them forward from
+/// the earlier in-epoch image or the indexed Iceberg row, and never blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_default_identity_carries_unchanged_toast_values_forward() {
+    carries_unchanged_toast_values_forward(false).await;
+}
+
+/// Moving a live FULL table to DEFAULT keeps it publishing complete rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_full_to_default_identity_switch_keeps_publishing() {
+    carries_unchanged_toast_values_forward(true).await;
+}
+
+async fn carries_unchanged_toast_values_forward(switch_from_full: bool) {
+    use arrow_array::{Array, Int64Array, StringArray};
+    use futures::TryStreamExt;
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, _sql_task) = connect(&url).await;
+    let name = unique("toast");
+    // EXTERNAL storage keeps large values out of line and uncompressed, so
+    // pgoutput sends unchanged-TOAST markers rather than inline values.
+    sql.batch_execute(&format!(
+        "CREATE SCHEMA {name};
+         CREATE TABLE {name}.docs (id bigint PRIMARY KEY, body text, version bigint);
+         ALTER TABLE {name}.docs ALTER COLUMN body SET STORAGE EXTERNAL;
+         ALTER TABLE {name}.docs REPLICA IDENTITY {};
+         INSERT INTO {name}.docs SELECT id, repeat(md5(id::text), 1000), 0 FROM generate_series(1, 3) id;
+         CREATE PUBLICATION {name} FOR TABLE {name}.docs;",
+        if switch_from_full { "FULL" } else { "DEFAULT" }
+    ))
+    .await
+    .unwrap();
+    let identity: String = sql
+        .query_one(
+            &format!("SELECT relreplident::text FROM pg_class WHERE oid = '{name}.docs'::regclass"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(identity, if switch_from_full { "f" } else { "d" });
+    let root = tempfile::tempdir().unwrap();
+    let mut config: Config = toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+    config.state_dir = root.path().join("state");
+    config.source.id = name.clone();
+    config.source.connection_env = "FLOW_POSTGRES_URL".into();
+    config.source.slot = name.clone();
+    config.source.publication = name.clone();
+    let uri = format!("memory://{name}");
+    config.catalog = HashMap::from([("uri".into(), uri.clone())]);
+    let mut table = config.tables[0].clone();
+    table.source_namespace = name.clone();
+    table.source_table = "docs".into();
+    table.target_namespace = vec![name.clone()];
+    table.target_table = "docs".into();
+    table.columns.push(table.columns[1].clone());
+    for (index, (name, data_type)) in [
+        ("id", flow_model::ColumnType::Int64),
+        ("body", flow_model::ColumnType::String),
+        ("version", flow_model::ColumnType::Int64),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        table.columns[index].field_id = index as i32 + 1;
+        table.columns[index].name = name.into();
+        table.columns[index].data_type = data_type;
+        table.columns[index].nullable = index > 0;
+    }
+    config.tables = vec![table];
+    let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                &name,
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), uri.clone())]),
+            )
+            .await
+            .unwrap(),
+    );
+    crate::services::TEST_CATALOGS
+        .lock()
+        .unwrap()
+        .insert(uri.clone(), catalog.clone());
+
+    let body = AssertUnwindSafe(async {
+        crate::bootstrap::initialize(config.clone()).await.unwrap();
+        let daemon = crate::runtime::run(config.clone(), false);
+        tokio::pin!(daemon);
+        let checks = async {
+            if switch_from_full {
+                // A live FULL table moves to DEFAULT: the same schema, not a block.
+                sql.batch_execute(&format!(
+                    "UPDATE {name}.docs SET version = 0 WHERE id = 3;
+                     ALTER TABLE {name}.docs REPLICA IDENTITY DEFAULT;"
+                ))
+                .await
+                .unwrap();
+            }
+            // Rows 1 and 2 resolve from the initial copy's Iceberg rows; row 2
+            // changes twice in one transaction; row 4 resolves in-epoch.
+            sql.batch_execute(&format!(
+                "UPDATE {name}.docs SET version = 1 WHERE id = 1;
+                 BEGIN;
+                 UPDATE {name}.docs SET version = 1 WHERE id = 2;
+                 UPDATE {name}.docs SET version = 2 WHERE id = 2;
+                 INSERT INTO {name}.docs VALUES (4, repeat(md5('4'), 1000), 0);
+                 UPDATE {name}.docs SET version = 5 WHERE id = 4;
+                 COMMIT;"
+            ))
+            .await
+            .unwrap();
+            let changed: i64 = sql
+                .query_one("SELECT (pg_current_wal_lsn() - '0/0')::bigint", &[])
+                .await
+                .unwrap()
+                .get(0);
+            until("the updates publish", || async {
+                materialized(&config, "docs") >= changed as u64
+            })
+            .await;
+            // A later epoch resolves from rows the previous epoch wrote.
+            sql.batch_execute(&format!("UPDATE {name}.docs SET version = 3 WHERE id = 2"))
+                .await
+                .unwrap();
+            let changed: i64 = sql
+                .query_one("SELECT (pg_current_wal_lsn() - '0/0')::bigint", &[])
+                .await
+                .unwrap()
+                .get(0);
+            until("the second epoch publishes", || async {
+                materialized(&config, "docs") >= changed as u64
+            })
+            .await;
+            assert!(blocked(&config).is_empty(), "{:?}", blocked(&config));
+            let ident = iceberg::TableIdent::new(
+                iceberg::NamespaceIdent::from_vec(vec![name.clone()]).unwrap(),
+                "docs".into(),
+            );
+            let table = catalog.load_table(&ident).await.unwrap();
+            let batches: Vec<_> = table
+                .scan()
+                .build()
+                .unwrap()
+                .to_arrow()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let mut rows = Vec::new();
+            for batch in &batches {
+                let column = |name| batch.column_by_name(name).unwrap();
+                let ids = column("id").as_any().downcast_ref::<Int64Array>().unwrap();
+                let bodies = column("body")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let versions = column("version")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for index in 0..batch.num_rows() {
+                    assert!(!bodies.is_null(index));
+                    rows.push((
+                        ids.value(index),
+                        bodies.value(index).to_owned(),
+                        versions.value(index),
+                    ));
+                }
+            }
+            rows.sort();
+            let expected: Vec<(i64, String, i64)> = sql
+                .query(
+                    &format!("SELECT id, body, version FROM {name}.docs ORDER BY id"),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect();
+            assert_eq!(
+                expected
+                    .iter()
+                    .map(|row| (row.0, row.2))
+                    .collect::<Vec<_>>(),
+                [(1, 1), (2, 3), (3, 0), (4, 5)]
+            );
+            assert!(expected.iter().all(|row| row.1.len() == 32_000));
+            assert_eq!(rows, expected);
+        };
+        tokio::select! {
+            result = &mut daemon => panic!("daemon stopped: {result:?}"),
+            () = checks => {}
+        }
+    });
+    let result = body.catch_unwind().await;
+    release_slot(&sql, &name).await;
+    sql.batch_execute(&format!(
+        "DROP PUBLICATION IF EXISTS {name}; DROP SCHEMA {name} CASCADE"
+    ))
+    .await
+    .unwrap();
+    crate::services::TEST_CATALOGS.lock().unwrap().remove(&uri);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

@@ -16,6 +16,15 @@ also missed the compacted-reader target. Separate 258-column, 1,502-column and
 approximately MiB-row recovery checks passed. Read the report's workload and
 host limits before using these observations for sizing.
 
+## Collapse memory
+
+The [collapse memory comparison](benchmarks/collapse-memory.md) raised the
+default `limits.collapse_memory_bytes` from 32 MiB to 128 MiB. With the old limit,
+most backlogged one-table epochs overflowed into disk collapse. On an 8-vCPU VM at
+50k offered mixed mutations/s, the daemon drained 21,684–22,316 mutations/s
+against 18,254–19,888/s, with commit-to-catalog p95 of 18–20 s against 29–30 s.
+Both still miss the latency target.
+
 ## Publication batching across many tables
 
 The shared `limits.pending_transactions` window (256 descriptors by default)
@@ -57,6 +66,18 @@ Both formats used DuckDB 1.5.5 with its external file cache disabled to work
 around a confirmed shared-Puffin reader bug. The record links the upstream
 fix and gives the exact reader settings. V3 preparation read amplification
 remains the measured high-load bottleneck.
+
+## Compaction worker
+
+A compaction worker no longer converts scanned Arrow batches into rows and back
+([report](benchmarks/arrow-compaction-rewrite.md)), and it now stages row
+mappings on a separate thread into scratch stores with larger memtables
+([report](benchmarks/compaction-staging.md)). On the focused worker benchmark,
+16 files of 32,768 ten-column rows, the staging change cut median worker latency
+a further 30–32% on two vCPUs and 14–24% on one, with 14–24% less CPU per
+compaction, for up to about 90 MiB more peak memory per running build. These
+are worker timings on local disk, not publication latency or service
+throughput; the numbers above were not rerun.
 
 ## Reproducibility
 

@@ -227,13 +227,16 @@ async fn run_service(
         }
     })
     .await?;
-    let publisher = Arc::new(TablePublisher::new(
-        store.clone(),
-        catalog.clone(),
-        crate::services::writer_config(&config),
-        config.limits.batch_rows,
-        config.limits.batch_bytes,
-    )?);
+    let publisher = Arc::new(
+        TablePublisher::new(
+            store.clone(),
+            catalog.clone(),
+            crate::services::writer_config(&config),
+            config.limits.batch_rows,
+            config.limits.batch_bytes,
+        )?
+        .with_read_limits(config.parquet_read.clone())?,
+    );
     let maintenance = Arc::new(
         TableMaintenance::new(
             store.clone(),

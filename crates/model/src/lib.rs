@@ -67,8 +67,34 @@ pub enum Value {
     },
     /// An absolute instant, stored as UTC microseconds since the Unix epoch.
     TimestampTzMicros(i64),
+    /// The source omitted this value because it did not change, such as an
+    /// out-of-line PostgreSQL TOAST value under DEFAULT replica identity. It
+    /// is never published: collapse or publication carries the key's previous
+    /// value forward, and every complete-row validation rejects it.
+    Unchanged,
 }
 pub type Row = Vec<Value>;
+
+/// Whether a source row omits at least one unchanged value.
+pub fn row_has_unchanged(row: &Row) -> bool {
+    row.iter().any(|value| matches!(value, Value::Unchanged))
+}
+
+/// Carry the previous image into each unchanged position. The previous image
+/// may itself be partial; those positions remain unchanged.
+pub fn carry_forward_unchanged(row: &mut Row, previous: &Row) -> Result<(), ModelError> {
+    if row.len() != previous.len() {
+        return Err(ModelError::InvalidRow(
+            "previous row image has a different column count".into(),
+        ));
+    }
+    for (value, previous) in row.iter_mut().zip(previous) {
+        if matches!(value, Value::Unchanged) {
+            *value = previous.clone();
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnType {
@@ -162,6 +188,12 @@ impl TableSchema {
             return Err(ModelError::InvalidRow("column count differs".into()));
         }
         for (col, value) in self.columns.iter().zip(row) {
+            if matches!(value, Value::Unchanged) {
+                return Err(ModelError::InvalidRow(format!(
+                    "unresolved unchanged value for {}",
+                    col.name
+                )));
+            }
             let valid = match (&col.data_type, value) {
                 (_, Value::Null) => col.nullable,
                 (ColumnType::Bool, Value::Bool(_))
@@ -207,6 +239,53 @@ impl TableSchema {
         self.validate_row(row)?;
         Ok(fingerprint(row))
     }
+    /// Validate an update image that may omit unchanged non-key values.
+    /// Primary-key values and every present value retain the complete-row rules.
+    pub fn validate_partial_row(&self, row: &Row) -> Result<(), ModelError> {
+        if row.len() != self.columns.len() {
+            return Err(ModelError::InvalidRow("column count differs".into()));
+        }
+        if self.append_only {
+            return Err(ModelError::InvalidRow(
+                "append-only rows cannot omit unchanged values".into(),
+            ));
+        }
+        let mut present = row.clone();
+        for (index, value) in present.iter_mut().enumerate() {
+            if matches!(value, Value::Unchanged) {
+                if self.primary_key.contains(&index) {
+                    return Err(ModelError::InvalidRow(format!(
+                        "primary-key column {} cannot be unchanged",
+                        self.columns[index].name
+                    )));
+                }
+                *value = placeholder(&self.columns[index].data_type);
+            }
+        }
+        self.validate_row(&present)
+    }
+    /// Encode the key of a complete or partial update image.
+    pub fn encode_partial_key(&self, row: &Row) -> Result<PrimaryKey, ModelError> {
+        self.validate_partial_row(row)?;
+        if self.primary_key.is_empty() {
+            return Err(ModelError::MissingKey);
+        }
+        let mut bytes = vec![1]; // canonical format version
+        for idx in &self.primary_key {
+            encode_value(&row[*idx], |chunk| bytes.extend_from_slice(chunk));
+        }
+        Ok(PrimaryKey(bytes))
+    }
+    /// [`Self::project_row`] for an image that may omit unchanged values.
+    /// Added nullable columns did not exist in the source image and become null.
+    pub fn project_partial_row(&self, mut row: Row, target: &Self) -> Result<Row, ModelError> {
+        self.validate_partial_row(&row)?;
+        if self != target {
+            self.validate_successor(target)?;
+        }
+        row.resize(target.columns.len(), Value::Null);
+        Ok(row)
+    }
     /// Project a historical row into a compatible nullable-column successor.
     /// Existing fields and key bytes retain their identity and ordering.
     pub fn project_row(&self, mut row: Row, target: &Self) -> Result<Row, ModelError> {
@@ -240,6 +319,27 @@ impl TableSchema {
             ));
         }
         Ok(())
+    }
+}
+
+/// A valid present value used only to type-check the other columns of a
+/// partial image; it is never stored or published.
+fn placeholder(data_type: &ColumnType) -> Value {
+    match data_type {
+        ColumnType::Bool => Value::Bool(false),
+        ColumnType::Int32 => Value::Int32(0),
+        ColumnType::Int64 => Value::Int64(0),
+        ColumnType::Float64 => Value::Float64(0.0),
+        ColumnType::String => Value::String(String::new()),
+        ColumnType::Binary => Value::Binary(Vec::new()),
+        ColumnType::Date => Value::Date(0),
+        ColumnType::TimestampMicros => Value::TimestampMicros(0),
+        ColumnType::Uuid => Value::Uuid([0; 16]),
+        ColumnType::Decimal { scale, .. } => Value::Decimal {
+            unscaled: 0,
+            scale: *scale,
+        },
+        ColumnType::TimestampTzMicros => Value::TimestampTzMicros(0),
     }
 }
 
@@ -301,6 +401,9 @@ fn encode_value(value: &Value, mut emit: impl FnMut(&[u8])) {
             emit(&[11]);
             emit(&v.to_be_bytes());
         }
+        // Complete-row validation rejects this before any key or fingerprint
+        // is persisted. The distinct tag keeps an unvalidated call unambiguous.
+        Value::Unchanged => emit(&[255]),
     }
 }
 pub fn fingerprint(row: &Row) -> [u8; 16] {

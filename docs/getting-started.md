@@ -54,16 +54,20 @@ CREATE PUBLICATION embrasure_flow FOR TABLE public.orders
 
 Mutable tables need a primary key and one of two replica identities:
 
-- `REPLICA IDENTITY FULL` works for every supported column type. PostgreSQL
-  logs the complete old row for each update and delete, so it writes more WAL.
-- `REPLICA IDENTITY DEFAULT` (PostgreSQL's default) also works when every
-  replicated column has a fixed-width type: `boolean`, `smallint`, `integer`,
-  `bigint`, `real`, `double precision`, `date`, `time`, `timestamp`,
-  `timestamptz`, `uuid`, an enum, or a domain over one of these. Such values
-  cannot be TOASTed, so every update carries the complete new row without the
-  extra old-row WAL. A table with any variable-width replicated column (`text`,
-  `numeric`, `jsonb`, arrays and so on) needs FULL; excluding such a column with
-  explicit `column_selection` does not change this.
+- `REPLICA IDENTITY DEFAULT` (PostgreSQL's default) is recommended. PostgreSQL
+  omits an out-of-line (TOAST) value from an update that does not change it.
+  Flow carries that value forward from the key's earlier image in the same
+  publication epoch, or from its row in the current Iceberg snapshot after
+  checking the row fingerprint recorded in the write-side index. It never
+  queries the source for the value and never publishes a placeholder.
+- `REPLICA IDENTITY FULL` makes PostgreSQL log the complete old row for each
+  update and delete, so it writes more WAL. Use it for tables whose primary
+  keys change: a key change that leaves a TOASTed value unchanged has no prior
+  image under DEFAULT, so that table blocks and needs a resync.
+
+A live table can switch between DEFAULT and FULL with `ALTER TABLE ... REPLICA
+IDENTITY`; Flow treats both as the same schema and keeps publishing. NOTHING and
+USING INDEX are rejected.
 
 `check --source` and `discover` report which identity each table needs. Tables
 without a primary key can only be replicated in append-only mode.
@@ -159,12 +163,13 @@ The configured column list defines the initial source schema; see the [type mapp
 
 Configure the REST catalog URI, warehouse and object-store endpoint for your own
 services. Flow needs catalog access to load/create tables and commit snapshots,
-and object access to read, write, list and delete its files. Use a persistent,
-writable `state_dir`; do not share it between running Flow processes. A
-relative `state_dir` is resolved against the configuration file's directory. It
-holds replicated row data, so Flow creates it and every file in it readable only
-by the user running Flow, and removes group and other access from an existing
-`state_dir` owned by that user. On shared volumes such as Kubernetes volumes
+and object access to read, write, list and delete its files. Use a writable
+`state_dir` on persistent storage, or on any storage with
+[remote durability](remote-durability.md); do not share it between running
+Flow processes. A relative `state_dir` is resolved against the configuration
+file's directory. It holds replicated row data, so Flow creates it and every
+file in it readable only by the user running Flow, and removes group and other
+access from an existing `state_dir` owned by that user. On shared volumes such as Kubernetes volumes
 with `fsGroup`, use a subdirectory like `/data/state`; see
 [security](../SECURITY.md#deployment).
 
@@ -180,7 +185,7 @@ the pipeline. See [operations](operations.md#before-initialization).
 
 Mutable tables require a primary key and a [supported replica identity](#replica-identity). Publications must include inserts, updates, deletes and truncates, and every configured table with all of its columns and no row filter; they may include other tables. During streaming, a committed TRUNCATE blocks the affected table and requires coordinated resynchronization. Keyless tables are supported only in append-only mode.
 
-An unchanged TOAST value is recovered from the complete old tuple included in that replication event. Missing or unresolved old values block the affected table rather than publishing an incomplete row.
+An unchanged TOAST value is recovered from the complete old tuple under FULL, or carried forward from the key's previous row under DEFAULT. A value with no prior image blocks the affected table rather than publishing an incomplete row.
 
 ```sh
 export FLOW_POSTGRES_URL='postgres://user:password@host/database?sslmode=verify-full&sslrootcert=/etc/flow/postgres-ca.pem'
@@ -222,7 +227,7 @@ authentication; bind it to a private interface. See [observability](observabilit
 | Source connection environment variable is missing | Export the variable named by `source.connection_env` in the process running Flow. |
 | Publication not found or a configured table is missing | Create the named publication in the source database with every configured table and all four operation flags. It may include other tables. |
 | Publication no longer matches the capture contract | A configured table was removed or given a row filter or column list: only that table is blocked with `publication_changed` and needs a resync. A missing publication or unpublished operation stops capture; every start for that slot then fails with "requires resynchronization before capture can resume". Restoring the setting does not clear either; changes may have been skipped. |
-| Replica identity or primary-key validation fails | Set FULL replica identity, or DEFAULT when every replicated column is [fixed-width](#replica-identity), and match the complete primary key in `primary_key`; keyless tables require append-only mode. `discover` generates matching blocks. |
+| Replica identity or primary-key validation fails | Set DEFAULT or FULL [replica identity](#replica-identity) and match the complete primary key in `primary_key`; keyless tables require append-only mode. `discover` generates matching blocks. |
 | Source column name or type differs | Match column order, names and the type mappings; check `column_selection` if intentionally excluding columns. |
 | Connection, authentication or access denied | Check PostgreSQL login/replication permissions, catalog credentials and object-store permissions. `check --source` validates the PostgreSQL side; plain `check` validates none of them. Tables blocked with `catalog_auth` need new or broader catalog credentials. |
 | Catalog TLS certificate verification fails | Trust the catalog's CA through the system store, `SSL_CERT_FILE`, or `catalog.tls_ca_file`, and connect with a host name the certificate covers. |
@@ -234,7 +239,7 @@ failures, including cases where healthy tables continue publishing.
 
 ## Recovery and operational limits
 
-`materialized` acknowledgement is the default. `journaled` mode requires an explicit declaration of independently durable storage. Selecting that mode does not replicate a local disk. Disk loss and a process crash are different failure models. Journaled mode lets PostgreSQL release WAL as soon as a transaction is in the local journal, so losing that journal loses those transactions. It is covered by source-ledger tests and a CI crash and outage run, but has far less production mileage than the default; prefer `materialized` unless WAL retention during catalog outages is the constraint.
+`materialized` acknowledgement is the default. `journaled` mode requires either [remote durability](remote-durability.md), which replicates the journal to object storage, or an explicit `journal_durability = "independent-storage"` declaration. The declaration alone does not replicate a local disk. Disk loss and a process crash are different failure models. Journaled mode lets PostgreSQL release WAL as soon as a transaction is in the local journal, so losing that journal loses those transactions. It is covered by source-ledger tests and a CI crash and outage run, but has far less production mileage than the default; prefer `materialized` unless WAL retention during catalog outages is the constraint.
 
 Keep snapshot history covering unfinished prepared operations, reader retention windows and useful checkpoints. The garbage collector protects retained snapshots, checkpoints and in-flight operations, and deletes only registered service-owned artifacts after a grace period. Index loss does not impair reads; startup restores a matching checkpoint or scans standard data and deletes, then atomically activates the rebuilt generation before restoring writes. Source lineage or unexplained external logical changes stop publication.
 
@@ -261,8 +266,8 @@ Current support boundaries:
 - Maximum row size: one captured row change must encode within `limits.chunk_bytes` (default 4 MiB) less 40 bytes of framing, which also reserves room to quarantine the complete decoded row if a streamed transaction later blocks its table. The encoding is close to the row's decoded value bytes; an UPDATE also carries its old primary key. A larger change durably blocks only its table, with a reason naming `limits.chunk_bytes`. The limit can be raised to just under 64 MiB (the journal and spool segment size); `limits.batch_bytes` and `limits.parquet_row_group_bytes` must be at least as large. Each pgoutput message must also fit `limits.source_message_bytes` (default 32 MiB, at least `chunk_bytes`). Text-mode messages expand bytea to hex and an UPDATE carries both row images, so size it at a few times the largest row. An oversized message is rejected before its table can be identified and stops capture for all tables until the limit is raised.
 - An UPDATE or DELETE on an `append_only = true` table durably blocks that table; resynchronize it, or set `append_only = false` (which needs a primary key and replica identity) and resynchronize.
 - Capture spools open source transactions on disk. `limits.spool_transactions` (default 1024) bounds concurrently open and streamed transactions, and `limits.spool_subtransactions` (default 1048576, roughly 100 bytes of memory each) bounds savepoints that captured rows within one transaction. Exceeding either, or `limits.spool_bytes`, stops capture with an error naming that setting.
-- A journal segment damaged before the final segment, or damage that would discard transactions the source ledger recorded as durable, stops startup without modifying the journal. Only an unsynchronized tail of the final segment is truncated after a crash. Restore the state directory or resynchronize the source.
-- Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor (systemd, Kubernetes or similar) that restarts it after a crash or failed start. The `state_dir` must be on persistent storage; Flow does not replicate it to another host.
+- A journal segment damaged before the final segment, or damage that would discard transactions the source ledger recorded as durable, stops startup without modifying the journal. Only an unsynchronized tail of the final segment is truncated after a crash. Restore the state directory or resynchronize the source. With remote durability, move the damaged state directory aside instead; the next start restores it from object storage.
+- Catalog and object-store transient failures retry with durable prepared-operation recovery. Run the daemon under a supervisor (systemd, Kubernetes or similar) that restarts it after a crash or failed start. Without [remote durability](remote-durability.md), the `state_dir` must be on persistent storage, because Flow does not replicate it to another host. With it, the `state_dir` may be ephemeral: a replacement host restores it from object storage, without losing changes acknowledged to the source.
 - Compaction supports unsorted layouts. Z-order-aware compaction, distributed compaction and high availability are not supported yet. Flow reconciles rewrites made by external compactors, and this is tested against Spark's maintenance procedures.
 
 Keep the source publication's operation flags, and the configured tables' membership, column lists and row filters, fixed from initialization through streaming. Other tables may join or leave the publication. [Operations](operations.md) describes resynchronization, adding tables and planned source maintenance. Coordinate changes by stopping capture and resynchronizing the affected source before resuming. PostgreSQL may silently omit changes under an altered publication, so restoring its settings or restarting the service cannot prove that no rows were missed. Flow re-checks this contract on every reconnect and about once a minute while running. A change to one configured table blocks only that table (`blocked_tables` code `publication_changed`) and drops its changes while the others keep syncing. A missing publication or unpublished operation stops the process and writes `state_dir/publication-resync-required.json`; later starts for that slot refuse until a resync. Neither clears when the publication is restored. The check is best effort: it cannot see a configured table removed and re-added between checks, and the writes made in that gap are never sent. Coordinate every publication change that affects configured tables with a resync.

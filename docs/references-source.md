@@ -62,11 +62,15 @@ Unknown formats, truncated records and invalid proofs fail closed.
   A requested replay LSN is not an ACK proof either. Automatic keepalive replies
   remain at zero until the coordinator supplies verified watermarks.
 * TOAST reconstruction: fetching missing values through a separate query races
-  with concurrent source writes. Mutable capture requires FULL identity. pgoutput
-  can still mark new tuple fields unchanged; capture reconstructs them only from
-  the validated complete old tuple carried by the same update. Missing, malformed, key-only,
-  or incomplete old tuples block that table (`source_schema_incompatible`) while
-  other tables keep publishing. No current-row query or placeholder is used.
+  with concurrent source writes. pgoutput marks unchanged out-of-line fields in
+  the new tuple. Under FULL, capture reconstructs them from the validated
+  complete old tuple carried by the same update; missing, malformed, key-only
+  or incomplete old tuples block that table. Under DEFAULT, the destination
+  already holds the value: collapse and publication carry it forward from the
+  key's previous image (PeerDB, Estuary and PostgreSQL's own apply worker use
+  the same approach). Key changes with unchanged values block that table. A
+  blocked table reports `source_schema_incompatible` while other tables keep
+  publishing. No current-row query or placeholder is used.
 
 ## Implemented paths and verification
 
@@ -78,7 +82,7 @@ Unknown formats, truncated records and invalid proofs fail closed.
 | Large streamed transactions | One bounded active buffer, disk spool, bounded XID/savepoint counts, terminal-only journal commit | Sustained throughput and source memory measurements |
 | Nested stream abort | Real disk suffix truncation removes aborted parent and child changes | PostgreSQL nested-savepoint workloads |
 | Rollback without a stream abort | Commit-time commit-log status excludes rolled-back subtransactions; live probe of a spilled savepoint over one restore batch in the PostgreSQL compatibility suite | Rate of PostgreSQL spilling in production workloads |
-| TOAST | Validated FULL old tuples resolve unchanged fields; unresolved values block the table instead of publishing. Real 18.6 updates, key moves and deletes preserve 16 KiB text and 8 KiB binary values | PostgreSQL version matrix and larger configured row limits |
+| TOAST | Validated FULL old tuples resolve unchanged fields; DEFAULT carries them forward from the prior in-epoch or indexed row after a fingerprint check, through memory and disk collapse; unresolved values block the table instead of publishing. Real 18.6 updates, key moves and deletes preserve 16 KiB text and 8 KiB binary values | PostgreSQL version matrix for DEFAULT, and larger configured row limits |
 | Reconnect | Real pinned transport against a local scripted wire peer; interrupted uncommitted stream reconnects; journal deduplicates committed LSNs | Real failover and PostgreSQL slot rollback |
 | Initial snapshot | Permanent slot export, imported snapshot with parallel binary COPY and concurrent CDC; real crashes before/after staging, nullable DDL between copy attempts, retained completed tables and index-loss recovery across PostgreSQL 14.24–18.6 | Larger copy and multi-hour recovery workloads |
 | Nullable additive DDL | Durable schema registry, exact source catalog proof, stable Iceberg field IDs, historical projection; mixed-version/savepoint/abort/restart contracts on PostgreSQL 14.24–18.6 | Broader incompatible-DDL matrix |
@@ -168,10 +172,12 @@ coordinator must not reclaim a transaction while its readers still need it.
 
 `sync_data` establishes the operating system/filesystem durability contract. It
 does **not** establish independent durability against node or disk loss. Use
-materialized ACK by default. Journaled ACK requires separately provisioned and
-documented independent storage durability, plus recovery procedures for storage
-corruption. Neither capture nor the journal automatically drops slots, advances
-over missing transactions, or removes an existing source snapshot.
+materialized ACK by default. Journaled ACK requires either
+[remote durability](remote-durability.md), which replicates the journal to
+object storage, or separately provisioned and documented independent storage
+durability, plus recovery procedures for storage corruption. Neither capture
+nor the journal automatically drops slots, advances over missing transactions,
+or removes an existing source snapshot.
 
 ## Deliberate limits and performance choices
 

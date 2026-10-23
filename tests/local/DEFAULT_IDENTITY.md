@@ -1,23 +1,22 @@
 # DEFAULT replica identity
 
-Mutable tables must have a primary key. FULL continues to support the existing
-source type mappings. DEFAULT is eligible only when every **selected** column is
-one of PostgreSQL's fixed-width supported builtins: bool, int2, int4, int8,
-float4, float8, date, time, timestamp, timestamptz, uuid; an enum; or a domain
-recursively based on an eligible type. Existing restrictions on key types and
-nullability still apply. All primary-key columns must be selected.
+Mutable tables must have a primary key. DEFAULT supports every source type
+mapping that FULL supports. Existing restrictions on key types and nullability
+still apply. All primary-key columns must be selected.
 
-This intentionally excludes all variable-width types, including numeric,
-bounded varchar, text, bytea, JSON, arrays and vector. Small current values,
-length modifiers, and SET STORAGE PLAIN are not eligibility proofs. Changing
-storage settings does not rewrite previously stored external values. The policy
-uses the intrinsic PostgreSQL type representation, not sampled row values.
-Unselected variable-width columns do not block an explicit projection.
+Under DEFAULT, PostgreSQL omits an out-of-line (TOAST) value from an update that
+does not change it. Capture journals that update with an explicit unchanged
+value. Collapse carries the value forward from the key's earlier image in the
+epoch; publication carries the rest forward from the key's indexed Iceberg row
+after its recorded fingerprint matches. The source is never queried for a value
+and no placeholder is published. A primary-key change that leaves a TOASTed
+value unchanged has no prior image, so that table blocks; keep FULL for tables
+whose keys change.
 
 PostgreSQL references: [TOAST storage](https://www.postgresql.org/docs/16/storage-toast.html)
 and [logical message formats](https://www.postgresql.org/docs/16/protocol-logicalrep-message-formats.html).
 
-The engine checks this rule during source/schema validation, including snapshot,
+The engine checks identity during source/schema validation, including snapshot,
 reconnect and relation changes. NOTHING and USING INDEX are not enabled.
 Append-only behavior is unchanged. No source DDL or ingestion-mode changes are
 performed by the implementation.
@@ -26,10 +25,11 @@ Key tuples retain relation column positions: only primary-key fields are decoded
 in configured key order. Non-key NULL placeholders never become replacement
 row values. Updates without an old tuple derive the unchanged key from the new
 row. A changed key uses the existing old-key delete/new-row insert application.
-Only FULL may fill an unchanged-TOAST marker from its complete old tuple; all
-unresolved markers fail. Invalid events cannot produce a successful capture
-commit. An unsupported change blocks its table until a resync: the target stays
-unchanged, and the source acknowledgement passes the table's dropped changes.
+FULL fills an unchanged-TOAST marker from its complete old tuple; DEFAULT
+carries it forward as described above. A marker with no prior image fails.
+Invalid events cannot produce a successful capture commit. An unsupported
+change blocks its table until a resync: the target stays unchanged, and the
+source acknowledgement passes the table's dropped changes.
 
 ## Engine-only run
 
@@ -54,7 +54,8 @@ Coverage includes exact snapshot-to-CDC convergence during writes, composite
 keys in non-attribute order, old-key moves, repeated row changes within/across
 transactions, rollback, NULL, projection excluding a large TOAST value, FULL
 with externally stored values, two SIGKILL/recovery cycles, nullable fixed-column
-addition, unsafe DEFAULT rejection, and checkpoint pinning on unsupported DDL.
+addition, DEFAULT carry-forward of externally stored text across epochs and
+crash recovery, and checkpoint pinning on unsupported DDL.
 The harness records failure rather than treating job/log success as row proof.
 
 ### Deterministic interrupted-batch recovery

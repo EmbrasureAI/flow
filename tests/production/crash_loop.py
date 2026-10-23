@@ -363,7 +363,7 @@ class CrashLoop(Run):
 
     def seed(self):
         result = super().seed()
-        # DEFAULT identity: fixed-width columns only, and added columns stay fixed-width.
+        # DEFAULT identity table; its added columns stay integer.
         self.pg.execute("""CREATE TABLE events (id bigint PRIMARY KEY, writer integer NOT NULL,
             version bigint, flag boolean, ratio double precision)""")
         self.pg.execute("INSERT INTO events SELECT i, 0, 0, i % 2 = 0, i * 0.5 FROM generate_series(1, 1000) i")
@@ -465,7 +465,7 @@ class CrashLoop(Run):
     def add_column(self):
         table = self.rng.choice(("orders", "events"))
         self.added_columns += 1
-        # DEFAULT identity requires fixed-width columns; FULL accepts any type.
+        # events stays integer-only; orders mixes integer and text additions.
         kind = "integer" if table == "events" or self.rng.random() < 0.5 else "text"
         name = f"added_{self.added_columns}_{'int' if kind == 'integer' else 'text'}"
         self.pg.execute("SET lock_timeout = '5s'")
@@ -489,8 +489,24 @@ class CrashLoop(Run):
             return self.run_cycle(number, window, fault, details)
         except BaseException:
             # A failed cycle is otherwise lost: only successful cycles are kept.
-            self.report["failed_cycle"] = {**details, "traceback": traceback.format_exc()}
+            self.report["failed_cycle"] = {**details, "traceback": traceback.format_exc(),
+                                           "daemon_fatal": self.daemon_fatal()}
             raise
+
+    def daemon_fatal(self):
+        """The current daemon generation's fatal error event, if it logged one."""
+        path = self.directory / f"daemon-{self.generation}.log"
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            return None
+        for line in reversed(lines):
+            if '"event":"fatal"' in line:
+                try:
+                    return json.loads(line)["fields"]
+                except (ValueError, KeyError):
+                    return line[:2000]
+        return None
 
     def run_cycle(self, number, window, fault, details):
         at = details["at_ms"]

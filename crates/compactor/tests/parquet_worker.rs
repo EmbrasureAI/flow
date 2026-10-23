@@ -274,10 +274,11 @@ async fn parquet_compaction_applies_position_deletes_and_stock_reader_sees_ident
             .collect::<BTreeSet<_>>(),
         (0..7).collect()
     );
-    assert!(mappings.iter().all(
-        |delta| delta.replacement.as_ref().unwrap().data_sequence_number
-            == deletion.sequence_number
-    ));
+    assert!(mappings.iter().all(|delta| {
+        let replacement = delta.replacement.as_ref().unwrap();
+        replacement.data_sequence_number == deletion.sequence_number
+            && replacement.row_fingerprint == delta.expected.as_ref().unwrap().row_fingerprint
+    }));
     let rewritten = RewriteFilesAction::new(&deletion.table, "compact")
         .remove_data_files(output.plan.input_files.iter().map(|file| file.0.clone()))
         .remove_delete_files(output.plan.delete_files.iter().map(|file| file.0.clone()))

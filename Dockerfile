@@ -5,6 +5,7 @@ ARG FLOW_FEATURES=""
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo/config.toml ./.cargo/config.toml
 COPY crates ./crates
 COPY vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo build --locked --release -p flow-daemon --features "$FLOW_FEATURES" && cp target/release/embrasure-flow /usr/local/bin/embrasure-flow

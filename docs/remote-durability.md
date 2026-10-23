@@ -4,7 +4,9 @@ With a `[durability]` section, Flow makes object storage the authority for its
 captured journal and control state. A worker and its entire state volume can be
 lost: the next owner restores the latest checkpoint plus a short log tail and
 resumes, without losing any change acknowledged to the source. The local volume
-remains the working copy and holds the replaceable row index.
+remains the working copy and holds the replaceable row index. It may be
+ephemeral, or [memory-backed](operations.md#memory-backed-state), but it needs
+the same [capacity](operations.md#disk-capacity) as without remote durability.
 
 Remote durability is opt-in. Without the section, local disk remains the
 authority exactly as before, and journaled acknowledgement still requires

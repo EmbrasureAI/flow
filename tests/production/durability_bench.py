@@ -313,6 +313,8 @@ def main():
                         choices=['none', 'crash', 'disk-loss', 'disk-loss-backlog', 'catalog-outage',
                                  'lost-catalog-response', 'stale-owner', 'clean-restart'])
     parser.add_argument('--limits-toml', default='', help='extra [limits] settings, TOML lines')
+    parser.add_argument('--storage-toml', default='',
+                        help='extra [storage] settings, TOML lines (for example medium = "memory")')
     parser.add_argument('--settle-seconds', type=float, default=240)
     parser.add_argument('--reader-interval', type=float, default=0.25)
     parser.add_argument('--duckdb-extensions', help='DuckDB extension directory (offline hosts)')
@@ -448,7 +450,9 @@ def main():
                      '"s3.path-style-access" = "true"\n')
             text += (f'[limits]\ntable_workers = {args.workers}\ncommits_per_second = 100\n'
                      'journal_bytes = 4294967296\nspool_bytes = 2147483648\n' + args.limits_toml + '\n')
-            text += f'[storage]\nmin_free_bytes = 0\n[http]\nlisten = "127.0.0.1:{http_port}"\n'
+            text += ('[storage]\n' + (args.storage_toml if 'min_free_bytes' in args.storage_toml
+                                       else 'min_free_bytes = 0\n' + args.storage_toml) + '\n')
+            text += f'[http]\nlisten = "127.0.0.1:{http_port}"\n'
             if args.maintenance == 'disabled':
                 text += ('[compaction]\nl0_soft_files = 1000000\nl0_hard_files = 2000000\n'
                          'oldest_l0_soft_ms = 100000000\noldest_l0_hard_ms = 200000000\n'
