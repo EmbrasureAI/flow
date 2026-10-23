@@ -167,6 +167,14 @@ This will be the initial public release, `0.1.0`.
   that savepoint's rollback. Capture now checks the status of each
   subtransaction with surviving changes in PostgreSQL's commit log at the
   commit and drops those that rolled back.
+- jemalloc builds keep transparent huge pages off the allocator's memory
+  (built-in `thp:never`). With the kernel set to `always`, huge pages made RSS
+  keep growing past the memory jemalloc held; `MALLOC_CONF` overrides the
+  default.
+- A subtransaction abort for a transaction not streamed on the current
+  replication connection no longer stops capture; it has nothing to discard,
+  as in PostgreSQL's apply worker. Other unexpected stream aborts still stop
+  capture, now naming the check that failed and the transaction IDs.
 
 ### Security
 

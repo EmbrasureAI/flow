@@ -543,6 +543,16 @@ gauges until a later sample succeeds; absence does not mean zero memory.
 Background reclamation does not cap live allocations or replace worker, batch,
 cache and container limits. Default and non-GNU/Linux builds omit these gauges.
 
+These builds set jemalloc's built-in option `thp:never` (from
+`.cargo/config.toml`), so jemalloc marks its mappings `MADV_NOHUGEPAGE`. With
+the kernel's transparent huge pages set to `always`, 2 MiB pages otherwise
+back jemalloc's memory beyond the pages it holds resident. In 30-minute seeded
+soaks, RSS grew 19–22% past steady state that way, while jemalloc's own resident
+bytes stayed flat; with `thp:never` RSS stayed flat and matched them. The
+`jemalloc initialized` log line reports the built-in options. To change them,
+set `MALLOC_CONF` (for example `MALLOC_CONF=thp:default`) when starting the
+daemon, or `JEMALLOC_SYS_WITH_MALLOC_CONF` when building it.
+
 Every build also exports the current usage of the process-wide memory budgets.
 A blocking thread samples them with the periodic health observation, at most
 one sample at a time, so the row index's property reads never delay
