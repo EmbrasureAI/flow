@@ -26,7 +26,7 @@ warehouse = "s3://warehouse/"
 batch_rows = 1024
 batch_bytes = 8388608
 # Additional per-worker collapse retention; 0 forces the disk path.
-collapse_memory_bytes = 33554432
+collapse_memory_bytes = 134217728
 parquet_row_group_bytes = 33554432
 # The largest single row change; a larger one blocks its table.
 chunk_bytes = 4194304

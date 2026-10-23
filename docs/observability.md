@@ -465,10 +465,14 @@ complete measurements under the declared deployment conditions.
 
 ## Collapse retention
 
-`limits.collapse_memory_bytes` defaults to 32 MiB per active table epoch; zero
-selects disk-only collapse. Four workers can retain up to 128 MiB of additional
+`limits.collapse_memory_bytes` defaults to 128 MiB per active table epoch; zero
+selects disk-only collapse. Four workers can retain up to 512 MiB of additional
 accounted memory. Charges include key and row-vector capacities, string/binary
 capacities, original physical paths and partitions, and conservative map storage.
+An epoch admits up to 32 MiB of serialized payload, and its accounted retention is
+usually several times that: about 3× for 256-byte rows, more for narrow rows.
+A limit near the payload budget sends most full epochs through the slower disk
+path after a discarded memory attempt.
 The limit applies during both folding and physical-location binding. Capacity
 exhaustion discards the attempt and replays its journal prefix on disk; source
 validation and storage errors remain errors.

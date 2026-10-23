@@ -16,6 +16,15 @@ also missed the compacted-reader target. Separate 258-column, 1,502-column and
 approximately MiB-row recovery checks passed. Read the report's workload and
 host limits before using these observations for sizing.
 
+## Collapse memory
+
+The [collapse memory comparison](benchmarks/collapse-memory.md) raised the
+default `limits.collapse_memory_bytes` from 32 MiB to 128 MiB. With the old limit,
+most backlogged one-table epochs overflowed into disk collapse. On an 8-vCPU VM at
+50k offered mixed mutations/s, the daemon drained 21,684–22,316 mutations/s
+against 18,254–19,888/s, with commit-to-catalog p95 of 18–20 s against 29–30 s.
+Both still miss the latency target.
+
 ## Publication batching across many tables
 
 The shared `limits.pending_transactions` window (256 descriptors by default)
