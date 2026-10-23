@@ -383,7 +383,7 @@ impl TableWork {
             StateStoreOptions {
                 apply_batch_rows: self.config.limits.batch_rows,
                 max_open_files: crate::disk::index_max_open_files(),
-                ..Default::default()
+                ..StateStoreOptions::scratch()
             },
         )?;
         let started = Instant::now();
@@ -420,7 +420,7 @@ impl TableWork {
             StateStoreOptions {
                 apply_batch_rows: self.config.limits.batch_rows,
                 max_open_files: crate::disk::index_max_open_files(),
-                ..Default::default()
+                ..StateStoreOptions::scratch()
             },
         )?;
         let started = Instant::now();
@@ -844,7 +844,7 @@ impl TableWork {
                 StateStoreOptions {
                     apply_batch_rows: self.config.limits.batch_rows,
                     max_open_files: crate::disk::index_max_open_files(),
-                    ..Default::default()
+                    ..StateStoreOptions::scratch()
                 },
             )?;
             let result = self.maintenance.reconcile(&current, &schema, scratch).await;
