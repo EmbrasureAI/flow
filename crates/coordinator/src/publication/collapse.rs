@@ -1,7 +1,8 @@
 //! Replay complete journal prefixes into rows bound to an exact table head.
 //!
 //! [`collapse_epoch`] validates the source schema and index before producing a
-//! [`CollapsedEpoch`]; capacity exhaustion alone permits a full replay on disk.
+//! [`CollapsedEpoch`]. An epoch folds in memory; if it outgrows its budget the
+//! fold spills to the disk map and the same pass continues there.
 
 use super::ReplanRequired;
 use anyhow::{Result, ensure};
@@ -13,7 +14,9 @@ use flow_model::{
     Mutation, MutationKind, OperationId, PgLsn, PrimaryKey, SourceId, SourceTransaction, TableId,
     TableSchema,
 };
-use flow_state_store::{BufferResult, Change, CollapseBuffer, MemoryRows, StateStore, TableState};
+use flow_state_store::{
+    Bound, BufferResult, Change, CollapseBuffer, MemoryRows, StateStore, TableState,
+};
 use iceberg::table::Table;
 
 /// A complete source prefix for one table. Transactions are never split at a file boundary.
@@ -92,14 +95,15 @@ impl CollapsedEpoch {
         &self.epoch
     }
 
-    /// The selected path and, for disk, why the buffer was bypassed or abandoned.
+    /// The selected path and, for disk, why the buffer was bypassed or spilled
+    /// (`disk_capacity`).
     pub fn mode(&self) -> &'static str {
         self.mode
     }
 
-    /// Peak accepted retained buffer payload, excluding separately bounded
-    /// decoding, binding batches and writer workspaces. Binding overflow returns
-    /// None because its consumed partial buffer is not observed. Not process RSS.
+    /// Peak accepted buffer payload, within the limit, excluding separately
+    /// bounded decoding, binding batches and writer workspaces. None when the
+    /// epoch never used the buffer. Not process RSS.
     pub fn memory_peak_bytes(&self) -> Option<usize> {
         self.memory_peak_bytes
     }
@@ -111,8 +115,8 @@ pub(super) enum CollapsedRows {
 }
 
 /// Collapse the current immutable source prefix on a blocking table actor.
-/// Capacity alone drops the ephemeral attempt and replays the complete prefix
-/// through the existing disk map; validation and I/O failures never select fallback.
+/// Capacity alone moves the fold to the existing disk map, without replaying
+/// what was already folded; validation and I/O failures never select fallback.
 pub fn collapse_epoch(
     store: &StateStore,
     journal: &impl ChunkReader,
@@ -154,30 +158,23 @@ pub fn collapse_epoch(
     }
     // Output position deletes use this prefix even when the input stays in memory.
     store.discard_transaction(&epoch.id.0)?;
-    let source_bytes = transactions.iter().fold(0u64, |bytes, transaction| {
-        bytes.saturating_add(transaction.mutation_chunks.payload_bytes())
-    });
-    // Match the current ordinary-prefix boundaries without changing scheduling.
-    // Unknown/oversized single transactions never pay a speculative prefix replay.
+    // Initial snapshots are copied into the spool directly; everything else folds
+    // in memory first and spills only if it outgrows the budget.
     let mut mode = if limits.memory_bytes == 0 {
         "disk_disabled"
     } else if epoch.initial_snapshot {
         "disk_initial"
-    } else if source_bytes > 32 << 20
-        || transactions.iter().any(|transaction| {
-            transaction
-                .mutation_count(epoch.table)
-                .is_none_or(|rows| rows > 10_000)
-        })
-    {
-        "disk_oversize"
     } else {
         "memory"
     };
-    let mut memory_peak_bytes = Some(0);
+    let mut memory_peak_bytes = None;
+    let disk_fold = |changes: &mut Vec<(TableId, PrimaryKey, Change)>| -> Result<()> {
+        store.collapse_changes(&epoch.id.0, changes.drain(..))?;
+        Ok(())
+    };
     let rows = if mode == "memory" {
-        let mut buffer = CollapseBuffer::new(epoch.table, limits.memory_bytes);
-        let folded = replay_epoch(
+        let mut buffer = Some(CollapseBuffer::new(epoch.table, limits.memory_bytes));
+        replay_epoch(
             store,
             journal,
             schema,
@@ -185,32 +182,52 @@ pub fn collapse_epoch(
             transactions,
             limits,
             |changes| {
-                for (_, key, change) in changes.drain(..) {
-                    if let BufferResult::CapacityExceeded = buffer.push(key, change)? {
-                        return Ok(BufferResult::CapacityExceeded);
+                let Some(fold) = buffer.as_mut() else {
+                    disk_fold(changes)?;
+                    return Ok(BufferResult::Ready(()));
+                };
+                let mut changes = changes.drain(..);
+                while let Some((_, key, change)) = changes.next() {
+                    if let BufferResult::CapacityExceeded = fold.push(key, change)? {
+                        let full = buffer.take().expect("buffer present above");
+                        memory_peak_bytes = Some(full.peak_accounted_bytes());
+                        store.spill_collapse_buffer(&epoch.id.0, full)?;
+                        store.collapse_changes(&epoch.id.0, changes)?;
+                        break;
                     }
                 }
                 Ok(BufferResult::Ready(()))
             },
         )?;
-        memory_peak_bytes = Some(buffer.peak_accounted_bytes());
-        match folded {
-            BufferResult::Ready(()) => match store.bind_collapse_buffer(buffer, &indexed)? {
-                BufferResult::Ready(rows) => {
-                    memory_peak_bytes = Some(rows.peak_accounted_bytes());
-                    Some(CollapsedRows::Memory(rows))
+        match buffer {
+            Some(buffer) => {
+                memory_peak_bytes = Some(buffer.peak_accounted_bytes());
+                match store.bind_collapse_buffer(buffer, &indexed)? {
+                    Bound::Ready(rows) => {
+                        memory_peak_bytes = Some(rows.peak_accounted_bytes());
+                        Some(CollapsedRows::Memory(rows))
+                    }
+                    Bound::Overflow(buffer) => {
+                        store.spill_collapse_buffer(&epoch.id.0, buffer)?;
+                        None
+                    }
                 }
-                BufferResult::CapacityExceeded => {
-                    memory_peak_bytes = None;
-                    None
-                }
-            },
-            BufferResult::CapacityExceeded => {
-                drop(buffer);
-                None
             }
+            None => None,
         }
     } else {
+        replay_epoch(
+            store,
+            journal,
+            schema,
+            epoch,
+            transactions,
+            limits,
+            |changes| {
+                disk_fold(changes)?;
+                Ok(BufferResult::Ready(()))
+            },
+        )?;
         None
     };
     let rows = match rows {
@@ -219,20 +236,6 @@ pub fn collapse_epoch(
             if mode == "memory" {
                 mode = "disk_capacity";
             }
-            // A new cursor, ordinal, projection cache and empty input map are used.
-            // No memory binding/snapshot survives into this full disk replay.
-            replay_epoch(
-                store,
-                journal,
-                schema,
-                epoch,
-                transactions,
-                limits,
-                |changes| {
-                    store.collapse_changes(&epoch.id.0, changes.drain(..))?;
-                    Ok(BufferResult::Ready(()))
-                },
-            )?;
             store.seal_transaction(&epoch.id.0)?;
             CollapsedRows::Disk
         }
