@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, ensure};
-use arrow_array::{
-    Array, ArrayRef, BinaryArray, Int64Array, LargeBinaryArray, RecordBatch, StringArray,
-};
+use arrow_array::{Int64Array, RecordBatch, StringArray};
 use flow_iceberg_ext::{ArtifactSet, ArtifactTracker};
-use flow_model::{ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableSchema, Value};
+use flow_model::{
+    ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableSchema, Value, fingerprint,
+};
 use iceberg::{
     arrow::schema_to_arrow_schema,
     io::FileIO,
@@ -20,7 +20,10 @@ use parquet::{
 };
 use std::{borrow::Borrow, sync::Arc};
 
-use crate::{iceberg_schema, rows_to_batch};
+use crate::{
+    arrow::{validated_columns, writer_arrow_schema},
+    iceberg_schema,
+};
 
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
@@ -185,6 +188,7 @@ pub struct DataWriter {
     row_group: RowGroupBudget,
     files: Vec<DataFile>,
     spec_id: i32,
+    arrow_schema: arrow_schema::SchemaRef,
     lineage_schema: Option<arrow_schema::SchemaRef>,
 }
 #[derive(Debug)]
@@ -213,6 +217,7 @@ impl DataWriter {
         );
         Ok(Self {
             file_io,
+            arrow_schema: writer_arrow_schema(&schema),
             schema,
             builder,
             config,
@@ -331,25 +336,9 @@ impl DataWriter {
         self.row_group
             .prepare(writer, rows.len(), bytes, &self.config)
             .await?;
-        let mut batch = rows_to_batch(&self.schema, rows)?;
-        if let Some(schema) = &self.lineage_schema {
-            // Iceberg's Arrow conversion maps binary to LargeBinary; rows are
-            // built as Binary. Both encode the same Parquet BYTE_ARRAY values.
-            let mut columns = batch
-                .columns()
-                .iter()
-                .zip(schema.fields())
-                .map(
-                    |(column, field)| match column.as_any().downcast_ref::<BinaryArray>() {
-                        Some(binary)
-                            if field.data_type() == &arrow_schema::DataType::LargeBinary =>
-                        {
-                            Arc::new(binary.iter().collect::<LargeBinaryArray>()) as ArrayRef
-                        }
-                        _ => column.clone(),
-                    },
-                )
-                .collect::<Vec<_>>();
+        // Rows were validated when the write call was admitted.
+        let mut columns = validated_columns(&self.schema, rows, true)?;
+        let batch = if let Some(schema) = &self.lineage_schema {
             for row_id in [true, false] {
                 let values = (0..rows.len()).map(|index| {
                     lineage.and_then(|values| {
@@ -362,8 +351,10 @@ impl DataWriter {
                 });
                 columns.push(Arc::new(values.collect::<Int64Array>()));
             }
-            batch = RecordBatch::try_new(schema.clone(), columns)?;
-        }
+            RecordBatch::try_new(schema.clone(), columns)?
+        } else {
+            RecordBatch::try_new(self.arrow_schema.clone(), columns)?
+        };
         let path = writer.current_file_path();
         let offset = writer.current_row_num() as u64;
         writer.write(&batch).await?;
@@ -377,7 +368,7 @@ impl DataWriter {
                 partition: vec![],
                 source_commit_lsn: source_lsn,
                 row_version: 0,
-                row_fingerprint: self.schema.fingerprint(row.borrow())?,
+                row_fingerprint: fingerprint(row.borrow()),
             });
         }
         Ok(())
