@@ -1006,7 +1006,6 @@ fn table_scoped(error: &flow_pg_source::Error) -> bool {
         Error::Row(_)
             | Error::Value(_)
             | Error::ReplicaIdentity(_)
-            | Error::DefaultIdentity(_)
             | Error::UnchangedToast(_)
             | Error::AppendOnly { .. }
             | Error::RowLimit { .. }

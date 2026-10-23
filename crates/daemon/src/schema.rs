@@ -730,7 +730,6 @@ pub(crate) fn schema_block_reason(error: &anyhow::Error) -> &str {
         if let Some(error) = cause.downcast_ref::<flow_pg_source::Error>() {
             return match error {
                 flow_pg_source::Error::Config(reason) => reason,
-                flow_pg_source::Error::DefaultIdentity(reason) => reason,
                 flow_pg_source::Error::ReplicaIdentity(_) => {
                     "source requires REPLICA IDENTITY FULL"
                 }
@@ -756,7 +755,6 @@ pub(crate) fn table_schema_error(error: &anyhow::Error) -> bool {
                 Some(
                     flow_pg_source::Error::Config(_)
                         | flow_pg_source::Error::ReplicaIdentity(_)
-                        | flow_pg_source::Error::DefaultIdentity(_)
                         | flow_pg_source::Error::UnchangedToast(_)
                         | flow_pg_source::Error::Value(_)
                         | flow_pg_source::Error::Row(_)

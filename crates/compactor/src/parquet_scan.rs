@@ -20,7 +20,7 @@ use iceberg::{
 use parquet::{
     arrow::{
         ProjectionMask,
-        arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
+        arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector},
         async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder},
     },
     basic::Type as PhysicalType,
@@ -595,6 +595,100 @@ pub(crate) async fn read_input_batches(
         "Parquet decoded row count differs from file metadata"
     );
     Ok(())
+}
+
+/// Read exactly the rows at strictly ascending physical `positions`, with every
+/// column. Returned batches preserve position order and contain only those
+/// rows, so the caller bounds their memory by the positions it requests. Row
+/// groups keep the same admission limits as maintenance scans; groups without
+/// a selected position are not fetched.
+pub async fn read_positions(
+    file_io: &FileIO,
+    path: &str,
+    positions: &[u64],
+    batch_rows: usize,
+    limits: &ReadLimits,
+) -> Result<Vec<RecordBatch>> {
+    limits.validate()?;
+    ensure!(batch_rows > 0, "Parquet batch row limit must be positive");
+    ensure!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "Parquet row positions must be strictly ascending"
+    );
+    let mut output = Vec::new();
+    if positions.is_empty() {
+        return Ok(output);
+    }
+    let input = file_io.new_input(path)?;
+    let file_size = input.metadata().await?.size;
+    let reader = ArrowFileReader::new(FileMetadata { size: file_size }, input.reader().await?);
+    let mut reader = BoundedReader::new(reader, file_size, limits);
+    let metadata = ArrowReaderMetadata::load_async(
+        &mut reader,
+        ArrowReaderOptions::new()
+            .with_skip_arrow_metadata(true)
+            .with_page_index_policy(PageIndexPolicy::Skip),
+    )
+    .await?;
+    let columns: Vec<_> = (0..metadata.parquet_schema().num_columns()).collect();
+    ensure!(!columns.is_empty(), "Parquet file has no columns");
+    let projection = ProjectionMask::leaves(metadata.parquet_schema(), columns.iter().copied());
+    let mut remaining = positions;
+    let mut group_start = 0u64;
+    for (index, group) in metadata.metadata().row_groups().iter().enumerate() {
+        let group_rows = u64::try_from(group.num_rows())?;
+        let group_end = group_start
+            .checked_add(group_rows)
+            .context("Parquet row count overflow")?;
+        let selected = remaining.partition_point(|position| *position < group_end);
+        let (in_group, rest) = remaining.split_at(selected);
+        remaining = rest;
+        if in_group.is_empty() {
+            group_start = group_end;
+            continue;
+        }
+        let rows = admit_group(&metadata, group, &columns, batch_rows, file_size, limits)
+            .with_context(|| format!("Parquet input {path}, row group {index}"))?;
+        let mut selectors = Vec::new();
+        let mut cursor = group_start;
+        for &position in in_group {
+            if position > cursor {
+                selectors.push(RowSelector::skip(usize::try_from(position - cursor)?));
+            }
+            selectors.push(RowSelector::select(1));
+            cursor = position + 1;
+        }
+        let reader = ArrowFileReader::new(FileMetadata { size: file_size }, input.reader().await?);
+        let reader = BoundedReader::new(reader, file_size, limits);
+        let mut batches =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata.clone())
+                .with_projection(projection.clone())
+                .with_row_groups(vec![index])
+                .with_row_selection(RowSelection::from(selectors))
+                .with_batch_size(rows)
+                .build()?;
+        let mut decoded = 0usize;
+        while let Some(batch) = batches.try_next().await? {
+            decoded = decoded
+                .checked_add(batch.num_rows())
+                .context("Parquet row count overflow")?;
+            ensure!(
+                decoded <= in_group.len(),
+                "Parquet decoded more rows than selected"
+            );
+            output.push(batch);
+        }
+        ensure!(
+            decoded == in_group.len(),
+            "Parquet decoded row count differs from selected positions"
+        );
+        group_start = group_end;
+    }
+    ensure!(
+        remaining.is_empty(),
+        "Parquet row position is beyond the end of {path}"
+    );
+    Ok(output)
 }
 
 #[cfg(test)]

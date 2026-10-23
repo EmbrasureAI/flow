@@ -56,7 +56,7 @@ of added files. Any disagreement falls back to the full rebuild.
 
 Primary keys use a versioned typed encoding with explicit variable-length framing. Keys cannot contain nulls or floating-point values in the initial profile. Float zero and NaN representations are canonicalized for row fingerprints. Trailing nulls do not change a fingerprint, allowing an additive nullable field to preserve old row identity.
 
-Unknown mutable keys are errors. An unchanged TOAST marker can be resolved from the same update's complete FULL old tuple; unavailable or incomplete old values are errors. Neither path emits equality deletes or placeholders. Key changes collapse as delete-old plus insert-new, including when both keys are touched repeatedly within one transaction.
+Unknown mutable keys are errors. Under FULL, capture resolves an unchanged TOAST marker from the same update's complete old tuple. Under DEFAULT, capture journals the update with an explicit unchanged value. Collapse fills it from the key's earlier image in the epoch; publication fills the rest from the key's indexed row in the bound snapshot, after its recorded fingerprint matches, before writing any artifact. Updates that change the key cannot carry values forward and stop instead. No path queries the source, emits equality deletes or publishes placeholders. Key changes collapse as delete-old plus insert-new, including when both keys are touched repeatedly within one transaction.
 
 Current-epoch collapse uses a bounded ordered memory map for ordinary source
 prefixes. It shares the disk path's mutation transitions and initial-presence
