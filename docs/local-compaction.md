@@ -22,6 +22,8 @@ work retain their existing paths.
    unsafe code is needed.
 3. Build selected live data and the complete original-to-replacement row mapping
    against S. Payloads, delete staging and mappings remain bounded or disk-backed.
+   Mappings are staged on one more thread, in order and at most two batches
+   behind the scan; the worker waits for it before sealing or returning an error.
    The worker cannot commit a catalog change or modify the live row index.
 4. Once the worker finishes, use a short idle table boundary to hand preparation
    to the background. The daemon pauses admission of the next same-table CDC

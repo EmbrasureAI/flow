@@ -288,8 +288,9 @@ volume:
 - Initial-copy staging during `init`, up to five times `journal_bytes`.
 
 The watermark protects memory only against the growth of state. Process memory
-(decoded batches, the row-index block cache, Parquet buffers) needs its own
-margin under the limit, sized from the [memory metrics](observability.md).
+(decoded batches, the row-index block cache, Parquet buffers, and up to 128 MiB
+of scratch memtables per running compaction build) needs its own margin under
+the limit, sized from the [memory metrics](observability.md).
 
 A container restart keeps an `emptyDir` and resumes immediately. A pod
 rescheduled to another node, or a host reboot, loses the state: the next start
