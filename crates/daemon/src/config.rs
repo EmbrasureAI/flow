@@ -191,7 +191,12 @@ pub struct Limits {
     /// Grace for superseded catalog metadata JSON once it leaves the catalog
     /// metadata log. Defaults to the smaller of 3600 and `orphan_grace_secs`.
     pub metadata_json_grace_secs: Option<u64>,
+    /// How long another writer's row changes to a target hold that table's
+    /// source WAL while publication retries. Rolling back the foreign snapshot
+    /// within it resumes the table; afterwards only a resync recovers it.
+    pub external_mutation_grace_secs: u64,
 }
+pub(crate) const DEFAULT_EXTERNAL_MUTATION_GRACE_SECS: u64 = 900;
 impl Limits {
     pub fn metadata_json_grace_secs(&self) -> u64 {
         self.metadata_json_grace_secs
@@ -227,6 +232,7 @@ impl Default for Limits {
             garbage_interval_secs: 300,
             orphan_grace_secs: 86400,
             metadata_json_grace_secs: None,
+            external_mutation_grace_secs: DEFAULT_EXTERNAL_MUTATION_GRACE_SECS,
         }
     }
 }

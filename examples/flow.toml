@@ -53,6 +53,9 @@ snapshot_expiration = true
 snapshot_retain_last = 128
 # Expire the oldest unprotected snapshots beyond this count, even inside the window.
 snapshot_max_count = 1000
+# Another writer's row changes hold that table's WAL this long; rolling them back
+# within it resumes the table, afterwards only a resync recovers it.
+# external_mutation_grace_secs = 900
 
 [storage]
 # Capture pauses below this much free space on the state volume (0 disables).

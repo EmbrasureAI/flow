@@ -525,7 +525,7 @@ impl TableWork {
                 // Resync is the only recovery, but an unfinished operation
                 // would hold its transactions forever. Settle it, then stay
                 // blocked; the runtime completes the rest without publishing.
-                Some(crate::schema::CaptureBlock::PublicationChanged)
+                Some(_)
                     if self
                         .store
                         .table_state(&schema.table_id)?
@@ -606,8 +606,13 @@ impl TableWork {
                 {
                     error_code = cause.code();
                 }
-                tracing::warn!(table = ?schema.table_id, error_code, %error,
-                    "table publication blocked; releasing worker until retry");
+                if super::blocked::requires_resync(error_code) {
+                    tracing::warn!(table = ?schema.table_id, error_code, %error,
+                        "table publication blocked until resync; releasing worker");
+                } else {
+                    tracing::warn!(table = ?schema.table_id, error_code, %error,
+                        "table publication blocked; releasing worker until retry");
+                }
                 TableOutcome::Blocked { error_code }
             }
             result => result?,
@@ -1591,7 +1596,7 @@ mod publication_retry_tests {
         Replaced,
     }
 
-    async fn settle_unfinished_operation(target: Target) {
+    async fn settle_unfinished_operation(target: Target, cause: crate::schema::CaptureBlock) {
         use flow_coordinator::{AckMode, JournalDurability, SourceLedger};
         use flow_model::{JournalChunks, TableMutationCount};
         use iceberg::{
@@ -1735,7 +1740,7 @@ mod publication_retry_tests {
                     .unwrap();
             }
         }
-        crate::schema::latch_publication_block(&store, &source, id).unwrap();
+        crate::schema::latch_capture_block(&store, &source, id, cause).unwrap();
 
         let completion = work
             .run(
@@ -1754,24 +1759,28 @@ mod publication_retry_tests {
             .unwrap();
         assert!(matches!(
             completion.outcome,
-            TableOutcome::Blocked {
-                error_code: "publication_changed"
-            }
+            TableOutcome::Blocked { error_code } if error_code == cause.code()
         ));
         assert_eq!(store.table_state(&id).unwrap().pending_operation, None);
 
         let mut blocked = super::super::blocked::BlockedTables::load(&store, &source).unwrap();
-        blocked.record(id, "publication_changed", None).unwrap();
-        super::super::settle_dropped_table(&mut ledger, &store, &mut blocked, id).unwrap();
+        blocked.record(id, cause.code(), None).unwrap();
+        super::super::settle_resync_table(&mut ledger, &store, &mut blocked, id).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
     }
 
     #[tokio::test]
     async fn a_dropped_table_settles_its_unfinished_operation_and_stays_blocked() {
-        settle_unfinished_operation(Target::Present).await;
-        settle_unfinished_operation(Target::Dropped).await;
-        settle_unfinished_operation(Target::Replaced).await;
+        use crate::schema::CaptureBlock;
+        for cause in [
+            CaptureBlock::PublicationChanged,
+            CaptureBlock::SchemaIncompatible,
+        ] {
+            settle_unfinished_operation(Target::Present, cause).await;
+            settle_unfinished_operation(Target::Dropped, cause).await;
+            settle_unfinished_operation(Target::Replaced, cause).await;
+        }
     }
 }
 

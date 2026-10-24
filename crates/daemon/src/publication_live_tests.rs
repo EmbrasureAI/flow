@@ -1,6 +1,7 @@
 //! The real daemon against live PostgreSQL and an in-memory Iceberg catalog:
 //! a publication change affecting one configured table blocks only that table,
-//! and a streamed transaction blocks a table only if it commits.
+//! a streamed transaction blocks a table only if it commits, and another
+//! writer's row changes block only their table until rollback or a resync.
 use crate::config::Config;
 use flow_pg_source::tokio_postgres::{self, Client, NoTls};
 use futures::FutureExt;
@@ -69,6 +70,19 @@ where
     F: FnOnce(Config, String) -> Fut,
     Fut: Future<Output = ()>,
 {
+    with_configured_daemon(url, sql, label, |_| {}, checks).await;
+}
+
+async fn with_configured_daemon<F, Fut>(
+    url: &str,
+    sql: &Client,
+    label: &str,
+    configure: impl FnOnce(&mut Config),
+    checks: F,
+) where
+    F: FnOnce(Config, String) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let name = format!(
         "flow_public_block_{label}_{}",
         SystemTime::now()
@@ -120,6 +134,7 @@ where
             configured
         })
         .collect();
+    configure(&mut config);
     let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
         MemoryCatalogBuilder::default()
             .load(
@@ -775,4 +790,199 @@ async fn live_streamed_ddl_blocks_only_when_it_commits() {
         .await;
     }
     sql_task.abort();
+}
+
+fn test_catalog(name: &str) -> Arc<dyn iceberg::Catalog> {
+    crate::services::TEST_CATALOGS
+        .lock()
+        .unwrap()
+        .get(&format!("memory://{name}"))
+        .cloned()
+        .unwrap()
+}
+
+/// Commit a row to `{name}.items` as another engine would: a plain Iceberg
+/// append without a Flow operation ID. Returns the snapshot it replaced.
+async fn append_externally(config: &Config, name: &str) -> i64 {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let catalog = test_catalog(name);
+    let table = catalog
+        .load_table(&iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new(name.into()),
+            "items".into(),
+        ))
+        .await
+        .unwrap();
+    let before = table.metadata().current_snapshot_id().unwrap();
+    let mut writer = flow_materializer::DataWriter::new(
+        table.file_io().clone(),
+        table.metadata().location(),
+        &flow_model::OperationId("external-append".into()),
+        config.tables[1].schema(0),
+        0,
+        flow_materializer::WriterConfig::default(),
+    )
+    .unwrap();
+    writer
+        .write(
+            &[vec![
+                flow_model::Value::Int64(900),
+                flow_model::Value::String("external".into()),
+            ]],
+            flow_model::PgLsn(0),
+        )
+        .await
+        .unwrap();
+    let transaction = Transaction::new(&table);
+    transaction
+        .fast_append()
+        .add_data_files(writer.close().await.unwrap())
+        .apply(transaction)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+    before
+}
+
+/// Point `{name}.items` back at `snapshot`, as an operator undoing a foreign write.
+async fn roll_back(name: &str, snapshot: i64) {
+    use iceberg::spec::{SnapshotReference, SnapshotRetention};
+    use iceberg::{TableRequirement, TableUpdate};
+    let catalog = test_catalog(name);
+    let table = catalog
+        .load_table(&iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new(name.into()),
+            "items".into(),
+        ))
+        .await
+        .unwrap();
+    let commit = iceberg::TableCommit::builder()
+        .ident(table.identifier().clone())
+        .updates(vec![TableUpdate::SetSnapshotRef {
+            ref_name: "main".into(),
+            reference: SnapshotReference {
+                snapshot_id: snapshot,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            },
+        }])
+        .requirements(vec![TableRequirement::UuidMatch {
+            uuid: table.metadata().uuid(),
+        }])
+        .build();
+    catalog.update_table(commit).await.unwrap();
+}
+
+fn external_block(config: &Config) -> Option<serde_json::Value> {
+    blocked_tables(config)
+        .into_iter()
+        .find(|record| record["error_code"] == "external_mutation")
+}
+
+/// Another engine appends a row to the `items` target. Only `items` blocks,
+/// with `external_mutation`, while `orders` keeps publishing. `rollback`
+/// undoes the foreign snapshot within the grace, which must resume `items`
+/// with every source change; otherwise the grace expires and `items` stops
+/// holding the source acknowledgement while its target stays unchanged.
+async fn external_write(url: &str, sql: &Client, rollback: bool) {
+    let label = if rollback { "rollback" } else { "expiry" };
+    let grace = if rollback { 600 } else { 2 };
+    with_configured_daemon(
+        url,
+        sql,
+        label,
+        |config| config.limits.external_mutation_grace_secs = grace,
+        |config, name| async move {
+            sql.batch_execute(&format!(
+                "BEGIN; INSERT INTO {name}.orders VALUES (2, 'before'); INSERT INTO {name}.items VALUES (2, 'before'); COMMIT"
+            ))
+            .await
+            .unwrap();
+            until("both tables publish before the foreign write", || async {
+                materialized(&config, "orders") > 0 && materialized(&config, "items") > 0
+                    && published_rows(&name, "items").await == 2
+            })
+            .await;
+            let original = append_externally(&config, &name).await;
+
+            sql.batch_execute(&format!("INSERT INTO {name}.items VALUES (3, 'after')"))
+                .await
+                .unwrap();
+            let mark = current(sql).await;
+            sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (3, 'after')"))
+                .await
+                .unwrap();
+            let healthy = current(sql).await;
+            until("items is blocked with external_mutation", || async {
+                external_block(&config).is_some()
+            })
+            .await;
+            assert_eq!(blocked_tables(&config).len(), 1);
+            until("orders keeps publishing past the foreign write", || async {
+                materialized(&config, "orders") as i64 >= healthy
+            })
+            .await;
+
+            if rollback {
+                let record = external_block(&config).unwrap();
+                assert!(record["resync_after_ms"].as_u64().is_some(), "{record}");
+                assert!(record.get("resync_required").is_none(), "{record}");
+                // Within the grace the table holds its source WAL.
+                assert!(confirmed(sql, &name).await < mark);
+                roll_back(&name, original).await;
+                until("rolling back the foreign snapshot clears the block", || async {
+                    blocked_tables(&config).is_empty()
+                })
+                .await;
+                until("items publishes the changes it held", || async {
+                    materialized(&config, "items") as i64 >= mark
+                        && published_rows(&name, "items").await == 3
+                })
+                .await;
+                until("the source acknowledgement passes items again", || async {
+                    confirmed(sql, &name).await >= mark
+                })
+                .await;
+            } else {
+                until("the grace passes and items requires a resync", || async {
+                    external_block(&config)
+                        .is_some_and(|record| record["resync_required"] == true)
+                })
+                .await;
+                until("the source acknowledgement passes the blocked table", || async {
+                    confirmed(sql, &name).await >= healthy
+                })
+                .await;
+                // Its target keeps the foreign row and never receives row 3.
+                assert_eq!(published_rows(&name, "items").await, 3);
+                let rows = published_rows(&name, "orders").await;
+                sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (4, 'later')"))
+                    .await
+                    .unwrap();
+                until("orders keeps publishing after the grace", || async {
+                    published_rows(&name, "orders").await == rows + 1
+                })
+                .await;
+                assert_eq!(published_rows(&name, "items").await, 3);
+                assert!(external_block(&config).is_some());
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_external_writes_block_one_table_until_rollback_or_grace() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    external_write(&url, &sql, true).await;
+    external_write(&url, &sql, false).await;
+    drop(sql);
+    sql_task.await.unwrap().unwrap();
 }

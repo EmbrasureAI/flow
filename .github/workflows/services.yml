@@ -203,7 +203,7 @@ jobs:
           --binary target/debug/embrasure-flow
           --compactor-binary target/debug/examples/local_compactor
           --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults"
-      - name: Source schema isolation, nullability, restart and selected-column quarantine
+      - name: Source schema isolation, nullability, restart and selected-column blocks
         if: matrix.suite == 'compatibility'
         run: |
           uv run tests/local/schema_isolation.py --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" --artifacts "$RUNNER_TEMP/service-schema-isolation"

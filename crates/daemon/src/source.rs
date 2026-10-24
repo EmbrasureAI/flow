@@ -256,8 +256,7 @@ pub(crate) async fn capture_loop(
                     tracing::warn!("pg_catalog.pg_control_system() is not executable; the SQL session relies on IDENTIFY_SYSTEM");
                 }
                 // Before schema refresh: a table the publication stopped covering
-                // must latch the drop block, not a quarantine block that would
-                // hold acknowledgement.
+                // latches its publication cause rather than a schema block.
                 for violation in verify_publication(&sql, &config, &schemas).await? {
                     registry.block_publication(violation.table, &violation.reason)?;
                 }
@@ -315,7 +314,7 @@ pub(crate) async fn capture_loop(
                 config.limits.chunk_bytes,
             )?
             .with_pending_commit_limit(JOURNAL_GROUP_TRANSACTIONS)?;
-            for table in registry.dropped() {
+            for table in registry.blocked() {
                 assembler.drop_table(table)?;
             }
             let mut wire_relations = std::collections::HashMap::new();
@@ -396,10 +395,7 @@ pub(crate) async fn capture_loop(
                                 Ok(violations) => {
                                     for violation in violations {
                                         registry.block_publication(violation.table, &violation.reason)?;
-                                        // An earlier schema block keeps its cause and quarantine.
-                                        if registry.is_dropped(violation.table) {
-                                            assembler.drop_table(violation.table)?;
-                                        }
+                                        registry.drop_blocked(violation.table, &mut assembler)?;
                                     }
                                     publication_checked_at = Instant::now();
                                 }
@@ -471,7 +467,7 @@ pub(crate) async fn capture_loop(
                                         }
                                     wire_relations.insert(relation.id, projected_relation.clone());
                                     if registry.is_blocked(id) {
-                                        registry.block_decoder(id, &mut assembler)?;
+                                        registry.drop_blocked(id, &mut assembler)?;
                                         continue;
                                     }
                                     // Keep the committed decoder for other transactions.
