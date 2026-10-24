@@ -130,27 +130,43 @@ async fn export_slot_snapshot<'a>(
             "CREATE_REPLICATION_SLOT {slot}{lifetime} LOGICAL pgoutput EXPORT_SNAPSHOT"
         ))
         .await?;
-    let row = result
-        .iter()
-        .find_map(|m| match m {
-            SimpleQueryMessage::Row(row) => Some(row),
-            _ => None,
-        })
-        .ok_or(Error::Protocol("slot creation returned no snapshot"))?;
-    let lsn = row
-        .get("consistent_point")
-        .ok_or(Error::Protocol("missing consistent point"))?;
-    let (hi, lo) = lsn
-        .split_once('/')
-        .ok_or(Error::Protocol("invalid snapshot LSN"))?;
-    let hi = u32::from_str_radix(hi, 16).map_err(|_| Error::Protocol("invalid snapshot LSN"))?;
-    let lo = u32::from_str_radix(lo, 16).map_err(|_| Error::Protocol("invalid snapshot LSN"))?;
-    let consistent_lsn = PgLsn(u64::from(hi) << 32 | u64::from(lo));
-    let snapshot_name = row
-        .get("snapshot_name")
-        .ok_or(Error::Protocol("slot did not export a snapshot"))?
-        .to_owned();
-    SnapshotSession::import(snapshot_client, slot, consistent_lsn, &snapshot_name).await
+    // Creation succeeded, so this attempt owns the slot until initialization
+    // returns a session. Include response validation in the cleanup boundary.
+    let snapshot = async {
+        let row = result
+            .iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .ok_or(Error::Protocol("slot creation returned no snapshot"))?;
+        let lsn = row
+            .get("consistent_point")
+            .ok_or(Error::Protocol("missing consistent point"))?;
+        let (hi, lo) = lsn
+            .split_once('/')
+            .ok_or(Error::Protocol("invalid snapshot LSN"))?;
+        let hi =
+            u32::from_str_radix(hi, 16).map_err(|_| Error::Protocol("invalid snapshot LSN"))?;
+        let lo =
+            u32::from_str_radix(lo, 16).map_err(|_| Error::Protocol("invalid snapshot LSN"))?;
+        let consistent_lsn = PgLsn(u64::from(hi) << 32 | u64::from(lo));
+        let snapshot_name = row
+            .get("snapshot_name")
+            .ok_or(Error::Protocol("slot did not export a snapshot"))?
+            .to_owned();
+        SnapshotSession::import(snapshot_client, slot, consistent_lsn, &snapshot_name).await
+    }
+    .await;
+    if snapshot.is_err()
+        && !temporary
+        && let Err(error) = replication
+            .simple_query(&format!("DROP_REPLICATION_SLOT {slot}"))
+            .await
+    {
+        tracing::warn!(%slot, %error, "failed to drop replication slot after snapshot initialization failed");
+    }
+    snapshot
 }
 
 impl<'a> SnapshotSession<'a> {
