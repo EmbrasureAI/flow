@@ -195,6 +195,11 @@ This will be the initial public release, `0.1.0`.
 - Remote durability restores journal segments concurrently and streams journal
   parts and row-index files to disk, and the startup scan of retained journal
   bytes no longer blocks replication.
+- Remote durability checkpoints upload journal parts of at most 8 MiB instead
+  of up to a whole 64 MiB segment, so the default `request_timeout_secs` needs
+  about 2 MiB/s of upload bandwidth instead of 16 MiB/s. Consolidating a
+  segment's small parts keeps its full-size parts instead of uploading the
+  whole segment again.
 - The scheduler no longer rescans the operations column family on every loop
   iteration, and `status.json` updates are coalesced and written off the
   scheduler task.
