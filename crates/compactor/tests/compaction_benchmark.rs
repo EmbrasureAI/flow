@@ -2,7 +2,7 @@
 //! catalog, scratch store and row index are real; publication is not timed.
 
 use flow_compactor::{CompactionPlan, Level, ReadLimits, compact};
-use flow_iceberg_ext::{RowDeltaAction, content_file_id, delete_content_size};
+use flow_iceberg_ext::{ManifestCache, RowDeltaAction, content_file_id, delete_content_size};
 use flow_materializer::{DataWriter, DeleteWriter, WriterConfig, iceberg_schema};
 use flow_model::{
     Column, ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value,
@@ -341,6 +341,7 @@ async fn run(fixture: &Fixture, iteration: usize) -> Sample {
         scratch,
         WriterConfig::default(),
         &ReadLimits::default(),
+        &ManifestCache::default(),
     )
     .await
     .unwrap();

@@ -19,7 +19,8 @@ use tokio::sync::watch;
 
 // Bound added low-load latency and the amount of terminal metadata held for one
 // durability barrier. An individual larger transaction still remains atomic.
-const JOURNAL_GROUP_TRANSACTIONS: usize = 32;
+// Under load, more small transactions share one sync; the delay bounds latency.
+const JOURNAL_GROUP_TRANSACTIONS: usize = 256;
 const JOURNAL_GROUP_BYTES: u64 = 4 << 20;
 const JOURNAL_GROUP_DELAY: Duration = Duration::from_millis(5);
 const SOURCE_SQL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -538,16 +539,22 @@ pub(crate) async fn capture_loop(
                                     }
                                 }
                                 registry.observe_nulls(&event, &mut assembler)?;
-                                let retained = row_table.map(|_| event.clone());
                                 let commit_xid = match &event { SourceEvent::Commit { xid, .. } => Some(*xid), _ => None };
                                 let ended = commit_xid.is_some() || matches!(&event, SourceEvent::Abort { .. });
-                                if let Err(error) = assembler.push_buffered_at(event, source.received_lsn, &mut journal) {
-                                    if let Some((_, id)) = row_table
-                                        && table_scoped(&error) {
+                                // A row stays owned here so a table-scoped error can quarantine it.
+                                let pushed = if let Some((_, id)) = row_table {
+                                    match assembler.push_row(&event) {
+                                        Err(error) if table_scoped(&error) => {
                                             let reason = table_block_reason(error);
-                                            registry.quarantine(id, retained.expect("row retained"), wire_relations.get(&id.0).context("row before source relation")?, &reason, &mut assembler)?;
+                                            registry.quarantine(id, event, wire_relations.get(&id.0).context("row before source relation")?, &reason, &mut assembler)?;
                                             continue;
                                         }
+                                        result => result,
+                                    }
+                                } else {
+                                    assembler.push_buffered_at(event, source.received_lsn, &mut journal)
+                                };
+                                if let Err(error) = pushed {
                                     if let Some(xid) = commit_xid
                                         && matches!(&error, flow_pg_source::Error::Journal(flow_ingress_journal::Error::Quota { .. })) {
                                             // Nothing past the durable journal was acknowledged. Drop the

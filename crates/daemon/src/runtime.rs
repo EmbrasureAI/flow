@@ -27,7 +27,7 @@ use flow_coordinator::{
     PreparationWait, Priority, ReadyCompaction, ReplanRequired, Scheduler, SourceLedger,
     TableMaintenance, TablePublisher,
 };
-use flow_model::{PgLsn, SourceId, TableId, TableSchema};
+use flow_model::{OperationId, PgLsn, SourceId, TableId, TableSchema};
 use flow_pg_source::Acknowledgement;
 use flow_state_store::{ControlStore, OperationKind, StateStore};
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -244,7 +244,8 @@ async fn run_service(
             config.compaction.clone(),
             crate::services::writer_config(&config),
         )?
-        .with_read_limits(config.parquet_read.clone())?,
+        .with_read_limits(config.parquet_read.clone())?
+        .with_manifest_cache(publisher.manifest_cache().clone()),
     );
     for operation in store.pending_operations()? {
         ensure!(
@@ -348,6 +349,16 @@ async fn run_service(
     let result = publishing
         .run(&mut ledger, &mut receive, &ack_send, &mut observation)
         .await;
+    // The stopped state and exit reason must follow the last observation.
+    let flushed = observation.flush_status();
+    let result = match (result, flushed) {
+        (Ok(()), flushed) => flushed,
+        (Err(error), Err(flush)) => {
+            tracing::warn!(error = %flush, "could not write the final status observation");
+            Err(error)
+        }
+        (result, Ok(())) => result,
+    };
     drop(receive);
     drop(ack_send);
     // Closing both channels interrupts a healthy capture actor. Socket operations
@@ -422,6 +433,49 @@ fn release_blocked_candidates<B, P>(
     released
 }
 
+/// One periodic visit runs at a time: the most overdue eligible table.
+fn next_periodic_visit(
+    due: &BTreeMap<TableId, Instant>,
+    active: bool,
+    now: Instant,
+    eligible: impl Fn(&TableId) -> bool,
+) -> Option<TableId> {
+    if active {
+        return None;
+    }
+    due.iter()
+        .filter(|(id, due)| **due <= now && eligible(id))
+        .min_by_key(|(_, due)| **due)
+        .map(|(id, _)| *id)
+}
+
+/// Every outcome of an admitted periodic visit releases the single periodic
+/// slot. A visit that only recovered an unfinished operation did not maintain
+/// the table, so the table stays due.
+fn finish_periodic_visit(
+    table: TableId,
+    outcome: &TableOutcome,
+    active: &mut bool,
+    due: &mut BTreeMap<TableId, Instant>,
+    now: Instant,
+) {
+    *active = false;
+    match outcome {
+        TableOutcome::PeriodicComplete {
+            next_due: Some(next),
+        } => {
+            due.insert(table, *next);
+        }
+        TableOutcome::PeriodicComplete { next_due: None } | TableOutcome::Blocked { .. } => {
+            due.remove(&table);
+        }
+        TableOutcome::Recovered => {
+            due.entry(table).or_insert(now + OPTIONAL_MAINTENANCE_DELAY);
+        }
+        _ => {}
+    }
+}
+
 fn feedback(ledger: &SourceLedger) -> Acknowledgement {
     Acknowledgement {
         received: ledger.watermarks().received_lsn,
@@ -472,6 +526,64 @@ fn remove_abandoned_scratch(config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Applied operations whose source progress the runtime has yet to record.
+/// Only table actors apply operations and only completion paths retire them,
+/// so the bounded OPERATIONS scan reruns after those instead of every loop.
+struct AppliedOperations {
+    limit: usize,
+    cached: Option<Vec<AppliedOperation>>,
+}
+
+#[derive(Clone)]
+struct AppliedOperation {
+    id: OperationId,
+    table_id: TableId,
+    last_lsn: PgLsn,
+}
+
+impl AppliedOperations {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            cached: None,
+        }
+    }
+
+    fn get(&mut self, store: &StateStore) -> Result<&[AppliedOperation]> {
+        if self.cached.is_none() {
+            let operations = store.applied_operations(self.limit)?;
+            self.cached = Some(
+                operations
+                    .into_iter()
+                    .map(|record| AppliedOperation {
+                        id: record.operation.id,
+                        table_id: record.operation.table_id,
+                        last_lsn: record.operation.last_lsn,
+                    })
+                    .collect(),
+            );
+        }
+        Ok(self.cached.as_deref().unwrap_or_default())
+    }
+
+    fn invalidate(&mut self) {
+        self.cached = None;
+    }
+}
+
+/// Remove a joined worker's scratch store off the scheduler task. Paths are
+/// never reused, and a directory left behind only holds disk until the next
+/// start removes abandoned scratch.
+fn remove_scratch(path: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(path = %path.display(), %error,
+                "could not remove compaction scratch; the next start removes it");
+        }
+        _ => {}
+    })
 }
 
 struct PublishRuntime {
@@ -590,6 +702,7 @@ impl PublishRuntime {
             .map(|id| (*id, first_maintenance))
             .collect();
         let mut periodic_due = maintenance_due.clone();
+        let mut applied = AppliedOperations::new(schemas.len().max(1));
         let mut periodic_active = false;
         let mut periodic_yield_to_cdc = false;
         let mut retry_yield_to_cdc = false;
@@ -603,10 +716,10 @@ impl PublishRuntime {
             // Liveness: every select arm is bounded and the health tick wakes
             // an idle loop every five seconds.
             crate::lifecycle::run_loop_progress();
-            recovering = store
-                .applied_operations(schemas.len().max(1))?
-                .into_iter()
-                .map(|operation| operation.operation.table_id)
+            recovering = applied
+                .get(store)?
+                .iter()
+                .map(|operation| operation.table_id)
                 .filter(|id| !busy.contains(id))
                 .collect();
             excluded = blocked
@@ -717,16 +830,17 @@ impl PublishRuntime {
                     ack.send(feedback(ledger))?;
                 }
                 _ = tokio::task::yield_now(), if !recovering.is_empty() || ledger.has_completed_prefix()? => {
-                    if let Some(operation) = store.applied_operations(schemas.len().max(1))?
-                        .into_iter().find(|operation| !busy.contains(&operation.operation.table_id)) {
-                        let id = operation.operation.table_id;
+                    if let Some(operation) = applied.get(store)?
+                        .iter().find(|operation| !busy.contains(&operation.table_id)).cloned() {
+                        applied.invalidate();
+                        let id = operation.table_id;
                         let transactions = ledger.pending_table_transactions_after(id, PgLsn(0))
                             .take(ledger.batch_capacity()).collect::<Result<Vec<_>>>()?;
                         let ends = transactions.iter()
-                            .take_while(|transaction| transaction.end_lsn <= operation.operation.last_lsn)
+                            .take_while(|transaction| transaction.end_lsn <= operation.last_lsn)
                             .map(|transaction| transaction.end_lsn).collect::<Vec<_>>();
                         if ends.is_empty() {
-                            store.forget_applied(&operation.operation.id)?;
+                            store.forget_applied(&operation.id)?;
                         } else {
                             ledger.table_materialized_batch(&ends, id,
                                 store.table_state(&id)?.snapshot_id.unwrap_or(0))?;
@@ -738,12 +852,17 @@ impl PublishRuntime {
                 }
                 Some(result) = running.next(), if !running.is_empty() => {
                     let TableCompletion { id, transactions, outcome, elapsed, reserved_build, finalization_lane, periodic_maintenance } = result?;
+                    // The actor may have applied, recovered or retired operations.
+                    applied.invalidate();
                     busy.remove(&id);
                     retrying.remove(&id);
                     if let Some(lane) = finalization_lane {
                         lane.record_release(id, Instant::now());
                     }
                     scheduler.stall(id, false);
+                    if periodic_maintenance {
+                        finish_periodic_visit(id, &outcome, &mut periodic_active, &mut periodic_due, Instant::now());
+                    }
                     match outcome {
                         TableOutcome::Blocked { error_code } => {
                             let indexed = store.table_state(&id)?;
@@ -760,9 +879,6 @@ impl PublishRuntime {
                             maintenance_due.remove(&id);
                             periodic_due.remove(&id);
                             idle_work.retain(|queued| *queued != id);
-                            if periodic_maintenance {
-                                periodic_active = false;
-                            }
                         }
                         TableOutcome::Recovered => {
                             if reserved_build {
@@ -781,14 +897,9 @@ impl PublishRuntime {
                             }));
                             maintenance_due.remove(&id);
                         }
-                        TableOutcome::PeriodicComplete { next_due } => {
-                            periodic_active = false;
-                            ensure!(!reserved_build && transactions.is_empty(), "invalid periodic maintenance completion");
-                            if let Some(due) = next_due {
-                                periodic_due.insert(id, due);
-                            } else {
-                                periodic_due.remove(&id);
-                            }
+                        TableOutcome::PeriodicComplete { .. } => {
+                            ensure!(periodic_maintenance && !reserved_build && transactions.is_empty(),
+                                "invalid periodic maintenance completion");
                         }
                         TableOutcome::ProbeComplete => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid background build probe");
@@ -917,7 +1028,7 @@ impl PublishRuntime {
                         }
                         Err(error) => {
                             // wait() joins the actual worker before releasing ownership.
-                            std::fs::remove_dir_all(path)?;
+                            remove_scratch(path);
                             build_active.remove(&id);
                             let hard_pressure = waiting_for_build.remove(&id);
                             scheduler.stall(id, busy.contains(&id));
@@ -1024,7 +1135,7 @@ impl PublishRuntime {
                         }
                         Err(error) => {
                             // wait() joins the actual worker before releasing BUILD.
-                            std::fs::remove_dir_all(path)?;
+                            remove_scratch(path);
                             build_active.remove(&id);
                             activation_pending.remove(&id);
                             let hard_pressure = waiting_for_build.remove(&id);
@@ -1057,7 +1168,7 @@ impl PublishRuntime {
                 }
                 Some(completion) = retirements.next(), if !retirements.is_empty() => {
                     let RetirementCompletion { id, path, result } = completion;
-                    std::fs::remove_dir_all(path)?;
+                    remove_scratch(path);
                     retiring_builds.remove(&id);
                     let hard_pressure = waiting_for_build.remove(&id);
                     scheduler.stall(id, busy.contains(&id));
@@ -1122,12 +1233,11 @@ impl PublishRuntime {
                         let cdc_ready = scheduler.next_deadline().is_some_and(|due| due <= now);
                         // One periodic visit at a time; ready CDC must receive a
                         // dispatch between visits even across different tables.
-                        let periodic = if optional_allowed && !periodic_active && !(periodic_yield_to_cdc && cdc_ready) {
-                            periodic_due.iter()
-                                .filter(|(id, due)| **due <= now && !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none()
-                                    && !build_active.contains(*id) && !retiring_builds.contains(*id))
-                                .min_by_key(|(_, due)| **due)
-                                .map(|(id, _)| *id)
+                        let periodic = if optional_allowed && !(periodic_yield_to_cdc && cdc_ready) {
+                            next_periodic_visit(&periodic_due, periodic_active, now, |id| {
+                                !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
+                                    && !build_active.contains(id) && !retiring_builds.contains(id)
+                            })
                         } else {
                             None
                         };
@@ -1307,6 +1417,7 @@ impl PublishRuntime {
                     }
                 }
                 _ = health.tick() => {
+                    applied.invalidate();
                     for id in schemas.keys().copied() {
                         let cause = crate::schema::capture_block(store, &SourceId(config.source.id.clone()), id)?;
                         let recorded = blocked.get(id).map(|record| record.error_code.clone());
@@ -1433,6 +1544,59 @@ mod maintenance_admission_tests {
         admission.observe(SourceHealthStatus::Healthy);
         assert!(admission.optional_allowed(4, 4, false));
         assert!(admission.optional_allowed(1, 1, true));
+    }
+
+    #[test]
+    fn a_periodic_visit_that_only_recovers_keeps_later_periodic_visits_running() {
+        let start = Instant::now();
+        let (recovered, quiet) = (TableId(1), TableId(2));
+        let mut due =
+            BTreeMap::from([(recovered, start), (quiet, start + Duration::from_secs(60))]);
+        let mut active = false;
+        let admit = |due: &mut BTreeMap<_, _>, active: &mut bool, now| {
+            let table = next_periodic_visit(due, *active, now, |_| true)?;
+            *active = true;
+            due.remove(&table);
+            Some(table)
+        };
+
+        // The visit finds an unfinished ingest operation and only recovers it.
+        assert_eq!(admit(&mut due, &mut active, start), Some(recovered));
+        assert_eq!(
+            next_periodic_visit(&due, active, start + Duration::from_secs(60), |_| true),
+            None
+        );
+        finish_periodic_visit(
+            recovered,
+            &TableOutcome::Recovered,
+            &mut active,
+            &mut due,
+            start,
+        );
+        assert!(!active);
+
+        // Its maintenance still runs, and so do later visits to other tables.
+        let retry = start + OPTIONAL_MAINTENANCE_DELAY;
+        assert_eq!(admit(&mut due, &mut active, retry), Some(recovered));
+        let complete = TableOutcome::PeriodicComplete { next_due: None };
+        finish_periodic_visit(recovered, &complete, &mut active, &mut due, retry);
+        let later = start + Duration::from_secs(60);
+        assert_eq!(admit(&mut due, &mut active, later), Some(quiet));
+        let continuation = TableOutcome::PeriodicComplete {
+            next_due: Some(later),
+        };
+        finish_periodic_visit(quiet, &continuation, &mut active, &mut due, later);
+        assert_eq!(admit(&mut due, &mut active, later), Some(quiet));
+        finish_periodic_visit(
+            quiet,
+            &TableOutcome::Blocked {
+                error_code: "catalog_unavailable",
+            },
+            &mut active,
+            &mut due,
+            later,
+        );
+        assert!(!active && due.is_empty());
     }
 
     #[test]
@@ -1666,6 +1830,17 @@ mod startup_recovery_tests {
         let blocked = TableId(8);
         let end = PgLsn(11);
         let id = OperationId("durable-applied-epoch".into());
+        let pending_tables = |ledger: &SourceLedger| {
+            [published, blocked]
+                .into_iter()
+                .filter(|table| {
+                    ledger
+                        .pending_table_transactions_after(*table, PgLsn(0))
+                        .map(|transaction| transaction.unwrap().end_lsn)
+                        .eq([end])
+                })
+                .collect::<Vec<_>>()
+        };
 
         let control = ControlStore::open(&control_path).unwrap();
         let store = control
@@ -1754,7 +1929,7 @@ mod startup_recovery_tests {
         assert_eq!(ledger.acknowledgement(), PgLsn(0));
         assert_eq!(reconcile_source_progress(&store, &mut ledger).unwrap(), 1);
         assert_eq!(ledger.acknowledgement(), PgLsn(0));
-        assert_eq!(ledger.pending_tables(end).unwrap(), [blocked]);
+        assert_eq!(pending_tables(&ledger), [blocked]);
         assert!(store.operation(&id).unwrap().is_none());
         assert!(control.operation(&id).unwrap().is_none());
         assert_eq!(
@@ -1777,7 +1952,7 @@ mod startup_recovery_tests {
             JournalDurability::LocalDisk,
         )
         .unwrap();
-        assert_eq!(ledger.pending_tables(end).unwrap(), [blocked]);
+        assert_eq!(pending_tables(&ledger), [blocked]);
         assert!(store.applied_operations(2).unwrap().is_empty());
         assert_eq!(
             control.table_state(&published).unwrap(),
@@ -1788,6 +1963,67 @@ mod startup_recovery_tests {
         ledger.reconcile_table_progress().unwrap();
         assert_eq!(ledger.acknowledgement(), end);
         assert_eq!(ledger.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn scratch_cleanup_runs_off_the_scheduler_and_tolerates_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("CURRENT"), "scratch").unwrap();
+        remove_scratch(scratch.clone()).await.unwrap();
+        assert!(!scratch.exists());
+        // Missing or unremovable scratch is logged, never fatal.
+        remove_scratch(scratch).await.unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, "").unwrap();
+        remove_scratch(file.clone()).await.unwrap();
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn applied_operations_rescan_only_after_invalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let store = control
+            .initialize_index(root.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let mut applied = AppliedOperations::new(4);
+        assert!(applied.get(&store).unwrap().is_empty());
+        let id = OperationId("applied-epoch".into());
+        store
+            .prepare(
+                PreparedOperation {
+                    id: id.clone(),
+                    table_id: TableId(3),
+                    kind: OperationKind::Ingest,
+                    base_snapshot_id: None,
+                    last_lsn: PgLsn(30),
+                    schema_version: 1,
+                    artifacts: vec![],
+                    payload: vec![],
+                },
+                [],
+            )
+            .unwrap();
+        store.mark_committed(&id, 100, 1).unwrap();
+        assert!(store.apply_committed(&id).unwrap().complete);
+        // A table actor applied it; its completion invalidates the cache.
+        assert!(applied.get(&store).unwrap().is_empty());
+        applied.invalidate();
+        let operations = applied.get(&store).unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(
+            (
+                &operations[0].id,
+                operations[0].table_id,
+                operations[0].last_lsn
+            ),
+            (&id, TableId(3), PgLsn(30))
+        );
+        store.forget_applied(&id).unwrap();
+        applied.invalidate();
+        assert!(applied.get(&store).unwrap().is_empty());
     }
 
     fn dropped_table_fixture() -> (

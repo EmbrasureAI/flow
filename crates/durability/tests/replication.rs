@@ -5,7 +5,99 @@ use flow_ingress_journal::{Journal, JournalConfig};
 use flow_model::{PgLsn, SourceId, SourceTransaction, TableId, TableMutationCount};
 use flow_state_store::{ControlStore, StateStore, StateStoreOptions};
 use opendal::{Operator, services::Memory};
-use std::{path::Path, time::Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
+
+/// Injects failures into object writes, as a flaky or unavailable store would.
+mod faults {
+    use opendal::raw::{
+        Access, Layer, LayeredAccess, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead, RpWrite,
+    };
+    use opendal::{Error, ErrorKind, Result};
+    use std::sync::{Arc, Mutex};
+
+    /// Fails writes below a prefix a number of times, or until cleared.
+    #[derive(Clone, Debug, Default)]
+    pub struct Faults(Arc<Mutex<Vec<(String, usize)>>>);
+
+    impl Faults {
+        pub fn fail(&self, prefix: &str, times: usize) {
+            self.0.lock().unwrap().push((prefix.to_owned(), times));
+        }
+
+        pub fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+
+        pub fn remaining(&self) -> usize {
+            self.0.lock().unwrap().iter().map(|(_, times)| times).sum()
+        }
+
+        fn hit(&self, path: &str) -> bool {
+            let path = path.trim_start_matches('/');
+            let mut faults = self.0.lock().unwrap();
+            let Some((_, times)) = faults
+                .iter_mut()
+                .find(|(prefix, times)| *times > 0 && path.starts_with(prefix.as_str()))
+            else {
+                return false;
+            };
+            *times -= 1;
+            true
+        }
+    }
+
+    impl<A: Access> Layer<A> for Faults {
+        type LayeredAccess = Faulty<A>;
+
+        fn layer(&self, inner: A) -> Faulty<A> {
+            Faulty {
+                inner,
+                faults: self.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Faulty<A> {
+        inner: A,
+        faults: Faults,
+    }
+
+    impl<A: Access> LayeredAccess for Faulty<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+        type Copier = A::Copier;
+
+        fn inner(&self) -> &A {
+            &self.inner
+        }
+
+        async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, A::Reader)> {
+            self.inner.read(path, args).await
+        }
+
+        async fn write(&self, path: &str, args: OpWrite) -> Result<(RpWrite, A::Writer)> {
+            if self.faults.hit(path) {
+                return Err(Error::new(ErrorKind::Unexpected, "injected failure").set_temporary());
+            }
+            self.inner.write(path, args).await
+        }
+
+        async fn delete(&self) -> Result<(RpDelete, A::Deleter)> {
+            self.inner.delete().await
+        }
+
+        async fn list(&self, path: &str, args: OpList) -> Result<(RpList, A::Lister)> {
+            self.inner.list(path, args).await
+        }
+    }
+}
 
 fn config() -> Config {
     Config {
@@ -553,5 +645,194 @@ async fn baselines_write_only_new_state_but_always_cover_new_files() {
         std::fs::read(restored.path().join("source-identity.json")).unwrap(),
         b"{\"late\":1}"
     );
+    durability.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_journal_of_many_segments_restores_exactly() {
+    let small = JournalConfig {
+        segment_bytes: 4096,
+        max_frame_bytes: 1024,
+        ..JournalConfig::default()
+    };
+    let operator = Operator::new(Memory::default()).unwrap().finish();
+    let state = tempfile::tempdir().unwrap();
+    {
+        let (mut journal, _) = Journal::open(state.path().join("journal"), small.clone()).unwrap();
+        for xid in 1..=40 {
+            commit(&mut journal, xid, &[xid as u8; 600]);
+        }
+    }
+    let durability = open(&operator, state.path()).await;
+    let control = ControlStore::open(state.path().join("control")).unwrap();
+    durability.attach_control(&control).await.unwrap();
+    durability.baseline().await.unwrap();
+    let (journal, _) = Journal::open(state.path().join("journal"), small.clone()).unwrap();
+    let expected = transactions(&journal);
+    let segments = journal.layout().segments.len();
+    assert!(segments > 4, "only {segments} segments");
+    drop((journal, control));
+    durability.release().await.unwrap();
+
+    let restored = tempfile::tempdir().unwrap();
+    let durability = open(&operator, restored.path()).await;
+    assert_eq!(durability.mode(), Mode::Restored);
+    let (journal, recovery) = Journal::open(restored.path().join("journal"), small).unwrap();
+    assert_eq!(recovery.truncated_bytes, 0);
+    assert_eq!(journal.layout().segments.len(), segments);
+    assert_eq!(transactions(&journal), expected);
+    drop(journal);
+    durability.stop();
+}
+
+fn faulty() -> (faults::Faults, Operator) {
+    let faults = faults::Faults::default();
+    let operator = Operator::new(Memory::default())
+        .unwrap()
+        .finish()
+        .layer(faults.clone());
+    (faults, operator)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_writes_retry_transient_failures() {
+    let (faults, operator) = faulty();
+    for prefix in ["format.json", "owners/", "log/"] {
+        faults.fail(prefix, 2);
+    }
+    let state = tempfile::tempdir().unwrap();
+    let durability = open(&operator, state.path()).await;
+    assert_eq!(durability.mode(), Mode::Fresh);
+    assert_eq!(faults.remaining(), 0);
+    durability.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn baseline_checkpoints_retry_transient_write_failures() {
+    let (faults, operator) = faulty();
+    let state = tempfile::tempdir().unwrap();
+    {
+        // Local state to migrate, so the baseline uploads journal parts.
+        let (mut journal, _) =
+            Journal::open(state.path().join("journal"), JournalConfig::default()).unwrap();
+        commit(&mut journal, 1, b"legacy");
+    }
+    let durability = open(&operator, state.path()).await;
+    assert_eq!(durability.mode(), Mode::Migrated);
+    for prefix in ["control/", "journals/", "checkpoints/"] {
+        faults.fail(prefix, 2);
+    }
+    let (control, index, mut journal) = attach(&durability, state.path()).await;
+    assert_eq!(faults.remaining(), 0);
+    assert!(durability.status().stats.retries >= 6);
+    commit(&mut journal, 2, b"after");
+    let expected = transactions(&journal);
+    durability.barrier().await.unwrap();
+    drop((control, index, journal));
+    durability.stop();
+
+    let restored = tempfile::tempdir().unwrap();
+    let durability = open(&operator, restored.path()).await;
+    assert_eq!(durability.mode(), Mode::Restored);
+    let (journal, _) =
+        Journal::open(restored.path().join("journal"), JournalConfig::default()).unwrap();
+    assert_eq!(transactions(&journal), expected);
+    drop(journal);
+    durability.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_baseline_waits_like_a_barrier_and_fails_once_replaced() {
+    let (faults, operator) = faulty();
+    let state = tempfile::tempdir().unwrap();
+    let durability = open(&operator, state.path()).await;
+    faults.fail("control/", usize::MAX);
+    let control = ControlStore::open(state.path().join("control")).unwrap();
+    durability.attach_control(&control).await.unwrap();
+    let baseline = tokio::spawn({
+        let durability = durability.clone();
+        async move { durability.baseline().await }
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !baseline.is_finished(),
+        "a transient failure must not fail the baseline"
+    );
+    // A successor claims the state: the waiting baseline now fails.
+    operator
+        .write(
+            &format!("owners/{:020}.json", durability.epoch() + 1),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), baseline)
+        .await
+        .expect("a replaced owner stops waiting")
+        .unwrap();
+    assert!(result.is_err());
+    assert!(durability.failure().is_some());
+    drop(control);
+    durability.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flush_and_release_give_up_after_one_lease_while_storage_is_unavailable() {
+    let (faults, operator) = faulty();
+    let state = tempfile::tempdir().unwrap();
+    let durability = open(&operator, state.path()).await;
+    let (control, index, journal) = attach(&durability, state.path()).await;
+    faults.fail("", usize::MAX);
+    index.put_source_transaction(b"k", b"v").unwrap();
+    let started = Instant::now();
+    assert!(durability.flush().await.is_err());
+    assert!(started.elapsed() < Duration::from_secs(8));
+    // Once storage is back, the same records flush.
+    faults.clear();
+    durability.flush().await.unwrap();
+
+    faults.fail("", usize::MAX);
+    index.put_source_transaction(b"k", b"w").unwrap();
+    drop((control, index, journal));
+    let started = Instant::now();
+    let released = tokio::time::timeout(Duration::from_secs(20), durability.release())
+        .await
+        .expect("release must not hang while storage is unavailable");
+    assert!(released.is_err());
+    durability.stop();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_baseline_that_cannot_read_local_state_fails_instead_of_hanging() {
+    let operator = Operator::new(Memory::default()).unwrap().finish();
+    let state = tempfile::tempdir().unwrap();
+    {
+        let (mut journal, _) =
+            Journal::open(state.path().join("journal"), JournalConfig::default()).unwrap();
+        commit(&mut journal, 1, b"legacy");
+    }
+    // A segment the baseline lists but cannot read.
+    let segment = state
+        .path()
+        .join("journal")
+        .join(flow_ingress_journal::segment_file_name(0));
+    std::fs::remove_file(&segment).unwrap();
+    std::os::unix::fs::symlink(state.path().join("missing"), &segment).unwrap();
+    let durability = open(&operator, state.path()).await;
+    assert_eq!(durability.mode(), Mode::Migrated);
+    let control = ControlStore::open(state.path().join("control")).unwrap();
+    durability.attach_control(&control).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), durability.baseline())
+        .await
+        .expect("a local error must fail the baseline, not hang it");
+    assert!(result.is_err());
+    // Only the request failed; replication itself keeps running.
+    assert!(durability.failure().is_none());
+    drop(control);
     durability.stop();
 }

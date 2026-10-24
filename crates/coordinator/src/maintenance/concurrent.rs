@@ -298,6 +298,7 @@ impl TableMaintenance {
         let mut writer = self.writer.clone();
         writer.artifact_tracker = Some(ownership.artifact_tracker());
         let limits = self.read_limits.clone();
+        let cache = self.cache.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
         let (captured, ready) = tokio::sync::oneshot::channel();
@@ -320,6 +321,7 @@ impl TableMaintenance {
                 scratch,
                 writer,
                 &limits,
+                &cache,
                 &worker_cancelled,
             ))
         });

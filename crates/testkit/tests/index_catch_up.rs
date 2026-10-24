@@ -6,6 +6,7 @@ mod fixture;
 use fixture::{Fixture, options, row};
 use flow_compactor::Policy;
 use flow_coordinator::{DeleteRewritePolicy, TableMaintenance, TablePublisher};
+use flow_iceberg_ext::RowDeltaAction;
 use flow_iceberg_ext::SnapshotView;
 use flow_materializer::WriterConfig;
 use flow_model::{FileId, PgLsn, Row, SourceId, Value};
@@ -251,4 +252,74 @@ async fn catch_up_rejects_a_checkpoint_that_disagrees_with_its_snapshot() {
         restored.table_state(&f.schema.table_id).unwrap(),
         at_checkpoint
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_rejects_a_removed_delete_for_a_surviving_file() {
+    let mut f = Fixture::new().await;
+    let checkpoint = f.temp.path().join("checkpoint");
+    f.index.checkpoint(&checkpoint).unwrap();
+    let at_checkpoint = f.index.table_state(&f.schema.table_id).unwrap();
+    // A new file gives catch-up work besides the delete change below.
+    cdc(
+        &mut f,
+        100,
+        vec![(140, Change::Insert(changed(140, "new")))],
+    )
+    .await;
+    let current = f.index.table_state(&f.schema.table_id).unwrap();
+    // An external writer removes a delete file. Rows 2 and 12 of both
+    // surviving data files are live again, but the checkpoint lacks them.
+    let view = SnapshotView::current(&f.head).await.unwrap();
+    let removed = view
+        .live_files
+        .values()
+        .find(|entry| {
+            entry.content_type() == DataContentType::PositionDeletes
+                && entry.file_path().contains("shared-b")
+        })
+        .unwrap();
+    f.head = RowDeltaAction::new(&f.head, "external-undelete")
+        .remove_delete_files([flow_iceberg_ext::content_file_id(&removed.data_file)])
+        .commit(f.catalog.as_ref(), &f.head)
+        .await
+        .unwrap()
+        .table;
+    let live = flow_testkit::scan(&f.head, &f.schema).await.unwrap();
+    assert!(live.contains(&row(2)) && live.contains(&row(12)));
+
+    let restored = StateStore::open(&checkpoint, options()).unwrap();
+    let error = maintenance(&f, &restored)
+        .catch_up_index(
+            &f.head,
+            &f.schema,
+            restored.clone(),
+            f.scratch("catch-up"),
+            at_checkpoint.snapshot_id,
+            current.materialized_lsn,
+            current.schema_version,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("removed or narrowed"),
+        "{error:#}"
+    );
+    // The caller's fallback, a full rebuild, indexes the restored rows.
+    let rebuilt = StateStore::open(f.temp.path().join("rebuilt"), options()).unwrap();
+    maintenance(&f, &rebuilt)
+        .rebuild_index(
+            &f.head,
+            &f.schema,
+            rebuilt.clone(),
+            f.scratch("rebuild"),
+            current.materialized_lsn,
+            current.schema_version,
+        )
+        .await
+        .unwrap();
+    for id in [2, 12, 140] {
+        let key = f.schema.encode_key(&row(id)).unwrap();
+        assert!(rebuilt.lookup(&f.schema.table_id, &key).unwrap().is_some());
+    }
 }
