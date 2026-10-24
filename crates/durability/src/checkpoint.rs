@@ -20,7 +20,11 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-/// A segment written in many small checkpoints is consolidated into one part.
+/// Journal bytes per part. Each part is one request that must finish within
+/// `request_timeout_secs`; at the default 4 seconds this needs about 2 MiB/s.
+const MAX_PART_BYTES: u64 = 8 << 20;
+/// Parts after a segment's leading full-size parts, left by frequent small
+/// checkpoints, before they are rewritten as full-size parts.
 const MAX_PARTS: usize = 16;
 /// Journal parts uploaded at once; each is read into memory whole.
 const PART_UPLOADS: usize = 4;
@@ -174,6 +178,31 @@ pub(crate) async fn checkpoint_loop(
     }
 }
 
+/// The ranges to upload so a segment's parts cover `[0, length)`, each at most
+/// `MAX_PART_BYTES`. Once `MAX_PARTS` parts follow the leading full-size ones,
+/// those parts are dropped and their bytes uploaded again, so consolidation
+/// never rewrites full-size parts.
+fn plan_parts(parts: &mut Vec<Part>, length: u64) -> Vec<(u64, u64)> {
+    if length <= parts.last().map_or(0, |part| part.end) {
+        return Vec::new();
+    }
+    let full = parts
+        .iter()
+        .take_while(|part| part.end - part.start >= MAX_PART_BYTES)
+        .count();
+    if parts.len() - full >= MAX_PARTS {
+        parts.truncate(full);
+    }
+    let mut start = parts.last().map_or(0, |part| part.end);
+    let mut ranges = Vec::new();
+    while start < length {
+        let end = length.min(start + MAX_PART_BYTES);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
 fn read_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     file.seek(SeekFrom::Start(start))?;
@@ -270,21 +299,8 @@ async fn checkpoint(
             if state.covered() > state.length {
                 parts.clear();
             }
-            let covered = parts.last().map_or(0, |part| part.end);
-            if state.length > covered {
-                let start = if parts.len() >= MAX_PARTS {
-                    parts.clear();
-                    0
-                } else {
-                    covered
-                };
-                uploads.push((
-                    name.clone(),
-                    model.root.clone(),
-                    *segment,
-                    start,
-                    state.length,
-                ));
+            for (start, end) in plan_parts(&mut parts, state.length) {
+                uploads.push((name.clone(), model.root.clone(), *segment, start, end));
             }
             image.segments.insert(
                 *segment,
@@ -301,7 +317,8 @@ async fn checkpoint(
             let part = upload_part(shared, operator, &root, &name, segment, start, end).await?;
             Ok::<_, anyhow::Error>((name, segment, part))
         })
-        .buffer_unordered(PART_UPLOADS)
+        // In order, so each segment's parts stay contiguous.
+        .buffered(PART_UPLOADS)
         .try_collect()
         .await?;
     for (name, segment, part) in uploaded {
@@ -618,6 +635,129 @@ mod tests {
         let mut expected = vec![b'a'; 100];
         expected.extend_from_slice(&[b'b'; 50]);
         assert_eq!(replayed(&operator, &checkpoint).await, expected);
+        shared.close();
+        writer.await.unwrap();
+    }
+
+    #[test]
+    fn journal_parts_are_capped_and_consolidation_keeps_full_parts() {
+        const M: u64 = MAX_PART_BYTES;
+        let part = |start, end| Part {
+            object: format!("{start}-{end}"),
+            start,
+            end,
+            crc32: 0,
+        };
+        let mut parts = Vec::new();
+        assert_eq!(
+            plan_parts(&mut parts, 2 * M + 5),
+            [(0, M), (M, 2 * M), (2 * M, 2 * M + 5)]
+        );
+        // Nothing new to cover.
+        let mut parts = vec![part(0, M)];
+        assert!(plan_parts(&mut parts, M).is_empty());
+        // Small parts accumulate after the full ones up to the limit...
+        let mut parts = vec![part(0, M), part(M, 2 * M)];
+        parts.extend((0..MAX_PARTS as u64 - 1).map(|i| part(2 * M + i, 2 * M + i + 1)));
+        let covered = parts.last().unwrap().end;
+        assert_eq!(
+            plan_parts(&mut parts, covered + 1),
+            [(covered, covered + 1)]
+        );
+        assert_eq!(parts.len(), MAX_PARTS + 1);
+        // ...and are then rewritten as full-size parts, keeping the full ones.
+        parts.push(part(covered, covered + 1));
+        let length = 3 * M + 7;
+        assert_eq!(
+            plan_parts(&mut parts, length),
+            [(2 * M, 3 * M), (3 * M, length)]
+        );
+        assert_eq!(parts, [part(0, M), part(M, 2 * M)]);
+        // A larger part from before the cap still counts as full.
+        let mut parts = vec![part(0, 64 << 20)];
+        parts.extend((0..MAX_PARTS as u64).map(|i| part((64 << 20) + i, (64 << 20) + i + 1)));
+        assert_eq!(
+            plan_parts(&mut parts, (64 << 20) + 20),
+            [(64 << 20, (64 << 20) + 20)]
+        );
+        assert_eq!(parts, [part(0, 64 << 20)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_segment_is_uploaded_in_capped_contiguous_parts() {
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let state = tempfile::tempdir().unwrap();
+        let root = state.path().join("journal");
+        std::fs::create_dir_all(&root).unwrap();
+        let length = 2 * MAX_PART_BYTES + 100;
+        let mut expected: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+        std::fs::write(segment(&root), &expected).unwrap();
+        let shared = Arc::new(Shared::new(tuning(), 1, 0, 1));
+        shared.renewed(Instant::now() + Duration::from_secs(60));
+        shared.lock().journals.insert(
+            "journal".into(),
+            JournalModel {
+                root: root.clone(),
+                reclaimed: 0,
+                segments: BTreeMap::from([(
+                    0,
+                    SegmentModel {
+                        length,
+                        ..SegmentModel::default()
+                    },
+                )]),
+                last_extents: BTreeMap::new(),
+            },
+        );
+        let writer = tokio::spawn(writer::write_loop(shared.clone(), operator.clone()));
+        let control = ControlStore::open(state.path().join("control")).unwrap();
+        control
+            .attach_mirror(Arc::new(crate::ControlAdapter(shared.clone())))
+            .unwrap();
+        let first = checkpoint(&shared, &operator, control.clone(), &History::default(), 1)
+            .await
+            .unwrap();
+        let bounds = |checkpoint: &Checkpoint| -> Vec<(u64, u64)> {
+            checkpoint.journals["journal"].segments[&0]
+                .parts
+                .iter()
+                .map(|part| (part.start, part.end))
+                .collect()
+        };
+        let m = MAX_PART_BYTES;
+        assert_eq!(bounds(&first.1), [(0, m), (m, 2 * m), (2 * m, length)]);
+        assert_eq!(imaged(&operator, &first.1).await, expected);
+
+        // A later checkpoint keeps those parts and adds only the new bytes.
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(segment(&root))
+            .unwrap();
+        std::io::Write::write_all(&mut &file, &[b'z'; 50]).unwrap();
+        drop(file);
+        shared
+            .append(Item::Extent {
+                journal: "journal".into(),
+                segment: 0,
+                offset: length,
+                len: 50,
+            })
+            .unwrap();
+        expected.extend_from_slice(&[b'z'; 50]);
+        let history = History {
+            latest: Some(first),
+            previous: None,
+        };
+        let (_, second) = checkpoint(&shared, &operator, control, &history, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            bounds(&second),
+            [(0, m), (m, 2 * m), (2 * m, length), (length, length + 50)]
+        );
+        assert_eq!(imaged(&operator, &second).await, expected);
         shared.close();
         writer.await.unwrap();
     }
