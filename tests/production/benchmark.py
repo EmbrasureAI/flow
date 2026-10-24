@@ -164,15 +164,18 @@ deleted_rows_percent = 100
 table_workers = {self.args.table_workers}
 manifest_max_count = {self.args.manifest_max_count}
 batch_rows = {self.args.batch_rows}
-chunk_bytes = 1048576
-batch_bytes = 8388608
+chunk_bytes = {self.args.chunk_bytes}
+batch_bytes = {self.args.batch_bytes}
 pending_transactions = {self.args.pending_transactions}
-commits_per_second = 100
+commits_per_second = {self.args.commits_per_second}
 journal_bytes = 8589934592
 spool_bytes = 4294967296
 wal_soft_bytes = 8589934592
 wal_hard_bytes = 17179869184
 snapshot_retention_secs = 3600
+'''
+        if self.args.collapse_memory_bytes is not None:
+            text += f'''collapse_memory_bytes = {self.args.collapse_memory_bytes}
 '''
         for name in self.names:
             text += f'''\n[[tables]]
@@ -1021,6 +1024,8 @@ columns = [
                            measured_seconds=args.duration, transaction_rows=args.transaction_rows, writers=args.writers,
                            key_distribution=args.key_distribution, reader_poll_seconds=args.reader_poll_seconds,
                            batch_rows=args.batch_rows, pending_transactions=args.pending_transactions,
+                           commits_per_second=args.commits_per_second, chunk_bytes=args.chunk_bytes,
+                           batch_bytes=args.batch_bytes, collapse_memory_bytes=args.collapse_memory_bytes,
                            maintenance_mode=args.maintenance_mode,
                            manifest_max_count=args.manifest_max_count,
                            payload=("distinct MD5 blocks per row and generation; hex text (4 bits per byte), PostgreSQL generation CPU included"
@@ -1105,6 +1110,14 @@ def main():
     parser.add_argument("--format-version", type=int, choices=(2, 3), default=2)
     parser.add_argument("--build-manifest", type=Path, required=True)
     parser.add_argument("--compactor-binary", type=Path)
+    # Engine limits; defaults keep earlier reports comparable. The managed
+    # service uses --commits-per-second 1 --chunk-bytes 33554432
+    # --batch-bytes 33554432 --pending-transactions 4096.
+    parser.add_argument("--commits-per-second", type=int, default=100)
+    parser.add_argument("--chunk-bytes", type=int, default=1048576)
+    parser.add_argument("--batch-bytes", type=int, default=8388608)
+    # Unset keeps the engine default.
+    parser.add_argument("--collapse-memory-bytes", type=int)
     parser.add_argument("--reader-baseline-compactor", type=Path)
     parser.add_argument("--reader-baseline-max-input-files", type=int, default=256)
     parser.add_argument("--reader-baseline-max-input-bytes", type=int, default=512 << 20)

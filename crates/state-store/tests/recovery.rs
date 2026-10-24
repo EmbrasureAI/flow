@@ -1,6 +1,6 @@
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId, Value};
 use flow_state_store::{
-    BufferResult, Change, CollapseBuffer, IndexDelta, OperationKind, OperationPhase,
+    Bound, BufferResult, Change, CollapseBuffer, IndexDelta, OperationKind, OperationPhase,
     OperationRecord, PreparedOperation, StateStore, StateStoreOptions,
 };
 use tempfile::TempDir;
@@ -580,6 +580,33 @@ fn checkpoint_restores_both_index_directions_and_delete_removes_reverse_row() {
 }
 
 #[test]
+fn sparse_staging_markers_backfill_once_and_keep_rejecting_earlier_duplicates() {
+    let temp = TempDir::new().unwrap();
+    let store = open(temp.path());
+    let id = OperationId("sparse".into());
+    store.begin_prepare(operation("sparse", None, 10)).unwrap();
+    // Ordered calls keep only each batch's largest markers.
+    for key in [1u8, 3, 5] {
+        store
+            .stage_deltas(
+                &id,
+                [
+                    insert(key, "a", u64::from(key)),
+                    insert(key + 1, "a", u64::from(key) + 1),
+                ],
+            )
+            .unwrap();
+    }
+    // An unordered but unique key backfills every earlier marker.
+    store.stage_deltas(&id, [insert(0, "b", 0)]).unwrap();
+    store.stage_deltas(&id, [insert(9, "c", 9)]).unwrap();
+    // Neither an early key nor an early location may be staged again.
+    assert!(store.stage_deltas(&id, [insert(3, "d", 0)]).is_err());
+    assert!(store.stage_deltas(&id, [insert(10, "a", 2)]).is_err());
+    assert!(store.stage_deltas(&id, [insert(11, "e", 0)]).is_ok());
+}
+
+#[test]
 fn duplicate_keys_and_locations_are_rejected_within_and_between_staging_batches() {
     for staging in [
         "same-batch",
@@ -908,7 +935,7 @@ proptest::proptest! {
         }
         store.seal_transaction("random").unwrap();
         let disk: Vec<_> = store.collapsed("random", &TableId(7)).unwrap().collect::<Result<_, _>>().unwrap();
-        let BufferResult::Ready(memory) = store.bind_collapse_buffer(memory, &store.table_state(&TableId(7)).unwrap()).unwrap() else { panic!("small fold must fit") };
+        let Bound::Ready(memory) = store.bind_collapse_buffer(memory, &store.table_state(&TableId(7)).unwrap()).unwrap() else { panic!("small fold must fit") };
         assert_eq!(memory.collect::<Vec<_>>(), disk);
         let actual: std::collections::BTreeMap<_, _> = disk.into_iter().map(|entry| {
             assert!(entry.original.is_none());
@@ -971,7 +998,7 @@ fn memory_collapse_keeps_key_move_tombstones_originals_and_full_state_fence() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let BufferResult::Ready(memory) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
+    let Bound::Ready(memory) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
         panic!("small fold must fit")
     };
     assert_eq!(memory.table_state(), &expected);
@@ -1030,7 +1057,7 @@ fn memory_collapse_keeps_key_move_tombstones_originals_and_full_state_fence() {
 }
 
 #[test]
-fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_disk() {
+fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_spills_to_disk() {
     let temp = TempDir::new().unwrap();
     let table = TableId(7);
     let store = open(temp.path());
@@ -1079,7 +1106,7 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
             memory.push(key, Change::Insert(row)).unwrap(),
             BufferResult::CapacityExceeded
         ));
-        // Ignoring overflow cannot turn the discarded prefix into valid input.
+        // Ignoring overflow cannot make an over-limit fold bindable in memory.
         assert!(matches!(
             memory
                 .push(PrimaryKey(vec![10]), Change::Insert(vec![]))
@@ -1088,7 +1115,7 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
         ));
         assert!(matches!(
             store.bind_collapse_buffer(memory, &expected).unwrap(),
-            BufferResult::CapacityExceeded
+            Bound::Overflow(_)
         ));
     }
 
@@ -1115,7 +1142,7 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
             ));
         }
     }
-    let BufferResult::Ready(rows) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
+    let Bound::Ready(rows) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
         panic!("replacement must release budget")
     };
     assert!(rows.peak_accounted_bytes() <= 16 << 10);
@@ -1134,10 +1161,16 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
         ));
     }
     // Batch one binds keys1/2; key3's path AND partition exceed the retained cap.
-    assert!(matches!(
-        store.bind_collapse_buffer(memory, &expected).unwrap(),
-        BufferResult::CapacityExceeded
-    ));
+    let Bound::Overflow(overflow) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
+        panic!("key3's original must overflow the retained cap")
+    };
+    store.spill_collapse_buffer("spilled", overflow).unwrap();
+    store.seal_transaction("spilled").unwrap();
+    let spilled = store
+        .collapsed("spilled", &table)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(store.table_state(&table).unwrap(), expected);
     assert_eq!(
         store.lookup(&table, &PrimaryKey(vec![3])).unwrap(),
@@ -1168,6 +1201,8 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(replay.len(), 3);
+    // Spilling the fold is equivalent to replaying its changes on disk.
+    assert_eq!(spilled, replay);
     for entry in replay {
         assert_eq!(entry.original, store.lookup(&table, &entry.key).unwrap());
         assert_eq!(entry.row, Some(vec![Value::Int32(99)]));

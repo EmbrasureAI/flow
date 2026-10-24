@@ -236,6 +236,54 @@ impl StateStore {
         result
     }
 
+    /// Bind already-folded rows of one table, in canonical key order, and write
+    /// them to an empty spool. Validation and suppression match `collapse_changes`.
+    pub(crate) fn spill_folded(
+        &self,
+        transaction: &str,
+        table: &TableId,
+        rows: Vec<(PrimaryKey, PendingRow)>,
+    ) -> Result<()> {
+        let _guard = self.lock()?;
+        if self
+            .get::<bool>(SPOOL, &transaction_prefix(transaction))?
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidState("transaction spool is sealed".into()));
+        }
+        let pk_cf = self.0.db.cf_handle(PK).expect("opened column family");
+        let keys: Vec<_> = rows.iter().map(|(key, _)| pk_key(table, key)).collect();
+        let originals = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), true);
+        let mut batch = WriteBatch::default();
+        for ((key, pending), original) in rows.into_iter().zip(originals) {
+            let original: Option<RowLocation> =
+                original?.map(|value| decode(&value)).transpose()?;
+            let present = original.is_some();
+            pending.validate_initial(present)?;
+            let encoded = mutation_key(transaction, table, &key);
+            self.put(
+                &mut batch,
+                SPOOL,
+                encoded,
+                &pending.into_mutation(*table, key, original),
+            )?;
+        }
+        self.write_staged(batch)
+    }
+
+    pub(crate) fn ensure_spool_empty(&self, transaction: &str, table: &TableId) -> Result<()> {
+        if self
+            .scan(SPOOL, table_prefix(transaction, table))
+            .next()
+            .is_some()
+        {
+            return Err(Error::InvalidState(
+                "a collapse fold can only spill into an empty transaction spool".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Seal only after the complete source transaction and terminal commit record
     /// have become durable in the source-wide ingress journal.
     pub fn seal_transaction(&self, transaction: &str) -> Result<()> {
@@ -375,6 +423,15 @@ impl StateStore {
     /// Used after abort, or after every table has durably published a transaction.
     pub fn discard_transaction(&self, transaction: &str) -> Result<()> {
         let _guard = self.lock()?;
+        // Every collapse discards first, and its spool is almost always empty.
+        // Deleting nothing needs neither a range tombstone nor a durable write.
+        if self
+            .scan(SPOOL, transaction_prefix(transaction))
+            .next()
+            .is_none()
+        {
+            return Ok(());
+        }
         let mut batch = WriteBatch::default();
         self.delete_prefix(&mut batch, SPOOL, &transaction_prefix(transaction));
         self.write(batch)
