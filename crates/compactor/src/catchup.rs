@@ -7,9 +7,9 @@ use flow_iceberg_ext::{CommitBase, ManifestCache, SnapshotView};
 use flow_materializer::WriterConfig;
 use flow_model::{FileId, RowLocation, TableSchema};
 use flow_state_store::{IndexDelta, RowIndex};
-use iceberg::{spec::DataContentType, table::Table};
+use iceberg::{puffin::DeleteVector, spec::DataContentType, table::Table};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     time::{Duration, Instant},
 };
 
@@ -515,10 +515,29 @@ async fn validate_history(
     let mut prior = original.clone();
     let mut checked_bytes = 0u64;
     let mut checked_rows = 0u64;
+    let limits = iceberg::puffin::DeletionVectorLimits {
+        max_blob_bytes: read_limits
+            .row_group_uncompressed_bytes
+            .min(policy.max_delete_input_bytes),
+        max_footer_bytes: read_limits.footer_bytes,
+        max_cardinality: policy.max_delete_input_rows,
+    };
+    let concurrency = read_limits.prefetch_files.max(1);
+    let read_limits = flow_materializer::VectorReadLimits {
+        max_footer_bytes: read_limits.footer_bytes,
+        concurrency,
+        max_batch_bytes: read_limits
+            .prefetch_file_bytes
+            .saturating_mul(concurrency as u64),
+    };
+    // A replacement read at one step is the original of a later one. Reuse
+    // it instead of reading and charging the same vector twice.
+    let mut replacements = HashMap::<String, DeleteVector>::new();
     for id in history.into_iter().rev() {
         let next = SnapshotView::load_with_cache(table, id, cache).await?;
         let mut required = output.plan.input_files.clone();
         required.extend(required_deletes(&prior, &output.plan.input_files)?);
+        let mut pairs = Vec::new();
         for path in required {
             let before = &prior.live_files[&path.0];
             if let Some(after) = next.live_files.get(&path.0) {
@@ -544,13 +563,20 @@ async fn validate_history(
                 next.live_files.contains_key(&target),
                 CatchUpRejected("selected input or delete was removed")
             );
-            let replacements = next.applicable_deletes(&target)?;
-            let after = replacements
+            let replacement = next.applicable_deletes(&target)?;
+            let after = replacement
                 .first()
                 .filter(|entry| entry.file_format() == iceberg::spec::DataFileFormat::Puffin)
                 .ok_or(CatchUpRejected("cumulative deletion vector was removed"))?;
-            let mut vectors = Vec::with_capacity(2);
-            for entry in [before.as_ref(), *after] {
+            pairs.push((path.0, before.as_ref(), *after));
+        }
+        let mut reads = Vec::new();
+        let mut slots = Vec::new();
+        for (pair, (path, before, after)) in pairs.iter().enumerate() {
+            for (side, entry) in [(0, *before), (1, *after)] {
+                if side == 0 && replacements.contains_key(path) {
+                    continue;
+                }
                 let file = &entry.data_file;
                 checked_bytes = checked_bytes
                     .checked_add(flow_iceberg_ext::delete_content_size(file))
@@ -563,33 +589,27 @@ async fn validate_history(
                         && checked_rows <= policy.max_delete_input_rows,
                     CatchUpRejected("DV history exceeds catch-up budget")
                 );
-                vectors.push(
-                    iceberg::puffin::read_deletion_vector(
-                        table.file_io(),
-                        file.file_path(),
-                        u64::try_from(
-                            file.content_offset()
-                                .ok_or_else(|| anyhow::anyhow!("DV lacks offset"))?,
-                        )?,
-                        u64::try_from(
-                            file.content_size_in_bytes()
-                                .ok_or_else(|| anyhow::anyhow!("DV lacks length"))?,
-                        )?,
-                        &target,
-                        file.record_count(),
-                        iceberg::puffin::DeletionVectorLimits {
-                            max_blob_bytes: read_limits
-                                .row_group_uncompressed_bytes
-                                .min(policy.max_delete_input_bytes),
-                            max_footer_bytes: read_limits.footer_bytes,
-                            max_cardinality: policy.max_delete_input_rows,
-                        },
-                    )
-                    .await?,
-                );
+                reads.push(flow_materializer::VectorRead::new(file, limits)?);
+                slots.push((pair, side));
             }
-            let mut newer = vectors[1].iter().peekable();
-            for position in vectors[0].iter() {
+        }
+        let mut vectors: Vec<[Option<DeleteVector>; 2]> =
+            pairs.iter().map(|_| [None, None]).collect();
+        for (pair, (path, _, _)) in pairs.iter().enumerate() {
+            vectors[pair][0] = replacements.remove(path);
+        }
+        flow_materializer::read_vectors(table.file_io(), &reads, read_limits, |index, vector| {
+            let (pair, side) = slots[index];
+            vectors[pair][side] = Some(vector);
+            Ok(())
+        })
+        .await?;
+        for ((_, _, after), [before, replacement]) in pairs.iter().zip(vectors) {
+            let (Some(before), Some(replacement)) = (before, replacement) else {
+                anyhow::bail!("deletion vector history read is incomplete");
+            };
+            let mut newer = replacement.iter().peekable();
+            for position in before.iter() {
                 while newer.peek().is_some_and(|next| *next < position) {
                     newer.next();
                 }
@@ -598,6 +618,10 @@ async fn validate_history(
                     CatchUpRejected("replacement DV resurrects an input row")
                 );
             }
+            replacements.insert(
+                flow_iceberg_ext::content_file_id(&after.data_file),
+                replacement,
+            );
         }
         prior = next;
     }

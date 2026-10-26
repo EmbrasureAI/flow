@@ -6,7 +6,7 @@ use iceberg::Result;
 use iceberg::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
 use iceberg::spec::{
     DataContentType, DataFileFormat, Datum, Manifest, ManifestEntry, ManifestEntryRef,
-    ManifestFile, PrimitiveLiteral,
+    ManifestFile, PrimitiveLiteral, SnapshotRef,
 };
 use iceberg::table::Table;
 use moka::future::Cache;
@@ -22,15 +22,38 @@ use crate::{content_file_id, invalid};
 /// default garbage interval keeps quiet tables' periodic maintenance warm.
 const MANIFEST_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Bounded, shared cache of immutable parsed manifests. A table coordinator can
-/// reuse this across actions so publication reads only new manifest objects.
-/// The budget is a decoded-size estimate, not an allocator quota.
+/// Bounded, shared cache of immutable parsed manifests and snapshot manifest
+/// lists. A table coordinator can reuse this across actions so publication
+/// reads only new manifest objects. The budget is a decoded-size estimate, not
+/// an allocator quota.
 #[derive(Debug, Clone)]
 pub struct ManifestCache {
     entries: Cache<ManifestCacheKey, Arc<Manifest>>,
+    lists: Cache<ManifestListKey, Arc<[ManifestFile]>>,
 }
 
 type ManifestCacheKey = (Uuid, String, i64, i64, Option<u64>);
+/// Table UUID, snapshot ID and manifest list path.
+type ManifestListKey = (Uuid, i64, String);
+
+/// Part of the budget reserved for manifest lists. A list entry is small
+/// compared with the manifest it names.
+const LIST_BUDGET_DIVISOR: u64 = 16;
+
+fn manifest_list_weight(manifests: &[ManifestFile]) -> usize {
+    manifests.iter().fold(256_usize, |bytes, manifest| {
+        bytes
+            .saturating_add(256)
+            .saturating_add(manifest.manifest_path.len())
+            .saturating_add(manifest.key_metadata.as_ref().map_or(0, Vec::len))
+            .saturating_add(
+                manifest
+                    .partitions
+                    .as_ref()
+                    .map_or(0, |fields| fields.len().saturating_mul(128)),
+            )
+    })
+}
 
 fn data_file_weight(file: &iceberg::spec::DataFile) -> usize {
     let mut bytes = 512_usize
@@ -70,9 +93,17 @@ impl ManifestCache {
     }
 
     fn with_idle(estimated_bytes: u64, idle: std::time::Duration) -> Self {
+        let list_bytes = estimated_bytes / LIST_BUDGET_DIVISOR;
         Self {
+            lists: Cache::builder()
+                .max_capacity(list_bytes)
+                .time_to_idle(idle)
+                .weigher(|_, manifests: &Arc<[ManifestFile]>| {
+                    u32::try_from(manifest_list_weight(manifests)).unwrap_or(u32::MAX)
+                })
+                .build(),
             entries: Cache::builder()
-                .max_capacity(estimated_bytes)
+                .max_capacity(estimated_bytes - list_bytes)
                 .time_to_idle(idle)
                 .weigher(|_, manifest: &Arc<Manifest>| {
                     let bytes = manifest.entries().iter().fold(4096_usize, |bytes, entry| {
@@ -87,11 +118,32 @@ impl ManifestCache {
     /// Estimated bytes charged against the budget. Maintenance runs lazily,
     /// so recent insertions and evictions may not be reflected yet.
     pub fn weighted_bytes(&self) -> u64 {
-        self.entries.weighted_size()
+        self.entries.weighted_size() + self.lists.weighted_size()
     }
 
+    /// Cached manifests; manifest lists are not counted.
     pub fn entry_count(&self) -> u64 {
         self.entries.entry_count()
+    }
+
+    /// The manifests named by a snapshot's immutable manifest list.
+    pub(crate) async fn manifest_list(
+        &self,
+        table: &Table,
+        snapshot: &SnapshotRef,
+    ) -> Result<Arc<[ManifestFile]>> {
+        let key = (
+            table.metadata().uuid(),
+            snapshot.snapshot_id(),
+            snapshot.manifest_list().to_owned(),
+        );
+        self.lists
+            .try_get_with(key, async {
+                let list = table.manifest_list_reader(snapshot).load().await?;
+                Ok::<_, iceberg::Error>(list.consume_entries().into_iter().collect())
+            })
+            .await
+            .map_err(|error| iceberg::Error::new(error.kind(), error.message()).with_source(error))
     }
 
     pub(crate) async fn load(
@@ -185,13 +237,7 @@ impl SnapshotView {
             .metadata()
             .snapshot_by_id(snapshot_id)
             .ok_or_else(|| invalid(format!("snapshot {snapshot_id} is not retained")))?;
-        let manifests: Vec<_> = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?
-            .consume_entries()
-            .into_iter()
-            .collect();
+        let manifests = cache.manifest_list(table, snapshot).await?.to_vec();
         if !table
             .metadata()
             .default_partition_spec()

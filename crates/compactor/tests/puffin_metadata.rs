@@ -352,7 +352,92 @@ async fn shared_puffin_counts_backing_requests_and_decodes_every_blob() {
     );
     assert_eq!(f.stage().await.unwrap(), 6);
     f.assert_positions();
-    assert_eq!(f.endpoint.counts.requests(), (1, 12));
+    // One size request and one whole-object read serve all three vectors.
+    assert_eq!(f.endpoint.counts.requests(), (1, 1));
+}
+
+#[tokio::test]
+async fn large_shared_puffin_reads_its_header_and_footer_once() {
+    // Each vector spans several bitmap containers, so the object exceeds the
+    // tail read. The last vector and the footer still share that read.
+    let f = Fixture::new(&[3], 140_000, Duration::ZERO, false).await;
+    let size = f.view.live_files[&f.deletes.first().unwrap().0]
+        .data_file
+        .file_size_in_bytes();
+    assert!(size > 96 << 10, "{size}");
+    f.stage().await.unwrap();
+    f.assert_positions();
+    // Size, then header and tail together, then the two earlier vectors.
+    assert_eq!(f.endpoint.counts.requests(), (1, 4));
+}
+
+#[tokio::test]
+async fn shared_puffin_rejects_wrong_target_and_cardinality_metadata() {
+    for (index, target, cardinality) in [(0, true, false), (1, false, true), (2, true, true)] {
+        let mut f = Fixture::new(&[3], 1, Duration::ZERO, false).await;
+        let id = f.deletes.iter().nth(index).unwrap().0.clone();
+        let old = &f.view.live_files[&id].data_file;
+        let other = f.view.live_files[&f.deletes.iter().nth((index + 1) % 3).unwrap().0]
+            .data_file
+            .referenced_data_file();
+        let bad = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(old.file_path().to_owned())
+            .file_format(DataFileFormat::Puffin)
+            .record_count(old.record_count() + u64::from(cardinality))
+            .file_size_in_bytes(old.file_size_in_bytes())
+            .partition_spec_id(0)
+            .referenced_data_file(if target {
+                other
+            } else {
+                old.referenced_data_file()
+            })
+            .content_offset(old.content_offset())
+            .content_size_in_bytes(old.content_size_in_bytes())
+            .build()
+            .unwrap();
+        f.view.live_files.insert(id, entry(bad, 2));
+        let error = f.stage().await.unwrap_err().to_string();
+        assert!(error.contains("metadata does not match"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn shared_puffin_rejects_a_corrupt_footer_and_budget_overruns_before_reads() {
+    let f = Fixture::new(&[3], 1, Duration::ZERO, false).await;
+    let path = f.view.live_files[&f.deletes.first().unwrap().0].file_path();
+    let original = f.source_io.new_input(path).unwrap().read().await.unwrap();
+    let mut corrupt = original.to_vec();
+    let end = corrupt.len();
+    corrupt[end - 1] ^= 1;
+    f.endpoint.replace(path, corrupt.into());
+    let error = f.stage().await.unwrap_err().to_string();
+    assert!(error.contains("footer magic"), "{error}");
+    f.endpoint.replace(path, original);
+    f.endpoint.counts.reset();
+    let error = tokio::time::timeout(
+        Duration::from_secs(60),
+        stage_delete_files(
+            &f.table,
+            &f.schema,
+            &f.view,
+            &f.inputs,
+            &f.deletes,
+            &f.store,
+            "scan",
+            1024,
+            DeleteReadLimits {
+                max_bytes: u64::MAX,
+                max_rows: 5,
+            },
+            &ReadLimits::default(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.to_string(), "delete scan exceeds input row budget");
+    assert_eq!(f.endpoint.counts.requests(), (0, 0));
 }
 
 #[tokio::test]
@@ -360,7 +445,7 @@ async fn multiple_puffin_files_count_backing_requests() {
     let f = Fixture::new(&[2, 2, 1], 1, Duration::ZERO, false).await;
     f.stage().await.unwrap();
     f.assert_positions();
-    assert_eq!(f.endpoint.counts.requests(), (3, 20));
+    assert_eq!(f.endpoint.counts.requests(), (3, 3));
 }
 
 #[tokio::test]
@@ -397,7 +482,7 @@ async fn a_new_scan_rechecks_metadata_and_replaces_scratch_positions() {
         f.endpoint.counts.reset();
         f.stage().await.unwrap();
         f.assert_positions();
-        assert_eq!(f.endpoint.counts.requests(), (1, 12));
+        assert_eq!(f.endpoint.counts.requests(), (1, 1));
     }
 }
 
@@ -411,7 +496,7 @@ async fn metadata_failure_can_be_retried_by_a_new_scan() {
     f.endpoint.counts.reset();
     f.stage().await.unwrap();
     f.assert_positions();
-    assert_eq!(f.endpoint.counts.requests(), (1, 12));
+    assert_eq!(f.endpoint.counts.requests(), (1, 1));
 }
 
 #[tokio::test]
@@ -445,7 +530,7 @@ async fn a_new_scan_rejects_a_changed_physical_size() {
     f.endpoint.counts.reset();
     f.stage().await.unwrap();
     f.assert_positions();
-    assert_eq!(f.endpoint.counts.requests(), (1, 12));
+    assert_eq!(f.endpoint.counts.requests(), (1, 1));
 }
 
 #[tokio::test]
@@ -458,7 +543,7 @@ async fn retry_after_a_later_blob_failure_discards_partial_scratch_state() {
             .to_string()
             .contains("checksum mismatch")
     );
-    assert_eq!(f.endpoint.counts.requests(), (1, 8));
+    assert_eq!(f.endpoint.counts.requests(), (1, 1));
     assert_eq!(
         f.store.position_deletes("scan", &f.schema.table_id).count(),
         1
@@ -475,7 +560,7 @@ async fn retry_after_a_later_blob_failure_discards_partial_scratch_state() {
     f.endpoint.counts.reset();
     f.stage().await.unwrap();
     f.assert_positions();
-    assert_eq!(f.endpoint.counts.requests(), (1, 8));
+    assert_eq!(f.endpoint.counts.requests(), (1, 1));
 }
 
 #[tokio::test]
@@ -667,7 +752,8 @@ async fn shared_puffin_preparation_benchmark() {
             let stage = start.elapsed();
             let counts = f.endpoint.counts.requests();
             // Do not report candidate timings if the intended reader was not used.
-            assert_eq!(counts, (2, f.deletes.len() * 4));
+            assert_eq!(counts.0, 2);
+            assert!(counts.1 <= 2 * 3 + f.deletes.len());
             let bytes = f.endpoint.counts.bytes.load(Ordering::SeqCst);
             let start = Instant::now();
             let mut decoded = 0;

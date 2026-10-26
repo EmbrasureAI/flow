@@ -213,24 +213,21 @@ impl RewriteManifestsAction {
 
     pub async fn write_artifacts(&self, table: &Table, cache: &ManifestCache) -> Result<()> {
         self.validate_base(table)?;
-        for path in self.artifacts() {
-            if table.file_io().exists(&path).await? {
-                return Err(invalid(format!(
-                    "refusing to overwrite prepared artifact {path}"
-                )));
-            }
+        let artifacts = self.artifacts();
+        let existing = futures::future::try_join_all(
+            artifacts.iter().map(|path| table.file_io().exists(path)),
+        )
+        .await?;
+        if let Some((path, _)) = artifacts.iter().zip(existing).find(|(_, exists)| *exists) {
+            return Err(invalid(format!(
+                "refusing to overwrite prepared artifact {path}"
+            )));
         }
         let snapshot = table
             .metadata()
             .current_snapshot()
             .ok_or_else(|| invalid("manifest rewrite needs a snapshot"))?;
-        let manifests: Vec<_> = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?
-            .consume_entries()
-            .into_iter()
-            .collect();
+        let manifests = cache.manifest_list(table, snapshot).await?.to_vec();
         let by_path: BTreeMap<_, _> = manifests
             .iter()
             .map(|manifest| (manifest.manifest_path.as_str(), manifest))
@@ -239,7 +236,7 @@ impl RewriteManifestsAction {
         if selected.len() != self.groups.iter().map(Vec::len).sum::<usize>() {
             return Err(invalid("manifest rewrite repeats an input"));
         }
-        let mut output = Vec::with_capacity(self.groups.len());
+        let mut writers = Vec::with_capacity(self.groups.len());
         let mut entries = 0_u64;
         for (index, group) in self.groups.iter().enumerate() {
             let first = group
@@ -280,9 +277,17 @@ impl RewriteManifestsAction {
                 }
             }
             if live_entries > 0 {
-                output.push(writer.write_manifest_file().await?);
+                writers.push(writer);
             }
         }
+        // The entry budget bounds every group held here; the list names them
+        // only after all are written.
+        let output = futures::future::try_join_all(
+            writers
+                .into_iter()
+                .map(|writer| writer.write_manifest_file()),
+        )
+        .await?;
         let mut writer = manifest_list_writer(
             table,
             &self.manifest_list(),

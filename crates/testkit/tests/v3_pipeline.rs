@@ -38,6 +38,7 @@ struct Fixture {
     store: StateStore,
     schema: TableSchema,
     head: Table,
+    batch_bytes: usize,
 }
 impl Fixture {
     async fn new(version: FormatVersion) -> Self {
@@ -73,6 +74,7 @@ impl Fixture {
             store,
             schema,
             head,
+            batch_bytes: 1 << 20,
         }
     }
     // Optional retained artifacts let independent engines verify this same fixture.
@@ -108,7 +110,7 @@ impl Fixture {
             self.catalog.clone(),
             WriterConfig::default(),
             2,
-            1 << 20,
+            self.batch_bytes,
         )
         .unwrap()
     }
@@ -122,13 +124,16 @@ impl Fixture {
         .unwrap()
     }
     fn maintenance(&self) -> TableMaintenance {
+        self.maintenance_with(&self.store, Policy::default())
+    }
+    fn maintenance_with(&self, store: &StateStore, policy: Policy) -> TableMaintenance {
         TableMaintenance::new(
-            self.store.clone(),
+            store.clone(),
             self.catalog.clone(),
             Policy {
                 l0_soft_files: 2,
                 min_file_age_ms: 0,
-                ..Default::default()
+                ..policy
             },
             WriterConfig::default(),
         )
@@ -205,6 +210,20 @@ impl Fixture {
     }
 }
 
+fn puffin_objects(directory: &std::path::Path) -> usize {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| {
+            if path.is_dir() {
+                puffin_objects(&path)
+            } else {
+                usize::from(path.extension().is_some_and(|ext| ext == "puffin"))
+            }
+        })
+        .sum()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_consolidation_must_retire_shared_puffin_objects() {
     let mut f = Fixture::new(FormatVersion::V3).await;
@@ -258,6 +277,7 @@ async fn delete_consolidation_must_retire_shared_puffin_objects() {
         max_input_files: 2,
         ..Default::default()
     };
+    let written = puffin_objects(f.temp.path());
     assert_eq!(
         f.maintenance()
             .compact_deletes(&f.head, &f.schema, f.scratch(), &policy)
@@ -265,6 +285,11 @@ async fn delete_consolidation_must_retire_shared_puffin_objects() {
             .unwrap(),
         None,
         "partial selection keeps both input objects live and must not add a third"
+    );
+    assert_eq!(
+        puffin_objects(f.temp.path()),
+        written,
+        "a rewrite known to be nonviable uploads nothing"
     );
     f.refresh().await;
     assert_eq!(f.head.metadata().current_snapshot_id(), snapshot);
@@ -1152,4 +1177,255 @@ async fn external_rewrite_of_vector_targets_replans_speculative_compaction() {
     assert!(f.store.pending_operations().unwrap().is_empty());
     f.refresh().await;
     assert_eq!(f.live().await, before);
+}
+
+async fn prior_vector_scenario(batch_bytes: usize) -> Fixture {
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    f.batch_bytes = batch_bytes;
+    f.publish(
+        10,
+        (0..800)
+            .map(|id| (id, Change::Insert(row(id, "initial"))))
+            .collect(),
+    )
+    .await;
+    f.publish(20, (0..600).map(|id| (id, Change::Delete)).collect())
+        .await;
+    f.publish(30, vec![(700, Change::Update(row(700, "late")))])
+        .await;
+    f.publish(40, vec![(650, Change::Delete), (750, Change::Delete)])
+        .await;
+    f
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prior_vectors_merge_in_memory_or_through_disk_identically() {
+    // The 600-position vector exceeds a 1 KiB batch, forcing disk staging.
+    let memory = prior_vector_scenario(1 << 20).await;
+    let disk = prior_vector_scenario(1024).await;
+    let expected: Vec<_> = (600..800)
+        .filter(|id| ![650, 750].contains(id))
+        .map(|id| row(id, if id == 700 { "late" } else { "initial" }))
+        .collect();
+    for f in [&memory, &disk] {
+        f.assert_rows(expected.clone()).await;
+        let view = SnapshotView::current(&f.head).await.unwrap();
+        let vectors: Vec<_> = view
+            .live_files
+            .values()
+            .filter(|entry| entry.file_format() == DataFileFormat::Puffin)
+            .collect();
+        assert_eq!(
+            vectors.len(),
+            1,
+            "one cumulative vector for the shared file"
+        );
+        assert_eq!(vectors[0].data_file().record_count(), 603);
+        assert!(flow_iceberg_ext::delete_content_size(vectors[0].data_file()) > 1024);
+    }
+    assert_eq!(memory.live().await, disk.live().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_prior_vector_fails_publication_without_dropping_deletes() {
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    f.publish(
+        10,
+        (1..=4)
+            .map(|id| (id, Change::Insert(row(id, "initial"))))
+            .collect(),
+    )
+    .await;
+    f.publish(20, vec![(1, Change::Delete)]).await;
+    let view = SnapshotView::current(&f.head).await.unwrap();
+    let vector = view
+        .live_files
+        .values()
+        .find(|entry| entry.file_format() == DataFileFormat::Puffin)
+        .unwrap();
+    let path = vector.file_path().trim_start_matches("file://").to_owned();
+    let original = std::fs::read(&path).unwrap();
+    let mut corrupt = original.clone();
+    // Flip a bitmap byte inside the blob; the CRC must reject it.
+    corrupt[vector.data_file().content_offset().unwrap() as usize + 10] ^= 1;
+    std::fs::write(&path, &corrupt).unwrap();
+    let snapshot = f.head.metadata().current_snapshot_id();
+    let (_, collapsed) = collapse_fixture(
+        &f.store,
+        &f.head,
+        &f.schema,
+        SourceId("v3-pipeline".into()),
+        PgLsn(30),
+        [(
+            f.schema.encode_key(&row(2, "")).unwrap(),
+            Change::Update(row(2, "late")),
+        )]
+        .into_iter(),
+    );
+    let error = f
+        .publisher()
+        .publish(&f.head, &f.schema, collapsed)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("checksum mismatch"),
+        "{error:#}"
+    );
+    f.refresh().await;
+    assert_eq!(f.head.metadata().current_snapshot_id(), snapshot);
+    std::fs::write(&path, &original).unwrap();
+    f.assert_rows(vec![
+        row(2, "initial"),
+        row(3, "initial"),
+        row(4, "initial"),
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_charges_each_intermediate_vector_once() {
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    for (lsn, ids) in [(10, 1..=6), (20, 7..=12)] {
+        f.publish(
+            lsn,
+            ids.map(|id| (id, Change::Insert(row(id, "initial"))))
+                .collect(),
+        )
+        .await;
+    }
+    f.publish(30, vec![(1, Change::Delete), (7, Change::Delete)])
+        .await;
+    // History reads A {1} -> {2} and B {1} -> {2}, then A {2} -> {4}: ten
+    // distinct positions. Charging A's middle vector twice would need twelve.
+    let maintenance = f.maintenance_with(
+        &f.store,
+        Policy {
+            max_delete_input_rows: 11,
+            ..Policy::default()
+        },
+    );
+    let ready = maintenance
+        .start_compaction(&f.head, &f.schema, f.scratch())
+        .await
+        .unwrap()
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    f.publish(
+        40,
+        vec![
+            (2, Change::Update(row(2, "late"))),
+            (8, Change::Update(row(8, "late"))),
+        ],
+    )
+    .await;
+    f.publish(
+        50,
+        vec![(3, Change::Update(row(3, "later"))), (4, Change::Delete)],
+    )
+    .await;
+    let before = f.live().await;
+    assert!(
+        maintenance
+            .finish_compaction(&f.head, &f.schema, ready)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    f.refresh().await;
+    assert_eq!(f.live().await, before);
+}
+
+/// Every indexed key with its location, fingerprint and data sequence.
+fn index_contents(
+    store: &StateStore,
+    schema: &TableSchema,
+    view: &SnapshotView,
+) -> BTreeMap<(FileId, u64), Vec<u8>> {
+    let mut rows = BTreeMap::new();
+    for entry in view
+        .live_files
+        .values()
+        .filter(|entry| entry.content_type() == DataContentType::Data)
+    {
+        let file = FileId(entry.file_path().into());
+        for item in store.file_rows(&schema.table_id, &file) {
+            let (position, key) = item.unwrap();
+            let location = store.lookup(&schema.table_id, &key).unwrap().unwrap();
+            assert_eq!(
+                (&location.data_file_id, location.row_position),
+                (&file, position)
+            );
+            let mut summary = key.0.clone();
+            summary.extend_from_slice(&location.row_fingerprint);
+            summary.extend_from_slice(&location.data_sequence_number.to_be_bytes());
+            rows.insert((file.clone(), position), summary);
+        }
+    }
+    rows
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_checkpoint_catches_up_through_replaced_vectors() {
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    f.publish(
+        10,
+        (1..=6)
+            .map(|id| (id, Change::Insert(row(id, "initial"))))
+            .collect(),
+    )
+    .await;
+    f.publish(
+        20,
+        vec![(1, Change::Delete), (2, Change::Update(row(2, "a")))],
+    )
+    .await;
+    let checkpoint = f.temp.path().join("checkpoint");
+    f.store.checkpoint(&checkpoint).unwrap();
+    let at_checkpoint = f.store.table_state(&f.schema.table_id).unwrap();
+    // Each epoch replaces the shared file's vector with a superset.
+    f.publish(
+        30,
+        vec![(3, Change::Delete), (2, Change::Update(row(2, "b")))],
+    )
+    .await;
+    f.publish(40, vec![(4, Change::Update(row(4, "c")))]).await;
+    let current = f.store.table_state(&f.schema.table_id).unwrap();
+    let restored = StateStore::open(&checkpoint, options()).unwrap();
+    let stats = f
+        .maintenance_with(&restored, Policy::default())
+        .catch_up_index(
+            &f.head,
+            &f.schema,
+            restored.clone(),
+            f.scratch(),
+            at_checkpoint.snapshot_id,
+            current.materialized_lsn,
+            current.schema_version,
+        )
+        .await
+        .unwrap();
+    assert!(stats.changed_files > 0 && stats.removed_rows > 0);
+    let rebuilt = StateStore::open(f.temp.path().join("rebuilt"), options()).unwrap();
+    f.maintenance_with(&rebuilt, Policy::default())
+        .rebuild_index(
+            &f.head,
+            &f.schema,
+            rebuilt.clone(),
+            f.scratch(),
+            current.materialized_lsn,
+            current.schema_version,
+        )
+        .await
+        .unwrap();
+    let view = SnapshotView::current(&f.head).await.unwrap();
+    assert_eq!(
+        restored.table_state(&f.schema.table_id).unwrap(),
+        rebuilt.table_state(&f.schema.table_id).unwrap()
+    );
+    assert_eq!(
+        index_contents(&restored, &f.schema, &view),
+        index_contents(&rebuilt, &f.schema, &view)
+    );
 }

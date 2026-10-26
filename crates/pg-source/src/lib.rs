@@ -13,14 +13,14 @@ mod snapshot;
 pub use schema::{
     ColumnMetadata, TABLE_METADATA_BATCH_SIZE, TableMetadata, TableMetadataRequest,
     fetch_table_metadata, fetch_table_metadata_batch, fetch_table_metadata_selected,
-    nullable_successor, nullable_successor_with_types, same_wire_schema, validate_schema_metadata,
+    nullable_successor_with_types, same_wire_schema, validate_schema_metadata,
 };
 mod spool;
 pub use capture::{CaptureAssembler, QUARANTINE_WRAP_BYTES, decode_row, decode_row_with_types};
 pub use protocol::{Cell, Column, Decoder, Relation, SourceEvent, Tuple};
 pub use snapshot::{
-    SnapshotSession, TablePreflight, decode_copy_row, decode_copy_row_with_types, export_snapshot,
-    export_temporary_snapshot, fetch_relation, preflight_table,
+    CopyRowDecoder, SnapshotSession, TablePreflight, export_snapshot, export_temporary_snapshot,
+    fetch_relation, preflight_table,
 };
 pub use spool::{SpoolConfig, TransactionSpool};
 pub use tokio_postgres;
@@ -35,8 +35,6 @@ use std::{
 };
 use thiserror::Error;
 use tokio_postgres::{Client, CopyBothDuplex};
-
-pub const TRANSPORT_REVISION: &str = "c4b8de06aaa99f71800126bedcca6e623d368357";
 
 #[derive(Debug, Error)]
 pub enum Error {

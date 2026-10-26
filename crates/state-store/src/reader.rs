@@ -60,6 +60,17 @@ impl IndexSnapshot<'_> {
             })
             .collect()
     }
+
+    /// [`RowIndex::lookup_many`] over borrowed keys.
+    pub(crate) fn lookup_keys<'k>(
+        &self,
+        table: &TableId,
+        keys: impl IntoIterator<Item = &'k PrimaryKey>,
+    ) -> Result<Vec<Option<RowLocation>>> {
+        let mut options = ReadOptions::default();
+        options.set_snapshot(&self.snapshot);
+        lookup_many(self.db, table, keys, &options)
+    }
 }
 
 impl StateStore {
@@ -138,9 +149,7 @@ impl RowIndex for IndexSnapshot<'_> {
         table: &TableId,
         keys: &[PrimaryKey],
     ) -> Result<Vec<Option<RowLocation>>> {
-        let mut options = ReadOptions::default();
-        options.set_snapshot(&self.snapshot);
-        lookup_many(self.db, table, keys, &options)
+        self.lookup_keys(table, keys)
     }
 
     fn file_rows<'a>(
@@ -154,14 +163,14 @@ impl RowIndex for IndexSnapshot<'_> {
     }
 }
 
-fn lookup_many(
+fn lookup_many<'k>(
     db: &DB,
     table: &TableId,
-    keys: &[PrimaryKey],
+    keys: impl IntoIterator<Item = &'k PrimaryKey>,
     options: &ReadOptions,
 ) -> Result<Vec<Option<RowLocation>>> {
     let cf = db.cf_handle(PK).expect("opened column family");
-    let encoded: Vec<_> = keys.iter().map(|key| pk_key(table, key)).collect();
+    let encoded: Vec<_> = keys.into_iter().map(|key| pk_key(table, key)).collect();
     db.batched_multi_get_cf_opt(&cf, encoded.iter(), false, options)
         .into_iter()
         .map(|item| {
