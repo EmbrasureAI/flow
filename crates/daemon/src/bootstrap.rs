@@ -171,6 +171,7 @@ pub struct InitOptions {
 
 /// Creates the permanent source incarnation once; subsequent calls resume its
 /// per-table copies without resetting that slot or its durable CDC journal.
+#[cfg(test)]
 pub async fn initialize(config: Config) -> Result<()> {
     initialize_with_options(config, InitOptions::default()).await
 }

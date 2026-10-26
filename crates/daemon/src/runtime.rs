@@ -45,7 +45,7 @@ use std::{
 };
 use tokio::sync::watch;
 
-pub use crate::bootstrap::{InitOptions, initialize, initialize_with_options};
+pub use crate::bootstrap::initialize_with_options;
 
 /// Print the local observation and return whether the service is ready.
 pub fn status(config: Config) -> Result<bool> {
