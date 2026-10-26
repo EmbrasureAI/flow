@@ -121,7 +121,8 @@ These are worker timings against local files, not service throughput or
 publication latency. Catalog commits, object-store latency and index
 application are outside the timed region. The fixture's table is unpartitioned
 and unsorted. Reconcile and index-rebuild scratch stores keep the default
-options; their staging pattern is similar but was not measured. The bigger
+options. For reconcile, 64 MiB memtables were later
+[measured](jemalloc-and-reconcile.md) and gave no consistent gain. The bigger
 remaining lever is RisingWave's: splitting one compaction's inputs across
 several workers, which needs one consistent index snapshot and a deterministic
 merge of staged mappings.
