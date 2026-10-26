@@ -20,7 +20,7 @@ pub use spool::{Change, CollapsedMutation};
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId};
 use rocksdb::{
     BlockBasedIndexType, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType,
-    Direction, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions,
+    Direction, FlushOptions, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions,
     checkpoint::Checkpoint,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1142,22 +1142,6 @@ impl StateStore {
         self.write(batch)
     }
 
-    /// Reclaim completed delta payloads after source acknowledgement is durable.
-    /// Keep the tiny operation marker for replay detection until snapshot history
-    /// retention permits the caller to remove it with the checkpoint protocol.
-    pub fn prune_applied_deltas(&self, id: &OperationId) -> Result<()> {
-        let _guard = self.lock()?;
-        let record = self.require_operation(id)?;
-        if record.phase != OperationPhase::Applied {
-            return Err(Error::InvalidState(
-                "cannot prune an incomplete index transition".into(),
-            ));
-        }
-        let mut batch = StateBatch::default();
-        self.delete_prefix(&mut batch, DELTAS, &operation_prefix(id));
-        self.write(batch)
-    }
-
     pub fn source_transaction(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(control) = &self.0.control {
             return control.source_transaction(key);
@@ -1190,7 +1174,24 @@ impl StateStore {
         }
     }
 
+    /// Flush every column family's memtable without taking the row lock.
+    /// A checkpoint flushes again under its locks; doing most of that work
+    /// first keeps writers waiting only for what arrived in between.
+    pub(crate) fn flush_memtables(&self) -> Result<()> {
+        let handles: Vec<_> = STATE_COLUMN_FAMILIES
+            .iter()
+            .map(|name| self.0.db.cf_handle(name).expect("opened column family"))
+            .collect();
+        self.0.db.flush()?;
+        self.0.db.flush_cfs_opt(
+            &handles.iter().collect::<Vec<_>>(),
+            &FlushOptions::default(),
+        )?;
+        Ok(())
+    }
+
     pub fn checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.flush_memtables()?;
         let _guard = self.lock()?;
         self.0.db.flush_wal(true)?;
         Checkpoint::new(&self.0.db)?.create_checkpoint(path.as_ref())?;

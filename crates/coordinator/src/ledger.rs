@@ -318,20 +318,6 @@ impl SourceLedger {
         }
         Ok(())
     }
-    pub fn pending_tables(&self, end_lsn: PgLsn) -> Result<Vec<TableId>> {
-        if end_lsn <= self.watermarks.materialized_lsn {
-            return Ok(Vec::new());
-        }
-        let entry = self
-            .entry(end_lsn)?
-            .ok_or_else(|| anyhow::anyhow!("unknown source transaction {end_lsn}"))?;
-        Ok(entry
-            .transaction
-            .affected_tables
-            .into_iter()
-            .filter(|table| !entry.committed_tables.contains_key(table))
-            .collect())
-    }
     pub fn pending_count(&self) -> usize {
         self.pending_count
     }

@@ -118,7 +118,7 @@ No separate export task is created.
 | `flow_journal_committed_payload_bytes_total` | Serialized mutation-chunk payload bytes in successfully synced source transactions; excludes aborted subtransactions, journal framing and terminal records |
 | `flow_source_registration_seconds` | Successful dispatcher page read and durable source-ledger registration, before feedback; includes blocking database work |
 | `flow_source_registration_transactions` | Newly registered transactions per successful dispatcher page; histogram count measures registration pages |
-| `flow_capture_phase_seconds` | Schema validation and spool begin/replay/disposal per transaction; journal sync per durability group, labelled by bounded phase and success/error |
+| `flow_capture_phase_seconds` | Schema validation and spool replay per transaction, spool begin/disposal per transaction spilled to disk; journal sync per durability group, labelled by bounded phase and success/error |
 | `flow_journal_commit_group_transactions` | Number of complete source transactions sharing a successful journal durability barrier |
 | `flow_catalog_commit_seconds` | Catalog publication path, including preparing and committing metadata |
 | `flow_catalog_commit_attempts_total{table_id}` | CDC catalog commit attempts, including retries and recovery of a prepared operation |
@@ -322,9 +322,9 @@ Each table accepts `priority = "realtime"`, `"balanced"`, or `"efficient"` (defa
 
 Checkpoint and index-generation events include their revisions, paths, durations and restore/rebuild result in structured logs. Catalog publication events expose the first/last LSN and actual catalog completion timestamp independently of index completion. The local test runner uses those events rather than treating acknowledgement or a recent status timestamp as proof of catalog visibility.
 
-Capture seals a group when it reaches 32 complete transactions, crosses 4 MiB of transaction payload, or reaches a five-millisecond scheduling deadline. The payload threshold can be exceeded by the final complete transaction; its payload stays disk-backed and the transaction remains atomic. Source/schema interruptions may seal smaller groups. Terminal records and their chunks become discoverable by concurrent journal readers together, only after sync; source notifications and ACK eligibility follow that boundary. Slow disk or source I/O can exceed the scheduling deadline.
+Capture seals a group when it reaches 256 complete transactions, crosses 4 MiB of transaction payload, or reaches a five-millisecond scheduling deadline. The payload threshold can be exceeded by the final complete transaction; its payload stays disk-backed and the transaction remains atomic. Source/schema interruptions may seal smaller groups. Terminal records and their chunks become discoverable by concurrent journal readers together, only after sync; source notifications and ACK eligibility follow that boundary. Slow disk or source I/O can exceed the scheduling deadline.
 
-Capture phase timings isolate work within the capture actor, not time waiting for PostgreSQL or queued WAL. Schema validation includes the final buffered chunk flush; ordinary verified schemas do not require a SQL query per transaction. Spool replay includes journal chunk appends but excludes terminal sync. Journal sync measures the commit `sync_data` call; it excludes terminal serialization and index bookkeeping. Spool begin and disposal measure filesystem lifecycle calls. These phases do not cover all capture CPU time and must not be treated as a complete latency decomposition.
+Capture phase timings isolate work within the capture actor, not time waiting for PostgreSQL or queued WAL. Schema validation includes the final buffered chunk flush; ordinary verified schemas do not require a SQL query per transaction. Spool replay includes journal chunk appends but excludes terminal sync. Journal sync measures the commit `sync_data` call; it excludes terminal serialization and index bookkeeping. Spool begin and disposal measure filesystem lifecycle calls; transactions that stay within the spool's memory bound make none. These phases do not cover all capture CPU time and must not be treated as a complete latency decomposition.
 
 `status` also reports `blocked_tables` with stable error codes, retry timestamps,
 attempt counts, and retained operation IDs. `table_progress` reports each table's
@@ -517,6 +517,11 @@ Compaction, external reconciliation, and index rebuild share `[parquet_read]`:
 | `row_group_uncompressed_bytes` | 256 MiB | Sum of selected uncompressed encoded column pages |
 | `batch_bytes` | 128 MiB | Conservative expanded values plus fixed slots, offsets, and validity |
 
+Deletion-vector reads observe each Puffin object's size and read its footer once
+per scan. They open up to `prefetch_files` objects (at least one) and fetch as
+many blobs at once, holding at most `prefetch_files × prefetch_file_bytes` of
+blob and tail bytes per batch; a larger single blob is still read alone.
+
 The scanner reads one rowgroup at a time and reduces batch row counts when the
 expanded payload requires it. It does not estimate variable values from average
 row width: dictionary repetition can expand far beyond encoded page size.
@@ -576,7 +581,7 @@ publication:
 | `flow_memory_index_block_cache_pinned_bytes` | Part of the block cache usage pinned by open readers |
 | `flow_memory_index_memtable_bytes` | Active, unflushed and pinned memtables across the row index's column families |
 | `flow_memory_index_table_reader_bytes` | Table-reader memory outside the block cache |
-| `flow_memory_manifest_cache_bytes{cache}` | Estimated bytes of parsed manifests in the shared `publication` or `maintenance` cache |
+| `flow_memory_manifest_cache_bytes{cache}` | Estimated bytes of parsed manifests in the `shared` cache used by publication and maintenance |
 | `flow_memory_manifest_cache_entries{cache}` | Parsed manifests in that cache |
 | `flow_memory_retained_index_bytes` | Estimated bytes last accounted by the garbage-collection reachability indexes |
 

@@ -188,39 +188,7 @@ impl TableSchema {
             return Err(ModelError::InvalidRow("column count differs".into()));
         }
         for (col, value) in self.columns.iter().zip(row) {
-            if matches!(value, Value::Unchanged) {
-                return Err(ModelError::InvalidRow(format!(
-                    "unresolved unchanged value for {}",
-                    col.name
-                )));
-            }
-            let valid = match (&col.data_type, value) {
-                (_, Value::Null) => col.nullable,
-                (ColumnType::Bool, Value::Bool(_))
-                | (ColumnType::Int32, Value::Int32(_))
-                | (ColumnType::Int64, Value::Int64(_))
-                | (ColumnType::Float64, Value::Float64(_))
-                | (ColumnType::String, Value::String(_))
-                | (ColumnType::Binary, Value::Binary(_))
-                | (ColumnType::Date, Value::Date(_))
-                | (ColumnType::TimestampMicros, Value::TimestampMicros(_))
-                | (ColumnType::TimestampTzMicros, Value::TimestampTzMicros(_))
-                | (ColumnType::Uuid, Value::Uuid(_)) => true,
-                (
-                    ColumnType::Decimal { precision, scale },
-                    Value::Decimal {
-                        unscaled,
-                        scale: actual,
-                    },
-                ) => scale == actual && unscaled.unsigned_abs() < 10u128.pow(u32::from(*precision)),
-                _ => false,
-            };
-            if !valid {
-                return Err(ModelError::InvalidRow(format!(
-                    "type or nullability mismatch for {}",
-                    col.name
-                )));
-            }
+            validate_value(col, value)?;
         }
         Ok(())
     }
@@ -229,11 +197,27 @@ impl TableSchema {
         if self.primary_key.is_empty() {
             return Err(ModelError::MissingKey);
         }
-        let mut bytes = vec![1]; // canonical format version
-        for idx in &self.primary_key {
-            encode_value(&row[*idx], |chunk| bytes.extend_from_slice(chunk));
+        Ok(encode_key_values(
+            self.primary_key.iter().map(|index| &row[*index]),
+        ))
+    }
+    /// Encode a key from only its values, in primary-key order. The bytes equal
+    /// [`Self::encode_key`] of any valid row with these key values.
+    pub fn encode_key_values(&self, values: &[Value]) -> Result<PrimaryKey, ModelError> {
+        if values.len() != self.primary_key.len() {
+            return Err(ModelError::InvalidRow("column count differs".into()));
         }
-        Ok(PrimaryKey(bytes))
+        for (index, value) in self.primary_key.iter().zip(values) {
+            let column = self
+                .columns
+                .get(*index)
+                .ok_or_else(|| ModelError::InvalidSchema("key column out of bounds".into()))?;
+            validate_value(column, value)?;
+        }
+        if self.primary_key.is_empty() {
+            return Err(ModelError::MissingKey);
+        }
+        Ok(encode_key_values(values))
     }
     pub fn fingerprint(&self, row: &Row) -> Result<[u8; 16], ModelError> {
         self.validate_row(row)?;
@@ -250,19 +234,21 @@ impl TableSchema {
                 "append-only rows cannot omit unchanged values".into(),
             ));
         }
-        let mut present = row.clone();
-        for (index, value) in present.iter_mut().enumerate() {
+        // An unchanged non-key value stands for a valid present value; every
+        // other position keeps the complete-row rules.
+        for (index, (column, value)) in self.columns.iter().zip(row).enumerate() {
             if matches!(value, Value::Unchanged) {
                 if self.primary_key.contains(&index) {
                     return Err(ModelError::InvalidRow(format!(
                         "primary-key column {} cannot be unchanged",
-                        self.columns[index].name
+                        column.name
                     )));
                 }
-                *value = placeholder(&self.columns[index].data_type);
+                continue;
             }
+            validate_value(column, value)?;
         }
-        self.validate_row(&present)
+        Ok(())
     }
     /// Encode the key of a complete or partial update image.
     pub fn encode_partial_key(&self, row: &Row) -> Result<PrimaryKey, ModelError> {
@@ -270,11 +256,9 @@ impl TableSchema {
         if self.primary_key.is_empty() {
             return Err(ModelError::MissingKey);
         }
-        let mut bytes = vec![1]; // canonical format version
-        for idx in &self.primary_key {
-            encode_value(&row[*idx], |chunk| bytes.extend_from_slice(chunk));
-        }
-        Ok(PrimaryKey(bytes))
+        Ok(encode_key_values(
+            self.primary_key.iter().map(|index| &row[*index]),
+        ))
     }
     /// [`Self::project_row`] for an image that may omit unchanged values.
     /// Added nullable columns did not exist in the source image and become null.
@@ -322,25 +306,49 @@ impl TableSchema {
     }
 }
 
-/// A valid present value used only to type-check the other columns of a
-/// partial image; it is never stored or published.
-fn placeholder(data_type: &ColumnType) -> Value {
-    match data_type {
-        ColumnType::Bool => Value::Bool(false),
-        ColumnType::Int32 => Value::Int32(0),
-        ColumnType::Int64 => Value::Int64(0),
-        ColumnType::Float64 => Value::Float64(0.0),
-        ColumnType::String => Value::String(String::new()),
-        ColumnType::Binary => Value::Binary(Vec::new()),
-        ColumnType::Date => Value::Date(0),
-        ColumnType::TimestampMicros => Value::TimestampMicros(0),
-        ColumnType::Uuid => Value::Uuid([0; 16]),
-        ColumnType::Decimal { scale, .. } => Value::Decimal {
-            unscaled: 0,
-            scale: *scale,
-        },
-        ColumnType::TimestampTzMicros => Value::TimestampTzMicros(0),
+fn validate_value(col: &Column, value: &Value) -> Result<(), ModelError> {
+    if matches!(value, Value::Unchanged) {
+        return Err(ModelError::InvalidRow(format!(
+            "unresolved unchanged value for {}",
+            col.name
+        )));
     }
+    let valid = match (&col.data_type, value) {
+        (_, Value::Null) => col.nullable,
+        (ColumnType::Bool, Value::Bool(_))
+        | (ColumnType::Int32, Value::Int32(_))
+        | (ColumnType::Int64, Value::Int64(_))
+        | (ColumnType::Float64, Value::Float64(_))
+        | (ColumnType::String, Value::String(_))
+        | (ColumnType::Binary, Value::Binary(_))
+        | (ColumnType::Date, Value::Date(_))
+        | (ColumnType::TimestampMicros, Value::TimestampMicros(_))
+        | (ColumnType::TimestampTzMicros, Value::TimestampTzMicros(_))
+        | (ColumnType::Uuid, Value::Uuid(_)) => true,
+        (
+            ColumnType::Decimal { precision, scale },
+            Value::Decimal {
+                unscaled,
+                scale: actual,
+            },
+        ) => scale == actual && unscaled.unsigned_abs() < 10u128.pow(u32::from(*precision)),
+        _ => false,
+    };
+    if !valid {
+        return Err(ModelError::InvalidRow(format!(
+            "type or nullability mismatch for {}",
+            col.name
+        )));
+    }
+    Ok(())
+}
+
+fn encode_key_values<'a>(values: impl IntoIterator<Item = &'a Value>) -> PrimaryKey {
+    let mut bytes = vec![1]; // canonical format version
+    for value in values {
+        encode_value(value, |chunk| bytes.extend_from_slice(chunk));
+    }
+    PrimaryKey(bytes)
 }
 
 /// Canonical, typed, length-delimited encoding. Never concatenate unframed keys.

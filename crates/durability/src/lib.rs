@@ -30,7 +30,7 @@ use flow_state_store::{ControlMirror, ControlStore};
 use opendal::Operator;
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Entry},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -62,7 +62,8 @@ pub struct Config {
     /// Zero removes the limit.
     #[serde(default = "defaults::max_writes_per_second")]
     pub max_writes_per_second: f64,
-    /// Queued control and file payloads before appends block.
+    /// Memory for queued records before appends block. Journal extents count
+    /// only their descriptors; their bytes are read when batched.
     #[serde(default = "defaults::queue_memory_bytes")]
     pub queue_memory_bytes: u64,
     #[serde(default = "defaults::checkpoint_interval_secs")]
@@ -199,7 +200,11 @@ struct Inner {
     lock: Mutex<Option<fs::File>>,
     requests: mpsc::Sender<checkpoint::Request>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// Sends the deadline by which replication must have stopped.
+    stop: Mutex<Option<oneshot::Sender<Instant>>>,
+    /// One lease after the latest release or flush began. Stopping drains
+    /// only until then, so a whole shutdown takes about one lease at most.
+    shutdown: Mutex<Option<Instant>>,
     uri: String,
     mode: Mode,
     restore: Option<RestoreStats>,
@@ -274,9 +279,10 @@ impl Durability {
         })?;
         let identity = recovery::lock_identity(&lock);
         let (ready, readiness) = oneshot::channel();
-        let (stop, stopped) = oneshot::channel::<()>();
+        let (stop, stopped) = oneshot::channel::<Instant>();
         let (requests, receiver) = mpsc::channel(16);
         let tuning = config.tuning();
+        let lease = tuning.lease;
         let policy = checkpoint::Policy {
             interval: Duration::from_secs(config.checkpoint_interval_secs),
             batches: config.checkpoint_batches,
@@ -354,11 +360,15 @@ impl Durability {
                         operator: operator.clone(),
                         runtime: tokio::runtime::Handle::current(),
                     }));
-                    let _ = stopped.await;
+                    let deadline = stopped.await.unwrap_or_else(|_| Instant::now() + lease);
                     shared.close();
-                    for task in tasks {
-                        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
-                    }
+                    // Queued records drain until the deadline, at most one
+                    // lease; renewal has stopped, so no write starts later.
+                    let _ = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        futures::future::join_all(tasks),
+                    )
+                    .await;
                 });
                 runtime.shutdown_timeout(Duration::from_secs(1));
             })?;
@@ -391,6 +401,7 @@ impl Durability {
             requests,
             thread: Mutex::new(Some(thread)),
             stop: Mutex::new(Some(stop)),
+            shutdown: Mutex::new(None),
             uri: config.uri.clone(),
             mode,
             restore,
@@ -503,33 +514,59 @@ impl Durability {
     /// so nothing this process inherited is visible externally before it is
     /// replicated.
     pub async fn baseline(&self) -> Result<()> {
-        let layout = &self.0.layout;
-        {
-            let mut state = self.0.shared.lock();
-            for name in &layout.journals {
-                if state.journals.contains_key(name) {
-                    continue;
-                }
-                let mut model = scan_journal(&self.0.state_dir.join(name))?;
-                if let Some(image) = self.0.inherited.get(name) {
+        // Model what is not attached yet without holding the shared state:
+        // verifying reused parts reads every retained journal byte.
+        let (journals, files) = {
+            let state = self.0.shared.lock();
+            let journals: Vec<String> = (self.0.layout.journals.iter())
+                .filter(|name| !state.journals.contains_key(*name))
+                .cloned()
+                .collect();
+            let files: Vec<String> = (self.0.layout.files.iter())
+                .filter(|name| !state.files.contains_key(*name))
+                .cloned()
+                .collect();
+            (journals, files)
+        };
+        let inner = self.0.clone();
+        let (journals, files) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut models = Vec::new();
+            for name in journals {
+                let mut model = scan_journal(&inner.state_dir.join(&name))?;
+                if let Some(image) = inner.inherited.get(&name) {
                     reuse_parts(&mut model, image)?;
                 }
-                state.journals.insert(name.clone(), model);
-                state.models_changed = true;
+                models.push((name, model));
             }
-            for name in &layout.files {
-                if state.files.contains_key(name) {
-                    continue;
-                }
-                match fs::read(self.0.state_dir.join(name)) {
-                    Ok(data) => {
-                        state.files.insert(name.clone(), data);
-                        state.models_changed = true;
-                    }
+            let mut contents = Vec::new();
+            for name in files {
+                match fs::read(inner.state_dir.join(&name)) {
+                    Ok(data) => contents.push((name, data)),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
             }
+            Ok((models, contents))
+        })
+        .await
+        .context("baseline scan task")??;
+        {
+            // Anything attached or written meanwhile is already modeled.
+            let mut state = self.0.shared.lock();
+            let mut changed = false;
+            for (name, model) in journals {
+                if let Entry::Vacant(entry) = state.journals.entry(name) {
+                    entry.insert(model);
+                    changed = true;
+                }
+            }
+            for (name, data) in files {
+                if let Entry::Vacant(entry) = state.files.entry(name) {
+                    entry.insert(data);
+                    changed = true;
+                }
+            }
+            state.models_changed |= changed;
         }
         let (reply, response) = oneshot::channel();
         self.0
@@ -587,13 +624,13 @@ impl Durability {
     /// call from a blocking thread. Returns total and newly uploaded bytes.
     pub fn upload_index_checkpoint(&self, directory: &Path) -> Result<(u64, u64)> {
         let operator = self.0.operator.clone();
+        let shared = self.0.shared.clone();
         let hashes = self.0.index_hashes.clone();
         let directory = directory.to_path_buf();
         let started = Instant::now();
-        let (total, uploaded) = self
-            .0
-            .runtime
-            .block_on(async move { index::upload(&operator, &hashes, &directory).await })?;
+        let (total, uploaded) = self.0.runtime.block_on(async move {
+            index::upload(&shared, &operator, &hashes, &directory).await
+        })?;
         metrics::histogram!("flow_durability_index_checkpoint_seconds")
             .record(started.elapsed().as_secs_f64());
         metrics::counter!("flow_durability_index_checkpoint_bytes_total").increment(uploaded);
@@ -637,33 +674,78 @@ impl Durability {
 
     /// Stop after a final barrier and a release record, so the next owner
     /// starts without waiting for this lease. Call after every user stopped.
+    /// Gives up after one lease, which is all a release saves the next owner,
+    /// so a clean shutdown does not hang while object storage is unavailable.
     pub async fn release(&self) -> Result<()> {
-        // A final checkpoint lets the next start replay almost no log. It is
-        // an optimisation; the log already holds everything appended.
-        if self.0.shared.lock().baseline {
-            let (reply, response) = oneshot::channel();
-            if self
-                .0
-                .requests
-                .send(checkpoint::Request::Now(reply))
-                .await
-                .is_ok()
-                && let Ok(Err(error)) = response.await
-            {
-                tracing::warn!(error = %format!("{error:#}"), "final durability checkpoint failed");
+        self.within_lease("release", async {
+            // A final checkpoint lets the next start replay almost no log. It
+            // is an optimisation; the log already holds everything appended.
+            if self.0.shared.lock().baseline {
+                let (reply, response) = oneshot::channel();
+                if self
+                    .0
+                    .requests
+                    .send(checkpoint::Request::Now(reply))
+                    .await
+                    .is_ok()
+                    && let Ok(Err(error)) = response.await
+                {
+                    tracing::warn!(error = %format!("{error:#}"), "final durability checkpoint failed");
+                }
             }
-        }
-        // No baseline is needed: without one this owner had no external effects.
-        let ordinal = self.0.shared.append(Item::Release {
-            epoch: self.0.shared.epoch,
-        })?;
-        self.0.shared.wait_durable(ordinal).await?;
+            // No baseline is needed: without one this owner had no external effects.
+            let ordinal = self.0.shared.append(Item::Release {
+                epoch: self.0.shared.epoch,
+            })?;
+            self.0.shared.wait_durable(ordinal).await
+        })
+        .await?;
         self.stop();
         Ok(())
     }
 
+    /// Wait, for at most one lease, until every change appended so far is
+    /// durable. Before stopping after an error, this gives records written
+    /// just before it, such as a resync marker, a chance to replicate.
+    pub async fn flush(&self) -> Result<()> {
+        let ordinal = self.0.shared.position();
+        self.within_lease("flush", self.0.shared.wait_durable(ordinal))
+            .await
+    }
+
+    async fn within_lease(
+        &self,
+        what: &str,
+        work: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        let lease = self.0.shared.tuning.lease;
+        let deadline = Instant::now() + lease;
+        *self
+            .0
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
+        let deadline = tokio::time::Instant::from_std(deadline);
+        tokio::time::timeout_at(deadline, work)
+            .await
+            .with_context(|| {
+                format!(
+                    "remote durability {what} did not complete within the {}s lease",
+                    lease.as_secs()
+                )
+            })?
+    }
+
     /// Stop replication without a release. The next owner waits one lease.
+    /// Queued records drain until one lease after the latest release or
+    /// flush began, or otherwise for one lease.
     pub fn stop(&self) {
+        let deadline = self
+            .0
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|| Instant::now() + self.0.shared.tuning.lease);
         if let Some(stop) = self
             .0
             .stop
@@ -671,7 +753,7 @@ impl Durability {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            let _ = stop.send(());
+            let _ = stop.send(deadline);
         }
         if let Some(thread) = self
             .0
@@ -751,7 +833,7 @@ fn scan_journal(root: &Path) -> Result<JournalModel> {
                         id,
                         SegmentModel {
                             length: entry.metadata()?.len(),
-                            parts: Vec::new(),
+                            ..SegmentModel::default()
                         },
                     );
                 }

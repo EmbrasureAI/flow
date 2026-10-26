@@ -4,8 +4,11 @@ use flow_coordinator::{SourceHealth, SourceLedger, Watermarks};
 use flow_model::{PgLsn, TableId};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -389,8 +392,10 @@ pub(crate) fn emit(
 }
 
 /// The run loop's observation: the process is serving, so an earlier exit
-/// reason no longer describes it.
+/// reason no longer describes it. It replaces every field, so the previous
+/// file is not read back.
 pub(crate) fn emit_running(
+    writer: &StatusWriter,
     config: &Config,
     ledger: &SourceLedger,
     captured: PgLsn,
@@ -398,17 +403,106 @@ pub(crate) fn emit_running(
     source_health: SourceHealthStatus,
     tables: (&[BlockedTable], &[TableProgress]),
 ) -> Result<()> {
-    update(config, |status| {
-        status.ready = ready;
-        status.watermarks = ledger.watermarks().clone();
-        status.pending_transactions = ledger.pending_count();
-        status.captured_durable_lsn = captured;
-        status.source_health = source_health;
-        status.blocked_tables = tables.0.to_vec();
-        status.table_progress = tables.1.to_vec();
-        status.state = ProcessState::Running;
-        status.last_error = None;
-    })
+    writer.submit(
+        config.state_dir.join("status.json"),
+        Status {
+            source_id: config.source.id.clone(),
+            process_id: std::process::id(),
+            ready,
+            updated_at_ms: now_ms()?,
+            watermarks: ledger.watermarks().clone(),
+            pending_transactions: ledger.pending_count(),
+            captured_durable_lsn: captured,
+            source_health,
+            blocked_tables: tables.0.to_vec(),
+            table_progress: tables.1.to_vec(),
+            state: ProcessState::Running,
+            last_error: None,
+            durability: None,
+        },
+    )
+}
+
+/// Writes the run loop's observations off the scheduler task. Only the latest
+/// observation is kept, so a slow volume coalesces intermediate ones. Call
+/// [`StatusWriter::flush`] before any other status writer, such as an exit record.
+#[derive(Default)]
+pub(crate) struct StatusWriter(Arc<StatusSlot>);
+
+#[derive(Default)]
+struct StatusSlot {
+    pending: Mutex<PendingStatus>,
+    /// Held across replacement, so observations land in submission order.
+    file: Mutex<()>,
+}
+
+#[derive(Default)]
+struct PendingStatus {
+    status: Option<(PathBuf, Status)>,
+    scheduled: bool,
+    /// Reported by the next submission or flush.
+    failure: Option<anyhow::Error>,
+}
+
+impl StatusWriter {
+    fn submit(&self, path: PathBuf, status: Status) -> Result<()> {
+        let schedule = {
+            let mut pending = lock(&self.0.pending);
+            if let Some(error) = pending.failure.take() {
+                return Err(error);
+            }
+            pending.status = Some((path, status));
+            !std::mem::replace(&mut pending.scheduled, true)
+        };
+        if schedule {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    let slot = self.0.clone();
+                    runtime.spawn_blocking(move || slot.drain());
+                }
+                Err(_) => return self.flush(),
+            }
+        }
+        Ok(())
+    }
+
+    /// Write any pending observation on this thread, after one in progress.
+    pub(crate) fn flush(&self) -> Result<()> {
+        self.0.drain();
+        lock(&self.0.pending).failure.take().map_or(Ok(()), Err)
+    }
+}
+
+impl StatusSlot {
+    fn drain(&self) {
+        let _file = lock(&self.file);
+        let next = {
+            let mut pending = lock(&self.pending);
+            pending.scheduled = false;
+            pending.status.take()
+        };
+        let Some((path, mut status)) = next else {
+            return;
+        };
+        status.durability = crate::durability::status();
+        let written = serde_json::to_vec_pretty(&status)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| write_observation(&path, bytes));
+        match written {
+            Ok(()) => {}
+            // A full volume must not stop the service.
+            Err(error) if crate::disk::is_storage_full(&error) => {
+                crate::disk::warn_observation_skipped(&error);
+            }
+            Err(error) => {
+                lock(&self.pending).failure.get_or_insert(error);
+            }
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn update(config: &Config, change: impl FnOnce(&mut Status)) -> Result<()> {
@@ -584,6 +678,7 @@ mod status_tests {
         )
         .unwrap();
         emit_running(
+            &StatusWriter::default(),
             &config,
             &ledger,
             PgLsn(1),
@@ -597,6 +692,62 @@ mod status_tests {
         assert_eq!(running["ready"], true);
         assert!(running.get("last_error").is_none());
         assert!(read(&config).unwrap().ready());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_observations_are_written_off_the_caller_and_flushed_before_exit() {
+        let (_root, config) = config();
+        let store = flow_state_store::StateStore::open(
+            config.state_dir.join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let ledger = SourceLedger::open(
+            store,
+            flow_model::SourceId(config.source.id.clone()),
+            flow_coordinator::AckMode::Materialized,
+            flow_coordinator::JournalDurability::LocalDisk,
+        )
+        .unwrap();
+        let writer = StatusWriter::default();
+        let emit = |captured| {
+            emit_running(
+                &writer,
+                &config,
+                &ledger,
+                PgLsn(captured),
+                true,
+                SourceHealthStatus::Healthy,
+                (&[], &[]),
+            )
+        };
+        for captured in 1..=64 {
+            emit(captured).unwrap();
+        }
+        writer.flush().unwrap();
+        let running = status(&config);
+        assert_eq!(running["captured_durable_lsn"], 64);
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["source_id"], config.source.id.as_str());
+
+        // An exit record follows the flushed observation.
+        record_exit_as(&config, &crate::exit::config("stopped"), true);
+        let stopped = status(&config);
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["captured_durable_lsn"], 64);
+        assert_eq!(stopped["last_error"]["exit_code"], 78);
+
+        // A failed write is reported once, then later observations resume.
+        let path = config.state_dir.join("status.json");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        emit(65).unwrap();
+        assert!(writer.flush().is_err());
+        writer.flush().unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        emit(66).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(status(&config)["captured_durable_lsn"], 66);
     }
 
     #[test]

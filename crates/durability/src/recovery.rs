@@ -9,8 +9,8 @@
 //! the recovered history and cannot have been the basis of an external effect.
 use crate::checkpoint::History;
 use crate::format::{
-    self, Batch, Checkpoint, IDENTITY_KEY, Identity, LockIdentity, Owner, Record, log_key,
-    owner_key,
+    self, Batch, Checkpoint, IDENTITY_KEY, Identity, LockIdentity, Owner, Record, SegmentImage,
+    log_key, owner_key,
 };
 use crate::store::{self, Created};
 use anyhow::{Context, Result, bail, ensure};
@@ -29,6 +29,8 @@ use std::{
 
 /// Concurrent object reads while recovering.
 const READ_CONCURRENCY: usize = 32;
+/// Retries of a transient failure while creating a startup object.
+const STARTUP_RETRIES: u32 = 5;
 pub(crate) const MARKER: &str = "remote-durability.json";
 
 /// How this process obtained its local state.
@@ -133,6 +135,23 @@ pub fn write_durable(path: &Path, data: &[u8]) -> Result<()> {
     sync_dir(path.parent().context("file has a parent directory")?)
 }
 
+/// Conditionally create a startup object, retrying transient failures a few
+/// times. Every attempt is a conditional create, so a retry whose first
+/// response was lost still finds its own write.
+async fn create(operator: &Operator, key: &str, bytes: Bytes) -> Result<Created> {
+    let mut attempt = 0;
+    loop {
+        match store::create(operator, key, bytes.clone()).await {
+            Err(error) if attempt < STARTUP_RETRIES && store::temporary(&error) => {
+                attempt += 1;
+                tracing::warn!(key, attempt, error = %format!("{error:#}"), "remote durability write failed; retrying");
+                tokio::time::sleep(crate::writer::backoff(attempt)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn ensure_identity(operator: &Operator, source_id: &str) -> Result<()> {
     let expected = Identity {
         format: format::FORMAT.into(),
@@ -141,7 +160,7 @@ async fn ensure_identity(operator: &Operator, source_id: &str) -> Result<()> {
     };
     let existing = match store::read_optional(operator, IDENTITY_KEY).await? {
         Some(bytes) => bytes,
-        None => match store::create(
+        None => match create(
             operator,
             IDENTITY_KEY,
             Bytes::from(serde_json::to_vec(&expected)?),
@@ -222,7 +241,7 @@ async fn claim(operator: &Operator, lock: Option<LockIdentity>) -> Result<u64> {
         started_unix_ms: unix_ms(),
         lock,
     };
-    match store::create(
+    match create(
         operator,
         &owner_key(epoch),
         Bytes::from(serde_json::to_vec(&owner)?),
@@ -414,6 +433,58 @@ async fn extend(
     Ok(())
 }
 
+/// Write one journal segment from its checkpoint parts, streaming each part
+/// to disk so restore memory does not grow with part size.
+async fn restore_segment(
+    operator: &Operator,
+    path: PathBuf,
+    segment: u64,
+    image: &SegmentImage,
+) -> Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(&path).await?;
+    let mut expected = 0;
+    for part in &image.parts {
+        let size = part.end.saturating_sub(part.start);
+        ensure!(
+            part.start == expected && part.end >= part.start && size <= format::MAX_OBJECT_BYTES,
+            "journal part {} is damaged or out of order",
+            part.object
+        );
+        let mut stream = operator
+            .reader(&part.object)
+            .await
+            .with_context(|| format!("read {}", part.object))?
+            .into_bytes_stream(..)
+            .await
+            .with_context(|| format!("read {}", part.object))?;
+        let mut crc32 = crc32fast::Hasher::new();
+        let mut length = 0u64;
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .with_context(|| format!("read {}", part.object))?
+        {
+            length += chunk.len() as u64;
+            ensure!(length <= size, "journal part {} is damaged", part.object);
+            crc32.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        ensure!(
+            length == size && crc32.finalize() == part.crc32,
+            "journal part {} is damaged",
+            part.object
+        );
+        expected = part.end;
+    }
+    file.flush().await?;
+    ensure!(
+        expected == image.length,
+        "journal segment {segment} image is incomplete"
+    );
+    Ok(expected)
+}
+
 /// Rebuilds local files in a private staging directory, then installs them.
 struct Restorer {
     staging: PathBuf,
@@ -469,39 +540,21 @@ impl Restorer {
                     "checkpoint names unknown journal {name}"
                 );
                 restorer.journals.insert(name.clone(), image.reclaimed);
-                for (segment, image) in &image.segments {
-                    let path = restorer
-                        .staging
+            }
+            let staging = &restorer.staging;
+            let segments = checkpoint.journals.iter().flat_map(|(name, image)| {
+                image.segments.iter().map(move |(segment, image)| {
+                    let path = staging
                         .join(name)
                         .join(flow_ingress_journal::segment_file_name(*segment));
-                    let mut file = File::create(&path)?;
-                    let mut expected = 0;
-                    let mut parts = futures::stream::iter(image.parts.iter())
-                        .map(|part| async move {
-                            Ok::<_, anyhow::Error>((
-                                part,
-                                store::read(operator, &part.object).await?,
-                            ))
-                        })
-                        .buffered(READ_CONCURRENCY);
-                    while let Some((part, data)) = parts.try_next().await? {
-                        ensure!(
-                            part.start == expected
-                                && data.len() as u64 == part.end - part.start
-                                && crc32fast::hash(&data) == part.crc32,
-                            "journal part {} is damaged or out of order",
-                            part.object
-                        );
-                        file.write_all(&data)?;
-                        expected = part.end;
-                        restorer.stats.journal_bytes += data.len() as u64;
-                    }
-                    ensure!(
-                        expected == image.length,
-                        "journal segment {segment} image is incomplete"
-                    );
-                }
-            }
+                    restore_segment(operator, path, *segment, image)
+                })
+            });
+            let restored: Vec<u64> = futures::stream::iter(segments)
+                .buffer_unordered(READ_CONCURRENCY)
+                .try_collect()
+                .await?;
+            restorer.stats.journal_bytes += restored.iter().sum::<u64>();
             restorer.files = checkpoint.files.clone();
         }
         restorer.control = Some(control);
@@ -806,7 +859,7 @@ pub(crate) async fn recover(
         first_ordinal: scan.last_ordinal + 1,
         records: vec![Record::EpochStart { epoch }],
     };
-    match store::create(
+    match create(
         operator,
         &log_key(scan.next),
         Bytes::from(format::encode_batch(&start)?),

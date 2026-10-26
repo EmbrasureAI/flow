@@ -256,6 +256,24 @@ impl TableMaintenance {
         }
         let retired_objects = retired_objects.len();
         let v3 = table.metadata().format_version() == iceberg::spec::FormatVersion::V3;
+        // A selected vector that still applies to its live target guarantees
+        // at least one output object, so fewer than two retired objects cannot
+        // shrink the table. Skip the reads and upload of a rejected rewrite.
+        if v3
+            && !repair
+            && retired_objects < 2
+            && selected.iter().any(|id| {
+                let entry = &view.live_files[&id.0];
+                entry.file_format() == iceberg::spec::DataFileFormat::Puffin
+                    && entry
+                        .data_file
+                        .referenced_data_file()
+                        .and_then(|target| view.live_files.get(&target))
+                        .is_some_and(|data| position_delete_may_apply(entry, data))
+            })
+        {
+            return Ok(None);
+        }
         let data_files = view
             .live_files
             .values()
@@ -440,11 +458,7 @@ impl TableMaintenance {
             }
             return Ok(None);
         };
-        let path = format!(
-            "{}/metadata/{}-prepared.avro",
-            table.metadata().location().trim_end_matches('/'),
-            id.0
-        );
+        let path = crate::artifacts::prepared_plan_path(&table, &id);
         write_artifact_plan(&table, &path, &[], &output).await?;
         let payload = serde_json::to_vec(&RewriteRecovery {
             output_data_sequence: None,

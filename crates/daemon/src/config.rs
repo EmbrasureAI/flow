@@ -548,6 +548,30 @@ mod tests {
     }
 
     #[test]
+    fn example_compaction_section_documents_the_defaults() {
+        let example = include_str!("../../../examples/flow.toml");
+        let (_, section) = example.split_once("\n# [compaction]\n").unwrap();
+        let keys = section
+            .lines()
+            .take_while(|line| line.starts_with('#'))
+            .filter_map(|line| line.strip_prefix("# "))
+            .filter(|line| {
+                line.split_once(" = ").is_some_and(|(key, _)| {
+                    key.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 21);
+        let documented: Config =
+            toml::from_str(&format!("{example}\n[compaction]\n{}\n", keys.join("\n"))).unwrap();
+        assert_eq!(
+            format!("{:?}", documented.compaction),
+            format!("{:?}", flow_compactor::Policy::default())
+        );
+    }
+
+    #[test]
     fn rejects_limits_that_downstream_fixed_configuration_cannot_use() {
         type Invalidate = fn(&mut Limits);
         type Case = (&'static str, Invalidate, &'static str);

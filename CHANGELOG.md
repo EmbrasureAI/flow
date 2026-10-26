@@ -144,11 +144,11 @@ This will be the initial public release, `0.1.0`.
 - Memory-budget gauges (`flow_memory_index_block_cache_bytes`,
   `flow_memory_index_memtable_bytes`, `flow_memory_manifest_cache_bytes`,
   `flow_memory_retained_index_bytes`, …) that attribute resident memory to the
-  row index, manifest caches and garbage reachability indexes.
-- The shared parsed-manifest caches release manifests unread for ten minutes
-  and reload them if read again, so rarely read manifests superseded by
-  commits, compaction and manifest rewrites no longer accumulate until each
-  cache reaches its 64 MiB budget.
+  row index, the manifest cache and garbage reachability indexes.
+- The parsed-manifest cache shared by publication and maintenance releases
+  manifests unread for ten minutes and reloads them if read again, so rarely
+  read manifests superseded by commits, compaction and manifest rewrites no
+  longer accumulate until the cache reaches its 128 MiB budget.
 - A Dockerfile that builds a minimal image running as an unprivileged user.
 - Operations guidance for systemd and Kubernetes, and disk sizing.
 
@@ -158,6 +158,57 @@ This will be the initial public release, `0.1.0`.
   another transaction holds an `ACCESS EXCLUSIVE` lock on a published table
   (for example a long `TRUNCATE`, rewriting `ALTER`, `VACUUM FULL` or
   `CLUSTER`). Capture that is already streaming continues.
+
+### Changed
+
+**Performance**
+
+- Capture keeps small PostgreSQL source transactions in a bounded memory buffer
+  (256 KiB each, 32 MiB in total, so capture may use up to about 32 MiB more
+  memory) instead of creating a spool directory and file per transaction.
+  Larger transactions still spill to disk under `limits.spool_bytes`.
+- Up to 256 small source transactions share one journal sync, still within the
+  5 ms group window, and each journal frame is written with one call.
+- UPDATE/DELETE keys are encoded without copying the table schema, and CDC and
+  initial COPY rows no longer revalidate the relation's types row by row.
+- The four concurrent initial COPY workers run on separate runtime threads.
+- Periodic row-index checkpoints flush memtables before taking the index
+  locks, and collapse folds source chunks outside the row lock, shortening
+  stalls of concurrent publication.
+- An epoch makes two REST catalog `loadTable` calls instead of three unless
+  recovery just committed through the catalog, and build probes skip a
+  redundant reload.
+- Publication and maintenance share one 128 MiB manifest cache instead of two
+  64 MiB caches, and snapshot manifest lists are cached too, removing duplicate
+  manifest and manifest-list fetches per epoch. The
+  `flow_memory_manifest_cache_bytes` and `flow_memory_manifest_cache_entries`
+  gauges report one `cache="shared"` series instead of `publication` and
+  `maintenance`.
+- v3 epochs merge each touched data file's previous deletion vector in memory
+  instead of restaging every prior position through the row index. Legacy
+  position deletes and unusually large priors keep the disk-backed path.
+- Deletion-vector reads parse each Puffin object's header and footer once and
+  fetch vectors concurrently within the `[parquet_read]` prefetch bounds. Small
+  objects go from four requests per vector to about one per object, with
+  unchanged validation.
+- Data builds reuse manifests already loaded for planning, and v3 delete
+  consolidation no longer reads inputs or uploads a Puffin object for a rewrite
+  that cannot reduce the object count.
+- Manifest rewrites check and write their outputs concurrently, garbage
+  collection history walks no longer evict current manifests from the cache,
+  and data rewrites commit without reading back the plan they just wrote.
+- Remote durability restores journal segments concurrently and streams journal
+  parts and row-index files to disk, and the startup scan of retained journal
+  bytes no longer blocks replication.
+- The scheduler no longer rescans the operations column family on every loop
+  iteration, and `status.json` updates are coalesced and written off the
+  scheduler task.
+
+**Remote durability metrics**
+
+- `flow_durability_put_seconds` gains `kind="checkpoint"`, and
+  `flow_durability_retries_total` also counts control snapshot, journal part and
+  checkpoint writes; filter by `kind` for log-batch retries only.
 
 ### Fixed
 
@@ -180,6 +231,43 @@ This will be the initial public release, `0.1.0`.
   replication connection no longer stops capture; it has nothing to discard,
   as in PostgreSQL's apply worker. Other unexpected stream aborts still stop
   capture, now naming the check that failed and the transaction IDs.
+- Remote durability: checkpoint uploads (control snapshots, journal parts and
+  manifests) retry transient object-storage errors. The startup checkpoint
+  waits like a barrier and fails only once replication stops, so a brief S3
+  error no longer stops the daemon at startup. A local error fails it after
+  three attempts instead of waiting forever.
+- Remote durability: a checkpoint that finished after a torn journal tail was
+  repaired could reuse stale journal parts, corrupting later restores.
+- Remote durability: S3 `409 ConditionalRequestConflict` responses and
+  transient errors during startup writes are retried.
+- Remote durability: `file://` prefixes create objects atomically through a
+  `.staging/` directory under the prefix, so a failed write no longer leaves a
+  partial object that stops replication. The filesystem must support hard
+  links.
+- Remote durability: shutdown waits about one lease at most while object
+  storage is unavailable instead of hanging; the next start then waits one
+  lease before taking over. Error exits first try, within that time, to
+  replicate records written just before them, such as a resync marker.
+- Remote durability: `queue_memory_bytes` also bounds queued journal extents,
+  so an outage no longer grows replication memory without bound.
+- Remote durability: row-index uploads require a fresh owner lease, and index
+  replica deletions are counted in `flow_durability_deleted_objects_total`.
+- Catching up a stale row-index checkpoint detects a delete that was removed or
+  narrowed for a surviving data file, for example by an external writer, and
+  falls back to a full rebuild instead of leaving the restored rows out of the
+  index.
+- A periodic maintenance visit that only recovered an unfinished ingest
+  operation no longer disables periodic metadata maintenance, snapshot
+  expiration and garbage collection for the rest of the process.
+- Background build catch-up reads and charges each intermediate deletion vector
+  once, avoiding spurious delete-budget rejections on chains of replaced
+  vectors.
+- Failing to delete a local compaction scratch directory is logged instead of
+  stopping the daemon; the next start removes leftovers.
+- [Remote durability](docs/remote-durability.md) lists the
+  `AbortMultipartUpload` permission and the upload bandwidth that
+  `request_timeout_secs` implies, and `examples/flow.toml` documents every
+  `[compaction]` key with its default.
 
 ### Security
 
