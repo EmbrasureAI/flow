@@ -16,8 +16,8 @@ use flow_model::{
     TableSchema, TableSchemaVersion,
 };
 use flow_pg_source::{
-    Acknowledgement, SnapshotSession, decode_copy_row_with_types, export_snapshot,
-    export_temporary_snapshot, fetch_relation,
+    Acknowledgement, CopyRowDecoder, SnapshotSession, export_snapshot, export_temporary_snapshot,
+    fetch_relation,
     tokio_postgres::{binary_copy::BinaryCopyOutStream, types::Type},
 };
 use flow_state_store::{ControlStore, OperationKind, OperationPhase, StateStore};
@@ -381,9 +381,7 @@ async fn add_configured_tables(
             !boot.schemas.iter().any(|s| s.table_id == schema.table_id),
             crate::exit::config(format!(
                 "table {}.{} has the same table id {} as an existing configured table",
-                configured.source_namespace,
-                configured.source_table,
-                schema.table_id.0
+                configured.source_namespace, configured.source_table, schema.table_id.0
             ))
         );
         validate_source_table(&sql, configured, &schema).await?;
@@ -511,7 +509,6 @@ async fn resnapshot_table(
     );
     Ok(())
 }
-
 
 async fn prepare_source(
     config: &Config,
@@ -946,16 +943,21 @@ pub(crate) async fn resume(
         progress_send,
         ack_recv,
     ));
+    // Each worker runs as its own task, so row decoding and staging of the
+    // concurrent COPYs use separate runtime threads. Workers start lazily as
+    // slots free up and are aborted if bootstrap is dropped.
+    let shared_config = Arc::new(config.clone());
     let work = futures::stream::iter(plans.into_iter().map(|(index, schema, copy, staged)| {
+        let config = shared_config.clone();
         let store = store.clone();
         let publisher = publisher.clone();
         let catalog = catalog.clone();
         let table = targets[&schema.table_id].clone();
         let exported = exported.clone();
-        async move {
+        CopyTask(tokio::spawn(async move {
             let cut = copy.cut;
             copy_and_publish(
-                config,
+                &config,
                 &store,
                 &publisher,
                 catalog.as_ref(),
@@ -976,7 +978,7 @@ pub(crate) async fn resume(
                     config.tables[index].source_namespace, config.tables[index].source_table
                 )
             })
-        }
+        }))
     }))
     .buffer_unordered(4);
     tokio::pin!(work);
@@ -1126,6 +1128,28 @@ fn staged_copy(
     Ok(Some((reader, transaction)))
 }
 
+/// A spawned COPY worker, aborted when dropped.
+struct CopyTask(tokio::task::JoinHandle<Result<(TableId, i64, PgLsn)>>);
+
+impl std::future::Future for CopyTask {
+    type Output = Result<(TableId, i64, PgLsn)>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|joined| joined.context("initial COPY worker did not finish")?)
+    }
+}
+
+impl Drop for CopyTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct CopyWork {
     schema: TableSchema,
     table: Table,
@@ -1201,6 +1225,7 @@ async fn copy_and_publish(
             recovered.transactions.is_empty(),
             "new COPY staging directory is not empty"
         );
+        let decoder = CopyRowDecoder::new(schema, &relation, &resolved_types)?;
         let mut rows = Vec::new();
         let mut bytes = 8u64;
         while let Some(row) = stream.as_mut().try_next().await? {
@@ -1208,7 +1233,7 @@ async fn copy_and_publish(
                 table_id: schema.table_id,
                 schema_version: schema.version,
                 kind: MutationKind::Insert {
-                    row: decode_copy_row_with_types(schema, &relation, &row, &resolved_types)?,
+                    row: decoder.decode(&row)?,
                 },
             };
             let size = bincode::serialized_size(&mutation)?;

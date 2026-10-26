@@ -30,9 +30,6 @@ pub struct Relation {
 }
 
 impl Relation {
-    pub fn validate_schema(&self, schema: &flow_model::TableSchema) -> Result<()> {
-        crate::capture::validate_relation(schema, self)
-    }
     pub fn validate_mutable(&self) -> Result<()> {
         if self.replica_identity != b'f'
             && !(self.replica_identity == b'd' && self.columns.iter().any(|column| column.identity))
@@ -109,42 +106,6 @@ pub enum SourceEvent {
     },
     /// Origin/type/logical-message metadata does not mutate a replicated table.
     Metadata,
-}
-
-impl SourceEvent {
-    /// Drop metadata and changes for relations outside the capture set. A
-    /// publication may contain other tables; pgoutput still sends them. A
-    /// TRUNCATE keeps only its captured relations. Transaction boundaries are
-    /// always retained, so a transaction without captured changes stays empty.
-    pub fn retain_relations(self, mut captured: impl FnMut(u32) -> bool) -> Option<Self> {
-        match self {
-            Self::Relation(Relation { id, .. })
-            | Self::Insert { relation: id, .. }
-            | Self::Update { relation: id, .. }
-            | Self::Delete { relation: id, .. }
-                if !captured(id) =>
-            {
-                None
-            }
-            Self::Truncate {
-                xid,
-                subxid,
-                mut relations,
-                cascade,
-                restart_identity,
-            } => {
-                relations.retain(|id| captured(*id));
-                (!relations.is_empty()).then_some(Self::Truncate {
-                    xid,
-                    subxid,
-                    relations,
-                    cascade,
-                    restart_identity,
-                })
-            }
-            event => Some(event),
-        }
-    }
 }
 
 pub struct Decoder {
@@ -461,23 +422,27 @@ impl Cursor {
         self.offset += count;
         Ok(bytes)
     }
+    /// Fixed-width fields are read in place; only variable-length values
+    /// share the message buffer as `Bytes`.
+    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        if N > self.remaining() {
+            return Err(Error::Protocol("truncated message"));
+        }
+        let bytes = self.bytes[self.offset..self.offset + N].try_into().unwrap();
+        self.offset += N;
+        Ok(bytes)
+    }
     fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        Ok(self.array::<1>()?[0])
     }
     fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_be_bytes(
-            self.take(2)?.as_ref().try_into().unwrap(),
-        ))
+        Ok(u16::from_be_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_be_bytes(
-            self.take(4)?.as_ref().try_into().unwrap(),
-        ))
+        Ok(u32::from_be_bytes(self.array()?))
     }
     fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_be_bytes(
-            self.take(8)?.as_ref().try_into().unwrap(),
-        ))
+        Ok(u64::from_be_bytes(self.array()?))
     }
     fn i64(&mut self) -> Result<i64> {
         Ok(self.u64()? as i64)
@@ -494,9 +459,11 @@ impl Cursor {
             .iter()
             .position(|&b| b == 0)
             .ok_or(Error::Protocol("unterminated string"))?;
-        let bytes = self.take(length)?;
-        self.u8()?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::Protocol("invalid UTF-8 identifier"))
+        let name = std::str::from_utf8(&self.bytes[self.offset..self.offset + length])
+            .map_err(|_| Error::Protocol("invalid UTF-8 identifier"))?
+            .to_owned();
+        self.offset += length + 1;
+        Ok(name)
     }
     fn tuple(&mut self) -> Result<Tuple> {
         let count = self.u16()? as usize;

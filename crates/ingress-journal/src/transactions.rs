@@ -329,7 +329,7 @@ mod tests {
         let (mut journal, _) = Journal::open(directory.path(), JournalConfig::default()).unwrap();
         for xid in 1..=1000 {
             journal
-                .stage_commit(SourceTransaction {
+                .stage_commit(&SourceTransaction {
                     source_id: SourceId("buffered-terminals".into()),
                     xid,
                     begin_lsn: PgLsn(u64::from(xid)),

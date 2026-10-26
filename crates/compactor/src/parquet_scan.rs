@@ -41,10 +41,12 @@ pub struct ReadLimits {
     pub batch_bytes: u64,
     /// Input files fetched whole ahead of a sequential scan. Object-store
     /// latency then overlaps instead of accumulating per small file. Zero
-    /// reads every file lazily by range.
+    /// reads every file lazily by range. Deletion-vector reads use it, at
+    /// least one, as their object and blob concurrency.
     pub prefetch_files: usize,
     /// Only files at most this large are fetched whole; larger ones are read
-    /// by range. Bounds prefetched memory to about `prefetch_files` times this.
+    /// by range. Bounds prefetched memory to about `prefetch_files` times this,
+    /// which also bounds each batch of deletion-vector reads.
     pub prefetch_file_bytes: u64,
 }
 
@@ -338,6 +340,8 @@ fn admit_group(
 pub(crate) enum Input {
     Fetched(Bytes),
     Lazy,
+    /// Read by range, with a size already observed from storage metadata.
+    Sized(u64),
 }
 
 impl Input {
@@ -345,13 +349,14 @@ impl Input {
         Ok(match self {
             Self::Fetched(bytes) => bytes.len() as u64,
             Self::Lazy => input.metadata().await?.size,
+            Self::Sized(size) => *size,
         })
     }
 
     async fn reader(&self, input: &iceberg::io::InputFile) -> Result<Box<dyn FileRead>> {
         Ok(match self {
             Self::Fetched(bytes) => Box::new(Fetched(bytes.clone())),
-            Self::Lazy => input.reader().await?,
+            Self::Lazy | Self::Sized(_) => input.reader().await?,
         })
     }
 }

@@ -28,6 +28,7 @@ pub(crate) struct Observation {
     started_at: SystemTime,
     memory_warned_at: Option<Instant>,
     memory_sample: Option<tokio::task::JoinHandle<Vec<String>>>,
+    status: crate::lifecycle::StatusWriter,
     #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
     allocator_sample: Option<(Instant, Option<crate::allocator::MemoryUsage>)>,
 }
@@ -47,7 +48,7 @@ impl Observation {
                 )?
                 .set_buckets_for_metric(
                     Matcher::Full("flow_journal_commit_group_transactions".into()),
-                    &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+                    &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0],
                 )?
                 .install_recorder()
                 // Test-only seam: `init` and `run` share one test process.
@@ -66,6 +67,7 @@ impl Observation {
             started_at: SystemTime::now(),
             memory_warned_at: None,
             memory_sample: None,
+            status: Default::default(),
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         })
@@ -199,6 +201,11 @@ impl Observation {
         }
     }
 
+    /// Write the latest status observation before the process records its exit.
+    pub(crate) fn flush_status(&self) -> Result<()> {
+        self.status.flush()
+    }
+
     fn write_at(
         &mut self,
         config: &Config,
@@ -209,6 +216,7 @@ impl Observation {
     ) -> Result<bool> {
         let ready = ready && self.source_health.permits_readiness();
         crate::lifecycle::emit_running(
+            &self.status,
             config,
             ledger,
             captured,
@@ -382,7 +390,7 @@ fn table_lag_seconds(table: &TableProgress, now_micros: i64) -> f64 {
 }
 
 /// Usage of the process-wide memory budgets: the row index's RocksDB block
-/// cache and memtables, the shared publication and maintenance manifest caches,
+/// cache and memtables, the manifest cache shared by publication and maintenance,
 /// and the garbage reachability indexes. These are the estimates each budget
 /// evicts against. They overlap one another and the allocator gauges and are
 /// not a decomposition of RSS. Returns the reads that failed.
@@ -418,15 +426,12 @@ fn sample_memory_budgets(
         Ok(bytes) => metrics::gauge!("flow_memory_retained_index_bytes").set(bytes as f64),
         Err(error) => failures.push(format!("retained indexes: {error}")),
     }
-    for (cache, manifests) in [
-        ("publication", publisher.manifest_cache()),
-        ("maintenance", maintenance.manifest_cache()),
-    ] {
-        metrics::gauge!("flow_memory_manifest_cache_bytes", "cache" => cache)
-            .set(manifests.weighted_bytes() as f64);
-        metrics::gauge!("flow_memory_manifest_cache_entries", "cache" => cache)
-            .set(manifests.entry_count() as f64);
-    }
+    // Publication and maintenance share one manifest cache.
+    let manifests = publisher.manifest_cache();
+    metrics::gauge!("flow_memory_manifest_cache_bytes", "cache" => "shared")
+        .set(manifests.weighted_bytes() as f64);
+    metrics::gauge!("flow_memory_manifest_cache_entries", "cache" => "shared")
+        .set(manifests.entry_count() as f64);
     failures
 }
 
@@ -612,6 +617,7 @@ mod tests {
             started_at: SystemTime::now(),
             memory_warned_at: None,
             memory_sample: None,
+            status: Default::default(),
             #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
             allocator_sample: None,
         };

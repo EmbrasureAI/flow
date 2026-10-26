@@ -73,11 +73,18 @@ pub(crate) enum Item {
 }
 
 impl Item {
+    /// Queue memory, including the descriptor. Extents are read from their
+    /// segment when batched, so only the descriptor counts for them.
     fn memory(&self) -> u64 {
-        match self {
-            Self::Control(data) | Self::File { data, .. } => data.len() as u64,
-            _ => 0,
-        }
+        let heap = match self {
+            Self::Control(data) => data.len(),
+            Self::File { name, data } => name.len() + data.len(),
+            Self::Extent { journal, .. }
+            | Self::Truncate { journal, .. }
+            | Self::Reclaim { journal, .. } => journal.len(),
+            Self::Release { .. } => 0,
+        };
+        (std::mem::size_of::<(u64, Self)>() + heap) as u64
     }
     fn encoded_bytes(&self) -> u64 {
         64 + match self {
@@ -93,6 +100,9 @@ pub(crate) struct SegmentModel {
     pub length: u64,
     /// Parts named by the latest durable checkpoint, covering a prefix.
     pub parts: Vec<Part>,
+    /// Ordinal of the latest truncation, which invalidates parts uploaded
+    /// before it even once the segment grows back.
+    pub truncated: u64,
 }
 
 impl SegmentModel {
@@ -123,6 +133,10 @@ pub(crate) struct State {
     pub baseline: bool,
     /// Journal or file models changed without a record, as by a baseline scan.
     pub models_changed: bool,
+    /// Queued extents below this ordinal no longer take more bytes: a
+    /// checkpoint copied the models at it and treats every ordinal below as
+    /// reflected, so later bytes need a new ordinal to be replayed.
+    pub merge_floor: u64,
     pub journals: BTreeMap<String, JournalModel>,
     pub files: BTreeMap<String, Vec<u8>>,
     /// Batch sequence and last ordinal of batches not yet retired by a checkpoint.
@@ -166,6 +180,7 @@ impl Shared {
                 lease_until: None,
                 baseline: false,
                 models_changed: false,
+                merge_floor: 0,
                 journals: BTreeMap::new(),
                 files: BTreeMap::new(),
                 batches: VecDeque::new(),
@@ -217,11 +232,18 @@ impl Shared {
         self.notify();
     }
 
-    /// Queue one record. Blocks only while queued in-memory payloads exceed
-    /// their budget; returns the record's ordinal.
+    /// Queue one record. Blocks only while queued records exceed their
+    /// memory budget; returns the record's ordinal. An extent continuing the
+    /// newest queued one joins it, so a stalled queue holds about one
+    /// descriptor per extent size rather than one per journal sync.
     pub(crate) fn append(&self, item: Item) -> std::io::Result<u64> {
         let memory = item.memory();
         let mut state = self.lock();
+        if let Some(ordinal) = merge_extent(&mut state, &item) {
+            drop(state);
+            self.wake_writer.notify_one();
+            return Ok(ordinal);
+        }
         loop {
             if let Some(failure) = &state.failure {
                 return Err(std::io::Error::other(format!(
@@ -299,7 +321,7 @@ impl Shared {
     }
 
     /// Fail unless the lease remains valid for at least `remaining`.
-    pub(crate) fn require_lease(&self, remaining: Duration) -> Result<()> {
+    pub(crate) fn require_lease(&self, remaining: Duration, what: &str) -> Result<()> {
         let state = self.lock();
         if let Some(failure) = &state.failure {
             bail!("remote durability unavailable: {failure}");
@@ -309,7 +331,7 @@ impl Shared {
             .is_some_and(|until| until > Instant::now() + remaining)
         {
             self.renew_lease.notify_one();
-            bail!("remote durability lease is not fresh enough to delete objects");
+            bail!("remote durability lease is not fresh enough to {what}");
         }
         Ok(())
     }
@@ -328,6 +350,20 @@ impl Shared {
                 return error;
             }
             // `self` owns the sender, so the channel never closes here.
+            let _ = changed.changed().await;
+        }
+    }
+
+    /// Resolves once replication has stopped or is closing.
+    pub(crate) async fn stopped(&self) {
+        let mut changed = self.changed.subscribe();
+        loop {
+            {
+                let state = self.lock();
+                if state.failure.is_some() || state.closing {
+                    return;
+                }
+            }
             let _ = changed.changed().await;
         }
     }
@@ -402,6 +438,49 @@ impl Shared {
     }
 }
 
+/// Extend the newest queued extent by `item` if it continues it, returning
+/// that extent's ordinal. The result still fits a single batch. Taken
+/// records are no longer queued, so only unwritten bytes ever merge.
+fn merge_extent(state: &mut State, item: &Item) -> Option<u64> {
+    if state.failure.is_some() || state.closing {
+        return None;
+    }
+    let Item::Extent {
+        journal,
+        segment,
+        offset,
+        len,
+    } = item
+    else {
+        return None;
+    };
+    let floor = state.merge_floor;
+    let (ordinal, queued) = state.queue.back_mut()?;
+    if *ordinal < floor {
+        return None;
+    }
+    let Item::Extent {
+        journal: queued_journal,
+        segment: queued_segment,
+        offset: queued_offset,
+        len: queued_len,
+    } = queued
+    else {
+        return None;
+    };
+    if queued_journal != journal
+        || queued_segment != segment
+        || *queued_offset + *queued_len != *offset
+        || *queued_len + len > MAX_EXTENT_BYTES
+    {
+        return None;
+    }
+    *queued_len += len;
+    let ordinal = *ordinal;
+    apply_to_model(state, item, ordinal);
+    Some(ordinal)
+}
+
 fn apply_to_model(state: &mut State, item: &Item, ordinal: u64) {
     match item {
         Item::Extent {
@@ -423,6 +502,7 @@ fn apply_to_model(state: &mut State, item: &Item, ordinal: u64) {
             if let Some(model) = state.journals.get_mut(journal) {
                 let entry = model.segments.entry(*segment).or_default();
                 entry.length = *length;
+                entry.truncated = ordinal;
                 if entry.covered() > *length {
                     entry.parts.clear();
                 }
@@ -490,7 +570,7 @@ fn take(shared: &Shared) -> Option<Taken> {
     })
 }
 
-fn materialize(epoch: u64, seq: u64, taken: Taken) -> Result<(Bytes, u64, u64)> {
+fn materialize(epoch: u64, seq: u64, taken: Taken) -> Result<(Bytes, u64)> {
     let count = taken.items.len() as u64;
     let records = taken
         .items
@@ -552,33 +632,61 @@ fn materialize(epoch: u64, seq: u64, taken: Taken) -> Result<(Bytes, u64, u64)> 
         first_ordinal: taken.first_ordinal,
         records,
     })?;
-    Ok((Bytes::from(encoded), count, taken.last_ordinal))
+    Ok((Bytes::from(encoded), count))
 }
 
-/// Create one log batch, retrying transient failures indefinitely. Only a
-/// conflicting object, which proves another owner wrote this sequence, fails.
-async fn upload(shared: &Shared, operator: &Operator, seq: u64, bytes: Bytes) -> Result<()> {
-    let key = format::log_key(seq);
+/// Encode one log batch on a blocking thread, then create it.
+async fn write_batch(shared: &Shared, operator: &Operator, seq: u64, taken: Taken) -> Result<()> {
+    let epoch = shared.epoch;
+    let (bytes, records) = tokio::task::spawn_blocking(move || materialize(epoch, seq, taken))
+        .await
+        .context("log batch task")?
+        .with_context(|| format!("build log batch {seq}"))?;
+    {
+        let mut state = shared.lock();
+        state.stats.batches += 1;
+        state.stats.records += records;
+        state.stats.bytes += bytes.len() as u64;
+    }
+    metrics::histogram!("flow_durability_batch_bytes").record(bytes.len() as f64);
+    metrics::histogram!("flow_durability_batch_records").record(records as f64);
+    create(shared, operator, "log", &format::log_key(seq), bytes).await
+}
+
+/// Conditionally create one object, retrying transient failures until it
+/// lands or replication stops. Every attempt starts under a lease that
+/// outlasts the request. Only an existing object with other bytes, which
+/// proves another owner wrote the key, fails, and it stops replication.
+pub(crate) async fn create(
+    shared: &Shared,
+    operator: &Operator,
+    kind: &'static str,
+    key: &str,
+    bytes: Bytes,
+) -> Result<()> {
     let mut attempt = 0u32;
     loop {
         shared.writable().await?;
         let started = Instant::now();
-        match store::create(operator, &key, bytes.clone()).await {
+        match store::create(operator, key, bytes.clone()).await {
             Ok(Created::New | Created::Same) => {
-                metrics::histogram!("flow_durability_put_seconds", "kind" => "log")
+                metrics::histogram!("flow_durability_put_seconds", "kind" => kind)
                     .record(started.elapsed().as_secs_f64());
                 return Ok(());
             }
             Ok(Created::Different(_)) => {
-                bail!("log batch {seq} was written by another owner; this process was replaced")
+                let message =
+                    format!("{key} was written by another owner; this process was replaced");
+                shared.fail(message.clone());
+                bail!(message);
             }
             Err(error) => {
                 attempt += 1;
                 shared.lock().stats.retries += 1;
-                metrics::counter!("flow_durability_retries_total", "kind" => "log").increment(1);
-                tracing::warn!(seq, attempt, error = %format!("{error:#}"), "remote durability write failed; retrying");
-                if shared.lock().failure.is_some() {
-                    bail!("remote durability already failed");
+                metrics::counter!("flow_durability_retries_total", "kind" => kind).increment(1);
+                tracing::warn!(key, attempt, bytes = bytes.len(), error = %format!("{error:#}"), "remote durability write failed; retrying");
+                if let Some(error) = failure(shared) {
+                    return Err(error);
                 }
                 tokio::time::sleep(backoff(attempt)).await;
             }
@@ -664,32 +772,15 @@ pub(crate) async fn write_loop(shared: Arc<Shared>, operator: Operator) {
                     state.batches.push_back((seq, taken.last_ordinal));
                     seq
                 };
-                let epoch = shared.epoch;
-                let built =
-                    tokio::task::spawn_blocking(move || materialize(epoch, seq, taken)).await;
-                let (bytes, records, last_ordinal) = match built {
-                    Ok(Ok(built)) => built,
-                    Ok(Err(error)) => {
-                        shared.fail(format!("build log batch {seq}: {error:#}"));
-                        return;
-                    }
-                    Err(error) => {
-                        shared.fail(format!("build log batch {seq}: {error}"));
-                        return;
-                    }
-                };
-                {
-                    let mut state = shared.lock();
-                    state.stats.batches += 1;
-                    state.stats.records += records;
-                    state.stats.bytes += bytes.len() as u64;
-                }
-                metrics::histogram!("flow_durability_batch_bytes").record(bytes.len() as f64);
-                metrics::histogram!("flow_durability_batch_records").record(records as f64);
-                order.push_back((seq, last_ordinal, false));
+                // Built inside the upload future, so completions keep being
+                // handled while batches are encoded.
+                order.push_back((seq, taken.last_ordinal, false));
                 let (task_shared, task_operator) = (shared.clone(), operator.clone());
                 inflight.push(async move {
-                    (seq, upload(&task_shared, &task_operator, seq, bytes).await)
+                    (
+                        seq,
+                        write_batch(&task_shared, &task_operator, seq, taken).await,
+                    )
                 });
                 continue;
             }
@@ -838,6 +929,42 @@ mod tests {
         assert!(shared.append(Item::Control(vec![1])).is_err());
         shared.close();
         writer.await.unwrap();
+    }
+
+    #[test]
+    fn contiguous_extents_share_one_queued_record_that_counts_against_memory() {
+        let shared = Shared::new(tuning(), 1, 0, 1);
+        shared.lock().journals.insert(
+            "journal".into(),
+            JournalModel {
+                root: PathBuf::new(),
+                reclaimed: 0,
+                segments: BTreeMap::new(),
+                last_extents: BTreeMap::new(),
+            },
+        );
+        let extent = |offset, len| Item::Extent {
+            journal: "journal".into(),
+            segment: 0,
+            offset,
+            len,
+        };
+        let first = shared.append(extent(0, 10)).unwrap();
+        for offset in (10..1000).step_by(10) {
+            assert_eq!(shared.append(extent(offset, 10)).unwrap(), first);
+        }
+        // A gap, or exceeding the extent size, starts a new record.
+        let second = shared.append(extent(2000, 10)).unwrap();
+        let third = shared.append(extent(2010, MAX_EXTENT_BYTES)).unwrap();
+        assert_eq!((second, third), (first + 1, first + 2));
+        let state = shared.lock();
+        assert_eq!(state.queue.len(), 3);
+        assert_eq!(state.memory, 3 * extent(0, 0).memory());
+        assert_eq!(
+            state.journals["journal"].segments[&0].length,
+            2010 + MAX_EXTENT_BYTES
+        );
+        assert_eq!(state.journals["journal"].last_extents[&0], third);
     }
 
     #[tokio::test]

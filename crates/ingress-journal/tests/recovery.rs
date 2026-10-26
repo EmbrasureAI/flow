@@ -532,7 +532,7 @@ fn terminal_cursor_is_stable_during_append_and_rebuilds_a_torn_index() {
             vec![journal.append_chunk(xid, b"row").unwrap()]
         };
         journal
-            .stage_commit(transaction(xid, u64::from(xid) * 10, chunks))
+            .stage_commit(&transaction(xid, u64::from(xid) * 10, chunks))
             .unwrap();
         if xid % 5 == 0 {
             journal.flush_commits().unwrap();
@@ -615,10 +615,10 @@ fn staged_group_crosses_segments_without_exposure_or_premature_reclamation() {
     journal.commit(transaction(1, 10, vec![first])).unwrap();
     let before = journal.transactions();
     let second = transaction(2, 20, vec![old]);
-    journal.stage_commit(second.clone()).unwrap();
+    journal.stage_commit(&second).unwrap();
     let third = journal.append_chunk(3, &[3; 300]).unwrap();
     let third = transaction(3, 30, vec![third]);
-    journal.stage_commit(third.clone()).unwrap();
+    journal.stage_commit(&third).unwrap();
     assert_eq!(journal.staged_lsn(), PgLsn(31));
     assert_eq!(journal.durable_lsn(), PgLsn(11));
     assert_eq!(journal.transactions().len(), 1);
@@ -696,32 +696,32 @@ fn staged_order_and_limits_reject_invalid_transitions_without_losing_the_group()
         let mut invalid = transaction(1, 10, vec![]);
         invalid.table_mutation_counts = counts;
         assert!(matches!(
-            journal.stage_commit(invalid),
+            journal.stage_commit(&invalid),
             Err(Error::Transaction(_))
         ));
         assert_eq!(journal.staged_lsn(), PgLsn(0));
     }
-    journal.stage_commit(transaction(1, 10, vec![])).unwrap();
+    journal.stage_commit(&transaction(1, 10, vec![])).unwrap();
     assert!(matches!(
         journal.append_chunk(1, b"late"),
         Err(Error::Transaction(_))
     ));
     assert!(matches!(journal.abort(1), Err(Error::Transaction(_))));
     assert!(matches!(
-        journal.stage_commit(transaction(1, 20, vec![])),
+        journal.stage_commit(&transaction(1, 20, vec![])),
         Err(Error::Transaction(_))
     ));
     assert!(matches!(
-        journal.stage_commit(transaction(2, 5, vec![])),
+        journal.stage_commit(&transaction(2, 5, vec![])),
         Err(Error::Transaction(_))
     ));
     let second = journal.append_chunk(2, b"second").unwrap();
     assert!(matches!(
-        journal.stage_commit(transaction(3, 30, vec![])),
+        journal.stage_commit(&transaction(3, 30, vec![])),
         Err(Error::Limit(_))
     ));
     journal
-        .stage_commit(transaction(2, 20, vec![second]))
+        .stage_commit(&transaction(2, 20, vec![second]))
         .unwrap();
     assert!(matches!(
         journal.append_chunk(3, b"third"),
@@ -741,11 +741,11 @@ fn restart_recovers_only_complete_transactions_from_an_unflushed_group() {
         let (mut journal, _) = Journal::open(dir.path(), config()).unwrap();
         let first = journal.append_chunk(1, &[1; 300]).unwrap();
         journal
-            .stage_commit(transaction(1, 10, vec![first]))
+            .stage_commit(&transaction(1, 10, vec![first]))
             .unwrap();
         let second = journal.append_chunk(2, &[2; 300]).unwrap();
         journal
-            .stage_commit(transaction(2, 20, vec![second]))
+            .stage_commit(&transaction(2, 20, vec![second]))
             .unwrap();
         assert_eq!(journal.durable_lsn(), PgLsn(0));
         drop(journal);

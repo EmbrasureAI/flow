@@ -126,11 +126,6 @@ impl Scheduler {
     pub fn remove(&mut self, table: TableId) {
         self.pending.remove(&table);
     }
-    pub fn force(&mut self, table: TableId, now: Instant) {
-        if let Some(p) = self.pending.get_mut(&table) {
-            p.ready_at = p.ready_at.min(now);
-        }
-    }
     pub fn next_deadline(&self) -> Option<Instant> {
         self.pending
             .values()
