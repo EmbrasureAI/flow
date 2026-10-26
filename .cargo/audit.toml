@@ -14,5 +14,21 @@ ignore = [
     # when opendal is upgraded.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # zstd 0.13.3 and zstd-safe 7.2.4. The fixes (zstd >= 0.14.3, zstd-safe
+    # >= 8.2.0) need parquet >= 60 and an apache-avro release on zstd 0.14;
+    # parquet 58, apache-avro 0.21 and the vendored iceberg all require zstd
+    # 0.13. None of the affected functions is reached:
+    # - RUSTSEC-2026-0391 affects only the `with_context` stream constructors.
+    #   Flow and the vendored iceberg use the bulk API and `decode_all`,
+    #   parquet the bulk API, and apache-avro `Encoder::new`/`Decoder::new`.
+    # - RUSTSEC-2026-0398 affects only the `seekable` feature, which nothing
+    #   enables.
+    # - RUSTSEC-2026-0403 affects only `stream::write::Decoder`; the read
+    #   decoder, `decode_all` and the bulk API are not affected.
+    # zstd-sys is at 2.1.2, which fixes RUSTSEC-2026-0410. Remove these entries
+    # once parquet and apache-avro allow zstd >= 0.14.3.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
 ]
 informational_warnings = ["unmaintained", "unsound", "notice"]
