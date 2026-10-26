@@ -124,7 +124,7 @@
     "zstd-sys": {
       "version": "2.1.2+zstd.1.5.7",
       "links": "zstd",
-      "review": "The Rust bindings are BSD-3-Clause. Select the BSD-3-Clause Zstandard library license and retain xxHash BSD notices; do not infer a GPL requirement from the alternative license or command-line source.",
+      "review": "The Rust wrapper is BSD-3-Clause from 2.1 (previously MIT/Apache-2.0); its bundled Zstandard 1.5.7 sources match 2.0.16. Select the BSD-3-Clause Zstandard library license and retain xxHash BSD notices; do not infer a GPL requirement from the alternative license or command-line source.",
       "files": {
         "LICENSE": "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60",
         "LICENSE.BSD-3-Clause": "bf7017a73a95ea63bf3716b13ec2bcd79c92942356e3408c6fb66332bad6d977",
