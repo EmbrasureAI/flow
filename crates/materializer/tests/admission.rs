@@ -627,12 +627,12 @@ async fn a_retry_never_overwrites_a_prepared_data_file() -> anyhow::Result<()> {
         )
     };
     let mut first = writer()?;
-    first.write(&rows, SourcePosition(10)).await?;
+    first.write(&rows, PgLsn(10)).await?;
     let files = first.close().await?;
     let prepared = std::fs::read(files[0].file_path())?;
     // The same operation names the same artifact; it must not be replaced.
     let mut retry = writer()?;
-    let error = match retry.write(&rows, SourcePosition(10)).await {
+    let error = match retry.write(&rows, PgLsn(10)).await {
         Err(error) => error,
         Ok(_) => retry.close().await.unwrap_err(),
     };
