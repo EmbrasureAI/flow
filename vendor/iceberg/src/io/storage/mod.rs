@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -88,6 +89,21 @@ pub trait Storage: Debug + Send + Sync {
     /// Get FileWrite from a path
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>>;
 
+    /// Write bytes only if nothing exists at the path. The default checks
+    /// first, which races with a concurrent writer; storages with conditional
+    /// creates override it so the write itself fails instead.
+    async fn write_if_absent(&self, path: &str, bs: Bytes) -> Result<()> {
+        ensure_absent(self, path).await?;
+        self.write(path, bs).await
+    }
+
+    /// Get a FileWrite that never replaces an existing file. With a
+    /// conditional create, a conflict is reported when the writer closes.
+    async fn writer_if_absent(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        ensure_absent(self, path).await?;
+        self.writer(path).await
+    }
+
     /// Delete a file at the given path
     async fn delete(&self, path: &str) -> Result<()>;
 
@@ -102,6 +118,16 @@ pub trait Storage: Debug + Send + Sync {
 
     /// Create a new output file for writing
     fn new_output(&self, path: &str) -> Result<OutputFile>;
+}
+
+async fn ensure_absent<S: Storage + ?Sized>(storage: &S, path: &str) -> Result<()> {
+    if storage.exists(path).await? {
+        return Err(crate::Error::new(
+            crate::ErrorKind::PreconditionFailed,
+            format!("refusing to overwrite existing file {path}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Factory for creating Storage instances from configuration.

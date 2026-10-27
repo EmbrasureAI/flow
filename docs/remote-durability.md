@@ -180,7 +180,8 @@ reclamation is replicated in order, so restored journals keep exactly the
 retained segments. A segment whose bytes are not durable yet is
 kept locally until a later reclamation instead of blocking the journal. Index
 checkpoint files are hashed and uploaded in 8 MiB pieces, and hashes of
-hard-linked SST files carry over between checkpoints.
+hard-linked SST files carry over between checkpoints and, through
+`checkpoints/replicated-hashes.json` (derived state), across restarts.
 
 ## Cost and tuning
 

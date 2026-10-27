@@ -632,7 +632,9 @@ pub async fn read_positions(
         &mut reader,
         ArrowReaderOptions::new()
             .with_skip_arrow_metadata(true)
-            .with_page_index_policy(PageIndexPolicy::Skip),
+            // Compacted files hold large row groups; the offset index lets a
+            // row selection decode only the pages holding selected rows.
+            .with_page_index_policy(PageIndexPolicy::Optional),
     )
     .await?;
     let columns: Vec<_> = (0..metadata.parquet_schema().num_columns()).collect();

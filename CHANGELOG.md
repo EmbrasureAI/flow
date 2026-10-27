@@ -203,6 +203,24 @@ This will be the initial public release, `0.1.0`.
 - The scheduler no longer rescans the operations column family on every loop
   iteration, and `status.json` updates are coalesced and written off the
   scheduler task.
+- Prepared data, delete and deletion-vector files, prepared plans and
+  manifest-rewrite artifacts are created with a conditional create
+  (`If-None-Match: *` on S3) instead of a HEAD before each write, which also
+  closes the race with a concurrent writer. With 20 ms of added object-store
+  latency, CDC service time per mutation fell 8% in the service benchmark.
+- A row-index checkpoint syncs its files after releasing the row and control
+  locks, so ingest and control transitions no longer wait for the sync. A
+  pending registration protects its snapshots meanwhile.
+- Remote durability keeps index checkpoint hashes in
+  `checkpoints/replicated-hashes.json`, so the first checkpoint after a restart
+  no longer hashes the whole row index again.
+- Compacted files and the initial copy use Parquet row groups of up to
+  `limits.parquet_row_group_rows` (default 122,880) instead of 8,192 rows. In
+  the service benchmark full scans took 15–17% less time, while CDC service
+  time per mutation rose about 3%, from compaction encoding larger groups
+  alongside it. CDC publication files keep 8,192 rows, compaction keeps
+  8,192-row batches, and position reads use the offset index to skip pages.
+  Set the limit to 8192 for the previous layout.
 
 **Remote durability metrics**
 

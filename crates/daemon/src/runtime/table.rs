@@ -1263,7 +1263,7 @@ impl TableWork {
         {
             return Ok(false);
         }
-        let checkpoints = self.control.checkpoints()?;
+        let checkpoints = self.control.checkpoint_protections()?;
         if unresolved_initial(id, &checkpoints) {
             return Ok(false);
         }
@@ -1399,7 +1399,7 @@ impl TableWork {
             }
         }
         if history_due {
-            let checkpoints = self.control.checkpoints()?;
+            let checkpoints = self.control.checkpoint_protections()?;
             if !unresolved_initial(id, &checkpoints) {
                 let protected =
                     flow_coordinator::GarbageProtection::from_checkpoints(id, &checkpoints);
@@ -1419,7 +1419,7 @@ impl TableWork {
         if garbage_due {
             let protection = flow_coordinator::GarbageProtection::from_checkpoints(
                 id,
-                &self.control.checkpoints()?,
+                &self.control.checkpoint_protections()?,
             );
             let started = Instant::now();
             let result = self

@@ -47,6 +47,13 @@ pub(crate) fn writer_config(config: &Config) -> flow_materializer::WriterConfig 
         ..Default::default()
     }
 }
+/// For files written to be read for long: compaction output and the initial copy.
+pub(crate) fn compacted_writer_config(config: &Config) -> flow_materializer::WriterConfig {
+    flow_materializer::WriterConfig {
+        row_group_rows: config.limits.parquet_row_group_rows,
+        ..writer_config(config)
+    }
+}
 /// Test-only seam: in-process tests run `init` and `run` against an in-memory
 /// catalog registered under the configured catalog `uri`.
 #[cfg(test)]
