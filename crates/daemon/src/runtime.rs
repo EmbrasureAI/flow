@@ -1654,6 +1654,9 @@ impl CheckpointTask {
                 return Ok(());
             }
             std::fs::create_dir_all(&directory)?;
+            // Checkpoints are serialized here, so a pending one is left over
+            // from an earlier failure; the sweep below removes its files.
+            control.forget_pending_checkpoints()?;
             let checkpoint =
                 control.checkpoint(&store, directory.join(uuid::Uuid::new_v4().to_string()))?;
             tracing::info!(event = "index_checkpoint_completed", revision = checkpoint.revision,
