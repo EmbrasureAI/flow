@@ -540,6 +540,39 @@ impl Storage for OpenDalStorage {
         )))
     }
 
+    async fn write_if_absent(&self, path: &str, bs: Bytes) -> Result<()> {
+        let (op, relative_path) = self.create_operator(&path)?;
+        if !op.info().full_capability().write_with_if_not_exists {
+            if op.exists(relative_path).await.map_err(from_opendal_error)? {
+                return Err(already_exists(path));
+            }
+            return self.write(path, bs).await;
+        }
+        op.write_with(relative_path, bs)
+            .if_not_exists(true)
+            .await
+            .map_err(from_opendal_error)?;
+        Ok(())
+    }
+
+    async fn writer_if_absent(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        let (op, relative_path) = self.create_operator(&path)?;
+        if !op.info().full_capability().write_with_if_not_exists {
+            if op.exists(relative_path).await.map_err(from_opendal_error)? {
+                return Err(already_exists(path));
+            }
+            return self.writer(path).await;
+        }
+        // S3 sends `If-None-Match: *` with the PUT or CompleteMultipartUpload,
+        // so a conflict surfaces as ConditionNotMatch when the writer closes.
+        Ok(Box::new(OpenDalWriter(
+            op.writer_with(relative_path)
+                .if_not_exists(true)
+                .await
+                .map_err(from_opendal_error)?,
+        )))
+    }
+
     async fn delete(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.create_operator(&path)?;
         Ok(op.delete(relative_path).await.map_err(from_opendal_error)?)
@@ -599,6 +632,13 @@ impl Storage for OpenDalStorage {
     fn new_output(&self, path: &str) -> Result<OutputFile> {
         Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
     }
+}
+
+fn already_exists(path: &str) -> iceberg::Error {
+    iceberg::Error::new(
+        iceberg::ErrorKind::PreconditionFailed,
+        format!("refusing to overwrite existing file {path}"),
+    )
 }
 
 // Newtype wrappers for opendal types to satisfy orphan rules.

@@ -500,6 +500,13 @@ string/binary lengths, offsets, and validity allowance. A row exceeding the
 batch limit fails before output registration. These limits apply during initial
 COPY, CDC publication, and maintenance.
 
+Row groups also end at a row count. Compacted files and the initial copy use
+`limits.parquet_row_group_rows` (default 122,880), so readers scan fewer, larger
+groups; CDC publication files keep 8,192 rows, so an epoch never buffers a
+larger group. Compaction still reads and rewrites in batches of 8,192 rows, and
+position reads use each file's offset index to decode only the pages holding
+the selected rows.
+
 Compaction, external reconciliation, and index rebuild share `[parquet_read]`:
 
 | Limit | Default | Admission check |

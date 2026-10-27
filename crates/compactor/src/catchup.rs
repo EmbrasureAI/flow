@@ -95,11 +95,7 @@ pub async fn catch_up(
         .filter(|entry| entry.content_type() == DataContentType::Data)
         .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
         .collect();
-    let batch_rows = output
-        .scratch
-        .batch_rows()
-        .min(config.row_group_rows)
-        .max(1);
+    let batch_rows = output.scratch.batch_rows().min(config.batch_rows).max(1);
     let batch_bytes = config.batch_bytes.min(config.row_group_bytes);
     ensure!(batch_bytes > 0, "mapping batch byte limit must be positive");
     let late_scan = format!("{}-late", output.operation_id.0);

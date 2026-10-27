@@ -213,16 +213,6 @@ impl RewriteManifestsAction {
 
     pub async fn write_artifacts(&self, table: &Table, cache: &ManifestCache) -> Result<()> {
         self.validate_base(table)?;
-        let artifacts = self.artifacts();
-        let existing = futures::future::try_join_all(
-            artifacts.iter().map(|path| table.file_io().exists(path)),
-        )
-        .await?;
-        if let Some((path, _)) = artifacts.iter().zip(existing).find(|(_, exists)| *exists) {
-            return Err(invalid(format!(
-                "refusing to overwrite prepared artifact {path}"
-            )));
-        }
         let snapshot = table
             .metadata()
             .current_snapshot()
@@ -243,8 +233,14 @@ impl RewriteManifestsAction {
                 .first()
                 .and_then(|path| by_path.get(path.as_str()))
                 .ok_or_else(|| invalid("manifest rewrite input disappeared"))?;
-            let mut writer =
-                manifest_writer(table, self.snapshot_id, &self.root, index, first.content)?;
+            let mut writer = manifest_writer(
+                table,
+                self.snapshot_id,
+                &self.root,
+                index,
+                first.content,
+                true,
+            )?;
             let mut live_entries = 0_u64;
             for path in group {
                 let manifest = by_path
@@ -294,6 +290,7 @@ impl RewriteManifestsAction {
             self.snapshot_id,
             self.base.snapshot_id,
             self.sequence_number,
+            true,
         )
         .await?;
         writer.add_manifests(

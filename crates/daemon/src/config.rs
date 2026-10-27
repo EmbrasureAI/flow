@@ -163,6 +163,10 @@ pub struct Limits {
     /// Additional retained collapse state per table worker; zero uses disk only.
     pub collapse_memory_bytes: usize,
     pub parquet_row_group_bytes: usize,
+    /// Rows per Parquet row group in compacted files and the initial copy,
+    /// which readers scan most. Publication files keep 8192 rows, so CDC
+    /// epochs do not buffer larger groups.
+    pub parquet_row_group_rows: usize,
     /// Queued lookahead descriptors shared by all tables. It makes tables
     /// schedulable; a dispatched epoch continues from the durable ledger up to
     /// its payload and descriptor-memory limits, so this does not cap batches.
@@ -211,6 +215,7 @@ impl Default for Limits {
             batch_bytes: 8 << 20,
             collapse_memory_bytes: 128 << 20,
             parquet_row_group_bytes: 32 << 20,
+            parquet_row_group_rows: 122_880,
             pending_transactions: 256,
             epoch_max_transactions: None,
             table_workers: 4,
@@ -393,6 +398,7 @@ impl Config {
                 && l.batch_rows >= 2
                 && l.batch_bytes >= l.chunk_bytes as usize
                 && l.parquet_row_group_bytes >= l.batch_bytes
+                && l.parquet_row_group_rows > 0
                 && l.batch_bytes <= i32::MAX as usize
                 && l.pending_transactions > 0
                 && l.epoch_max_transactions != Some(0)

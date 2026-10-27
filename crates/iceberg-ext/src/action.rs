@@ -769,8 +769,14 @@ async fn publish(
     let mut writers = Vec::new();
     let mut manifest_number = 0;
     for (manifest, entries) in rewritten {
-        let mut writer =
-            manifest_writer(table, snapshot_id, &root, manifest_number, manifest.content)?;
+        let mut writer = manifest_writer(
+            table,
+            snapshot_id,
+            &root,
+            manifest_number,
+            manifest.content,
+            false,
+        )?;
         manifest_number += 1;
         for entry in entries.iter().filter(|entry| entry.is_alive()) {
             let sequence = entry
@@ -815,7 +821,8 @@ async fn publish(
         if files.is_empty() && removed.is_empty() {
             continue;
         }
-        let mut writer = manifest_writer(table, snapshot_id, &root, manifest_number, content)?;
+        let mut writer =
+            manifest_writer(table, snapshot_id, &root, manifest_number, content, false)?;
         manifest_number += 1;
         for file in files {
             writer.add_file(file.clone(), sequence)?;
@@ -846,6 +853,7 @@ async fn publish(
         snapshot_id,
         metadata.current_snapshot_id(),
         sequence_number,
+        false,
     )
     .await?;
     writer.add_manifests(manifests.into_iter())?;
@@ -998,17 +1006,25 @@ pub(crate) async fn commit_snapshot(
     })
 }
 
+/// `if_absent` makes the write fail instead of replacing an existing manifest,
+/// as prepared artifacts require.
 pub(crate) fn manifest_writer(
     table: &Table,
     snapshot_id: i64,
     root: &str,
     number: usize,
     content: ManifestContentType,
+    if_absent: bool,
 ) -> Result<ManifestWriter> {
+    let output = table
+        .file_io()
+        .new_output(format!("{root}-m{number}.avro"))?;
     let builder = ManifestWriterBuilder::new(
-        table
-            .file_io()
-            .new_output(format!("{root}-m{number}.avro"))?,
+        if if_absent {
+            output.if_absent()
+        } else {
+            output
+        },
         Some(snapshot_id),
         table.metadata().current_schema().clone(),
         table.metadata().default_partition_spec().as_ref().clone(),
@@ -1028,8 +1044,15 @@ pub(crate) async fn manifest_list_writer(
     snapshot_id: i64,
     parent: Option<i64>,
     sequence: i64,
+    if_absent: bool,
 ) -> Result<ManifestListWriter> {
-    let output = table.file_io().new_output(path)?.writer().await?;
+    let output = table.file_io().new_output(path)?;
+    let output = if if_absent {
+        output.if_absent()
+    } else {
+        output
+    };
+    let output = output.writer().await?;
     Ok(if table.metadata().format_version() == FormatVersion::V3 {
         ManifestListWriter::v3(
             output,

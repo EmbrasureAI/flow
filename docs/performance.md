@@ -79,6 +79,14 @@ compaction, for up to about 90 MiB more peak memory per running build. These
 are worker timings on local disk, not publication latency or service
 throughput; the numbers above were not rerun.
 
+Those worker benchmarks linked the system allocator. Built with jemalloc, as
+the daemon is, the same worker benchmark ran 9–17% faster on two vCPUs in
+paired runs on a noisy host, with 8–16% less CPU
+([report](benchmarks/jemalloc-and-reconcile.md)). The same report times
+reconciliation of an external rewrite at about 46,000 rows/s on two vCPUs,
+mostly in unbatched row-index lookups and apply; larger scratch memtables gave
+no consistent gain there and were not adopted.
+
 ## Reproducibility
 
 The [benchmark report](benchmarks/v3-deletion-vectors.md) gives the environment,
