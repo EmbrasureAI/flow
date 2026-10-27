@@ -231,7 +231,7 @@ pub async fn build_data(
         input_delete_bytes = plan.delete_input_bytes,
         "compaction metadata admitted before file reads"
     );
-    let batch_rows = scratch.batch_rows().min(config.row_group_rows).max(1);
+    let batch_rows = scratch.batch_rows().min(config.batch_rows).max(1);
     scratch.begin_prepare(PreparedOperation {
         id: operation_id.clone(),
         table_id: schema.table_id,
@@ -561,11 +561,7 @@ pub(crate) async fn write_residual_positions(
         .div_ceil(MAX_COHORTS)
         .max(config.row_group_rows as u64)
         .max(1);
-    let batch_rows = output
-        .scratch
-        .batch_rows()
-        .min(config.row_group_rows)
-        .max(1);
+    let batch_rows = output.scratch.batch_rows().min(config.batch_rows).max(1);
     config.target_file_bytes = usize::MAX;
     let mut writer = DeleteWriter::new_for_version(
         table.file_io().clone(),

@@ -489,7 +489,7 @@ pub(crate) async fn resume(
         WriterConfig {
             target_file_bytes: usize::try_from(config.compaction.l1_target_bytes)
                 .context("initial target file size exceeds platform limit")?,
-            ..crate::services::writer_config(config)
+            ..crate::services::compacted_writer_config(config)
         },
         config.limits.batch_rows,
         config.limits.batch_bytes,

@@ -203,6 +203,13 @@ This will be the initial public release, `0.1.0`.
 - The scheduler no longer rescans the operations column family on every loop
   iteration, and `status.json` updates are coalesced and written off the
   scheduler task.
+- Compacted files and the initial copy use Parquet row groups of up to
+  `limits.parquet_row_group_rows` (default 122,880) instead of 8,192 rows. In
+  the service benchmark full scans took 15–17% less time, while CDC service
+  time per mutation rose about 3%, from compaction encoding larger groups
+  alongside it. CDC publication files keep 8,192 rows, compaction keeps
+  8,192-row batches, and position reads use the offset index to skip pages.
+  Set the limit to 8192 for the previous layout.
 
 **Remote durability metrics**
 

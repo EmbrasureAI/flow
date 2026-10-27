@@ -31,6 +31,9 @@ use crate::{
 pub struct WriterConfig {
     pub target_file_bytes: usize,
     pub row_group_rows: usize,
+    /// Rows per batch when compaction reads and rewrites files, independent of
+    /// how many rows each written row group holds.
+    pub batch_rows: usize,
     /// Logical input bytes per Arrow batch, including offsets and validity allowance.
     /// This is not a bound on codec buffers or process memory.
     pub batch_bytes: usize,
@@ -44,6 +47,7 @@ impl Default for WriterConfig {
         Self {
             target_file_bytes: 16 * 1024 * 1024,
             row_group_rows: 8192,
+            batch_rows: 8192,
             batch_bytes: 8 * 1024 * 1024,
             row_group_bytes: 32 * 1024 * 1024,
             compression: Compression::ZSTD(ZstdLevel::default()),
@@ -56,6 +60,7 @@ impl WriterConfig {
         ensure!(
             self.target_file_bytes > 0
                 && self.row_group_rows > 0
+                && self.batch_rows > 0
                 && self.batch_bytes > 0
                 && self.row_group_bytes > 0,
             "writer limits must be positive"

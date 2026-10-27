@@ -661,3 +661,45 @@ async fn prefetched_inputs_decode_like_range_reads_and_check_manifest_sizes() ->
     assert!(ordered.next(&sizes[1].0).await.is_err());
     Ok(())
 }
+
+#[tokio::test]
+async fn position_reads_select_rows_across_pages_of_one_large_row_group() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("large-group.parquet");
+    let schema = schema(&[ColumnType::Int64, ColumnType::String], &[1, 2]);
+    let rows: Vec<Row> = (0..50_000)
+        .map(|id| vec![Value::Int64(id), Value::String(format!("row-{id}"))])
+        .collect();
+    // One row group of many small pages, as compaction now writes.
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rows.len()))
+        .set_data_page_row_count_limit(1_000)
+        .set_write_batch_size(1_000)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(&path)?,
+        arrow_schema(&schema),
+        Some(properties),
+    )?;
+    writer.write(&rows_to_batch(&schema, &rows)?)?;
+    writer.close()?;
+    let positions = [0, 3, 1_000, 25_000, 49_999];
+    let batches = read_positions(
+        &iceberg::io::FileIO::new_with_fs(),
+        path.to_str().unwrap(),
+        &positions,
+        8192,
+        &ReadLimits::default(),
+    )
+    .await?;
+    let mut read = Vec::new();
+    for batch in &batches {
+        read.extend(rows_from_batch(&schema, batch)?);
+    }
+    let expected: Vec<Row> = positions
+        .iter()
+        .map(|&p| rows[p as usize].clone())
+        .collect();
+    assert_eq!(read, expected);
+    Ok(())
+}
