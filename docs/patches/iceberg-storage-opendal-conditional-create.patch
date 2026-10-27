@@ -1,0 +1,77 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 85ed1ea..89bcb9b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -540,6 +540,39 @@ impl Storage for OpenDalStorage {
+         )))
+     }
+ 
++    async fn write_if_absent(&self, path: &str, bs: Bytes) -> Result<()> {
++        let (op, relative_path) = self.create_operator(&path)?;
++        if !op.info().full_capability().write_with_if_not_exists {
++            if op.exists(relative_path).await.map_err(from_opendal_error)? {
++                return Err(already_exists(path));
++            }
++            return self.write(path, bs).await;
++        }
++        op.write_with(relative_path, bs)
++            .if_not_exists(true)
++            .await
++            .map_err(from_opendal_error)?;
++        Ok(())
++    }
++
++    async fn writer_if_absent(&self, path: &str) -> Result<Box<dyn FileWrite>> {
++        let (op, relative_path) = self.create_operator(&path)?;
++        if !op.info().full_capability().write_with_if_not_exists {
++            if op.exists(relative_path).await.map_err(from_opendal_error)? {
++                return Err(already_exists(path));
++            }
++            return self.writer(path).await;
++        }
++        // S3 sends `If-None-Match: *` with the PUT or CompleteMultipartUpload,
++        // so a conflict surfaces as ConditionNotMatch when the writer closes.
++        Ok(Box::new(OpenDalWriter(
++            op.writer_with(relative_path)
++                .if_not_exists(true)
++                .await
++                .map_err(from_opendal_error)?,
++        )))
++    }
++
+     async fn delete(&self, path: &str) -> Result<()> {
+         let (op, relative_path) = self.create_operator(&path)?;
+         Ok(op.delete(relative_path).await.map_err(from_opendal_error)?)
+@@ -601,6 +634,13 @@ impl Storage for OpenDalStorage {
+     }
+ }
+ 
++fn already_exists(path: &str) -> iceberg::Error {
++    iceberg::Error::new(
++        iceberg::ErrorKind::PreconditionFailed,
++        format!("refusing to overwrite existing file {path}"),
++    )
++}
++
+ // Newtype wrappers for opendal types to satisfy orphan rules.
+ // We can't implement iceberg's FileRead/FileWrite traits directly on opendal's
+ // Reader/Writer since neither trait nor type is defined in this crate.
+diff --git a/src/resolving.rs b/src/resolving.rs
+index cd1e102..e18abc7 100644
+--- a/src/resolving.rs
++++ b/src/resolving.rs
+@@ -313,6 +313,14 @@ impl Storage for OpenDalResolvingStorage {
+         self.resolve(path)?.writer(path).await
+     }
+ 
++    async fn write_if_absent(&self, path: &str, bs: Bytes) -> Result<()> {
++        self.resolve(path)?.write_if_absent(path, bs).await
++    }
++
++    async fn writer_if_absent(&self, path: &str) -> Result<Box<dyn FileWrite>> {
++        self.resolve(path)?.writer_if_absent(path).await
++    }
++
+     async fn delete(&self, path: &str) -> Result<()> {
+         self.resolve(path)?.delete(path).await
+     }

@@ -263,12 +263,13 @@ impl VectorWriter {
                     })
                     .await?;
             }
-            ensure!(
-                !self.file_io.exists(&path).await?,
-                "refusing to overwrite prepared delete artifact"
-            );
             self.current = Some(
-                PuffinWriter::new(&self.file_io.new_output(&path)?, HashMap::new(), false).await?,
+                PuffinWriter::new(
+                    &self.file_io.new_output(&path)?.if_absent(),
+                    HashMap::new(),
+                    false,
+                )
+                .await?,
             );
         }
         let blob = Blob::builder()

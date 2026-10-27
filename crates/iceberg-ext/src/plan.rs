@@ -25,20 +25,6 @@ pub async fn write_artifact_plan(
     added_deletes: &[DataFile],
 ) -> Result<()> {
     CommitBase::new(table).validate(table)?;
-    let candidates = [
-        path.to_owned(),
-        format!("{path}-m0.avro"),
-        format!("{path}-m1.avro"),
-    ];
-    let existing = futures::future::try_join_all(
-        candidates
-            .iter()
-            .map(|candidate| table.file_io().exists(candidate)),
-    )
-    .await?;
-    if existing.into_iter().any(|exists| exists) {
-        return Err(invalid("artifact plan attempt already exists"));
-    }
     let root = path;
     let mut writers = Vec::new();
     for (number, (files, content)) in [
@@ -51,7 +37,8 @@ pub async fn write_artifact_plan(
         if files.is_empty() {
             continue;
         }
-        let mut writer = manifest_writer(table, 0, root, number, content)?;
+        // Conditional creates refuse to replace any artifact of an earlier attempt.
+        let mut writer = manifest_writer(table, 0, root, number, content, true)?;
         for file in files {
             writer.add_file(file.clone(), -1)?;
         }
@@ -64,7 +51,12 @@ pub async fn write_artifact_plan(
             .map(|writer| writer.write_manifest_file()),
     )
     .await?;
-    let output = table.file_io().new_output(path)?.writer().await?;
+    let output = table
+        .file_io()
+        .new_output(path)?
+        .if_absent()
+        .writer()
+        .await?;
     // Prepared plans deliberately leave lineage unassigned until publication.
     let mut writer = if table.metadata().format_version() == FormatVersion::V3 {
         ManifestListWriter::v3(output, 0, None, 0, None)

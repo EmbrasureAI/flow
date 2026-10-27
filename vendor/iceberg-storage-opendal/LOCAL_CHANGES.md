@@ -53,3 +53,12 @@ patch -p3 < docs/patches/iceberg-storage-opendal-debug-redaction.patch
 The patches include prominent local-modification notices. This provenance file is
 added separately. The crate's original Cargo.lock is omitted because the repository
 uses its root Cargo.lock. No upstream submission is claimed.
+
+The conditional-create patch implements `write_if_absent` and
+`writer_if_absent` with OpenDAL's `if_not_exists` where the operator supports
+it. S3 sends `If-None-Match: *` with the PUT or the CompleteMultipartUpload,
+so a streamed writer reports a conflict as `ConditionNotMatch` when it closes;
+the filesystem service creates the file exclusively. Other operators fall back
+to checking existence first. The resolving storage forwards both methods.
+Changed files: `src/lib.rs` and `src/resolving.rs`. See
+`docs/patches/iceberg-storage-opendal-conditional-create.patch`.

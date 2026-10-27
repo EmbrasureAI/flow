@@ -313,6 +313,14 @@ impl Storage for OpenDalResolvingStorage {
         self.resolve(path)?.writer(path).await
     }
 
+    async fn write_if_absent(&self, path: &str, bs: Bytes) -> Result<()> {
+        self.resolve(path)?.write_if_absent(path, bs).await
+    }
+
+    async fn writer_if_absent(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        self.resolve(path)?.writer_if_absent(path).await
+    }
+
     async fn delete(&self, path: &str) -> Result<()> {
         self.resolve(path)?.delete(path).await
     }

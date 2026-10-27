@@ -439,11 +439,11 @@ impl DataWriter {
                     })
                     .await?;
             }
-            ensure!(
-                !self.file_io.exists(&path).await?,
-                "refusing to overwrite prepared artifact {path}"
+            self.current = Some(
+                self.builder
+                    .build(self.file_io.new_output(path)?.if_absent())
+                    .await?,
             );
-            self.current = Some(self.builder.build(self.file_io.new_output(path)?).await?);
         }
         let writer = self.current.as_mut().expect("writer opened above");
         self.row_group
@@ -623,11 +623,11 @@ impl ParquetDeleteWriter {
                     })
                     .await?;
             }
-            ensure!(
-                !self.file_io.exists(&path).await?,
-                "refusing to overwrite prepared delete artifact"
+            self.current = Some(
+                self.builder
+                    .build(self.file_io.new_output(path)?.if_absent())
+                    .await?,
             );
-            self.current = Some(self.builder.build(self.file_io.new_output(path)?).await?);
         }
         let writer = self.current.as_mut().expect("writer opened above");
         self.row_group
