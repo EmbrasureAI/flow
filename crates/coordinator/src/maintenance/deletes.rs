@@ -4,18 +4,20 @@ use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
 use flow_compactor::{
     DeleteLayout, DeleteReadLimits, Level, MergeBudget, PublicationPressure, TargetDeleteFile,
-    TargetDeletes, stage_delete_files,
+    TargetDeletes, read_delete_files,
 };
 use flow_iceberg_ext::{CommitBase, SnapshotView, position_delete_may_apply, write_artifact_plan};
 use flow_materializer::{DeleteWriter, iceberg_schema};
-use flow_model::{FileId, OperationId, RowLocation, TableSchema};
+use flow_model::{FileId, OperationId, TableSchema};
 use flow_state_store::{OperationKind, PreparedOperation, StateStore};
 use iceberg::{spec::DataContentType, table::Table};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Limits one position-delete consolidation. Sorting and deduplication spill to
-/// the worker's scratch index; neither data files nor the live row index are read.
+/// Limits one position-delete consolidation. Its inputs' effective positions are
+/// merged in memory, 16 bytes each, so `max_input_rows` also bounds that memory;
+/// neither data files nor the live row index are read. The scratch store only
+/// sets the write batch size.
 #[derive(Debug, Clone)]
 pub struct DeleteRewritePolicy {
     pub min_input_files: usize,
@@ -319,7 +321,6 @@ impl TableMaintenance {
         })
         .await?;
         let worker_table = table.clone();
-        let worker_schema = schema.clone();
         let worker_id = id.clone();
         let limits = DeleteReadLimits {
             max_bytes: policy.max_input_bytes,
@@ -336,14 +337,11 @@ impl TableMaintenance {
         let (output, scanned_rows, isolation) = tokio::task::spawn_blocking(move || {
             super::worker_runtime()?.block_on(async move {
                 let batch_rows = scratch.batch_rows().min(8192);
-                let scanned_rows = stage_delete_files(
+                let (positions, scanned_rows) = read_delete_files(
                     &worker_table,
-                    &worker_schema,
                     &worker_view,
                     &data_files,
                     &selected,
-                    &scratch,
-                    &worker_id.0,
                     batch_rows,
                     limits,
                     &read_limits,
@@ -355,8 +353,8 @@ impl TableMaintenance {
                         .iter()
                         .map(|target| (target.id.clone(), 0u64))
                         .collect::<HashMap<_, _>>();
-                    for position in scratch.position_deletes(&worker_id.0, &table_id) {
-                        if let Some(count) = counts.get_mut(&position?.data_file_id) {
+                    for (target, _) in positions.iter() {
+                        if let Some(count) = counts.get_mut(target) {
                             *count += 1;
                         }
                     }
@@ -371,9 +369,7 @@ impl TableMaintenance {
                 } else {
                     None
                 };
-                let mut positions = scratch.position_deletes(&worker_id.0, &table_id);
-                let first = positions.next().transpose()?;
-                if !repair && input_files == 1 && first.is_some() {
+                if !repair && input_files == 1 && !positions.is_empty() {
                     return Ok((None, scanned_rows, None));
                 }
                 let mut writer = DeleteWriter::new_for_version(
@@ -386,10 +382,9 @@ impl TableMaintenance {
                 )?;
                 let mut batch = Vec::with_capacity(batch_rows);
                 let mut range = None;
-                for position in first.map(Ok).into_iter().chain(positions) {
-                    let position = position?;
+                for (data_file, position) in positions.iter() {
                     if let Some((target, _)) = &isolation {
-                        let next_range = position.data_file_id.cmp(target);
+                        let next_range = data_file.cmp(target);
                         if range.is_some_and(|previous| previous != next_range) {
                             writer.write(&batch).await?;
                             batch.clear();
@@ -397,7 +392,7 @@ impl TableMaintenance {
                         }
                         range = Some(next_range);
                     }
-                    batch.push(position);
+                    batch.push((data_file.0.as_str(), position));
                     if batch.len() == batch_rows {
                         writer.write(&batch).await?;
                         batch.clear();
@@ -631,7 +626,6 @@ impl TableMaintenance {
         })
         .await?;
         let worker_table = table.clone();
-        let worker_schema = schema.clone();
         let worker_id = id.clone();
         let limits = DeleteReadLimits {
             max_bytes: policy.max_input_bytes,
@@ -653,25 +647,22 @@ impl TableMaintenance {
         let (output, scanned_rows, merged) = tokio::task::spawn_blocking(move || {
             super::worker_runtime()?.block_on(async move {
                 let batch_rows = scratch.batch_rows().min(8192);
-                let mut scanned_rows = stage_delete_files(
+                let (positions, mut scanned_rows) = read_delete_files(
                     &worker_table,
-                    &worker_schema,
                     &worker_view,
                     &data_files,
                     &worker_selected,
-                    &scratch,
-                    &worker_id.0,
                     batch_rows,
                     limits,
                     &read_limits,
                 )
                 .await?;
-                let mut new_rows = HashMap::<FileId, u64>::new();
-                for position in scratch.position_deletes(&worker_id.0, &table_id) {
-                    *new_rows.entry(position?.data_file_id).or_default() += 1;
+                let mut new_rows = HashMap::<&FileId, u64>::new();
+                for (target, _) in positions.iter() {
+                    *new_rows.entry(target).or_default() += 1;
                 }
                 // Every target that keeps a single-target file afterwards.
-                for target in new_rows.keys() {
+                for &target in new_rows.keys() {
                     targeted.entry(target.clone()).or_default();
                 }
                 let targets = targeted
@@ -685,16 +676,14 @@ impl TableMaintenance {
                     })
                     .collect::<Vec<_>>();
                 let merged = compaction.select_target_merges(&targets, budget);
-                let merge_scan = format!("{}-targets", worker_id.0);
-                if !merged.is_empty() {
-                    scanned_rows += stage_delete_files(
+                let merged_positions = if merged.is_empty() {
+                    None
+                } else {
+                    let (positions, rows) = read_delete_files(
                         &worker_table,
-                        &worker_schema,
                         &worker_view,
                         &data_files,
                         &merged,
-                        &scratch,
-                        &merge_scan,
                         batch_rows,
                         DeleteReadLimits {
                             max_bytes: budget.bytes,
@@ -703,7 +692,9 @@ impl TableMaintenance {
                         &read_limits,
                     )
                     .await?;
-                }
+                    scanned_rows += rows;
+                    Some(positions)
+                };
                 let mut writer = DeleteWriter::new_for_version(
                     worker_table.file_io().clone(),
                     worker_table.metadata().location(),
@@ -712,28 +703,25 @@ impl TableMaintenance {
                     writer_config,
                     worker_table.metadata().format_version(),
                 )?;
-                let merged_positions = (!merged.is_empty())
-                    .then(|| scratch.position_deletes(&merge_scan, &table_id))
-                    .into_iter()
-                    .flatten();
                 let mut batch = Vec::with_capacity(batch_rows);
-                let mut target = None::<FileId>;
-                for position in merge_positions(
-                    scratch.position_deletes(&worker_id.0, &table_id),
-                    merged_positions,
+                let mut target = None::<&FileId>;
+                for (data_file, position) in merge_positions(
+                    positions.iter(),
+                    merged_positions
+                        .iter()
+                        .flat_map(|positions| positions.iter()),
                 ) {
-                    let position = position?;
-                    if target.as_ref() != Some(&position.data_file_id) {
-                        if let Some(previous) = &target
-                            && !worker_ranges.continues(previous, &position.data_file_id)
+                    if target != Some(data_file) {
+                        if let Some(previous) = target
+                            && !worker_ranges.continues(previous, data_file)
                         {
                             writer.write(&batch).await?;
                             batch.clear();
                             writer.finish_target().await?;
                         }
-                        target = Some(position.data_file_id.clone());
+                        target = Some(data_file);
                     }
-                    batch.push(position);
+                    batch.push((data_file.0.as_str(), position));
                     if batch.len() == batch_rows {
                         writer.write(&batch).await?;
                         batch.clear();
@@ -1027,19 +1015,18 @@ fn delete_path_bounds(file: &iceberg::spec::DataFile) -> Option<(FileId, FileId)
 
 /// Merge two position streams, each sorted and unique by path and position,
 /// into one, keeping a position present in both once.
-fn merge_positions<E>(
-    left: impl Iterator<Item = std::result::Result<RowLocation, E>>,
-    right: impl Iterator<Item = std::result::Result<RowLocation, E>>,
-) -> impl Iterator<Item = std::result::Result<RowLocation, E>> {
+fn merge_positions<'a>(
+    left: impl Iterator<Item = (&'a FileId, u64)>,
+    right: impl Iterator<Item = (&'a FileId, u64)>,
+) -> impl Iterator<Item = (&'a FileId, u64)> {
     let mut left = left.peekable();
     let mut right = right.peekable();
     std::iter::from_fn(move || {
         let order = match (left.peek(), right.peek()) {
             (None, None) => return None,
-            (Some(Err(_)), _) | (Some(_), None) => Ordering::Less,
-            (_, Some(Err(_))) | (None, Some(_)) => Ordering::Greater,
-            (Some(Ok(left)), Some(Ok(right))) => (&left.data_file_id, left.row_position)
-                .cmp(&(&right.data_file_id, right.row_position)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(left), Some(right)) => left.cmp(right),
         };
         match order {
             Ordering::Less => left.next(),

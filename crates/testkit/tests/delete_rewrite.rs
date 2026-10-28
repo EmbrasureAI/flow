@@ -2955,3 +2955,475 @@ async fn per_target_delete_files_stay_bounded_under_skewed_updates() {
     assert!(with.consolidation_rows <= 3 * with.cdc_deletes);
     assert!(with.data_rewrite_bytes * 4 <= without.data_rewrite_bytes * 5);
 }
+
+/// Delete files whose positions repeat within and across files, name paths that
+/// are never live or not yet live at the delete's sequence, cover several
+/// targets each, and include an unsorted external file and a dangling one.
+/// Paths are long, as object-store paths are.
+struct SpoolCase {
+    temp: tempfile::TempDir,
+    catalog: std::sync::Arc<dyn Catalog>,
+    index: StateStore,
+    schema: flow_model::TableSchema,
+    head: iceberg::table::Table,
+    /// Every committed delete file, in commit order.
+    deletes: Vec<FileId>,
+    /// The effective positions, by hand.
+    expected: Vec<(FileId, u64)>,
+}
+
+impl SpoolCase {
+    async fn new() -> Self {
+        let temp = tempfile::TempDir::new().unwrap();
+        let catalog: std::sync::Arc<dyn Catalog> =
+            std::sync::Arc::new(flow_testkit::catalog(&temp.path().join("warehouse")).await);
+        let schema = flow_testkit::schema(1);
+        let mut head = flow_testkit::table(catalog.as_ref(), &schema).await;
+        let long = "object-store-partition-prefix-".repeat(3);
+        let mut data = Vec::new();
+        let mut locations = Vec::new();
+        for name in ["a", "b", "c"] {
+            let mut writer = DataWriter::new(
+                head.file_io().clone(),
+                head.metadata().location(),
+                &OperationId(format!("{long}{name}")),
+                schema.clone(),
+                0,
+                WriterConfig::default(),
+            )
+            .unwrap();
+            locations.push(
+                writer
+                    .write(&(0..6).map(row).collect::<Vec<_>>(), PgLsn(80))
+                    .await
+                    .unwrap()
+                    .locations,
+            );
+            data.extend(writer.close().await.unwrap());
+        }
+        assert!(data[0].file_path().len() > 120);
+        let never = FileId(format!(
+            "{}/data/{long}never-live.parquet",
+            head.metadata().location()
+        ));
+        let at = |file: usize, position: u64| {
+            let mut location = locations[0][0].clone();
+            location.data_file_id = if file == 3 {
+                never.clone()
+            } else {
+                FileId(data[file].file_path().into())
+            };
+            location.row_position = position;
+            location
+        };
+        let paths = |count: usize| {
+            data[..count]
+                .iter()
+                .map(|file| file.file_path().to_owned())
+                .collect::<Vec<_>>()
+        };
+        head = RowDeltaAction::new(&head, "data-ab")
+            .add_data_files(data[..2].to_vec())
+            .commit(catalog.as_ref(), &head)
+            .await
+            .unwrap()
+            .table;
+        let mut deletes = Vec::new();
+        let mut commit = async |head: &iceberg::table::Table,
+                                id: &str,
+                                files: Vec<iceberg::spec::DataFile>,
+                                live: usize| {
+            deletes.extend(files.iter().map(|file| FileId(file.file_path().into())));
+            RowDeltaAction::new(head, id)
+                .add_delete_files(files)
+                .validate_data_files_exist(paths(live))
+                .commit(catalog.as_ref(), head)
+                .await
+                .unwrap()
+                .table
+        };
+        let first = [(0, 0), (0, 1), (0, 2), (1, 0), (3, 0)];
+        let files = delete(&head, "d1", first.map(|(f, p)| at(f, p)).to_vec()).await;
+        head = commit(&head, "d1", files, 2).await;
+        // C is not yet live, so its position here never applies.
+        let second = [(0, 1), (0, 3), (1, 0), (1, 2), (2, 0)];
+        let files = delete(&head, "d2", second.map(|(f, p)| at(f, p)).to_vec()).await;
+        head = commit(&head, "d2", files, 2).await;
+        head = RowDeltaAction::new(&head, "data-c")
+            .add_data_files(vec![data[2].clone()])
+            .commit(catalog.as_ref(), &head)
+            .await
+            .unwrap()
+            .table;
+        let third = [(0, 3), (0, 4), (1, 5), (2, 1), (2, 2)];
+        let files = delete(&head, "d3", third.map(|(f, p)| at(f, p)).to_vec()).await;
+        head = commit(&head, "d3", files, 3).await;
+        // Another engine's file: unsorted, with a repeated position, no bounds.
+        let delete_schema = flow_model::TableSchema {
+            table_id: flow_model::TableId(0),
+            version: 0,
+            columns: [(2147483546, "file_path"), (2147483545, "pos")]
+                .into_iter()
+                .map(|(field_id, name)| flow_model::Column {
+                    field_id,
+                    name: name.into(),
+                    data_type: if field_id == 2147483546 {
+                        flow_model::ColumnType::String
+                    } else {
+                        flow_model::ColumnType::Int64
+                    },
+                    nullable: false,
+                })
+                .collect(),
+            primary_key: vec![],
+            append_only: true,
+        };
+        let unsorted =
+            [(2, 3), (0, 5), (1, 1), (0, 0), (2, 1), (0, 5), (3, 1)].map(|(file, position)| {
+                vec![
+                    Value::String(at(file, position).data_file_id.0),
+                    Value::Int64(position as i64),
+                ]
+            });
+        let batch = flow_materializer::rows_to_batch(&delete_schema, &unsorted).unwrap();
+        let mut buffer = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let path = format!(
+            "{}/data/external-unsorted.parquet",
+            head.metadata().location()
+        );
+        let size = buffer.len() as u64;
+        head.file_io()
+            .new_output(&path)
+            .unwrap()
+            .write(buffer.into())
+            .await
+            .unwrap();
+        let external = iceberg::spec::DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_format(iceberg::spec::DataFileFormat::Parquet)
+            .file_path(path)
+            .partition(iceberg::spec::Struct::empty())
+            .partition_spec_id(0)
+            .record_count(unsorted.len() as u64)
+            .file_size_in_bytes(size)
+            .build()
+            .unwrap();
+        head = commit(&head, "d4", vec![external], 3).await;
+        let dangling = [(3, 2), (3, 3)];
+        let files = delete(&head, "d5", dangling.map(|(f, p)| at(f, p)).to_vec()).await;
+        head = commit(&head, "d5", files, 3).await;
+        let expected = [
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (0, 5),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 5),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+        ]
+        .map(|(file, position)| (at(file, position).data_file_id, position))
+        .to_vec();
+        let control = flow_state_store::ControlStore::open(temp.path().join("control")).unwrap();
+        let index = control
+            .initialize_index(temp.path().join("index"), options())
+            .unwrap();
+        let id = OperationId("seed-index".into());
+        index
+            .prepare(
+                PreparedOperation {
+                    id: id.clone(),
+                    table_id: schema.table_id,
+                    kind: OperationKind::Ingest,
+                    base_snapshot_id: None,
+                    last_lsn: PgLsn(80),
+                    schema_version: schema.version,
+                    artifacts: vec![],
+                    payload: vec![],
+                },
+                [],
+            )
+            .unwrap();
+        let snapshot = head.metadata().current_snapshot().unwrap();
+        index
+            .mark_committed(&id, snapshot.snapshot_id(), snapshot.sequence_number())
+            .unwrap();
+        index.apply_committed(&id).unwrap();
+        index.forget_applied(&id).unwrap();
+        Self {
+            temp,
+            catalog,
+            index,
+            schema,
+            head,
+            deletes,
+            expected,
+        }
+    }
+
+    fn scratch(&self, name: &str, batch_rows: usize) -> StateStore {
+        StateStore::open(
+            self.temp.path().join(name),
+            flow_state_store::StateStoreOptions {
+                apply_batch_rows: batch_rows,
+                ..options()
+            },
+        )
+        .unwrap()
+    }
+
+    /// What the scratch spool stages for `deletes`, as consolidation read it.
+    async fn spooled(
+        &self,
+        view: &SnapshotView,
+        deletes: &BTreeSet<FileId>,
+        batch_rows: usize,
+        limits: DeleteReadLimits,
+    ) -> anyhow::Result<(Vec<flow_model::RowLocation>, u64)> {
+        let scratch = self.scratch(&format!("spool-{}", uuid::Uuid::new_v4()), batch_rows);
+        let rows = stage_delete_files(
+            &self.head,
+            &self.schema,
+            view,
+            &live_data(view),
+            deletes,
+            &scratch,
+            "spool",
+            batch_rows,
+            limits,
+            &flow_compactor::ReadLimits::default(),
+        )
+        .await?;
+        let positions = scratch
+            .position_deletes("spool", &self.schema.table_id)
+            .collect::<flow_state_store::Result<Vec<_>>>()?;
+        Ok((positions, rows))
+    }
+}
+
+fn live_data(view: &SnapshotView) -> BTreeSet<FileId> {
+    view.live_files
+        .values()
+        .filter(|entry| entry.content_type() == DataContentType::Data)
+        .map(|entry| FileId(entry.file_path().into()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_memory_delete_reads_match_the_scratch_spool() {
+    let case = SpoolCase::new().await;
+    let view = SnapshotView::current(&case.head).await.unwrap();
+    let all = case.deletes.iter().cloned().collect::<BTreeSet<_>>();
+    let unlimited = DeleteReadLimits {
+        max_bytes: u64::MAX,
+        max_rows: u64::MAX,
+    };
+    let only = |indexes: &[usize]| {
+        indexes
+            .iter()
+            .map(|&index| case.deletes[index].clone())
+            .collect::<BTreeSet<_>>()
+    };
+    // All inputs, the unsorted external file, overlapping pairs, a file whose
+    // positions are all dangling, and no input at all.
+    for (deletes, batch_rows) in [
+        (all.clone(), 2),
+        (all.clone(), 1024),
+        (only(&[3]), 2),
+        (only(&[0, 1]), 3),
+        (only(&[1, 2, 3]), 2),
+        (only(&[4]), 2),
+        (BTreeSet::new(), 2),
+    ] {
+        let (spooled, spooled_rows) = case
+            .spooled(&view, &deletes, batch_rows, unlimited)
+            .await
+            .unwrap();
+        let (positions, rows) = flow_compactor::read_delete_files(
+            &case.head,
+            &view,
+            &live_data(&view),
+            &deletes,
+            batch_rows,
+            unlimited,
+            &flow_compactor::ReadLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows, spooled_rows);
+        assert_eq!(positions.len(), spooled.len());
+        assert_eq!(
+            positions
+                .iter()
+                .map(|(file, position)| (file.clone(), position))
+                .collect::<Vec<_>>(),
+            spooled
+                .iter()
+                .map(|location| (location.data_file_id.clone(), location.row_position))
+                .collect::<Vec<_>>()
+        );
+        if deletes == all {
+            assert_eq!(rows, 24);
+            assert_eq!(
+                positions
+                    .iter()
+                    .map(|(file, position)| (file.clone(), position))
+                    .collect::<Vec<_>>(),
+                case.expected
+            );
+        }
+        if deletes.len() < 2 && deletes.iter().all(|id| *id == case.deletes[4]) {
+            assert!(positions.is_empty());
+        }
+    }
+    // Budget and identity failures are the spool's.
+    let missing = BTreeSet::from([FileId("missing.parquet".into())]);
+    for (deletes, limits) in [
+        (
+            all.clone(),
+            DeleteReadLimits {
+                max_bytes: 1,
+                max_rows: u64::MAX,
+            },
+        ),
+        (
+            all.clone(),
+            DeleteReadLimits {
+                max_bytes: u64::MAX,
+                max_rows: 23,
+            },
+        ),
+        (missing, unlimited),
+    ] {
+        let spooled = case
+            .spooled(&view, &deletes, 2, limits)
+            .await
+            .unwrap_err()
+            .to_string();
+        let error = flow_compactor::read_delete_files(
+            &case.head,
+            &view,
+            &live_data(&view),
+            &deletes,
+            2,
+            limits,
+            &flow_compactor::ReadLimits::default(),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(error, spooled);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consolidation_writes_the_files_the_scratch_spool_wrote() {
+    let case = SpoolCase::new().await;
+    let view = SnapshotView::current(&case.head).await.unwrap();
+    // Small batches and a one-byte target rotate the output at every batch.
+    let batch_rows = 4;
+    let policy = DeleteRewritePolicy {
+        min_input_files: 2,
+        target_file_bytes: 1,
+        ..Default::default()
+    };
+    let writer = WriterConfig::default();
+    // The previous consolidation: stage every input in the scratch spool,
+    // then write its sorted positions in scratch-sized batches.
+    let all = case.deletes.iter().cloned().collect::<BTreeSet<_>>();
+    let (spooled, _) = case
+        .spooled(
+            &view,
+            &all,
+            batch_rows,
+            DeleteReadLimits {
+                max_bytes: policy.max_input_bytes,
+                max_rows: policy.max_input_rows,
+            },
+        )
+        .await
+        .unwrap();
+    let mut reference = flow_materializer::DeleteWriter::new(
+        case.head.file_io().clone(),
+        case.head.metadata().location(),
+        &OperationId("spool-reference".into()),
+        0,
+        WriterConfig {
+            target_file_bytes: policy.target_file_bytes,
+            ..writer.clone()
+        },
+    )
+    .unwrap();
+    for batch in spooled.chunks(batch_rows) {
+        reference.write(batch).await.unwrap();
+    }
+    let reference = reference.close().await.unwrap();
+    assert!(reference.len() > 1, "the reference output must rotate");
+    let snapshot = TableMaintenance::new(
+        case.index.clone(),
+        case.catalog.clone(),
+        Policy::default(),
+        writer,
+    )
+    .unwrap()
+    .compact_deletes(
+        &case.head,
+        &case.schema,
+        case.scratch("rewrite", batch_rows),
+        &policy,
+    )
+    .await
+    .unwrap();
+    assert!(snapshot.is_some());
+    let head = case
+        .catalog
+        .load_table(case.head.identifier())
+        .await
+        .unwrap();
+    let after = SnapshotView::current(&head).await.unwrap();
+    let mut output = after
+        .live_files
+        .values()
+        .filter(|entry| entry.content_type() == DataContentType::PositionDeletes)
+        .map(|entry| entry.data_file.clone())
+        .collect::<Vec<_>>();
+    output.sort_by(|left, right| left.file_path().cmp(right.file_path()));
+    assert_eq!(output.len(), reference.len());
+    for (file, expected) in output.iter().zip(&reference) {
+        let read = |path: String| {
+            let file_io = head.file_io().clone();
+            async move { file_io.new_input(path).unwrap().read().await.unwrap() }
+        };
+        assert_eq!(
+            read(file.file_path().into()).await,
+            read(expected.file_path().into()).await,
+            "output bytes"
+        );
+        assert_eq!(file.content_type(), expected.content_type());
+        assert_eq!(file.file_format(), expected.file_format());
+        assert_eq!(file.partition(), expected.partition());
+        assert_eq!(file.record_count(), expected.record_count());
+        assert_eq!(file.file_size_in_bytes(), expected.file_size_in_bytes());
+        assert_eq!(file.column_sizes(), expected.column_sizes());
+        assert_eq!(file.value_counts(), expected.value_counts());
+        assert_eq!(file.null_value_counts(), expected.null_value_counts());
+        assert_eq!(file.lower_bounds(), expected.lower_bounds());
+        assert_eq!(file.upper_bounds(), expected.upper_bounds());
+        assert_eq!(file.split_offsets(), expected.split_offsets());
+        assert_eq!(file.referenced_data_file(), expected.referenced_data_file());
+    }
+    assert_eq!(
+        output.iter().map(|file| file.record_count()).sum::<u64>(),
+        case.expected.len() as u64
+    );
+}

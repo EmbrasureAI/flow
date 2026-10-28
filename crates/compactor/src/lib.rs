@@ -1183,6 +1183,6 @@ mod residual;
 pub use catchup::{CatchUpRejected, catch_up};
 mod worker;
 pub use worker::{
-    BuiltData, DeleteReadLimits, LiveBatch, WorkerOutput, build_data, compact, scan_live_files,
-    stage_delete_files, stage_position_deletes,
+    BuiltData, DeletePositions, DeleteReadLimits, LiveBatch, WorkerOutput, build_data, compact,
+    read_delete_files, scan_live_files, stage_delete_files, stage_position_deletes,
 };

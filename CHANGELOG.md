@@ -261,6 +261,13 @@ From earlier development builds of `main`:
   fetch vectors concurrently within the `[parquet_read]` prefetch bounds. Small
   objects go from four requests per vector to about one per object, with
   unchanged validation.
+- Delete-only consolidation merges its inputs' positions in memory (16 bytes
+  each, within its one-million-position budget) and writes them from borrowed
+  paths, instead of round-tripping every position through the scratch store.
+  Merging eight files of about 800,000 positions with 120-byte paths fell from
+  948 ms to 123 ms (shared layout) and from 1,251 ms to 154 ms (`per_target`)
+  in a local release benchmark, with byte-identical outputs. Delete scans for
+  data rewrites and catch-up resolve each run of positions on one path once.
 - Data builds reuse manifests already loaded for planning, and v3 delete
   consolidation no longer reads inputs or uploads a Puffin object for a rewrite
   that cannot reduce the object count.

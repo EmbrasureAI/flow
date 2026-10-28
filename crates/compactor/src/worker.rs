@@ -17,7 +17,7 @@ use flow_state_store::{
 };
 use iceberg::{io::FileIO, spec::DataFile, table::Table};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Artifacts and durable row mappings only. There is deliberately no catalog
@@ -1092,6 +1092,118 @@ async fn stage_delete_files_inner(
         batch_rows > 0 && batch_rows <= scratch.batch_rows(),
         "scan batch exceeds scratch budget"
     );
+    check_delete_scan(table, view, files)?;
+    // A reused scratch directory after failure must not retain old delete state.
+    scratch.discard_transaction(scan_id)?;
+    check_delete_inputs(view, delete_files)?;
+    let targets = DeleteTargets::new(view, files)?;
+    let spec_id = table.metadata().default_partition_spec_id();
+    load_deletes(
+        table.file_io(),
+        view,
+        &targets,
+        delete_files,
+        batch_rows,
+        limits,
+        read_limits,
+        cancelled,
+        |positions| {
+            let locations = positions
+                .iter()
+                .map(|&(rank, position)| {
+                    Ok(RowLocation {
+                        data_file_id: targets.ids[rank as usize].clone(),
+                        row_position: position,
+                        data_sequence_number: targets.entries[rank as usize]
+                            .sequence_number
+                            .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
+                        spec_id,
+                        partition: Vec::new(),
+                        source_commit_lsn: PgLsn(0),
+                        row_version: 0,
+                        row_fingerprint: [0; 16],
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(scratch.put_position_deletes(scan_id, &schema.table_id, locations)?)
+        },
+    )
+    .await
+}
+
+/// The effective positions of a set of delete files, sorted by data-file path
+/// and row position, without duplicates: the set [`stage_delete_files`] stages.
+pub struct DeletePositions {
+    targets: Vec<FileId>,
+    /// Indexes into `targets`, which is in path order, and row positions.
+    positions: Vec<(u32, u64)>,
+}
+
+impl DeletePositions {
+    pub fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    /// Each position's data file and row, in path and row order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&FileId, u64)> + '_ {
+        self.positions
+            .iter()
+            .map(|&(rank, position)| (&self.targets[rank as usize], position))
+    }
+}
+
+/// [`stage_delete_files`] without a scratch store: the same checks, limits and
+/// errors, returning the effective positions and the rows scanned. Positions
+/// are merged in memory at 16 bytes each, so `limits.max_rows` also bounds
+/// memory; inputs need not be sorted. A consolidation then writes them
+/// without a scratch-store round trip.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_delete_files(
+    table: &Table,
+    view: &SnapshotView,
+    files: &BTreeSet<FileId>,
+    delete_files: &BTreeSet<FileId>,
+    batch_rows: usize,
+    limits: DeleteReadLimits,
+    read_limits: &ReadLimits,
+) -> Result<(DeletePositions, u64)> {
+    ensure!(batch_rows > 0, "scan batch must be positive");
+    check_delete_scan(table, view, files)?;
+    check_delete_inputs(view, delete_files)?;
+    let targets = DeleteTargets::new(view, files)?;
+    let mut positions = Vec::new();
+    let rows = load_deletes(
+        table.file_io(),
+        view,
+        &targets,
+        delete_files,
+        batch_rows,
+        limits,
+        read_limits,
+        None,
+        |batch| {
+            positions.extend_from_slice(batch);
+            Ok(())
+        },
+    )
+    .await?;
+    // Each input is usually one sorted run, which the stable sort merges.
+    positions.sort();
+    positions.dedup();
+    Ok((
+        DeletePositions {
+            targets: files.iter().cloned().collect(),
+            positions,
+        },
+        rows,
+    ))
+}
+
+fn check_delete_scan(table: &Table, view: &SnapshotView, files: &BTreeSet<FileId>) -> Result<()> {
     ensure!(
         matches!(
             table.metadata().format_version(),
@@ -1121,8 +1233,10 @@ async fn stage_delete_files_inner(
             .is_some_and(|entry| entry.content_type() == iceberg::spec::DataContentType::Data)),
         "delete scan requires live data-file identities"
     );
-    // A reused scratch directory after failure must not retain old delete state.
-    scratch.discard_transaction(scan_id)?;
+    Ok(())
+}
+
+fn check_delete_inputs(view: &SnapshotView, delete_files: &BTreeSet<FileId>) -> Result<()> {
     ensure!(
         delete_files
             .iter()
@@ -1131,37 +1245,52 @@ async fn stage_delete_files_inner(
             )),
         "delete scan requires live position-delete files"
     );
-    load_deletes(
-        table.file_io(),
-        view,
-        files,
-        delete_files,
-        table.metadata().default_partition_spec_id(),
-        scratch,
-        scan_id,
-        schema,
-        batch_rows,
-        limits,
-        read_limits,
-        cancelled,
-    )
-    .await
+    Ok(())
 }
 
+/// The live data files a delete scan keeps positions for. Their indexes
+/// follow path order, so `(index, position)` sorts like `(path, position)`.
+struct DeleteTargets<'a> {
+    ids: Vec<&'a FileId>,
+    entries: Vec<&'a iceberg::spec::ManifestEntry>,
+    indexes: HashMap<&'a str, u32>,
+}
+
+impl<'a> DeleteTargets<'a> {
+    /// `files` must be live data files.
+    fn new(view: &'a SnapshotView, files: &'a BTreeSet<FileId>) -> Result<Self> {
+        ensure!(
+            u32::try_from(files.len()).is_ok(),
+            "delete scan has too many data files"
+        );
+        Ok(Self {
+            ids: files.iter().collect(),
+            entries: files
+                .iter()
+                .map(|file| view.live_files[&file.0].as_ref())
+                .collect(),
+            indexes: files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| (file.0.as_str(), index as u32))
+                .collect(),
+        })
+    }
+}
+
+/// Read the effective positions of `delete_files` on `targets`, passing each
+/// bounded batch to `sink` as `(target index, row position)` in read order.
 #[allow(clippy::too_many_arguments)]
 async fn load_deletes(
     file_io: &FileIO,
     view: &SnapshotView,
-    input_files: &BTreeSet<FileId>,
+    targets: &DeleteTargets<'_>,
     delete_files: &BTreeSet<FileId>,
-    spec_id: i32,
-    scratch: &StateStore,
-    scan_id: &str,
-    schema: &TableSchema,
     batch_rows: usize,
     limits: DeleteReadLimits,
     read_limits: &ReadLimits,
     cancelled: Option<&AtomicBool>,
+    mut sink: impl FnMut(&[(u32, u64)]) -> Result<()>,
 ) -> Result<u64> {
     let vector_targets = view
         .live_files
@@ -1206,11 +1335,13 @@ async fn load_deletes(
                 .live_files
                 .get(&read.referenced_data_file)
                 .ok_or_else(|| anyhow::anyhow!("DV target is not live"))?;
-            let target = FileId(read.referenced_data_file.clone());
-            let applies = input_files.contains(&target)
-                && flow_iceberg_ext::position_delete_may_apply(delete_entry, data);
+            let target = targets
+                .indexes
+                .get(read.referenced_data_file.as_str())
+                .copied()
+                .filter(|_| flow_iceberg_ext::position_delete_may_apply(delete_entry, data));
             vectors.push(read);
-            vector_files.push((target, data, applies));
+            vector_files.push((target, data));
         } else {
             parquet_files.push((file, delete_entry));
         }
@@ -1220,6 +1351,7 @@ async fn load_deletes(
     // Vectors share Puffin objects. Each object's size and footer are read
     // once per scan; every descriptor is still validated against both.
     let mut rows = 0u64;
+    let mut accepted = Vec::with_capacity(batch_rows);
     let concurrency = read_limits.prefetch_files.max(1);
     flow_materializer::read_vectors(
         file_io,
@@ -1233,7 +1365,7 @@ async fn load_deletes(
         },
         |index, vector| {
             check_cancelled(cancelled)?;
-            let (target, data, applies) = &vector_files[index];
+            let (target, data) = &vector_files[index];
             rows = rows
                 .checked_add(vector.len())
                 .ok_or_else(|| anyhow::anyhow!("delete row count overflow"))?;
@@ -1244,37 +1376,28 @@ async fn load_deletes(
                     .is_none_or(|position| position < data.data_file.record_count()),
                 "delete position exceeds data row count"
             );
-            if !applies {
+            let Some(target) = *target else {
                 return Ok(());
-            }
-            let sequence = data
-                .sequence_number
+            };
+            data.sequence_number
                 .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?;
             let mut positions = vector.iter();
             loop {
-                let mut batch = positions.by_ref().take(batch_rows).peekable();
-                if batch.peek().is_none() {
+                accepted.clear();
+                accepted.extend(
+                    positions
+                        .by_ref()
+                        .take(batch_rows)
+                        .map(|position| (target, position)),
+                );
+                if accepted.is_empty() {
                     return Ok(());
                 }
-                scratch.put_position_deletes(
-                    scan_id,
-                    &schema.table_id,
-                    batch.map(|position| RowLocation {
-                        data_file_id: target.clone(),
-                        row_position: position,
-                        data_sequence_number: sequence,
-                        spec_id,
-                        partition: Vec::new(),
-                        source_commit_lsn: PgLsn(0),
-                        row_version: 0,
-                        row_fingerprint: [0; 16],
-                    }),
-                )?;
+                sink(&accepted)?;
             }
         },
     )
     .await?;
-    let input_paths: HashSet<&str> = input_files.iter().map(|file| file.0.as_str()).collect();
     let mut prefetch = Prefetch::new(
         file_io,
         parquet_files
@@ -1303,6 +1426,10 @@ async fn load_deletes(
         );
         let declared_rows = delete_entry.data_file.record_count();
         let mut file_rows = 0u64;
+        // Sorted inputs repeat each path for a run of positions; resolve the
+        // target and its applicability once per run, without allocating.
+        let mut run_path = String::new();
+        let mut run_target = None::<Option<u32>>;
         read_input_batches(
             file_io,
             delete_entry.file_path(),
@@ -1345,38 +1472,39 @@ async fn load_deletes(
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| anyhow::anyhow!("delete position must be long"))?;
-                let mut locations = Vec::new();
+                accepted.clear();
                 for idx in 0..batch.num_rows() {
                     ensure!(
                         !paths.is_null(idx) && !positions.is_null(idx) && positions.value(idx) >= 0,
                         "invalid null or negative position delete"
                     );
                     let path = paths.value(idx);
-                    if !input_paths.contains(path) || vector_targets.contains(path) {
-                        continue;
+                    if run_target.is_none() || run_path != path {
+                        run_path.clear();
+                        run_path.push_str(path);
+                        run_target = Some(targets.indexes.get(path).copied().filter(|&target| {
+                            !vector_targets.contains(path)
+                                && flow_iceberg_ext::position_delete_may_apply(
+                                    delete_entry,
+                                    targets.entries[target as usize],
+                                )
+                        }));
                     }
-                    let data = &view.live_files[path];
-                    if !flow_iceberg_ext::position_delete_may_apply(delete_entry, data) {
+                    let Some(Some(target)) = run_target else {
                         continue;
-                    }
+                    };
+                    let data = targets.entries[target as usize];
                     ensure!(
                         (positions.value(idx) as u64) < data.data_file.record_count(),
                         "delete position exceeds data row count"
                     );
-                    locations.push(RowLocation {
-                        data_file_id: FileId(path.to_owned()),
-                        row_position: positions.value(idx) as u64,
-                        data_sequence_number: data
-                            .sequence_number
-                            .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
-                        spec_id,
-                        partition: Vec::new(),
-                        source_commit_lsn: PgLsn(0),
-                        row_version: 0,
-                        row_fingerprint: [0; 16],
-                    });
+                    data.sequence_number
+                        .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?;
+                    accepted.push((target, positions.value(idx) as u64));
                 }
-                scratch.put_position_deletes(scan_id, &schema.table_id, locations)?;
+                if !accepted.is_empty() {
+                    sink(&accepted)?;
+                }
                 Ok(())
             },
         )
