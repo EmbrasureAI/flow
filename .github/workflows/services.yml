@@ -14,7 +14,7 @@ jobs:
   build:
     # Every service job executes these exact binaries; native dependencies compile once.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -37,7 +37,7 @@ jobs:
       - name: Build PostgreSQL regression tests
         run: |
           cargo test --locked -p flow-pg-source --test snapshot_timeout --test schema_batch --test superset_publication --no-run --message-format=json > target/pg-test-build.jsonl
-          cargo test --locked -p flow-daemon --bin embrasure-flow --no-run --message-format=json > target/daemon-test-build.jsonl
+          cargo test --locked --features flow-daemon/jemalloc -p flow-daemon --bin embrasure-flow --no-run --message-format=json > target/daemon-test-build.jsonl
           python3 - <<'PYTEST'
           import json
           import shutil
@@ -61,11 +61,18 @@ jobs:
 
   minio:
     # Public MinIO images are gone; build the pinned releases from source once for every service job.
+    # The saved tar is keyed on the Dockerfile, so only a pin change rebuilds from source (about 4 minutes).
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: images
+        with:
+          path: ${{ runner.temp }}/minio-images.tar
+          key: minio-images-${{ hashFiles('tests/production/Dockerfile.minio') }}
       - name: Build MinIO fixture images
+        if: steps.images.outputs.cache-hit != 'true'
         run: |
           docker build -f tests/production/Dockerfile.minio --target server -t flow-test-minio:RELEASE.2025-04-22T22-12-26Z tests/production
           docker build -f tests/production/Dockerfile.minio --target client -t flow-test-mc:RELEASE.2025-04-16T18-13-26Z tests/production
@@ -141,7 +148,8 @@ jobs:
         run: docker load -i "$RUNNER_TEMP/minio-images/minio-images.tar"
       - name: Reserve disk for independent reader images
         if: matrix.suite == 'readers' || matrix.suite == 'v3'
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+        # Deleting takes about 100 seconds, so run it beside service setup; the reader steps wait for the marker.
+        run: setsid nohup bash -c 'sudo rm -rf /usr/local/lib/android /usr/share/dotnet; touch "$1"' _ "$RUNNER_TEMP/disk-reserved" > /dev/null 2>&1 &
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Verify stock reader extensions from an empty cache
         run: uv run tests/local/duckdb_extensions.py
@@ -196,7 +204,9 @@ jobs:
         if: matrix.suite == 'compatibility'
         run: target/debug/snapshot_timeout_tests --ignored
       - name: Crash recovery and concurrent compaction
-        if: matrix.suite == 'compatibility'
+        # Not version-sensitive (about 170 seconds): the lifecycle shards cover the oldest and newest majors, and
+        # moving it out of the compatibility shards keeps those below the longest suite.
+        if: matrix.suite == 'lifecycle'
         run: >-
           uv run tests/production/faults.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
@@ -338,11 +348,12 @@ jobs:
           --artifacts "$RUNNER_TEMP/service-boundaries"
       - name: Standard readers with native and external maintenance
         if: matrix.suite == 'readers'
-        run: >-
-          uv run tests/production/readers.py
-          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers"
-          --native-compaction --keyless-duplicates
+        run: |
+          until [ -e "$RUNNER_TEMP/disk-reserved" ]; do sleep 1; done
+          uv run tests/production/readers.py \
+            --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+            --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers" \
+            --native-compaction --keyless-duplicates
       - name: TRUNCATE and catalog-failure table isolation, then journal quota recovery
         if: matrix.suite == 'isolation'
         run: |
@@ -372,11 +383,12 @@ jobs:
           --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults-v3"
       - name: Iceberg v3 standard readers with native and external maintenance
         if: matrix.suite == 'v3'
-        run: >-
-          uv run tests/production/readers.py --format-version 3
-          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers-v3"
-          --native-compaction --keyless-duplicates
+        run: |
+          until [ -e "$RUNNER_TEMP/disk-reserved" ]; do sleep 1; done
+          uv run tests/production/readers.py --format-version 3 \
+            --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
+            --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers-v3" \
+            --native-compaction --keyless-duplicates
       - name: Randomized crash loop (seed printed; rerun with --seed)
         if: matrix.suite == 'crash-loop'
         run: >-
