@@ -34,6 +34,10 @@ installs anything missing, starts Docker and the benchmark fixture, and warms a
   revision on both sides.
 - `tests/production/epoch_report.py DIR...` breaks any benchmark run into collapse,
   prepare, commit, apply, time between epochs and compaction stall.
+- The PostgreSQL benchmark source tops out at roughly 50,000 mutations/s on one
+  host. Measure ingest capacity beyond that, or a single stage, with
+  `cargo test --release -p flow-testkit --test ingest_benchmark -- --ignored
+  --nocapture`; `INGEST_BENCH_*` variables change its shape.
 - `bench-fast` and `profiling` builds keep frame pointers, so `perf record -g
   --call-graph fp -p <daemon pid>` works.
 - Only one benchmark may run on a machine at a time. Use separate machines for
