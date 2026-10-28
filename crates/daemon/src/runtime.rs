@@ -3,16 +3,18 @@
 pub(crate) mod blocked;
 mod health;
 mod pending;
+mod prefold;
 mod table;
 
 use self::{
     blocked::{BlockedTables, PUBLICATION_CHANGED},
     health::{HealthCheckResult, check_health, observe_health, record_publication_changed},
     pending::{EPOCH_MAX_BYTES, EPOCH_MUTATION_TRIGGER, PendingWork, schedule_transactions},
+    prefold::Prefolds,
     table::{
         BuildAdmission, CompactionCandidate, CompletedBuild, CompletedPreparation,
-        FinalizationLane, StartedBuild, StartedPreparation, TableCompletion, TableOutcome,
-        TableWork, WorkOptions, retry_table_work,
+        FinalizationLane, PrefoldLink, StartedBuild, StartedPreparation, TableCompletion,
+        TableOutcome, TableWork, WorkOptions, retry_table_work,
     },
 };
 use crate::{
@@ -661,6 +663,13 @@ impl PublishRuntime {
         )?;
         let mut capture_goal = receive.borrow_and_update().durable_lsn;
         let mut busy = HashSet::new();
+        let mut prefolds = Prefolds::new(
+            SourceId(config.source.id.clone()),
+            store.clone(),
+            work.reader.clone(),
+            work.collapse_limits(),
+            config.limits.collapse_prefold,
+        );
         let mut running = FuturesUnordered::<BoxFuture<'static, Result<TableCompletion>>>::new();
         // At most two speculative builds share the worker budget with CDC,
         // leaving one actor slot reusable for publication. Reservations span
@@ -850,8 +859,13 @@ impl PublishRuntime {
                     }
                     ack.send(feedback(ledger))?;
                 }
+                _ = prefolds.woken() => {}
                 Some(result) = running.next(), if !running.is_empty() => {
                     let TableCompletion { id, transactions, outcome, elapsed, reserved_build, finalization_lane, periodic_maintenance } = result?;
+                    // Only a published CDC epoch leaves the next epoch's fold valid.
+                    if !matches!(outcome, TableOutcome::Complete { operation: Some(_), .. }) {
+                        prefolds.discard(id, "epoch_not_published");
+                    }
                     // The actor may have applied, recovered or retired operations.
                     applied.invalidate();
                     busy.remove(&id);
@@ -1385,6 +1399,15 @@ impl PublishRuntime {
                         if transactions.is_empty() && !idle {
                             continue;
                         }
+                        let prefold = if transactions.is_empty() || candidate.is_some() {
+                            prefolds.discard(id, "maintenance_dispatch");
+                            PrefoldLink::default()
+                        } else {
+                            PrefoldLink {
+                                ticket: prefolds.take(id),
+                                rows_released: prefolds.dispatched(id).map(|release| Box::new(release) as _),
+                            }
+                        };
                         if !idle {
                             periodic_yield_to_cdc = false;
                             retry_yield_to_cdc = false;
@@ -1411,6 +1434,7 @@ impl PublishRuntime {
                                 options,
                                 candidate,
                                 finalization_lane,
+                                prefold,
                             )
                             .await
                         }));
@@ -1501,6 +1525,7 @@ impl PublishRuntime {
                 config.limits.pending_transactions,
                 &excluded,
             )?;
+            prefolds.advance(&pending, &busy, &schemas);
             for id in busy
                 .iter()
                 .chain(&waiting_for_build)

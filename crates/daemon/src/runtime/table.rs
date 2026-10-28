@@ -1,12 +1,13 @@
 //! Execute one table's publication or maintenance visit under scheduler ownership.
 
+use super::prefold::PrefoldTicket;
 use super::{BUILD_MAX_AGE, OPTIONAL_MAINTENANCE_DELAY, blocked::publication_error_code};
 use crate::config::Config;
 use anyhow::{Context, Result, bail, ensure};
 use flow_coordinator::{
     CollapseLimits, DeleteRepairCursor, Epoch, PreparedCompaction, ReadyCompaction, ReplanRequired,
     RunningCompaction, RunningCompactionPreparation, TableMaintenance, TablePublisher,
-    collapse_epoch,
+    collapse_epoch_prefolded,
 };
 use flow_ingress_journal::JournalReader;
 use flow_model::{OperationId, SourceId, SourceTransaction, TableId, TableSchema};
@@ -156,6 +157,14 @@ pub(super) struct WorkOptions {
     pub(super) build_active: bool,
     pub(super) build_admission: BuildAdmission,
     pub(super) actor_acquired_at: Instant,
+}
+
+/// The fold of a CDC epoch's leading transactions, and the callback that lets
+/// the runtime fold the next epoch once this one's rows are consumed.
+#[derive(Default)]
+pub(super) struct PrefoldLink {
+    pub(super) ticket: Option<PrefoldTicket>,
+    pub(super) rows_released: Option<Box<dyn FnOnce() + Send>>,
 }
 
 pub(super) struct StartedBuild {
@@ -368,6 +377,14 @@ enum PendingRecovery {
 }
 
 impl TableWork {
+    pub(super) fn collapse_limits(&self) -> CollapseLimits {
+        CollapseLimits {
+            batch_rows: self.config.limits.batch_rows,
+            batch_bytes: self.config.limits.batch_bytes,
+            memory_bytes: self.config.limits.collapse_memory_bytes,
+        }
+    }
+
     async fn start_build(
         &self,
         table: &Table,
@@ -509,6 +526,7 @@ impl TableWork {
         options: WorkOptions,
         mut candidate: Option<CompactionCandidate>,
         finalization_lane: Option<FinalizationLane>,
+        prefold: PrefoldLink,
     ) -> Result<TableCompletion> {
         let started = Instant::now();
         let mut repair_cursor = DeleteRepairCursor::default();
@@ -558,6 +576,7 @@ impl TableWork {
                     options,
                     &mut candidate,
                     &mut repair_cursor,
+                    prefold,
                 )
                 .await
         }
@@ -764,6 +783,7 @@ impl TableWork {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_once(
         self,
         table: Table,
@@ -772,6 +792,7 @@ impl TableWork {
         options: WorkOptions,
         candidate: &mut Option<CompactionCandidate>,
         repair_cursor: &mut DeleteRepairCursor,
+        prefold: PrefoldLink,
     ) -> Result<TableOutcome> {
         let id = schema.table_id;
         if options.build_admission == BuildAdmission::Probe {
@@ -977,13 +998,18 @@ impl TableWork {
         let transaction_count = transactions.len();
         let prepare_table = current.clone();
         let reader = self.reader.clone();
-        let collapse_limits = CollapseLimits {
-            batch_rows: self.config.limits.batch_rows,
-            batch_bytes: self.config.limits.batch_bytes,
-            memory_bytes: self.config.limits.collapse_memory_bytes,
+        let collapse_limits = self.collapse_limits();
+        let PrefoldLink {
+            ticket,
+            rows_released,
+        } = prefold;
+        let prefold = match ticket {
+            Some(ticket) => ticket.resolve().await,
+            None => None,
         };
+        let offered = prefold.as_ref().map_or(0, |prefold| prefold.transactions().len());
         let collapsed = tokio::task::spawn_blocking(move || {
-            collapse_epoch(
+            collapse_epoch_prefolded(
                 &store,
                 &reader,
                 &prepare_table,
@@ -991,9 +1017,15 @@ impl TableWork {
                 &prepare_epoch,
                 &transactions,
                 collapse_limits,
+                prefold,
             )
         })
         .await??;
+        if offered > 0 {
+            let used = collapsed.prefolded_transactions() > 0;
+            metrics::counter!("flow_collapse_prefolds_total", "table_id" => id.0.to_string(),
+                "result" => if used { "used" } else { "discarded" }).increment(1);
+        }
         let seconds = collapse_started.elapsed().as_secs_f64();
         metrics::histogram!("flow_table_local_phase_seconds", "table_id" => id.0.to_string(), "phase" => "collapse").record(seconds);
         tracing::debug!(target: "flow_events", event = "epoch_collapsed", operation_id = %epoch.id.0,
@@ -1002,8 +1034,17 @@ impl TableWork {
             collapse_memory_limit_bytes = collapse_limits.memory_bytes,
             collapse_memory_peak_bytes = collapsed.memory_peak_bytes(),
             collapse_memory_peak_known = collapsed.memory_peak_bytes().is_some(),
+            prefold_offered_transactions = offered,
+            prefolded_transactions = collapsed.prefolded_transactions(),
             "epoch mutations collapsed against the row index");
-        let snapshot = self.publisher.publish(&current, &schema, collapsed).await?;
+        let snapshot = self
+            .publisher
+            .publish_observed(&current, &schema, collapsed, || {
+                if let Some(release) = rows_released {
+                    release();
+                }
+            })
+            .await?;
         if !options.build_active
             && let Some(periodic) = self
                 .maintain_after_publication(&current, id, manifests)
@@ -1770,6 +1811,7 @@ mod publication_retry_tests {
                 },
                 None,
                 None,
+                PrefoldLink::default(),
             )
             .await
             .unwrap();
@@ -2139,7 +2181,14 @@ mod metadata_maintenance_tests {
         let completion = f
             .work
             .clone()
-            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .run(
+                f.schema.clone(),
+                vec![transaction],
+                options(),
+                None,
+                None,
+                PrefoldLink::default(),
+            )
             .await
             .unwrap();
         let TableOutcome::Complete {
@@ -2174,7 +2223,14 @@ mod metadata_maintenance_tests {
         let transaction = journal_insert(&mut f, 101, 1010);
         f.work
             .clone()
-            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .run(
+                f.schema.clone(),
+                vec![transaction],
+                options(),
+                None,
+                None,
+                PrefoldLink::default(),
+            )
             .await
             .unwrap();
         assert_eq!(load(&f).await.metadata().snapshots().len(), 4);
@@ -2195,7 +2251,14 @@ mod metadata_maintenance_tests {
         let completion = f
             .work
             .clone()
-            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .run(
+                f.schema.clone(),
+                vec![transaction],
+                options(),
+                None,
+                None,
+                PrefoldLink::default(),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -2254,7 +2317,14 @@ mod metadata_maintenance_tests {
         let completion = f
             .work
             .clone()
-            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .run(
+                f.schema.clone(),
+                vec![transaction],
+                options(),
+                None,
+                None,
+                PrefoldLink::default(),
+            )
             .await
             .unwrap();
         // Publishing on the pre-recovery head would first reconcile the index

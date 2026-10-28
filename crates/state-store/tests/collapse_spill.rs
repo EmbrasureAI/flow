@@ -197,6 +197,110 @@ proptest! {
     }
 }
 
+/// Apply the previous epoch: delete `deleted`, insert `inserted` and move
+/// every other present key to a new file, committed at snapshot 2.
+fn previous_epoch(store: &StateStore, present: &[u8], deleted: &[u8], inserted: &[u8]) -> Vec<u8> {
+    let moved = |key: u8| RowLocation {
+        data_file_id: FileId("s3://bucket/data/previous.parquet".into()),
+        row_position: 100 + u64::from(key),
+        data_sequence_number: 2,
+        source_commit_lsn: PgLsn(20),
+        row_version: 2,
+        ..location(key)
+    };
+    let id = OperationId("previous".into());
+    let deltas = present
+        .iter()
+        .map(|key| IndexDelta {
+            key: PrimaryKey(vec![*key]),
+            expected: Some(location(*key)),
+            replacement: (!deleted.contains(key)).then(|| moved(*key)),
+        })
+        .chain(inserted.iter().map(|key| IndexDelta {
+            key: PrimaryKey(vec![*key]),
+            expected: None,
+            replacement: Some(moved(*key)),
+        }));
+    store
+        .prepare(
+            PreparedOperation {
+                id: id.clone(),
+                table_id: TABLE,
+                kind: OperationKind::Ingest,
+                base_snapshot_id: Some(1),
+                last_lsn: PgLsn(20),
+                schema_version: 1,
+                artifacts: vec![],
+                payload: vec![],
+            },
+            deltas,
+        )
+        .unwrap();
+    store.mark_committed(&id, 2, 2).unwrap();
+    store.apply_committed(&id).unwrap();
+    let mut after: Vec<u8> = present
+        .iter()
+        .filter(|key| !deleted.contains(key))
+        .chain(inserted)
+        .copied()
+        .collect();
+    after.sort_unstable();
+    after
+}
+
+fn fold(input: &[(TableId, PrimaryKey, Change)]) -> CollapseBuffer {
+    let mut buffer = CollapseBuffer::new(TABLE, 64 << 20);
+    for (_, key, change) in input.iter().cloned() {
+        assert!(matches!(
+            buffer.push(key, change).unwrap(),
+            BufferResult::Ready(())
+        ));
+    }
+    buffer
+}
+
+fn bind(store: &StateStore, buffer: CollapseBuffer) -> Vec<CollapsedMutation> {
+    let expected = store.table_state(&TABLE).unwrap();
+    match store.bind_collapse_buffer(buffer, &expected).unwrap() {
+        Bound::Ready(rows) => rows.collect(),
+        Bound::Overflow(_) => panic!("fold fits its budget"),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    /// A fold made before the previous epoch changed the index (an epoch
+    /// prefold) binds to the same rows as a fold made afterwards, and both
+    /// match the disk path. Folding reads no index state.
+    #[test]
+    fn a_prefolded_epoch_binds_to_the_same_rows_as_a_cold_collapse(
+        present in proptest::collection::btree_set(0u8..24, 0..24),
+        removed in proptest::collection::btree_set(0u8..24, 0..8),
+        added in proptest::collection::btree_set(24u8..32, 0..8),
+        steps in proptest::collection::vec(step(), 1..120),
+    ) {
+        let present: Vec<u8> = present.into_iter().collect();
+        let deleted: Vec<u8> = removed.into_iter().filter(|key| present.contains(key)).collect();
+        let inserted: Vec<u8> = added.into_iter().collect();
+        let temp = TempDir::new().unwrap();
+        let store = seeded(temp.path(), &present);
+        let live = {
+            let mut live: Vec<u8> = present.iter().filter(|key| !deleted.contains(key)).copied().collect();
+            live.extend(&inserted);
+            live
+        };
+        let input = changes(&live, &steps);
+        prop_assume!(!input.is_empty());
+        let prefolded = fold(&input);
+        let after = previous_epoch(&store, &present, &deleted, &inserted);
+        prop_assert_eq!(after.len(), live.len());
+        let warm = bind(&store, prefolded);
+        let cold = bind(&store, fold(&input));
+        prop_assert_eq!(&warm, &cold);
+        prop_assert_eq!(&cold, &disk(&store, "disk", &input));
+    }
+}
+
 #[test]
 fn a_tiny_budget_spills_every_epoch_and_still_matches_disk() {
     let present = [1, 2, 3, 4, 5, 6];

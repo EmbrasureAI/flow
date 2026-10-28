@@ -27,6 +27,9 @@ batch_rows = 1024
 batch_bytes = 8388608
 # Additional per-worker collapse retention; 0 forces the disk path.
 collapse_memory_bytes = 134217728
+# Fold a busy table's next epoch while the current one commits and applies,
+# within the same collapse budget.
+collapse_prefold = true
 parquet_row_group_bytes = 33554432
 # Rows per row group in compacted files and the initial copy; publication
 # files keep 8192.

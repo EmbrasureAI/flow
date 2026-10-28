@@ -132,6 +132,8 @@ No separate export task is created.
 | `flow_state_apply_batch_seconds` | State-store aggregate lock wait, preparation, commit and lock hold, plus decode, PK lookup, reverse lookup, mutation-build and file-count components; fixed operation-kind and controlled/standalone labels |
 | `flow_state_apply_batch_size` | Apply cursor rows, serialized index `WriteBatch` bytes, submitted update-record count and reverse-owner reads; fixed measurement, operation-kind and controlled/standalone labels |
 | `flow_state_stage_batch_seconds` | Delta-batch construction, duplicate lookup and staged write; fixed operation-kind and controlled/standalone labels |
+| `flow_collapse_prefolds_total{table_id,result}` | Folds of a table's next epoch offered to its collapse, `used` or `discarded`; see [collapse retention](#collapse-retention) |
+| `flow_collapse_prefold_seconds{table_id}` | Duration of each fold or extension of a table's next epoch |
 | `flow_state_collapse_batch_seconds` | Disk-collapse batch setup, fold, prior spool reads, index lookup, binding and staged write; fixed phase and controlled/standalone labels |
 | `flow_table_l0_files`, `flow_table_l0_bytes`, `flow_table_oldest_l0_seconds`, `flow_table_small_files`, `flow_table_*delete_files`, `flow_table_reclaimable_bytes`, `flow_table_manifest*`, `flow_table_publication_pressure` | L0 count, bytes and oldest-file age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
@@ -490,6 +492,17 @@ dropped; `collapse_memory_peak_known` distinguishes that from zero. The outer
 collapse duration covers every mode. StateStore's six batch-phase histograms
 cover only disk collapse and must not be treated as a complete decomposition of
 buffered epochs.
+
+With `limits.collapse_prefold` (on by default), once a busy table's epoch has
+sealed its preparation and released its collapsed rows, the transactions its
+next epoch must begin with are folded from the journal while the current epoch
+commits and applies. The fold holds no index state and stays within the same
+collapse budget; a fold that would exceed it is dropped rather than spilled.
+The next collapse uses it only if that epoch begins with exactly the folded
+transactions under the same source, schema and budget, and still binds it
+against the index with every check of a cold collapse. `epoch_collapsed`
+reports `prefold_offered_transactions` and `prefolded_transactions`, and
+`flow_collapse_prefolds_total{result="used"|"discarded"}` counts offered folds.
 
 ## Parquet admission
 

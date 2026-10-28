@@ -167,6 +167,12 @@ This will be the initial public release, `0.1.0`.
 - UPDATE/DELETE keys are encoded without copying the table schema, and CDC and
   initial COPY rows no longer revalidate the relation's types row by row.
 - The four concurrent initial COPY workers run on separate runtime threads.
+- A busy table's next epoch is folded from the journal while the current
+  epoch commits and applies, so its collapse only binds the fold against the
+  index. The fold stays within `limits.collapse_memory_bytes`, is used only if
+  the epoch begins with exactly the folded transactions, and is checked like a
+  cold collapse. `limits.collapse_prefold = false` turns it off;
+  `flow_collapse_prefolds_total` counts used and discarded folds.
 - Periodic row-index checkpoints flush memtables before taking the index
   locks, and collapse folds source chunks outside the row lock, shortening
   stalls of concurrent publication.

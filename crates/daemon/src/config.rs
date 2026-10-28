@@ -162,6 +162,9 @@ pub struct Limits {
     pub batch_bytes: usize,
     /// Additional retained collapse state per table worker; zero uses disk only.
     pub collapse_memory_bytes: usize,
+    /// Fold a busy table's next epoch from the journal while its current
+    /// epoch commits and applies, within the same collapse budget.
+    pub collapse_prefold: bool,
     pub parquet_row_group_bytes: usize,
     /// Rows per Parquet row group in compacted files and the initial copy,
     /// which readers scan most. Publication files keep 8192 rows, so CDC
@@ -214,6 +217,7 @@ impl Default for Limits {
             batch_rows: 1024,
             batch_bytes: 8 << 20,
             collapse_memory_bytes: 128 << 20,
+            collapse_prefold: true,
             parquet_row_group_bytes: 32 << 20,
             parquet_row_group_rows: 122_880,
             pending_transactions: 256,

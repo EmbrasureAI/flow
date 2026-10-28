@@ -67,6 +67,13 @@ publication rechecks both before writing artifacts or completing a no-op. If
 retained state exceeds `limits.collapse_memory_bytes`, the entire memory attempt
 is dropped and the same durable journal prefix is replayed through the disk path.
 Initial copies, oversized transactions and descriptors without mutation counts use disk directly.
+Once a busy table's epoch has sealed its preparation, its next epoch's leading
+queued transactions may be folded from the journal while the current epoch
+commits and applies (`limits.collapse_prefold`). The fold holds no index state
+and stays within the collapse budget. The next collapse uses it only if that
+epoch begins with exactly the folded transactions under the same source, schema
+and budget, and binds it with every check of a cold collapse; otherwise it is
+dropped.
 Crash recovery always comes from the journal or the existing Prepared operation.
 
 Replaying durable input avoids a second spill format. Memory and spill budgets
