@@ -1,7 +1,6 @@
 # Performance
 
-The service has passing local correctness and recovery checks, but has not met
-its full performance targets. The current targets are 50,000 mixed mutations/s,
+The current targets are 50,000 mixed mutations/s,
 PostgreSQL-commit-to-Iceberg-publication latency below 1 second at p95 and
 2 seconds at p99, and read time at most 1.25 times a compacted equivalent.
 No 24-hour endurance qualification has completed.
