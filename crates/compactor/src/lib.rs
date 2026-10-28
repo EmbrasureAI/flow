@@ -279,9 +279,12 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             data_rewrite_scope: DataRewriteScope::All,
-            l0_soft_files: 24,
+            // Start small-file compaction early but pause publication late:
+            // soft debt only schedules background work, and fewer files keep
+            // merge-on-read scans close to a compacted layout.
+            l0_soft_files: 6,
             l0_hard_files: 32,
-            stable_small_soft_files: 24,
+            stable_small_soft_files: 6,
             stable_small_hard_files: 32,
             l0_soft_bytes: 128 << 20,
             l0_hard_bytes: 256 << 20,

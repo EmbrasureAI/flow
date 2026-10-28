@@ -174,6 +174,7 @@ impl Harness {
             // L0 debt by count alone, as the daemon's age limits would.
             l0_soft_files: 8,
             l0_hard_files: 16,
+            stable_small_soft_files: 24,
             oldest_l0_soft_ms: 600_000,
             oldest_l0_hard_ms: 1_200_000,
             l1_target_bytes: smallest,

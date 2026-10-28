@@ -388,7 +388,13 @@ fn soft_aging_closes_old_singletons_and_new_files_wait() {
 
 #[test]
 fn fragmented_external_output_is_bounded_without_rewriting_idle_singletons() {
-    let policy = Policy::default();
+    // Soft limits above the nine files left after one consolidation isolate the
+    // bounded group from ordinary soft small-file compaction.
+    let policy = Policy {
+        l0_soft_files: 24,
+        stable_small_soft_files: 24,
+        ..Policy::default()
+    };
     let mut files = (0..40)
         .map(|id| {
             let mut candidate = file(id, 128 + id as u64 * 64);

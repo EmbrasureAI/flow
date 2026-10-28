@@ -87,14 +87,14 @@ prefetch_file_bytes = 4194304
 # "all", "l0-only", or "disabled"; delete-file compaction runs in every scope.
 # data_rewrite_scope = "all"
 # Uncompacted ingest output (L0): file count, total bytes and oldest file age.
-# l0_soft_files = 24
+# l0_soft_files = 6
 # l0_hard_files = 32
 # l0_soft_bytes = 134217728
 # l0_hard_bytes = 268435456
 # oldest_l0_soft_ms = 10000
 # oldest_l0_hard_ms = 30000
 # Files outside L0 smaller than l1_target_bytes, such as external rewrite output.
-# stable_small_soft_files = 24
+# stable_small_soft_files = 6
 # stable_small_hard_files = 32
 # Delete files that apply to any single data file.
 # delete_files_soft = 8

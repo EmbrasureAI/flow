@@ -2889,8 +2889,12 @@ impl ZipfTable {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_target_delete_files_stay_bounded_under_skewed_updates() {
     const EPOCHS: u64 = 80;
+    // Late small-file compaction lets the unbounded layout accumulate the
+    // delete files the bounds exist to prevent.
     let per_target = Policy {
         delete_layout: flow_compactor::DeleteLayout::PerTarget,
+        l0_soft_files: 24,
+        stable_small_soft_files: 24,
         ..Policy::default()
     };
     let mut unbounded = ZipfTable::new(Policy {

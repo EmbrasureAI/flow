@@ -24,7 +24,8 @@ From earlier development builds of `main`:
 - Data rewrites of keyed tables commit lazy index remaps, and delete-file count
   debt is paid by delete-only consolidation, by default. Set
   `[compaction] lazy_index_remap = false` or `delete_debt = "current"` for the
-  earlier behaviour.
+  earlier behaviour. Small-file compaction also starts earlier
+  (`l0_soft_files` and `stable_small_soft_files` default to 6 instead of 24).
 
 ### Added
 
@@ -220,6 +221,12 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- `[compaction] l0_soft_files` and `stable_small_soft_files` default to 6
+  instead of 24, so background compaction starts earlier; the hard limits stay
+  at 32, so publication pauses at the same debt. Merge-on-read scan cost tracks
+  file count, and at 30,000 mutations/s the median read slowdown against a
+  compacted copy fell from 2.7× to 1.6× and commit-to-catalog p95 by 43%, for
+  about 8% more CDC work per mutation.
 - Capture keeps small PostgreSQL source transactions in a bounded memory buffer
   (256 KiB each, 32 MiB in total, so capture may use up to about 32 MiB more
   memory) instead of creating a spool directory and file per transaction.
