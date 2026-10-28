@@ -1,13 +1,15 @@
 //! Current and snapshot index reads for bounded compaction workers.
 
 use crate::{
-    Error, FILE_COUNTS, PK, REVERSE, Result, StateStore, TABLES, TableState, decode,
-    decode_file_count, file_prefix, prefix_end,
+    Error, FILE_COUNTS, PK, REVERSE, Result, SnapshotIter, StateStore, TABLES, TableState, decode,
+    decode_file_count, file_prefix,
+    files::{self, FileOrdinals, NO_FILE, PathReader, StoredLocation},
+    prefix_end,
     remap::{RemapCache, Resolver},
 };
 use flow_model::{FileId, PgLsn, PrimaryKey, RowLocation, TableId};
 use rocksdb::{DB, DBPinnableSlice, Direction, IteratorMode, ReadOptions, SnapshotWithThreadMode};
-use serde::Deserialize;
+use std::sync::Arc;
 
 /// The worker's read-only index surface. Scratch writes remain separate.
 pub trait RowIndex: Sync {
@@ -34,6 +36,7 @@ pub struct IndexSnapshot<'db> {
     state: TableState,
     /// Lazy remaps visible in this snapshot may exist.
     remaps: Option<&'db RemapCache>,
+    files: &'db FileOrdinals,
 }
 
 impl IndexSnapshot<'_> {
@@ -73,7 +76,8 @@ impl IndexSnapshot<'_> {
     ) -> Result<Vec<Option<RowLocation>>> {
         let mut options = ReadOptions::default();
         options.set_snapshot(&self.snapshot);
-        lookup_many(self.db, table, keys, &options, self.remaps)
+        lookup_many(self.db, self.files, table, keys, &options, self.remaps)?
+            .ok_or_else(files::unknown_file)
     }
 
     /// Like [`Self::lookup_keys`], but passes each original in key order to
@@ -88,28 +92,44 @@ impl IndexSnapshot<'_> {
         let mut options = ReadOptions::default();
         options.set_snapshot(&self.snapshot);
         if self.remaps.is_some() {
-            return lookup_many(self.db, table, keys, &options, self.remaps)?
+            return lookup_many(self.db, self.files, table, keys, &options, self.remaps)?
+                .ok_or_else(files::unknown_file)?
                 .iter()
                 .map(|location| location.as_ref().map(LocationRef::from))
                 .try_for_each(visit);
         }
         // The pinned values outlive the borrowed decodes; errors keep key order.
+        // Ordinals resolve in this snapshot, to paths shared with the cache.
         let values = multi_get(self.db, table, keys, &options);
-        values
+        let mut paths = PathReader::new(self.files, self.db, Some(&options));
+        let decoded = values
             .iter()
             .map(|item| match item {
-                Ok(value) => value.as_deref().map(decode_ref).transpose(),
+                Ok(Some(value)) => {
+                    let stored = files::decode_location(value)?;
+                    let path = paths
+                        .path(*table, stored.file)?
+                        .ok_or_else(files::unknown_file)?;
+                    Ok(Some((stored, path)))
+                }
+                Ok(None) => Ok(None),
                 Err(error) => Err(error.clone().into()),
             })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
+            .collect::<Result<Vec<Option<(StoredLocation<'_>, Arc<str>)>>>>()?;
+        decoded
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|(stored, path)| LocationRef::stored(stored, path))
+            })
             .try_for_each(visit)
     }
 }
 
-/// A [`RowLocation`] decoded in place, borrowing its path and partition.
-/// Bincode encodes a string or byte vector and its borrowed form identically.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+/// A [`RowLocation`] that borrows its path and partition, from the cached
+/// path and the pinned value.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LocationRef<'a> {
     pub data_file_id: &'a str,
     pub row_position: u64,
@@ -136,8 +156,30 @@ impl<'a> From<&'a RowLocation> for LocationRef<'a> {
     }
 }
 
-fn decode_ref(value: &[u8]) -> Result<LocationRef<'_>> {
-    Ok(bincode::deserialize(value)?)
+impl<'a> LocationRef<'a> {
+    fn stored(stored: &'a StoredLocation<'_>, path: &'a str) -> Self {
+        // Exhaustive, so a new stored field cannot be silently dropped.
+        let StoredLocation {
+            file: _,
+            row_position,
+            data_sequence_number,
+            spec_id,
+            partition,
+            source_commit_lsn,
+            row_version,
+            row_fingerprint,
+        } = stored;
+        Self {
+            data_file_id: path,
+            row_position: *row_position,
+            data_sequence_number: *data_sequence_number,
+            spec_id: *spec_id,
+            partition,
+            source_commit_lsn: *source_commit_lsn,
+            row_version: *row_version,
+            row_fingerprint: *row_fingerprint,
+        }
+    }
 }
 
 impl StateStore {
@@ -170,6 +212,7 @@ impl StateStore {
             table: *table,
             state,
             remaps: self.remaps_possible().then_some(&self.0.remap_cache),
+            files: &self.0.files,
         })
     }
 
@@ -179,15 +222,28 @@ impl StateStore {
         table: &TableId,
         keys: &[PrimaryKey],
     ) -> Result<Vec<Option<RowLocation>>> {
-        if !self.remaps_possible() {
-            return lookup_many(&self.0.db, table, keys, &ReadOptions::default(), None);
+        if !self.remaps_possible()
+            && let Some(locations) = lookup_many(
+                &self.0.db,
+                &self.0.files,
+                table,
+                keys,
+                &ReadOptions::default(),
+                None,
+            )?
+        {
+            return Ok(locations);
         }
         // Read raw entries and remaps from one view, so a concurrent
         // materialization cannot hide a remap from an entry read before it.
+        // The same view also resolves an ordinal released after an entry
+        // read without one.
         let snapshot = self.0.db.snapshot();
         let mut options = ReadOptions::default();
         options.set_snapshot(&snapshot);
-        lookup_many(&self.0.db, table, keys, &options, Some(&self.0.remap_cache))
+        let remaps = self.remaps_possible().then_some(&self.0.remap_cache);
+        lookup_many(&self.0.db, &self.0.files, table, keys, &options, remaps)?
+            .ok_or_else(files::unknown_file)
     }
 
     /// Ordered reverse scan, bounded by the caller's consumption. Deleted rows
@@ -200,7 +256,15 @@ impl StateStore {
         table: &TableId,
         file: &FileId,
     ) -> impl Iterator<Item = Result<(u64, PrimaryKey)>> + Send + 'a {
-        file_rows(&self.0.db, table, file, ReadOptions::default())
+        // The file's ordinal and its reverse entries come from one view: a
+        // release and re-allocation in between would scan the wrong ordinal.
+        let snapshot = self.0.db.snapshot();
+        let mut options = ReadOptions::default();
+        options.set_snapshot(&snapshot);
+        SnapshotIter {
+            rows: file_rows(&self.0.db, table, file, options),
+            _snapshot: snapshot,
+        }
     }
 }
 
@@ -242,28 +306,36 @@ impl RowIndex for IndexSnapshot<'_> {
     }
 }
 
+/// `None` when an entry names an ordinal absent from `options`' view, which
+/// a reader without a snapshot can see if the file was released in between.
 fn lookup_many<'k>(
     db: &DB,
+    files: &FileOrdinals,
     table: &TableId,
     keys: impl IntoIterator<Item = &'k PrimaryKey>,
     options: &ReadOptions,
     remaps: Option<&RemapCache>,
-) -> Result<Vec<Option<RowLocation>>> {
-    let mut locations = multi_get(db, table, keys, options)
-        .into_iter()
-        .map(|item| {
-            item.map_err(Error::from)?
-                .map(|value| decode(&value))
-                .transpose()
-        })
-        .collect::<Result<Vec<Option<RowLocation>>>>()?;
+) -> Result<Option<Vec<Option<RowLocation>>>> {
+    let mut paths = PathReader::new(files, db, Some(options));
+    let values = multi_get(db, table, keys, options);
+    let mut locations = Vec::with_capacity(values.len());
+    for item in values {
+        let Some(value) = item? else {
+            locations.push(None);
+            continue;
+        };
+        match paths.location(*table, &files::decode_location(&value)?)? {
+            Some(location) => locations.push(Some(location)),
+            None => return Ok(None),
+        }
+    }
     if let Some(cache) = remaps {
         let mut resolver = Resolver::new(db, cache, *table, options);
         for location in locations.iter_mut().flatten() {
             resolver.resolve_in_place(location)?;
         }
     }
-    Ok(locations)
+    Ok(Some(locations))
 }
 
 /// Raw primary-key entries in input order. The encoded keys share one buffer.
@@ -307,29 +379,37 @@ fn file_rows<'a>(
     file: &FileId,
     mut options: ReadOptions,
 ) -> impl Iterator<Item = Result<(u64, PrimaryKey)>> + Send + 'a + use<'a> {
-    let prefix = file_prefix(table, file);
+    // The ordinal is read in the scan's own view. A file without one has no
+    // reverse entries, and no ordinal has the reserved value.
+    let (ordinal, error) = match files::ordinal_in_view(db, &options, table, file) {
+        Ok(ordinal) => (ordinal.unwrap_or(NO_FILE), None),
+        Err(error) => (NO_FILE, Some(error)),
+    };
+    let prefix = files::reverse_prefix(table, ordinal);
     options.fill_cache(false);
     if let Some(end) = prefix_end(&prefix) {
         options.set_iterate_upper_bound(end);
     }
     let cf = db.cf_handle(REVERSE).expect("opened column family");
-    db.iterator_cf_opt(
-        &cf,
-        options,
-        IteratorMode::From(&prefix, Direction::Forward),
+    error.map(Err).into_iter().chain(
+        db.iterator_cf_opt(
+            &cf,
+            options,
+            IteratorMode::From(&prefix, Direction::Forward),
+        )
+        .take_while(move |item| {
+            item.as_ref()
+                .map(|(key, _)| key.starts_with(&prefix))
+                .unwrap_or(true)
+        })
+        .map(|item| {
+            let (key, value) = item?;
+            let bytes: [u8; 8] = key[key.len() - 8..]
+                .try_into()
+                .map_err(|_| Error::InvalidState("invalid reverse index key".into()))?;
+            Ok((u64::from_be_bytes(bytes), decode(&value)?))
+        }),
     )
-    .take_while(move |item| {
-        item.as_ref()
-            .map(|(key, _)| key.starts_with(&prefix))
-            .unwrap_or(true)
-    })
-    .map(|item| {
-        let (key, value) = item?;
-        let bytes: [u8; 8] = key[key.len() - 8..]
-            .try_into()
-            .map_err(|_| Error::InvalidState("invalid reverse index key".into()))?;
-        Ok((u64::from_be_bytes(bytes), decode(&value)?))
-    })
 }
 
 #[cfg(test)]
@@ -337,7 +417,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_borrowed_location_decodes_the_stored_encoding() {
+    fn a_borrowed_location_matches_its_stored_encoding() {
         let location = RowLocation {
             data_file_id: FileId("s3://bucket/δ/data.parquet".into()),
             row_position: u64::MAX - 1,
@@ -348,8 +428,12 @@ mod tests {
             row_version: u64::MAX - 3,
             row_fingerprint: [0xa5; 16],
         };
-        let stored = bincode::serialize(&location).unwrap();
-        assert_eq!(decode_ref(&stored).unwrap(), LocationRef::from(&location));
-        assert!(decode_ref(&stored[..stored.len() - 1]).is_err());
+        let mut encoded = Vec::new();
+        files::encode_location(&mut encoded, &StoredLocation::new(9, &location)).unwrap();
+        let stored = files::decode_location(&encoded).unwrap();
+        assert_eq!(
+            LocationRef::stored(&stored, &location.data_file_id.0),
+            LocationRef::from(&location)
+        );
     }
 }

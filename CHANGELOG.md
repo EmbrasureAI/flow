@@ -17,14 +17,20 @@ This will be the initial public release, `0.1.0`.
 
 From earlier development builds of `main`:
 
-- The row index gains a `file_remaps` column family on first start, with or
-  without lazy remaps. Earlier builds refuse to open such an index
-  (`Column families not opened: file_remaps`) without changing it. To go
-  back, restore the `state_dir` copied before the upgrade.
+- The row index moves to format 4, which names data files by ordinal. The
+  first start rebuilds it from the control store and Iceberg, skipping
+  row-index checkpoints of the older format; the journal, control store,
+  source slot and Iceberg tables are kept. Allow for the rebuild's time and its
+  copy of the index (see [disk sizing](docs/operations.md#index-verification-and-rebuild-space)).
+- Earlier builds refuse to open the new index, which also has new
+  `file_remaps` and `file_ordinals` column families (RocksDB reports
+  `Column families not opened`), without changing it. To downgrade, restore
+  the `state_dir` copied before the upgrade, or delete the row index so the
+  earlier build rebuilds it from Iceberg.
 - Data rewrites of keyed tables commit lazy index remaps, and delete-file count
   debt is paid by delete-only consolidation, by default. Set
   `[compaction] lazy_index_remap = false` or `delete_debt = "current"` for the
-  earlier behaviour. Small-file compaction also starts earlier
+  earlier behavior. Small-file compaction also starts earlier
   (`l0_soft_files` and `stable_small_soft_files` default to 6 instead of 24).
 
 ### Added
@@ -221,6 +227,21 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- The row index names data files by per-table ordinal instead of path in
+  primary-key values, reverse keys and staged deltas (index format 4), so
+  lookups, staging, apply and RocksDB compaction no longer scale with path
+  length. In the ingest microbenchmark one table rose from about 113,000 to
+  158,000 mutations/s with default paths and from 83,000 to 157,000 with
+  paths 155 characters longer
+  ([report](docs/benchmarks/index-file-ordinals.md)).
+- Index apply looks up and checks each chunk's rows on up to
+  `min(available_parallelism, 8)` threads, and collapse binds folded keys
+  against the index on up to four threads, decoding locations without
+  allocating their paths. In the service benchmark CDC service time per
+  mutation fell 6–8% from parallel apply and collapse time 52–58% from
+  parallel bind.
+- Data-rewrite residuals stream staged delete positions without decoding each
+  record; the residual merge took about half as long in a local benchmark.
 - `[compaction] l0_soft_files` and `stable_small_soft_files` default to 6
   instead of 24, so background compaction starts earlier; the hard limits stay
   at 32, so publication pauses at the same debt. Merge-on-read scan cost tracks

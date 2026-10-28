@@ -199,6 +199,8 @@ impl StateStore {
         let mut batch = WriteBatch::default();
         let remap_options = ReadOptions::default();
         let mut resolvers = std::collections::HashMap::new();
+        // Under the row lock the ordinal cache is exact.
+        let mut paths = self.path_reader(None);
         for ((key, (table_id, primary_key, pending)), existing) in pending.into_iter().zip(existing)
         {
             let (original, present) = match existing {
@@ -207,7 +209,7 @@ impl StateStore {
                     let mut original: Option<RowLocation> = originals
                         .next()
                         .expect("one index result per missing spool key")?
-                        .map(|value| decode(&value))
+                        .map(|value| paths.pk_value(table_id, &value))
                         .transpose()?;
                     if let Some(location) = &mut original
                         && self.remaps_possible()
@@ -277,9 +279,11 @@ impl StateStore {
         let mut resolver = self.remaps_possible().then(|| {
             crate::remap::Resolver::new(&self.0.db, &self.0.remap_cache, *table, &remap_options)
         });
+        let mut paths = self.path_reader(None);
         for ((key, pending), original) in rows.into_iter().zip(originals) {
-            let mut original: Option<RowLocation> =
-                original?.map(|value| decode(&value)).transpose()?;
+            let mut original: Option<RowLocation> = original?
+                .map(|value| paths.pk_value(*table, &value))
+                .transpose()?;
             if let (Some(location), Some(resolver)) = (&mut original, &mut resolver) {
                 resolver.resolve_in_place(location)?;
             }

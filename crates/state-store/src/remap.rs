@@ -20,8 +20,11 @@
 
 use crate::{
     DELTAS, Error, FILE_COUNTS, OUTPUT_COUNT_MARKER, OperationKind, OperationPhase, PK,
-    REMAP_MARKER, REMAPS, REVERSE, Result, StateBatch, StateStore, apply::FileCountShadow, decode,
-    file_prefix, operation_prefix, pk_key, reverse_key,
+    REMAP_MARKER, REMAPS, REVERSE, Result, StateBatch, StateStore,
+    apply::FileCountShadow,
+    decode, file_prefix,
+    files::{self, OrdinalMemo, StoredLocation, reverse_key},
+    operation_prefix, pk_key,
 };
 use flow_model::{FileId, OperationId, PrimaryKey, RowLocation, TableId};
 use rocksdb::{DB, IteratorMode, ReadOptions};
@@ -757,6 +760,8 @@ impl StateStore {
                 if raw.is_none() {
                     let node = graph.remove(&file).expect("candidate root");
                     batch.delete_cf(&remaps_cf, &node.key);
+                    // No raw entry names the retired file any more.
+                    self.mark_file_released(&mut batch, *table, &file);
                     removed.push((file, node));
                 }
             }
@@ -817,40 +822,40 @@ impl StateStore {
             let current = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), false);
             let options = ReadOptions::default();
             let mut resolver = Resolver::new(&self.0.db, &self.0.remap_cache, *table, &options);
+            // The rows were found under this file's ordinal.
+            let ordinal = self
+                .0
+                .files
+                .ordinal(*table, &file.0)
+                .ok_or_else(files::unknown_file)?;
             let mut batch = StateBatch::default();
+            // Only valid while this lock is held.
+            let mut memo = OrdinalMemo::default();
+            let mut encoded = Vec::new();
             for (((position, key), pk), current) in rows.iter().zip(&keys).zip(current) {
-                let raw = reverse_key(
-                    table,
-                    &RowLocation {
-                        data_file_id: file.clone(),
-                        row_position: *position,
-                        data_sequence_number: 0,
-                        spec_id: 0,
-                        partition: Vec::new(),
-                        source_commit_lsn: Default::default(),
-                        row_version: 0,
-                        row_fingerprint: [0; 16],
-                    },
-                );
                 let Some(current) = current? else {
                     return Err(Error::RecoveryRequired(
                         "reverse index has no forward entry; rebuild the index".into(),
                     ));
                 };
-                let location: RowLocation = decode(&current)?;
-                if &location.data_file_id != file || location.row_position != *position {
+                let stored = files::decode_location(&current)?;
+                if stored.file != ordinal || stored.row_position != *position {
                     return Err(Error::RecoveryRequired(
                         "forward and reverse index disagree; rebuild the index".into(),
                     ));
                 }
                 let translated = resolver
-                    .resolve(&location)?
+                    .resolve(&stored.to_location(&file.0))?
                     .ok_or_else(|| Error::InvalidState("retired file lost its remap".into()))?;
-                batch.delete_cf(&reverse_cf, raw);
-                batch.put_cf(&pk_cf, pk, bincode::serialize(&translated)?);
+                // A lazy output may have had no row of its own until now.
+                let target =
+                    self.file_ordinal(&mut batch, &mut memo, *table, &translated.data_file_id)?;
+                batch.delete_cf(&reverse_cf, reverse_key(table, ordinal, *position));
+                files::encode_location(&mut encoded, &StoredLocation::new(target, &translated))?;
+                batch.put_cf(&pk_cf, pk, &encoded);
                 batch.put_cf(
                     &reverse_cf,
-                    reverse_key(table, &translated),
+                    reverse_key(table, target, translated.row_position),
                     bincode::serialize(key)?,
                 );
                 rewritten += 1;
@@ -1527,6 +1532,41 @@ mod tests {
         assert_model(&store, &model);
         assert_eq!(raw_rows(&store, "d"), 7);
         assert_eq!(raw_rows(&store, "a2") + raw_rows(&store, "n0"), 0);
+    }
+
+    #[test]
+    fn retired_files_keep_their_ordinal_until_their_remap_is_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let mut model = insert(&store, "a", &[0, 1]);
+        rewrite_all(&store, &mut model, "b");
+        // Raw entries still name `a`; a lazy output has no ordinal of its own.
+        assert!(store.cached_ordinal(TABLE, "a").is_some());
+        assert!(store.cached_ordinal(TABLE, "b").is_none());
+        assert_model(&store, &model);
+        // Expectations in `b` allocate its ordinal at staging.
+        update(&store, &mut model, 0, "n0");
+        assert!(store.cached_ordinal(TABLE, "b").is_some());
+        update(&store, &mut model, 1, "n1");
+        assert!(store.cached_ordinal(TABLE, "a").is_some(), "remap retained");
+        assert_eq!(
+            store
+                .clean_remaps(&TABLE, &UNBOUNDED)
+                .unwrap()
+                .dropped_files,
+            1
+        );
+        // The next retirement releases both files; nothing names them.
+        update(&store, &mut model, 0, "n2");
+        assert!(store.cached_ordinal(TABLE, "a").is_none());
+        assert!(store.cached_ordinal(TABLE, "b").is_none());
+        assert!(store.cached_ordinal(TABLE, "n0").is_none());
+        assert!(store.cached_ordinal(TABLE, "n1").is_some());
+        assert_model(&store, &model);
+        drop(store);
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        assert_model(&store, &model);
+        assert_eq!(raw_rows(&store, "n1") + raw_rows(&store, "n2"), 2);
     }
 
     #[test]

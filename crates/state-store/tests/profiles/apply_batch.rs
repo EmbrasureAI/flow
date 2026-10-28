@@ -1,6 +1,6 @@
 use super::*;
-use crate::{ControlStore, PreparedOperation, StateStoreOptions, TableState};
-use flow_model::TableId;
+use crate::{ControlStore, IndexDelta, PreparedOperation, StateStoreOptions, TableState};
+use flow_model::{PgLsn, RowLocation, TableId};
 use serde_json::json;
 use std::{
     fs,

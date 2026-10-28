@@ -4,13 +4,13 @@
 //! same write batch. Intermediate batches retain the existing durability rules.
 
 use crate::{
-    ApplyResult, DELTAS, Error, FILE_COUNTS, IndexDelta, OPERATIONS, OperationKind, OperationPhase,
-    PK, REVERSE, Result, StateBatch, StateStore, TABLES, decode, decode_file_count, delta_key,
-    file_prefix, pk_key, reverse_key,
+    ApplyResult, DELTAS, Error, FILE_COUNTS, OPERATIONS, OperationKind, OperationPhase, PK,
+    REVERSE, Result, StateBatch, StateStore, TABLES, decode, decode_file_count, delta_key,
+    file_prefix,
+    files::{self, NO_FILE, StoredDelta, StoredLocation, reverse_key},
 };
-use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation};
+use flow_model::{FileId, OperationId, PrimaryKey};
 use rocksdb::ReadOptions;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -19,75 +19,6 @@ use std::{
 #[cfg(all(test, feature = "apply-profile"))]
 #[path = "../tests/profiles/apply_batch.rs"]
 mod apply_batch_profile;
-
-// This mirrors RowLocation's durable bincode shape while borrowing its variable-size
-// fields from a pinned RocksDB value. `matches` exhaustively destructures RowLocation so
-// adding a field cannot silently weaken the apply compare-and-swap check.
-#[derive(Debug, Serialize, Deserialize)]
-struct BorrowedFileId<'a>(#[serde(borrow)] &'a str);
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BorrowedRowLocation<'a> {
-    #[serde(borrow)]
-    data_file_id: BorrowedFileId<'a>,
-    row_position: u64,
-    data_sequence_number: i64,
-    spec_id: i32,
-    #[serde(borrow)]
-    partition: &'a [u8],
-    source_commit_lsn: PgLsn,
-    row_version: u64,
-    row_fingerprint: [u8; 16],
-}
-
-impl<'a> BorrowedRowLocation<'a> {
-    fn from_owned(location: &'a RowLocation) -> Self {
-        Self {
-            data_file_id: BorrowedFileId(&location.data_file_id.0),
-            row_position: location.row_position,
-            data_sequence_number: location.data_sequence_number,
-            spec_id: location.spec_id,
-            partition: &location.partition,
-            source_commit_lsn: location.source_commit_lsn,
-            row_version: location.row_version,
-            row_fingerprint: location.row_fingerprint,
-        }
-    }
-
-    fn to_owned_location(&self) -> RowLocation {
-        RowLocation {
-            data_file_id: FileId(self.data_file_id.0.to_owned()),
-            row_position: self.row_position,
-            data_sequence_number: self.data_sequence_number,
-            spec_id: self.spec_id,
-            partition: self.partition.to_vec(),
-            source_commit_lsn: self.source_commit_lsn,
-            row_version: self.row_version,
-            row_fingerprint: self.row_fingerprint,
-        }
-    }
-
-    fn matches(&self, expected: &RowLocation) -> bool {
-        let RowLocation {
-            data_file_id,
-            row_position,
-            data_sequence_number,
-            spec_id,
-            partition,
-            source_commit_lsn,
-            row_version,
-            row_fingerprint,
-        } = expected;
-        self.data_file_id.0 == data_file_id.0
-            && self.row_position == *row_position
-            && self.data_sequence_number == *data_sequence_number
-            && self.spec_id == *spec_id
-            && self.partition == partition
-            && self.source_commit_lsn == *source_commit_lsn
-            && self.row_version == *row_version
-            && self.row_fingerprint == *row_fingerprint
-    }
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ApplyBatchStats {
@@ -208,7 +139,8 @@ impl StateStore {
         while cursor < end {
             let chunk_end = end.min(cursor.saturating_add(self.0.lookup_rows as u64));
             let decode_started = Instant::now();
-            let mut deltas = Vec::<IndexDelta>::with_capacity((chunk_end - cursor) as usize);
+            let mut deltas =
+                Vec::<StoredDelta<'static>>::with_capacity((chunk_end - cursor) as usize);
             for offset in cursor..chunk_end {
                 let Some((key, value)) = records.item() else {
                     records.status()?;
@@ -220,7 +152,7 @@ impl StateStore {
                         "prepared delta ordinal is missing".into(),
                     ));
                 }
-                deltas.push(decode(value)?);
+                deltas.push(files::decode_delta(value)?.into_owned());
                 if offset + 1 < end {
                     records.next();
                 }
@@ -229,13 +161,19 @@ impl StateStore {
 
             let keys: Vec<_> = deltas
                 .iter()
-                .map(|delta| pk_key(&record.operation.table_id, &delta.key))
+                .map(|delta| crate::pk_key_bytes(&record.operation.table_id, &delta.key))
                 .collect();
             let reverse_lookup_started = Instant::now();
             let targets: Vec<_> = deltas
                 .iter()
                 .filter_map(|delta| delta.replacement.as_ref())
-                .map(|location| reverse_key(&record.operation.table_id, location))
+                .map(|location| {
+                    reverse_key(
+                        &record.operation.table_id,
+                        location.file,
+                        location.row_position,
+                    )
+                })
                 .collect();
             let fresh = self.reverse_targets_are_fresh(&reverse_cf, &targets);
             if !fresh {
@@ -261,7 +199,7 @@ impl StateStore {
                         .collect::<Vec<_>>()
                 })
             };
-            let mut chunk_file_counts = BTreeMap::<FileId, i64>::new();
+            let mut chunk_file_counts = BTreeMap::<u64, i64>::new();
             for output in outputs {
                 let output = output?;
                 for operation in output.operations {
@@ -294,6 +232,14 @@ impl StateStore {
                 if change == 0 {
                     continue;
                 }
+                // Counts stay keyed by path, like the remaps that move them.
+                let file = FileId(
+                    self.0
+                        .files
+                        .path(record.operation.table_id, file)
+                        .ok_or_else(files::unknown_file)?
+                        .to_string(),
+                );
                 let previous = if let Some(count) = file_counts.get(&file) {
                     count.current
                 } else {
@@ -346,6 +292,7 @@ impl StateStore {
             let key = file_prefix(&record.operation.table_id, &file);
             if count.current == 0 {
                 batch.delete_cf(&counts_cf, key);
+                self.mark_file_released(&mut batch, record.operation.table_id, &file);
             } else {
                 batch.put_cf(&counts_cf, key, count.current.to_be_bytes());
             }
@@ -449,7 +396,7 @@ fn record_apply_batch_metrics(
 
 /// Rows of one lookup chunk handled by one thread.
 struct PartInput {
-    deltas: Vec<IndexDelta>,
+    deltas: Vec<StoredDelta<'static>>,
     keys: Vec<Vec<u8>>,
     targets: Vec<Vec<u8>>,
 }
@@ -463,7 +410,8 @@ enum PartOperation {
 
 struct PartOutput {
     operations: Vec<PartOperation>,
-    file_counts: BTreeMap<FileId, i64>,
+    /// Keyed by ordinal; the caller converts to paths once per chunk.
+    file_counts: BTreeMap<u64, i64>,
     applied: u64,
     obsolete: u64,
     pk_lookup: Duration,
@@ -473,7 +421,7 @@ struct PartOutput {
 
 /// Split a chunk into up to `threads` contiguous parts of at least 128 rows.
 fn split_parts(
-    deltas: Vec<IndexDelta>,
+    deltas: Vec<StoredDelta<'static>>,
     keys: Vec<Vec<u8>>,
     targets: Vec<Vec<u8>>,
     threads: usize,
@@ -552,6 +500,7 @@ fn build_part(
             &remap_options,
         )
     });
+    let table = record.operation.table_id;
     let mut targets = targets.into_iter();
     for ((mut delta, current), key) in deltas.into_iter().zip(current).zip(keys) {
         let target = delta.replacement.as_ref().map(|_| {
@@ -563,26 +512,36 @@ fn build_part(
             (owner, targets.next().expect("one target per replacement"))
         });
         let current = current?;
-        let current = current
-            .as_deref()
-            .map(decode_borrowed_row_location)
-            .transpose()?;
+        let current = current.as_deref().map(files::decode_location).transpose()?;
         // A raw entry in a lazily retired file compares by its translated
         // location; its reverse entry stays at the raw location.
         let mut raw_reverse = None;
         let translated = match (&mut resolver, &current) {
             (Some(resolver), Some(raw)) => {
-                let owned = raw.to_owned_location();
-                let translated = resolver.resolve(&owned)?;
+                // Parts run under the row lock, so the ordinal cache is exact.
+                let path = store
+                    .0
+                    .files
+                    .path(table, raw.file)
+                    .ok_or_else(files::unknown_file)?;
+                let translated = resolver.resolve(&raw.to_location(&path))?;
                 if translated.is_some() {
-                    raw_reverse = Some(reverse_key(&record.operation.table_id, &owned));
+                    raw_reverse = Some(reverse_key(&table, raw.file, raw.row_position));
                 }
                 translated
             }
             _ => None,
         };
         let current = match &translated {
-            Some(location) => Some(BorrowedRowLocation::from_owned(location)),
+            // A translated file without an ordinal matches no expectation.
+            Some(location) => Some(StoredLocation::new(
+                store
+                    .0
+                    .files
+                    .ordinal(table, &location.data_file_id.0)
+                    .unwrap_or(NO_FILE),
+                location,
+            )),
             None => current,
         };
         if !matches_expected(current.as_ref(), delta.expected.as_ref()) {
@@ -596,7 +555,7 @@ fn build_part(
             }
             return Err(Error::IndexConflict {
                 table: record.operation.table_id,
-                key: delta.key,
+                key: PrimaryKey(delta.key.into_owned()),
             });
         }
         if let Some(replacement) = &mut delta.replacement
@@ -615,8 +574,9 @@ fn build_part(
             output
                 .operations
                 .push(PartOperation::DeleteReverse(reverse_key(
-                    &record.operation.table_id,
-                    old,
+                    &table,
+                    old.file,
+                    old.row_position,
                 )));
         }
         match (&delta.replacement, target) {
@@ -626,38 +586,40 @@ fn build_part(
                     .flatten()
                     .map(|value| decode(&value))
                     .transpose()?;
-                if owner.as_ref().is_some_and(|owner| owner != &delta.key) {
+                if owner.as_ref().is_some_and(|owner| owner.0 != *delta.key) {
                     return Err(Error::InvalidState(
                         "two live keys claim the same physical row".into(),
                     ));
                 }
-                output
-                    .operations
-                    .push(PartOperation::PutPk(key, bincode::serialize(new)?));
+                let mut value = Vec::new();
+                files::encode_location(&mut value, new)?;
+                output.operations.push(PartOperation::PutPk(key, value));
+                // The owner keeps PrimaryKey's encoding: a length-prefixed byte
+                // sequence, which is how bincode writes the slice.
                 output.operations.push(PartOperation::PutReverse(
                     target,
-                    bincode::serialize(&delta.key)?,
+                    bincode::serialize(&*delta.key)?,
                 ));
             }
             (None, None) => output.operations.push(PartOperation::DeletePk(key)),
             _ => unreachable!("one reverse-owner result per replacement"),
         }
-        let old = delta.expected.as_ref().map(|row| &row.data_file_id);
-        let new = delta.replacement.as_ref().map(|row| &row.data_file_id);
+        let old = delta.expected.as_ref().map(|row| row.file);
+        let new = delta.replacement.as_ref().map(|row| row.file);
         if old != new {
             for (file, change) in old
                 .into_iter()
                 .map(|file| (file, -1))
                 .chain(new.into_iter().map(|file| (file, 1)))
             {
-                if let Some(count) = output.file_counts.get_mut(file) {
+                if let Some(count) = output.file_counts.get_mut(&file) {
                     *count = count.checked_add(change).ok_or_else(|| {
                         Error::InvalidState(
                             "file count delta exceeds the bounded lookup chunk".into(),
                         )
                     })?;
                 } else {
-                    output.file_counts.insert(file.clone(), change);
+                    output.file_counts.insert(file, change);
                 }
             }
         }
@@ -667,20 +629,17 @@ fn build_part(
     Ok(output)
 }
 
-fn decode_borrowed_row_location(value: &[u8]) -> Result<BorrowedRowLocation<'_>> {
-    Ok(bincode::deserialize(value)?)
-}
 fn matches_expected(
-    current: Option<&BorrowedRowLocation<'_>>,
-    expected: Option<&RowLocation>,
+    current: Option<&StoredLocation<'_>>,
+    expected: Option<&StoredLocation<'_>>,
 ) -> bool {
-    match (current, expected) {
-        (None, None) => true,
-        (Some(current), Some(expected)) => current.matches(expected),
-        _ => false,
-    }
+    // Exhaustive field equality, with the ordinal standing in for the path.
+    current == expected
 }
-fn is_obsolete(current: Option<&BorrowedRowLocation<'_>>, expected: Option<&RowLocation>) -> bool {
+fn is_obsolete(
+    current: Option<&StoredLocation<'_>>,
+    expected: Option<&StoredLocation<'_>>,
+) -> bool {
     match (current, expected) {
         // Absence alone is not a durable proof of a newer source delete.
         (None, Some(_)) => false,
@@ -695,9 +654,10 @@ fn is_obsolete(current: Option<&BorrowedRowLocation<'_>>, expected: Option<&RowL
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flow_model::{PgLsn, RowLocation};
 
     #[test]
-    fn borrowed_row_location_preserves_codec_and_malformed_boundaries() {
+    fn stored_location_preserves_every_field_and_rejects_damage() {
         let location = RowLocation {
             data_file_id: FileId("s3://bucket/δ\0/data.parquet".into()),
             row_position: u64::MAX - 1,
@@ -708,34 +668,43 @@ mod tests {
             row_version: u64::MAX - 3,
             row_fingerprint: [0xa5; 16],
         };
-        let encoded = bincode::serialize(&location).unwrap();
-        let borrowed = decode_borrowed_row_location(&encoded).unwrap();
-        assert!(borrowed.matches(&location));
-        assert_eq!(bincode::serialize(&borrowed).unwrap(), encoded);
+        let stored = StoredLocation::new(u64::MAX - 5, &location);
+        let mut encoded = Vec::new();
+        files::encode_location(&mut encoded, &stored).unwrap();
+        let decoded = files::decode_location(&encoded).unwrap();
+        assert_eq!(decoded, stored);
+        assert!(matches_expected(Some(&decoded), Some(&stored)));
+        assert_eq!(decoded.to_location(&location.data_file_id.0), location);
+
+        // Each field takes part in the compare-and-swap.
+        let mut other = stored.clone();
+        other.file -= 1;
+        assert!(!matches_expected(Some(&decoded), Some(&other)));
+        let mut other = stored.clone();
+        other.row_fingerprint[15] ^= 1;
+        assert!(!matches_expected(Some(&decoded), Some(&other)));
+        let mut other = stored.clone();
+        other.partition = std::borrow::Cow::Owned(vec![0, 255, 1]);
+        assert!(!matches_expected(Some(&decoded), Some(&other)));
+        assert!(!matches_expected(None, Some(&stored)));
 
         let mut trailing = encoded.clone();
         trailing.extend_from_slice(&[0xde, 0xad]);
-        assert_eq!(
-            bincode::deserialize::<RowLocation>(&trailing).unwrap(),
-            location
-        );
-        assert!(
-            decode_borrowed_row_location(&trailing)
-                .unwrap()
-                .matches(&location)
-        );
+        assert!(files::decode_location(&trailing).is_err());
+        assert!(files::decode_location(&encoded[..encoded.len() - 1]).is_err());
 
-        let mut invalid_utf8 = encoded.clone();
-        let path_start = invalid_utf8
-            .windows(b"s3://".len())
-            .position(|bytes| bytes == b"s3://")
-            .unwrap();
-        invalid_utf8[path_start] = 0xff;
-        assert!(bincode::deserialize::<RowLocation>(&invalid_utf8).is_err());
-        assert!(decode_borrowed_row_location(&invalid_utf8).is_err());
-
-        let truncated = &encoded[..encoded.len() - 1];
-        assert!(bincode::deserialize::<RowLocation>(truncated).is_err());
-        assert!(decode_borrowed_row_location(truncated).is_err());
+        // Typical values stay small whatever the path length.
+        let long = RowLocation {
+            data_file_id: FileId("x".repeat(400)),
+            row_position: 1_000,
+            data_sequence_number: 12,
+            spec_id: 0,
+            partition: Vec::new(),
+            source_commit_lsn: PgLsn(1 << 40),
+            row_version: 7,
+            row_fingerprint: [1; 16],
+        };
+        files::encode_location(&mut encoded, &StoredLocation::new(3, &long)).unwrap();
+        assert!(encoded.len() <= 40, "{} bytes", encoded.len());
     }
 }

@@ -87,6 +87,16 @@ reconciliation of an external rewrite at about 46,000 rows/s on two vCPUs,
 mostly in unbatched row-index lookups and apply; larger scratch memtables gave
 no consistent gain there and were not adopted.
 
+## Row index
+
+Index format 4 names data files by per-table ordinal instead of path in
+primary-key values, reverse keys and staged deltas
+([report](benchmarks/index-file-ordinals.md)). In the PostgreSQL-free ingest
+microbenchmark on a 16-vCPU host, one busy table with 113,000 mutations per
+epoch rose from 111,000–116,000 to 158,000–159,000 mutations/s, and path length
+no longer affects apply or collapse time. These are local stage timings, not
+publication latency or service throughput.
+
 ## Reproducibility
 
 The [benchmark report](benchmarks/v3-deletion-vectors.md) gives the environment,
