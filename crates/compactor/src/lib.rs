@@ -2,7 +2,9 @@
 //! table coordinator can validate and publish their output.
 
 use flow_model::FileId;
+use iceberg::spec::FormatVersion;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -26,14 +28,15 @@ pub enum DataRewriteScope {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeleteDebt {
-    /// A data file with `delete_files_soft` applicable delete files is a data
-    /// rewrite candidate, and delete-only consolidation runs only when no file
-    /// needs delete reclamation.
-    #[default]
+    /// The previous behavior: a data file with `delete_files_soft` applicable
+    /// delete files is a data rewrite candidate, and delete-only consolidation
+    /// runs only when no file needs delete reclamation.
     Current,
     /// Delete-file count debt, soft or hard, is paid first by a delete-only
     /// consolidation. Data rewrites for deletes select only files whose own
-    /// deleted fraction reaches `deleted_rows_percent`.
+    /// deleted fraction reaches `deleted_rows_percent`. Format v3 tables use
+    /// [`DeleteDebt::Current`]; see [`Policy::for_format_version`].
+    #[default]
     Consolidate,
 }
 
@@ -151,7 +154,7 @@ impl Default for Policy {
             l2_target_bytes: 512 << 20,
             min_file_age_ms: 1_000,
             lazy_index_remap: true,
-            delete_debt: DeleteDebt::Current,
+            delete_debt: DeleteDebt::Consolidate,
             remap_max_files: 512,
             remap_max_depth: 8,
             remap_cleanup_rows: 32_768,
@@ -378,6 +381,22 @@ impl Policy {
             PublicationPressure::Delay
         } else {
             PublicationPressure::Healthy
+        }
+    }
+
+    /// The policy for a table of `version`. A v3 table keeps at most one
+    /// deletion vector per data file, merged at publication, so a delete-only
+    /// consolidation can repack Puffin objects but never lowers a file's
+    /// delete-file count. Only a data rewrite pays that debt, so v3 tables
+    /// keep [`DeleteDebt::Current`].
+    pub fn for_format_version(&self, version: FormatVersion) -> Cow<'_, Self> {
+        if version >= FormatVersion::V3 && self.delete_debt != DeleteDebt::Current {
+            Cow::Owned(Self {
+                delete_debt: DeleteDebt::Current,
+                ..self.clone()
+            })
+        } else {
+            Cow::Borrowed(self)
         }
     }
 

@@ -187,13 +187,22 @@ written, so an older binary fails at startup instead of misreading raw entries
 in retired files. Run this release or a newer one on that state directory; the
 flag does not make an index readable by older binaries.
 
-## Experimental consolidation-first delete debt
+## Consolidation-first delete debt
 
-`[compaction] delete_debt = "consolidate"` (default `"current"`) pays
-delete-file count debt with the delete-only consolidation before any data
-rewrite. Delete-file count is the most delete files applying to one data file,
-or the table-wide count of shared position-delete files. With `"current"`
-nothing changes.
+By default (`[compaction] delete_debt = "consolidate"`) delete-file count debt
+is paid with the delete-only consolidation before any data rewrite.
+Delete-file count is the most delete files applying to one data file, or the
+table-wide count of shared position-delete files. `delete_debt = "current"`
+restores the previous behavior: a data file with `delete_files_soft`
+applicable delete files is a data rewrite candidate, and consolidation runs
+only when no file needs delete reclamation, so a mostly-live base under
+update fanout is rewritten whole.
+
+Format v3 tables always use `"current"`. A data file keeps at most one
+deletion vector, merged at publication, so consolidation can repack Puffin
+objects but never lowers a file's delete-file count; only a data rewrite pays
+that debt. Readers without deletion-vector support, such as Trino 470, also
+depend on that rewrite retiring sparse vectors.
 
 - A table visit runs the bounded consolidation (at most 32 inputs, 32 MiB and
   one million positions, at least `min(delete_files_soft, 32)` inputs) whenever
@@ -209,6 +218,10 @@ nothing changes.
   do. L0 and small-file debt keep their grouping.
 - If consolidation cannot reduce the count, no other group exists and the count
   stays at `delete_files_hard`, planning falls back to the count-driven rewrite.
+- On a 2M-row Zipf workload with 90% updates, p95 commit-to-catalog latency
+  fell 71-74% against `"current"` (6.8 s to 2.0 s with lazy index remap), and
+  reads stayed within the 1.25x read gate. The default 100k-row mixed workload
+  was neutral.
 - Each choice emits a `maintenance_action_chosen` debug event on the
   `flow_events` target with `action`, `reason`, the path (`publication`,
   `idle`, `probe` or `build_active`) and the debt counts. Build and rewrite

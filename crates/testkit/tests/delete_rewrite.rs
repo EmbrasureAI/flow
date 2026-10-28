@@ -1626,6 +1626,7 @@ async fn repeated_updates_past_the_hard_delete_limit_recover_by_consolidation() 
         l0_hard_files: 400,
         oldest_l0_soft_ms: 600_000,
         oldest_l0_hard_ms: 1_200_000,
+        delete_debt: DeleteDebt::Current,
         ..Policy::default()
     };
     let policy = Policy {

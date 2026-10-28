@@ -576,11 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn delete_debt_defaults_to_current_and_accepts_consolidate() {
+    fn delete_debt_defaults_to_consolidate_and_accepts_current() {
         let example = include_str!("../../../examples/flow.toml");
         assert_eq!(
             valid_config().compaction.delete_debt,
-            flow_compactor::DeleteDebt::Current
+            flow_compactor::DeleteDebt::Consolidate
         );
         for (value, expected) in [
             ("current", flow_compactor::DeleteDebt::Current),

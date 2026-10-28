@@ -316,7 +316,28 @@ fn forced_delete_rewrite_keeps_companions_within_the_size_tier() {
     over_limit.level = Level::L1;
     let mut large = file(3, 128 << 20);
     large.level = Level::L1;
-    let policy = Policy::default();
+    // With consolidation, the default, an L1 seed admits only companions that
+    // are themselves past the deleted fraction.
+    let plan = Policy::default()
+        .plan(
+            1,
+            0,
+            &[
+                small.clone(),
+                at_limit.clone(),
+                over_limit.clone(),
+                large.clone(),
+            ],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.input_files, BTreeSet::from([small.id.clone()]));
+    // The current policy fills the group with companions within the size tier.
+    let policy = Policy {
+        delete_debt: DeleteDebt::Current,
+        ..Policy::default()
+    };
     let plan = policy
         .plan(
             1,
@@ -606,11 +627,12 @@ fn hot_base_with_delete_fanout() -> (Vec<FileCandidate>, Vec<DeleteDependency>) 
 fn delete_file_count_debt_selects_consolidation_not_a_base_rewrite() {
     let (files, deletes) = hot_base_with_delete_fanout();
     let base = files[0].id.clone();
-    let current = Policy::default();
-    let consolidate = Policy {
-        delete_debt: DeleteDebt::Consolidate,
+    let current = Policy {
+        delete_debt: DeleteDebt::Current,
         ..Policy::default()
     };
+    let consolidate = Policy::default();
+    assert_eq!(consolidate.delete_debt, DeleteDebt::Consolidate);
     for policy in [&current, &consolidate] {
         let debt = policy
             .debt_with_shared_deletes(&files, deletes.len())
@@ -697,10 +719,7 @@ fn delete_file_count_debt_selects_consolidation_not_a_base_rewrite() {
 
 #[test]
 fn consolidated_delete_debt_rewrites_only_files_past_the_deleted_fraction() {
-    let consolidate = Policy {
-        delete_debt: DeleteDebt::Consolidate,
-        ..Policy::default()
-    };
+    let consolidate = Policy::default();
     let mut files = Vec::new();
     for (id, level, deleted) in [
         (0, Level::L2, 350_000),
@@ -718,7 +737,10 @@ fn consolidated_delete_debt_rewrites_only_files_past_the_deleted_fraction() {
     }
     // The current policy groups each dense file with a mostly-live neighbour
     // selected only for its delete-file count.
-    let current = Policy::default();
+    let current = Policy {
+        delete_debt: DeleteDebt::Current,
+        ..Policy::default()
+    };
     let plan = current.plan(1, 0, &files, &[]).unwrap().unwrap();
     assert_eq!(
         plan.input_files,
@@ -750,10 +772,7 @@ fn consolidated_delete_debt_rewrites_only_files_past_the_deleted_fraction() {
 
 #[test]
 fn consolidated_delete_debt_falls_back_to_count_driven_rewrite_at_the_hard_limit() {
-    let consolidate = Policy {
-        delete_debt: DeleteDebt::Consolidate,
-        ..Policy::default()
-    };
+    let consolidate = Policy::default();
     let mut base = file(0, 600 << 20);
     base.level = Level::L2;
     base.row_count = 1_000_000;
@@ -770,4 +789,49 @@ fn consolidated_delete_debt_falls_back_to_count_driven_rewrite_at_the_hard_limit
     assert_eq!(plan.reason, PlanReason::DeleteFileCount);
     base.delete_file_count = 15;
     assert!(consolidate.plan(1, 0, &[base], &[]).unwrap().is_none());
+}
+
+#[test]
+fn format_v3_tables_pay_delete_file_count_with_a_data_rewrite() {
+    use iceberg::spec::FormatVersion;
+    let policy = Policy::default();
+    let mut base = file(0, 600 << 20);
+    base.level = Level::L2;
+    base.row_count = 1_000_000;
+    base.deleted_rows = 10_000;
+    base.age_ms = 60_000;
+    base.delete_file_count = policy.delete_files_soft;
+    let debt = policy.debt(std::slice::from_ref(&base)).unwrap();
+    assert_eq!(debt.pressure, PublicationPressure::Delay);
+    for version in [FormatVersion::V1, FormatVersion::V2] {
+        let v2 = policy.for_format_version(version);
+        assert!(matches!(v2, std::borrow::Cow::Borrowed(_)));
+        assert!(v2.consolidates_delete_debt(&debt));
+        assert!(
+            v2.plan(1, 0, std::slice::from_ref(&base), &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+    // A data file keeps at most one deletion vector, so consolidation cannot
+    // lower this count; v3 rewrites the mostly-live base as before.
+    let v3 = policy.for_format_version(FormatVersion::V3);
+    assert_eq!(v3.delete_debt, DeleteDebt::Current);
+    assert_eq!(
+        format!("{:?}", *v3),
+        format!(
+            "{:?}",
+            Policy {
+                delete_debt: DeleteDebt::Current,
+                ..Policy::default()
+            }
+        )
+    );
+    assert!(!v3.consolidates_delete_debt(&debt));
+    let plan = v3
+        .plan(1, 0, std::slice::from_ref(&base), &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.input_files, BTreeSet::from([base.id.clone()]));
+    assert_eq!(plan.reason, PlanReason::DeleteFileCount);
 }

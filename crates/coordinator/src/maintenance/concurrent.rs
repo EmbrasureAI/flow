@@ -270,12 +270,15 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, schema.table_id).await?;
-        let Some(plan) = self.policy.plan(
-            snapshot,
-            table.metadata().current_schema_id(),
-            &inventory.files,
-            &inventory.deletes,
-        )?
+        let Some(plan) = self
+            .policy
+            .for_format_version(table.metadata().format_version())
+            .plan(
+                snapshot,
+                table.metadata().current_schema_id(),
+                &inventory.files,
+                &inventory.deletes,
+            )?
         else {
             return Ok(None);
         };

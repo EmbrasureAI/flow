@@ -136,12 +136,15 @@ impl TableMaintenance {
         let view = SnapshotView::current_with_cache(&table, &self.cache).await?;
         let repair_input = if let Some(cursor) = &cursor {
             let inventory = self.inventory(&table, table_id).await?;
-            match self.policy.plan(
-                base.snapshot_id.ok_or(ReplanRequired)?,
-                table.metadata().current_schema_id(),
-                &inventory.files,
-                &inventory.deletes,
-            ) {
+            match self
+                .policy
+                .for_format_version(table.metadata().format_version())
+                .plan(
+                    base.snapshot_id.ok_or(ReplanRequired)?,
+                    table.metadata().current_schema_id(),
+                    &inventory.files,
+                    &inventory.deletes,
+                ) {
                 Err(flow_compactor::Error::DependencyBudget) => {}
                 Err(error) => return Err(error.into()),
                 Ok(_) => return Ok(None),

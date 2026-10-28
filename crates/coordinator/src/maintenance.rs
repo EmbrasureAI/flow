@@ -71,6 +71,9 @@ pub struct Inventory {
     pub manifest_count: usize,
     pub manifest_entries: usize,
     pub delete_file_count: usize,
+    /// The table's format version, which selects the delete-debt policy. See
+    /// [`flow_compactor::Policy::for_format_version`].
+    pub format_version: iceberg::spec::FormatVersion,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -423,6 +426,7 @@ impl TableMaintenance {
             manifest_count: view.manifest_count(),
             manifest_entries: view.manifest_entries(),
             delete_file_count,
+            format_version: table.metadata().format_version(),
         })
     }
 
@@ -454,12 +458,15 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, table_id).await?;
-        let Some(plan) = self.policy.plan(
-            snapshot,
-            table.metadata().current_schema_id(),
-            &inventory.files,
-            &inventory.deletes,
-        )?
+        let Some(plan) = self
+            .policy
+            .for_format_version(table.metadata().format_version())
+            .plan(
+                snapshot,
+                table.metadata().current_schema_id(),
+                &inventory.files,
+                &inventory.deletes,
+            )?
         else {
             return Ok(None);
         };

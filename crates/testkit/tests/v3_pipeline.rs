@@ -1633,3 +1633,125 @@ async fn v3_rewrites_with_or_without_lazy_remap_keep_vectors_and_index_exact() {
         assert_index_exact(&f).await;
     }
 }
+
+/// Every live delete of a v3 table is a deletion vector on a live data file,
+/// and no data file has more than one.
+fn assert_vectors_well_formed(view: &SnapshotView) {
+    let mut targets = BTreeSet::new();
+    for entry in view
+        .live_files
+        .values()
+        .filter(|entry| entry.content_type() != DataContentType::Data)
+    {
+        assert_eq!(entry.content_type(), DataContentType::PositionDeletes);
+        assert_eq!(entry.file_format(), DataFileFormat::Puffin);
+        let target = entry
+            .data_file()
+            .referenced_data_file()
+            .expect("a deletion vector names its data file");
+        assert!(
+            view.live_files
+                .get(&target)
+                .is_some_and(|data| data.content_type() == DataContentType::Data),
+            "vector targets a live data file"
+        );
+        assert!(targets.insert(target), "one vector per data file");
+    }
+}
+
+/// Readers without deletion-vector support, such as Trino 470, reject any
+/// live `PUFFIN` delete entry, and the service fixture relies on maintenance
+/// retiring sparse vectors once one delete file per data file is soft debt.
+/// Consolidation cannot lower a file below one vector, so with the default
+/// `delete_debt` a v3 table still pays that debt by rewriting the mostly-live
+/// base instead of leaving its vector live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_delete_debt_retires_sparse_vectors_on_a_mostly_live_base() {
+    use flow_compactor::{DeleteDebt, Level, PublicationPressure};
+    let mut f = Fixture::new(FormatVersion::V3).await;
+    // The service fixture's thresholds.
+    let policy = Policy {
+        deleted_rows_percent: 1,
+        delete_files_soft: 1,
+        delete_files_hard: 2,
+        ..Policy::default()
+    };
+    assert_eq!(policy.delete_debt, DeleteDebt::Consolidate);
+    let effective = policy.for_format_version(FormatVersion::V3);
+    assert_eq!(effective.delete_debt, DeleteDebt::Current);
+    let maintenance = f.maintenance_with(&f.store, policy.clone());
+    let mut expected = BTreeMap::new();
+    for (lsn, ids) in [(10, 0..500), (20, 500..1000)] {
+        let changes = ids
+            .map(|id| {
+                expected.insert(id, row(id, "initial"));
+                (id, Change::Insert(row(id, "initial")))
+            })
+            .collect();
+        f.publish(lsn, changes).await;
+    }
+    // Two L0 files are soft debt; their rewrite moves the base out of L0.
+    assert!(
+        maintenance
+            .compact(&f.head, &f.schema, f.scratch())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    f.refresh().await;
+    let inventory = maintenance
+        .inventory(&f.head, f.schema.table_id)
+        .await
+        .unwrap();
+    assert_eq!(inventory.files.len(), 1);
+    assert_ne!(inventory.files[0].level, Level::L0);
+    assert_eq!(inventory.debt.pressure, PublicationPressure::Healthy);
+    for epoch in 1..=6u64 {
+        // A hot key and one cold key of the base change every epoch; the
+        // base stays below `deleted_rows_percent`.
+        let changes = [0, epoch as i64 * 100]
+            .into_iter()
+            .map(|id| {
+                let value = row(id, &format!("v{epoch}"));
+                expected.insert(id, value.clone());
+                (id, Change::Update(value))
+            })
+            .collect();
+        f.publish(100 + epoch * 10, changes).await;
+        assert_vectors_well_formed(&SnapshotView::current(&f.head).await.unwrap());
+        f.assert_rows(expected.values().cloned().collect()).await;
+        let inventory = maintenance
+            .inventory(&f.head, f.schema.table_id)
+            .await
+            .unwrap();
+        assert_eq!(inventory.format_version, FormatVersion::V3);
+        assert!(inventory.debt.max_delete_files <= 1);
+        assert_ne!(inventory.debt.pressure, PublicationPressure::Healthy);
+        assert!(!effective.consolidates_delete_debt(&inventory.debt));
+        for _ in 0..8 {
+            let rewritten = maintenance
+                .compact(&f.head, &f.schema, f.scratch())
+                .await
+                .unwrap();
+            f.refresh().await;
+            if rewritten.is_none() {
+                break;
+            }
+        }
+        let view = SnapshotView::current(&f.head).await.unwrap();
+        assert_vectors_well_formed(&view);
+        assert!(
+            view.live_files
+                .values()
+                .all(|entry| entry.content_type() == DataContentType::Data),
+            "epoch {epoch}: maintenance retires every sparse vector"
+        );
+        let inventory = maintenance
+            .inventory(&f.head, f.schema.table_id)
+            .await
+            .unwrap();
+        assert_eq!(inventory.debt.pressure, PublicationPressure::Healthy);
+        f.assert_rows(expected.values().cloned().collect()).await;
+        assert_index_exact(&f).await;
+    }
+}

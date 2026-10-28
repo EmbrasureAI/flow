@@ -21,6 +21,10 @@ From earlier development builds of `main`:
   without lazy remaps. Earlier builds refuse to open such an index
   (`Column families not opened: file_remaps`) without changing it. To go
   back, restore the `state_dir` copied before the upgrade.
+- Data rewrites of keyed tables commit lazy index remaps, and delete-file count
+  debt is paid by delete-only consolidation, by default. Set
+  `[compaction] lazy_index_remap = false` or `delete_debt = "current"` for the
+  earlier behaviour.
 
 ### Added
 
@@ -99,14 +103,17 @@ From earlier development builds of `main`:
   `flow_index_remap_max_depth`, `flow_index_remaps_dropped_total` and
   `flow_index_remap_rows_materialized_total` report it. See
   [local compaction](docs/local-compaction.md#lazy-index-remap).
-- Experimental `[compaction] delete_debt = "consolidate"` (default
-  `"current"`) pays delete-file count debt, including hard pressure, with the
-  delete-only consolidation instead of rewriting a mostly-live base; data
-  rewrites for deletes then select only files past `deleted_rows_percent`. With
-  Zipf-skewed updates at 30,000 mutations/s, commit-to-catalog p95 fell from
-  5.9 s to 1.5 s. A `maintenance_action_chosen` debug event and a
-  `selection_reason` field on build and rewrite events record why each action
-  ran.
+- Delete-file count debt, soft and hard, is paid by the bounded delete-only
+  consolidation instead of a data rewrite of a mostly-live base, and
+  delete-driven data rewrites select only files past `deleted_rows_percent`
+  (`[compaction] delete_debt`, default `"consolidate"`; `"current"` restores
+  count-driven data rewrites). With 2M rows and Zipf-skewed updates at 30,000
+  mutations/s, commit-to-catalog p95 fell from 6.8 s to 2.0 s and reads stayed
+  within 1.25× of a compacted copy; the default mixed workload was neutral.
+  Format v3 tables keep `"current"`: a data file has at most one deletion
+  vector, so consolidation cannot lower its count. A
+  `maintenance_action_chosen` debug event and a `selection_reason` field on
+  build and rewrite events record why each action ran.
 
 **Commands and configuration**
 

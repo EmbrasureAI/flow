@@ -1096,8 +1096,7 @@ impl TableWork {
             // otherwise wait for hard pressure. The consolidation is bounded
             // and changes no row locations, so this visit can pay it.
             if self
-                .config
-                .compaction
+                .delete_policy(&inventory)
                 .consolidates_delete_debt(&inventory.debt)
             {
                 self.choose_maintenance(id, &inventory, "delete_consolidation", "probe");
@@ -1113,8 +1112,18 @@ impl TableWork {
         })
     }
 
+    /// The configured compaction policy as it applies to this table's format.
+    fn delete_policy(
+        &self,
+        inventory: &flow_coordinator::Inventory,
+    ) -> std::borrow::Cow<'_, flow_compactor::Policy> {
+        self.config
+            .compaction
+            .for_format_version(inventory.format_version)
+    }
+
     fn prefers_delete_rewrite(&self, inventory: &flow_coordinator::Inventory) -> bool {
-        let policy = &self.config.compaction;
+        let policy = self.delete_policy(inventory);
         policy.consolidates_delete_debt(&inventory.debt)
             || inventory.delete_file_count >= policy.delete_files_soft
                 && (policy.data_rewrite_scope != flow_compactor::DataRewriteScope::All
@@ -1133,7 +1142,7 @@ impl TableWork {
         action: &'static str,
         path: &'static str,
     ) {
-        let policy = &self.config.compaction;
+        let policy = self.delete_policy(inventory);
         let debt = &inventory.debt;
         let reasons = policy.pressure_reasons(debt);
         // Consolidation pays delete-file count; other actions pay whatever
@@ -1180,8 +1189,7 @@ impl TableWork {
             // invalidated at catch-up and rescheduled.
             if self.compaction
                 && self
-                    .config
-                    .compaction
+                    .delete_policy(&inventory)
                     .consolidates_delete_debt(&inventory.debt)
                 && self.config.compaction.layout_pressure(&inventory.debt)
                     != flow_compactor::PublicationPressure::Pause
