@@ -1086,7 +1086,8 @@ impl TableWork {
         {
             return Ok(TableOutcome::ProbeComplete);
         }
-        let inventory = self.maintenance.inventory(&current, id).await?;
+        let mut current = current;
+        let mut inventory = self.maintenance.inventory(&current, id).await?;
         crate::observation::table_inventory(id, &inventory);
         if inventory.debt.pressure != flow_compactor::PublicationPressure::Delay {
             return Ok(TableOutcome::ProbeComplete);
@@ -1103,7 +1104,21 @@ impl TableWork {
                 self.compact(&current, &schema, CompactionKind::Deletes)
                     .await?;
             }
-            return Ok(TableOutcome::ProbeComplete);
+            if !self.rewrites_after_consolidation(&inventory) {
+                return Ok(TableOutcome::ProbeComplete);
+            }
+            // Per target, continuous CDC keeps consolidation due on nearly
+            // every visit, which would otherwise starve the data rewrites
+            // that retire small files and their delete files. The same probe
+            // also captures one when that debt remains.
+            current = self.catalog.load_table(current.identifier()).await?;
+            inventory = self.maintenance.inventory(&current, id).await?;
+            crate::observation::table_inventory(id, &inventory);
+            if inventory.debt.pressure != flow_compactor::PublicationPressure::Delay
+                || !self.has_rewrite_debt(&inventory)
+            {
+                return Ok(TableOutcome::ProbeComplete);
+            }
         }
         self.choose_maintenance(id, &inventory, "background_build", "probe");
         Ok(match self.start_build(&current, &schema).await? {
@@ -1139,6 +1154,25 @@ impl TableWork {
                         .any(|file| policy.needs_delete_reclamation(file)))
     }
 
+    /// Whether a maintenance visit continues with a data rewrite after its
+    /// consolidation: with [`flow_compactor::DeleteLayout::PerTarget`], when
+    /// data rewrites may run. The shared layout keeps one action per visit.
+    fn rewrites_after_consolidation(&self, inventory: &flow_coordinator::Inventory) -> bool {
+        let policy = self.delete_policy(inventory);
+        policy.delete_layout == flow_compactor::DeleteLayout::PerTarget
+            && policy.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
+    }
+
+    /// Whether any debt a data rewrite pays remains: L0 and small-file
+    /// limits, dense deletes, or single-target files on small files.
+    fn has_rewrite_debt(&self, inventory: &flow_coordinator::Inventory) -> bool {
+        let policy = self.delete_policy(inventory);
+        let debt = &inventory.debt;
+        policy.layout_pressure(debt) != flow_compactor::PublicationPressure::Healthy
+            || debt.dense_delete_files > 0
+            || policy.small_target_debt(debt)
+    }
+
     /// Record which maintenance action a table visit chose and the debt that
     /// drove it, so benchmark runs can attribute their stalls.
     fn choose_maintenance(
@@ -1169,6 +1203,8 @@ impl TableWork {
             delete_files = inventory.delete_file_count,
             shared_delete_files = debt.shared_delete_files,
             max_delete_files = debt.max_delete_files,
+            target_delete_files = debt.target_delete_files,
+            small_target_delete_files = debt.small_target_delete_files,
             dense_delete_files = debt.dense_delete_files,
             l0_files = debt.l0_files,
             small_files = debt.small_files,
@@ -1237,13 +1273,26 @@ impl TableWork {
             let before = current.metadata().current_snapshot_id();
             let data_rewrite_scope = self.config.compaction.data_rewrite_scope;
             let path = if optional { "idle" } else { "publication" };
-            let rewritten = if self.prefers_delete_rewrite(&inventory) {
+            let mut rewritten = if self.prefers_delete_rewrite(&inventory) {
                 self.choose_maintenance(id, &inventory, "delete_consolidation", path);
                 self.compact(&current, schema, CompactionKind::Deletes)
                     .await?
             } else {
                 None
             };
+            if rewritten.is_some() && self.rewrites_after_consolidation(&inventory) {
+                // As in the probe: a data rewrite follows in the same visit
+                // while the debt it pays remains.
+                current = self.catalog.load_table(current.identifier()).await?;
+                inventory = self.maintenance.inventory(&current, id).await?;
+                crate::observation::table_inventory(id, &inventory);
+                pressure = inventory.debt.pressure;
+                if pressure != flow_compactor::PublicationPressure::Healthy
+                    && self.has_rewrite_debt(&inventory)
+                {
+                    rewritten = None;
+                }
+            }
             if rewritten.is_none() {
                 let soft = pressure == flow_compactor::PublicationPressure::Delay;
                 if soft && options.build_admission == BuildAdmission::Wait {
@@ -1994,6 +2043,9 @@ mod publication_retry_tests {
         settle_unfinished_operation(Target::Replaced).await;
     }
 }
+
+#[cfg(test)]
+mod per_target_tests;
 
 #[cfg(test)]
 mod metadata_maintenance_tests {

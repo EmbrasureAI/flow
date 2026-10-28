@@ -363,6 +363,7 @@ impl TableMaintenance {
                 row_count: file.record_count(),
                 deleted_rows: 0,
                 delete_file_count: deletes.len(),
+                target_delete_files: 0,
                 age_ms,
                 spec_id: table.metadata().default_partition_spec_id(),
                 partition: Vec::new(),
@@ -386,6 +387,22 @@ impl TableMaintenance {
             file.deleted_rows = file.row_count.checked_sub(live_rows).ok_or_else(|| {
                 anyhow::anyhow!("indexed live rows exceed physical rows in {}", file.id.0)
             })?;
+        }
+        let positions = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.id.clone(), index))
+            .collect::<HashMap<_, _>>();
+        for (path, targets) in &dependencies {
+            let file = &view.live_files[path].data_file;
+            if let (1, Some(target)) = (targets.len(), targets.first())
+                && !self.policy.settled_target_delete(
+                    file.record_count(),
+                    flow_iceberg_ext::delete_content_size(file),
+                )
+            {
+                files[positions[target]].target_delete_files += 1;
+            }
         }
         let deletes = dependencies
             .into_iter()

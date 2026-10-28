@@ -652,10 +652,19 @@ pub(crate) async fn write_residual_positions(
         config,
         table.metadata().format_version(),
     )?;
-    // Per-target residuals rotate at each target instead, so no data file
-    // gains a shared dependency. Format v3 vectors are per target already.
+    // Per-target residuals rotate at each full-size target instead, so no
+    // full-size data file gains a shared dependency; positions on L0 and small
+    // files, this rewrite's small outputs included, share ranges. Format v3
+    // vectors are per target already.
     let per_target = output.plan.per_target_deletes
         && table.metadata().format_version() < iceberg::spec::FormatVersion::V3;
+    let mut ranges = output.plan.target_ranges.clone();
+    for file in &output.data_files {
+        ranges.add(
+            FileId(file.file_path().to_owned()),
+            file.file_size_in_bytes(),
+        );
+    }
     let outputs = output
         .data_files
         .iter()
@@ -676,7 +685,9 @@ pub(crate) async fn write_residual_positions(
         residual_rows += u64::from(!outputs.contains(position.data_file_id.0.as_str()));
         if per_target {
             if target.as_ref() != Some(&position.data_file_id) {
-                if target.is_some() {
+                if let Some(previous) = &target
+                    && !ranges.continues(previous, &position.data_file_id)
+                {
                     writer.write(&batch).await?;
                     batch.clear();
                     writer.finish_target().await?;

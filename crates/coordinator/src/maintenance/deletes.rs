@@ -526,6 +526,18 @@ impl TableMaintenance {
     ) -> Result<Option<i64>> {
         let table_id = schema.table_id;
         let cap = self.policy.target_delete_files();
+        let inventory = self.inventory(table, table_id).await?;
+        let full_size = inventory
+            .files
+            .iter()
+            .filter(|file| self.policy.full_size_target(file))
+            .map(|file| file.id.clone())
+            .collect::<BTreeSet<_>>();
+        // Positions on L0 and small files share ranges; see `TargetRanges`.
+        let ranges = self
+            .policy
+            .target_ranges(&inventory.files, &BTreeSet::new());
+        let worker_ranges = ranges.clone();
         let mut shared = Vec::new();
         let mut targeted = BTreeMap::<FileId, Vec<TargetDeleteFile>>::new();
         for (id, entry) in &view.live_files {
@@ -590,8 +602,11 @@ impl TableMaintenance {
         let over_cap = targeted.iter().any(|(target, files)| {
             files.len() >= 2 && files.len() + other_files.get(target).copied().unwrap_or(0) > cap
         });
-        if selected.is_empty() && !over_cap
-            || before.0.max(before.1).max(selected.len()) < policy.min_input_files
+        // The table-wide budget can be paid without shared inputs.
+        let over_budget = self.policy.over_target_budget(&inventory.debt);
+        if selected.is_empty() && !over_cap && !over_budget
+            || !over_budget
+                && before.most.max(before.shared).max(selected.len()) < policy.min_input_files
         {
             return Ok(None);
         }
@@ -655,11 +670,16 @@ impl TableMaintenance {
                 for position in scratch.position_deletes(&worker_id.0, &table_id) {
                     *new_rows.entry(position?.data_file_id).or_default() += 1;
                 }
+                // Every target that keeps a single-target file afterwards.
+                for target in new_rows.keys() {
+                    targeted.entry(target.clone()).or_default();
+                }
                 let targets = targeted
                     .into_iter()
                     .map(|(target, files)| TargetDeletes {
                         new_rows: new_rows.get(&target).copied().unwrap_or(0),
                         other_files: other_files.get(&target).copied().unwrap_or(0),
+                        full_size: full_size.contains(&target),
                         target,
                         files,
                     })
@@ -704,7 +724,9 @@ impl TableMaintenance {
                 ) {
                     let position = position?;
                     if target.as_ref() != Some(&position.data_file_id) {
-                        if target.is_some() {
+                        if let Some(previous) = &target
+                            && !worker_ranges.continues(previous, &position.data_file_id)
+                        {
                             writer.write(&batch).await?;
                             batch.clear();
                             writer.finish_target().await?;
@@ -736,13 +758,20 @@ impl TableMaintenance {
             .max()
             .unwrap_or(0);
         ensure!(
-            output
-                .iter()
-                .all(|file| flow_iceberg_ext::exact_delete_target(file).is_some()),
-            "per-target delete output spans more than one data file"
+            output.iter().all(|file| {
+                flow_iceberg_ext::exact_delete_target(file).is_some()
+                    || delete_path_bounds(file).is_some_and(|(lower, upper)| {
+                        ranges.pooled.contains(&lower)
+                            && ranges.pooled.contains(&upper)
+                            && ranges.continues(&lower, &upper)
+                    })
+            }),
+            "per-target delete output spans a data file it may not share"
         );
         let after = delete_file_debt(&view, &removed_deletes, &output, sequence);
-        if !(after.1 < before.1 || after.0 < before.0)
+        if !(after.shared < before.shared
+            || after.most < before.most
+            || over_budget && after.single < before.single)
             || !preserves_delete_locality(&view, &removed_deletes, &output, sequence, &self.policy)
         {
             // The rewrite would not lower delete-file count debt. Ownership
@@ -912,15 +941,24 @@ fn largest_rows(view: &SnapshotView, files: &BTreeSet<String>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Delete-file count debt once `removed` is replaced by `output` at
-/// `sequence`: the most delete files applying to one live data file, and the
-/// table-wide count of files that do not target exactly one live data file.
+/// Delete-file counts once `removed` is replaced by `output`.
+struct DeleteFileDebt {
+    /// The most delete files applying to one live data file.
+    most: usize,
+    /// Files that do not target exactly one live data file, table-wide.
+    shared: usize,
+    /// Files that do, table-wide.
+    single: usize,
+}
+
+/// Delete-file count debt once `removed` is replaced by per-target `output`
+/// at `sequence`.
 fn delete_file_debt(
     view: &SnapshotView,
     removed: &BTreeSet<String>,
     output: &[iceberg::spec::DataFile],
     sequence: i64,
-) -> (usize, usize) {
+) -> DeleteFileDebt {
     let output = removed
         .first()
         .and_then(|path| view.live_files.get(path))
@@ -947,6 +985,13 @@ fn delete_file_debt(
         .iter()
         .filter(|entry| view.single_target(entry).is_none())
         .count();
+    // Pooled ranges are shared; every other output targets one file.
+    let pooled = output
+        .iter()
+        .filter(|entry| flow_iceberg_ext::exact_delete_target(&entry.data_file).is_none())
+        .count();
+    let single = deletes.len() - shared + output.len() - pooled;
+    let shared = shared + pooled;
     let most = view
         .live_files
         .values()
@@ -961,7 +1006,23 @@ fn delete_file_debt(
         })
         .max()
         .unwrap_or(0);
-    (most, shared)
+    DeleteFileDebt {
+        most,
+        shared,
+        single,
+    }
+}
+
+/// The lower and upper `file_path` bounds of a position-delete file.
+fn delete_path_bounds(file: &iceberg::spec::DataFile) -> Option<(FileId, FileId)> {
+    let bound = |bounds: &std::collections::HashMap<i32, iceberg::spec::Datum>| match bounds
+        .get(&iceberg::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH)?
+        .literal()
+    {
+        iceberg::spec::PrimitiveLiteral::String(path) => Some(FileId(path.clone())),
+        _ => None,
+    };
+    Some((bound(file.lower_bounds())?, bound(file.upper_bounds())?))
 }
 
 /// Merge two position streams, each sorted and unique by path and position,

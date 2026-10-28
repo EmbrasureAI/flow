@@ -1369,8 +1369,9 @@ fn id_of(row: &Row) -> i64 {
 }
 
 /// With `delete_layout = "per_target"`, a caught-up build writes its residuals
-/// for unselected files and its masks for late deletes on its output as one
-/// single-target file per data file, and the rows and index stay exact.
+/// for unselected full-size files and its masks for late deletes on its
+/// output as one single-target file per data file, and those for L0 files in
+/// pooled ranges that no full-size file sees. Rows and index stay exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_target_catch_up_writes_residuals_and_masks_per_data_file() {
     let mut f = Fixture::new().await;
@@ -1380,6 +1381,8 @@ async fn per_target_catch_up_writes_residuals_and_masks_per_data_file() {
         Policy {
             lazy_index_remap: true,
             delete_layout: flow_compactor::DeleteLayout::PerTarget,
+            // Every file outside L0 is full-size.
+            target_delete_min_file_bytes: 1,
             ..compaction_policy()
         },
         WriterConfig::default(),
@@ -1403,15 +1406,28 @@ async fn per_target_catch_up_writes_residuals_and_masks_per_data_file() {
     assert_index_exact(&f, &f.head, "per-target-audit").await;
     let before = SnapshotView::current(&late).await.unwrap();
     let after = SnapshotView::current(&f.head).await.unwrap();
+    let full_size = per_target
+        .inventory(&f.head, f.schema.table_id)
+        .await
+        .unwrap()
+        .files
+        .into_iter()
+        .filter(|file| file.level != flow_compactor::Level::L0)
+        .map(|file| after.live_files[&file.id.0].clone())
+        .collect::<Vec<_>>();
     let mut targets = std::collections::BTreeSet::new();
     for (id, entry) in &after.live_files {
         if entry.content_type() == DataContentType::PositionDeletes
             && !before.live_files.contains_key(id)
         {
-            let target = after
-                .single_target(entry)
-                .expect("residuals and masks target one data file");
-            assert!(targets.insert(target.file_path().to_owned()));
+            match after.single_target(entry) {
+                Some(target) => assert!(targets.insert(target.file_path().to_owned())),
+                None => assert!(
+                    full_size
+                        .iter()
+                        .all(|data| !flow_iceberg_ext::position_delete_may_apply(entry, data))
+                ),
+            }
         }
     }
     assert!(!targets.is_empty(), "late deletes leave masks or residuals");

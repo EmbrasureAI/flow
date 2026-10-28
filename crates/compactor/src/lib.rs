@@ -49,7 +49,8 @@ pub enum DeleteLayout {
     #[default]
     Shared,
     /// Delete-only consolidation and data-rewrite residuals write one file per
-    /// target data file, with exact single-path bounds, and consolidation
+    /// full-size target data file, with exact single-path bounds, and pooled
+    /// ranges for L0 and smaller ones (see [`TargetRanges`]); consolidation
     /// merges a target's existing files by size tier. CDC epochs still write
     /// one shared file. Format v3 tables keep one deletion vector per data file
     /// and use [`DeleteLayout::Shared`]; see [`Policy::for_format_version`].
@@ -79,6 +80,10 @@ pub enum PlanReason {
     L0Debt,
     /// An ordinary full-size group promoted to the next level.
     Promotion,
+    /// Small files outside L0 carrying single-target delete files, once those
+    /// reach `small_file_target_deletes` table-wide with
+    /// [`DeleteLayout::PerTarget`].
+    TargetDeletes,
 }
 
 impl PlanReason {
@@ -89,6 +94,7 @@ impl PlanReason {
             Self::SmallFiles => "small_files",
             Self::L0Debt => "l0_debt",
             Self::Promotion => "promotion",
+            Self::TargetDeletes => "target_deletes",
         }
     }
 }
@@ -101,6 +107,9 @@ pub struct FileCandidate {
     pub row_count: u64,
     pub deleted_rows: u64,
     pub delete_file_count: usize,
+    /// Applicable delete files that apply to no other live data file, except
+    /// those too large to merge. See [`Policy::settled_target_delete`].
+    pub target_delete_files: usize,
     pub age_ms: u64,
     pub spec_id: i32,
     pub partition: Vec<u8>,
@@ -134,6 +143,60 @@ pub struct TargetDeletes {
     pub new_rows: u64,
     /// Applicable shared delete files the consolidation leaves in place.
     pub other_files: usize,
+    /// Whether the target is full-size, so its single-target files count
+    /// toward `target_delete_files_max`. See [`Policy::full_size_target`].
+    pub full_size: bool,
+}
+
+/// How [`DeleteLayout::PerTarget`] groups rewritten positions into files.
+///
+/// Only full-size data files get one delete file each. Positions on L0 and
+/// small data files are pooled into shared range files, as with
+/// [`DeleteLayout::Shared`]: those files are rewritten soon, and the next
+/// rewrite or consolidation consumes a range, while one file per small data
+/// file would add a delete file per epoch-sized output under skew. A range
+/// ends before any full-size data file between its targets by path, so no
+/// full-size file is charged for it, unless there are more than
+/// [`TargetRanges::MAX_BREAKS`] full-size files; then ranges may span them,
+/// as shared files do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetRanges {
+    /// Live L0 and small data files.
+    pub pooled: BTreeSet<FileId>,
+    /// Live full-size data files.
+    pub breaks: BTreeSet<FileId>,
+    /// Data files at least this large are full-size:
+    /// `target_delete_min_file_bytes`.
+    pub full_size_bytes: u64,
+}
+
+impl TargetRanges {
+    /// At most this many full-size files split a pooled range, so a pooled
+    /// rewrite writes at most one more range than this.
+    pub const MAX_BREAKS: usize = 7;
+
+    /// Classify a data file a rewrite adds, such as its output.
+    pub fn add(&mut self, id: FileId, bytes: u64) {
+        if bytes >= self.full_size_bytes {
+            self.breaks.insert(id);
+        } else {
+            self.pooled.insert(id);
+        }
+    }
+
+    /// Whether positions on `next` may join the range that holds `previous`.
+    pub fn continues(&self, previous: &FileId, next: &FileId) -> bool {
+        use std::ops::Bound::Excluded;
+        self.pooled.contains(previous)
+            && self.pooled.contains(next)
+            && previous < next
+            && (self.breaks.len() > Self::MAX_BREAKS
+                || self
+                    .breaks
+                    .range((Excluded(previous), Excluded(next)))
+                    .next()
+                    .is_none())
+    }
 }
 
 /// Input a consolidation may still read after its shared inputs.
@@ -142,6 +205,17 @@ pub struct MergeBudget {
     pub files: usize,
     pub bytes: u64,
     pub rows: u64,
+}
+
+impl MergeBudget {
+    /// The budget left after reading `file`, if it fits.
+    fn charge(self, file: &TargetDeleteFile) -> Option<Self> {
+        Some(Self {
+            files: self.files.checked_sub(1)?,
+            bytes: self.bytes.checked_sub(file.bytes)?,
+            rows: self.rows.checked_sub(file.rows)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,6 +249,21 @@ pub struct Policy {
     pub delete_debt: DeleteDebt,
     /// How rewritten v2 position deletes are laid out. See [`DeleteLayout`].
     pub delete_layout: DeleteLayout,
+    /// With [`DeleteLayout::PerTarget`], rewrite small data files outside L0
+    /// once this many single-target delete files apply to them table-wide.
+    /// Such a rewrite moves few rows and removes their delete files instead
+    /// of keeping one per small file.
+    pub small_file_target_deletes: usize,
+    /// With [`DeleteLayout::PerTarget`], the most single-target delete files
+    /// full-size data files keep table-wide while one has more than one. At
+    /// this count, delete-only consolidation merges the smallest of each such
+    /// file's delete files until at most half as many remain. Files too large
+    /// to merge do not count; see [`Policy::settled_target_delete`].
+    pub target_delete_files_max: usize,
+    /// With [`DeleteLayout::PerTarget`], data files outside L0 at least this
+    /// large are full-size: they keep one delete file each. Positions on
+    /// smaller and L0 files share range files; see [`TargetRanges`].
+    pub target_delete_min_file_bytes: u64,
     /// Periodic maintenance materializes a table's remaps while more retired
     /// files than this keep one.
     pub remap_max_files: u64,
@@ -213,6 +302,9 @@ impl Default for Policy {
             lazy_index_remap: true,
             delete_debt: DeleteDebt::Consolidate,
             delete_layout: DeleteLayout::Shared,
+            small_file_target_deletes: 8,
+            target_delete_files_max: 16,
+            target_delete_min_file_bytes: 128 << 20,
             remap_max_files: 512,
             remap_max_depth: 8,
             remap_cleanup_rows: 32_768,
@@ -241,6 +333,15 @@ pub struct Debt {
     pub shared_delete_files: usize,
     /// Data files whose own deleted fraction reaches `deleted_rows_percent`.
     pub dense_delete_files: usize,
+    /// With [`DeleteLayout::PerTarget`], single-target delete files on small
+    /// data files outside L0. Reaching `small_file_target_deletes` is soft
+    /// debt that a data rewrite of those files pays.
+    pub small_target_delete_files: usize,
+    /// With [`DeleteLayout::PerTarget`], delete files that apply to exactly
+    /// one live full-size data file, table-wide ...
+    pub target_delete_files: usize,
+    /// ... and how many of them are not their data file's only one.
+    pub excess_target_delete_files: usize,
     pub reclaimable_bytes: u64,
     pub pressure: PublicationPressure,
 }
@@ -263,6 +364,8 @@ pub struct CompactionPlan {
     /// Write residual position deletes one file per target data file
     /// ([`DeleteLayout::PerTarget`]) instead of in shared ranges.
     pub per_target_deletes: bool,
+    /// With `per_target_deletes`, which residual targets share ranges.
+    pub target_ranges: TargetRanges,
     /// Why this group was selected, for attribution only.
     pub reason: PlanReason,
 }
@@ -298,6 +401,9 @@ impl Policy {
             || self.oldest_l0_soft_ms > self.oldest_l0_hard_ms
             || self.delete_files_soft == 0
             || self.delete_files_soft > self.delete_files_hard
+            || self.small_file_target_deletes == 0
+            || self.target_delete_files_max == 0
+            || self.target_delete_min_file_bytes == 0
         {
             return Err(Error::InvalidPolicy(
                 "soft limits must be positive and at most hard limits",
@@ -347,6 +453,9 @@ impl Policy {
             max_delete_files: 0,
             shared_delete_files: 0,
             dense_delete_files: 0,
+            small_target_delete_files: 0,
+            target_delete_files: 0,
+            excess_target_delete_files: 0,
             reclaimable_bytes: 0,
             pressure: PublicationPressure::Healthy,
         };
@@ -366,7 +475,17 @@ impl Policy {
             if file.level != Level::L0 && file.size_bytes < self.l1_target_bytes {
                 debt.small_files += 1;
             }
+            if self.delete_layout == DeleteLayout::PerTarget
+                && file.level != Level::L0
+                && !self.full_size_target(file)
+            {
+                debt.small_target_delete_files += file.target_delete_files;
+            }
             debt.max_delete_files = debt.max_delete_files.max(file.delete_file_count);
+            if self.delete_layout == DeleteLayout::PerTarget && self.full_size_target(file) {
+                debt.target_delete_files += file.target_delete_files;
+                debt.excess_target_delete_files += file.target_delete_files.saturating_sub(1);
+            }
             if file.row_count > 0 {
                 let dense = self.needs_delete_reclamation(file);
                 dense_deletes |= dense;
@@ -382,6 +501,8 @@ impl Policy {
             || debt.oldest_l0_ms >= self.oldest_l0_soft_ms
             || debt.max_delete_files >= self.delete_files_soft
             || dense_deletes
+            || self.small_target_debt(&debt)
+            || self.over_target_budget(&debt)
         {
             debt.pressure = PublicationPressure::Delay;
         }
@@ -413,13 +534,47 @@ impl Policy {
         Ok(debt)
     }
 
+    /// Whether single-target delete files on small data files outside L0 are
+    /// due for a data rewrite of those files. See [`PlanReason::TargetDeletes`].
+    pub fn small_target_debt(&self, debt: &Debt) -> bool {
+        self.delete_layout == DeleteLayout::PerTarget
+            && debt.small_target_delete_files >= self.small_file_target_deletes
+    }
+
+    /// Whether a data file is full-size: outside L0 and at least
+    /// `target_delete_min_file_bytes`. Rewriting it costs too much to pay its
+    /// delete-file count, so with [`DeleteLayout::PerTarget`] it keeps its
+    /// own delete files, they count toward `target_delete_files_max`, and
+    /// consolidation merges them. Smaller files share ranges and are
+    /// rewritten instead; see [`TargetRanges`] and [`PlanReason::TargetDeletes`].
+    pub fn full_size_target(&self, file: &FileCandidate) -> bool {
+        file.level != Level::L0 && file.size_bytes >= self.target_delete_min_file_bytes
+    }
+
+    /// Whether a single-target delete file is too large to count toward the
+    /// per-target limits: above half of `max_delete_input_rows` or
+    /// `max_delete_input_bytes`, so two would not fit one consolidation.
+    pub fn settled_target_delete(&self, rows: u64, bytes: u64) -> bool {
+        rows > self.max_delete_input_rows / 2 || bytes > self.max_delete_input_bytes / 2
+    }
+
+    /// Whether full-size data files keep `target_delete_files_max`
+    /// single-target delete files while one has more than one, so that
+    /// consolidation can lower the count by merging a target's files.
+    pub fn over_target_budget(&self, debt: &Debt) -> bool {
+        self.delete_layout == DeleteLayout::PerTarget
+            && debt.target_delete_files >= self.target_delete_files_max
+            && debt.excess_target_delete_files > 0
+    }
+
     /// Pressure from delete-file count alone: the most delete files applying
-    /// to one data file, or the table-wide shared delete-file count.
+    /// to one data file, or the table-wide shared delete-file count. With
+    /// [`DeleteLayout::PerTarget`], [`Self::over_target_budget`] is soft.
     pub fn delete_file_pressure(&self, debt: &Debt) -> PublicationPressure {
         let count = debt.max_delete_files.max(debt.shared_delete_files);
         if count >= self.delete_files_hard {
             PublicationPressure::Pause
-        } else if count >= self.delete_files_soft {
+        } else if count >= self.delete_files_soft || self.over_target_budget(debt) {
             PublicationPressure::Delay
         } else {
             PublicationPressure::Healthy
@@ -474,6 +629,27 @@ impl Policy {
             && self.delete_file_pressure(debt) != PublicationPressure::Healthy
     }
 
+    /// The [`TargetRanges`] of a [`DeleteLayout::PerTarget`] rewrite of
+    /// `selected`, over the live data files outside it.
+    pub fn target_ranges(
+        &self,
+        files: &[FileCandidate],
+        selected: &BTreeSet<FileId>,
+    ) -> TargetRanges {
+        let mut ranges = TargetRanges {
+            full_size_bytes: self.target_delete_min_file_bytes,
+            ..TargetRanges::default()
+        };
+        for file in files.iter().filter(|file| !selected.contains(&file.id)) {
+            if self.full_size_target(file) {
+                ranges.breaks.insert(file.id.clone());
+            } else {
+                ranges.pooled.insert(file.id.clone());
+            }
+        }
+        ranges
+    }
+
     /// The limits that set `debt.pressure`, for attribution. Empty when healthy.
     pub fn pressure_reasons(&self, debt: &Debt) -> Vec<&'static str> {
         let hard = match debt.pressure {
@@ -509,6 +685,7 @@ impl Policy {
                 deletes == PublicationPressure::Pause,
             ),
             ("deleted_rows", debt.dense_delete_files > 0, false),
+            ("target_deletes", self.small_target_debt(debt), false),
         ]
         .into_iter()
         .filter(|&(_, soft, hard_limit)| if hard { hard_limit } else { soft })
@@ -569,7 +746,8 @@ impl Policy {
     }
 
     /// Choose which existing single-target files a per-target consolidation
-    /// merges into each target's new output, within `budget`.
+    /// merges into each target's new output, within `budget`. `targets` lists
+    /// every data file that has single-target files or new rows.
     ///
     /// Per target, files are taken smallest first while their rows total at
     /// most the target's new rows, so the rewrite stays proportional to new
@@ -580,6 +758,12 @@ impl Policy {
     /// its target's count. Targets with the most applicable files are served
     /// first; a file that exceeds the remaining budget ends its target's
     /// selection.
+    ///
+    /// Finally, if full-size targets would keep `target_delete_files_max` or
+    /// more single-target files, the merge that removes one more of their
+    /// files for the fewest rows read is added until at most half that many
+    /// remain or the budget is spent, so the smallest files go first and the
+    /// next runs need not merge again.
     pub fn select_target_merges(
         &self,
         targets: &[TargetDeletes],
@@ -592,7 +776,8 @@ impl Policy {
                 .cmp(&(a.files.len() + a.other_files))
                 .then_with(|| a.target.cmp(&b.target))
         });
-        let mut selected = BTreeSet::new();
+        // Each target's files, smallest first, and how many are merged.
+        let mut plans = Vec::with_capacity(order.len());
         for target in order {
             let mut files = target.files.iter().collect::<Vec<_>>();
             files.sort_by(|a, b| a.rows.cmp(&b.rows).then_with(|| a.id.cmp(&b.id)));
@@ -616,29 +801,87 @@ impl Policy {
                 take += 1;
             }
             let mut next = budget;
-            let mut admitted = Vec::new();
+            let mut admitted = 0;
             for file in &files[..take] {
-                let (Some(count), Some(bytes), Some(rows)) = (
-                    next.files.checked_sub(1),
-                    next.bytes.checked_sub(file.bytes),
-                    next.rows.checked_sub(file.rows),
-                ) else {
+                let Some(charged) = next.charge(file) else {
                     break;
                 };
-                next = MergeBudget {
-                    files: count,
-                    bytes,
-                    rows,
-                };
-                admitted.push(&file.id);
+                next = charged;
+                admitted += 1;
             }
-            if admitted.len() == 1 && target.new_rows == 0 {
-                continue;
+            if admitted == 1 && target.new_rows == 0 {
+                admitted = 0;
+            } else {
+                budget = next;
             }
-            budget = next;
-            selected.extend(admitted.into_iter().cloned());
+            plans.push((target, files, admitted));
         }
-        selected
+        // Single-target files left once the selected merges are written.
+        // Settled files neither count nor merge for the table-wide limit.
+        let settled = |file: &TargetDeleteFile| self.settled_target_delete(file.rows, file.bytes);
+        let kept = |target: &TargetDeletes, files: &[&TargetDeleteFile], take: usize| {
+            files[take..].iter().filter(|file| !settled(file)).count()
+                + usize::from(target.new_rows > 0 || take > 0)
+        };
+        let mut total = plans
+            .iter()
+            .filter(|(target, ..)| target.full_size)
+            .map(|(target, files, take)| kept(target, files, *take))
+            .sum::<usize>();
+        // The files that remove one more of a target's files: the next one
+        // once it has an output, else its two smallest.
+        let next_merge = |target: &TargetDeletes, files: &[&TargetDeleteFile], take: usize| {
+            let count = if target.new_rows > 0 || take > 0 {
+                1
+            } else {
+                2
+            };
+            let next = files.get(take..take + count)?;
+            if next.iter().any(|file| settled(file)) {
+                return None;
+            }
+            let rows = next
+                .iter()
+                .map(|file| file.rows)
+                .fold(0u64, u64::saturating_add);
+            Some((rows, count))
+        };
+        let mut queue = std::collections::BinaryHeap::new();
+        for (index, (target, files, take)) in plans.iter().enumerate() {
+            if let Some((rows, count)) = next_merge(target, files, *take)
+                && target.full_size
+            {
+                queue.push(std::cmp::Reverse((rows, index, count)));
+            }
+        }
+        let goal = if total >= self.target_delete_files_max {
+            self.target_delete_files_max / 2
+        } else {
+            total
+        };
+        while total > goal {
+            let Some(std::cmp::Reverse((_, index, count))) = queue.pop() else {
+                break;
+            };
+            let (target, files, take) = &mut plans[index];
+            let Some(charged) = files[*take..*take + count]
+                .iter()
+                .try_fold(budget, |budget, file| budget.charge(file))
+            else {
+                continue;
+            };
+            budget = charged;
+            *take += count;
+            total -= 1;
+            if let Some((rows, count)) = next_merge(target, files, *take) {
+                queue.push(std::cmp::Reverse((rows, index, count)));
+            }
+        }
+        plans
+            .into_iter()
+            .flat_map(|(_, files, take)| files.into_iter().take(take))
+            .map(|file| file.id.clone())
+            .collect()
     }
 
     fn plan_with(
@@ -677,6 +920,17 @@ impl Policy {
                 && file.level != Level::L0
                 && file.size_bytes < self.l1_target_bytes
         };
+        // With the per-target layout, a small file's single-target deletes are
+        // cheaper to remove by rewriting its few rows than to keep in one more
+        // file per small file. L0 files are already rewritten for L0 debt.
+        let target_debt = self.small_target_debt(&debt);
+        let per_target = self.delete_layout == DeleteLayout::PerTarget;
+        let needs_target_rewrite = |file: &FileCandidate| {
+            target_debt
+                && file.level != Level::L0
+                && !self.full_size_target(file)
+                && file.target_delete_files > 0
+        };
         // Under delete pressure, retiring effective positions can remove more
         // residual files than another small L0 rewrite. Hard L0 limits retain
         // their existing ordering so reclamation cannot postpone that debt.
@@ -703,7 +957,11 @@ impl Policy {
                                 || needs_delete_rewrite(file)
                         }
                         Level::L1 => true,
-                        Level::L2 => needs_delete_rewrite(file) || needs_small_file_rewrite(file),
+                        Level::L2 => {
+                            needs_delete_rewrite(file)
+                                || needs_small_file_rewrite(file)
+                                || needs_target_rewrite(file)
+                        }
                     }
             })
             .collect();
@@ -712,6 +970,14 @@ impl Policy {
                 .cmp(&(hard_l0_debt && a.level == Level::L0))
                 .then_with(|| needs_delete_rewrite(b).cmp(&needs_delete_rewrite(a)))
                 .then_with(|| needs_small_file_rewrite(b).cmp(&needs_small_file_rewrite(a)))
+                .then_with(|| needs_target_rewrite(b).cmp(&needs_target_rewrite(a)))
+                .then_with(|| {
+                    if needs_target_rewrite(a) && needs_target_rewrite(b) {
+                        b.target_delete_files.cmp(&a.target_delete_files)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
                 .then_with(|| {
                     if prioritize_reclamation && needs_delete_rewrite(a) && needs_delete_rewrite(b)
                     {
@@ -736,15 +1002,21 @@ impl Policy {
             } else {
                 self.l2_target_bytes
             };
-            let forced = needs_delete_rewrite(seed)
-                || (seed.level == Level::L0 && debt.pressure != PublicationPressure::Healthy);
             let small_group = needs_small_file_rewrite(seed);
+            // Any carrier may be rewritten alone: its delete files go away.
+            let target_group =
+                !small_group && !needs_delete_rewrite(seed) && needs_target_rewrite(seed);
+            let forced = needs_delete_rewrite(seed)
+                || target_group
+                || (seed.level == Level::L0 && debt.pressure != PublicationPressure::Healthy);
             let reason = if self.needs_delete_reclamation(seed) {
                 PlanReason::DeletedRows
             } else if needs_delete_rewrite(seed) {
                 PlanReason::DeleteFileCount
             } else if small_group {
                 PlanReason::SmallFiles
+            } else if target_group {
+                PlanReason::TargetDeletes
             } else if forced {
                 PlanReason::L0Debt
             } else {
@@ -759,12 +1031,17 @@ impl Policy {
                     || count >= self.min_group_files
                         && (seed.level != Level::L1 || bytes >= target_file_bytes || small_group)
             };
+            // Small-file and target-delete groups take only their own kind,
+            // across levels outside L0 and of mixed small sizes.
+            let member = |file: &FileCandidate| {
+                small_group && needs_small_file_rewrite(file)
+                    || target_group && needs_target_rewrite(file)
+            };
             let companions = eligible.iter().copied().filter(|file| {
                 if file.id == seed.id
                     || dense_only && !self.needs_delete_reclamation(file)
-                    || small_group && !needs_small_file_rewrite(file)
-                    || (file.level != seed.level
-                        && !(small_group && needs_small_file_rewrite(file)))
+                    || (small_group || target_group) && !member(file)
+                    || (file.level != seed.level && !member(file))
                     || file.spec_id != seed.spec_id
                     || file.partition != seed.partition
                 {
@@ -774,6 +1051,7 @@ impl Policy {
                 // File-count consolidation admits mixed small sizes.
                 let smallest = seed.size_bytes.min(file.size_bytes).max(1);
                 small_group
+                    || target_group
                     || u128::from(seed.size_bytes.max(file.size_bytes)) <= u128::from(smallest) * 4
             });
             let mut delete_files = BTreeSet::new();
@@ -837,6 +1115,11 @@ impl Policy {
                     total = next_total;
                 }
                 if useful(selected.len(), total) {
+                    let target_ranges = if per_target {
+                        self.target_ranges(files, &selected)
+                    } else {
+                        TargetRanges::default()
+                    };
                     return Ok(Some(CompactionPlan {
                         base_snapshot_id,
                         schema_id,
@@ -854,6 +1137,7 @@ impl Policy {
                         delete_input_rows,
                         lazy_index_remap: self.lazy_index_remap,
                         per_target_deletes: self.delete_layout == DeleteLayout::PerTarget,
+                        target_ranges,
                         reason,
                     }));
                 }

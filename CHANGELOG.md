@@ -125,6 +125,19 @@ From earlier development builds of `main`:
   write one shared delete file each. `delete_rewrite_completed`,
   `compaction_completed` and `compaction_catch_up_completed` report the
   layout, input kinds and residual rows.
+- With `delete_layout = "per_target"`, the delete files readers open stay
+  bounded under skew. Only full-size data files (outside L0, at least
+  `[compaction] target_delete_min_file_bytes`, 128 MiB) keep one delete file
+  each; positions on L0 and smaller files share range files. Once single-target
+  files on full-size files reach `target_delete_files_max` (16) while one has
+  more than one, consolidation merges the smallest until at most half remain,
+  and smaller data files carrying single-target files are rewritten at
+  `small_file_target_deletes` (8). A build probe or idle visit that
+  consolidates also starts a background data rewrite while rewrite debt
+  remains, so continuous CDC no longer starves builds. In a daemon test of
+  Zipf CDC the mean delete-file count fell from 85 to 13 and the peak from 150
+  to 23. New `flow_table_target_delete_files` and
+  `flow_table_small_target_delete_files` gauges report both counts.
 
 **Commands and configuration**
 

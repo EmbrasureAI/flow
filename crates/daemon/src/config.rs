@@ -566,7 +566,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(keys.len(), 27);
+        assert_eq!(keys.len(), 30);
         let documented: Config =
             toml::from_str(&format!("{example}\n[compaction]\n{}\n", keys.join("\n"))).unwrap();
         assert_eq!(

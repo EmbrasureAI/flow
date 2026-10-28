@@ -448,6 +448,14 @@ pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
         ),
         ("flow_table_max_delete_files", debt.max_delete_files as f64),
         (
+            "flow_table_target_delete_files",
+            debt.target_delete_files as f64,
+        ),
+        (
+            "flow_table_small_target_delete_files",
+            debt.small_target_delete_files as f64,
+        ),
+        (
             "flow_table_delete_files",
             inventory.delete_file_count as f64,
         ),
