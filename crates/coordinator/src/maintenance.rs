@@ -664,7 +664,12 @@ impl TableMaintenance {
         };
         let store = self.store.clone();
         blocking(move || {
-            if !context.deltas_staged {
+            if let Some(remap) = output.lazy_remap() {
+                // O(files) lazy remap instead of one delta per moved row.
+                store.stage_remap(&operation.id, remap)?;
+            } else if output.is_lazy() {
+                anyhow::bail!("a lazy compaction build must be caught up before publication");
+            } else if !context.deltas_staged {
                 store.stage_deltas_fallible(&operation.id, output.index_deltas()?)?;
             }
             store.seal_prepare_with_record(

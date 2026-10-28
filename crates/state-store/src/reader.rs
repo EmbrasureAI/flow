@@ -3,6 +3,7 @@
 use crate::{
     Error, FILE_COUNTS, PK, REVERSE, Result, StateStore, TABLES, TableState, decode,
     decode_file_count, file_prefix, pk_key, prefix_end,
+    remap::{RemapCache, Resolver},
 };
 use flow_model::{FileId, PrimaryKey, RowLocation, TableId};
 use rocksdb::{DB, Direction, IteratorMode, ReadOptions, SnapshotWithThreadMode};
@@ -30,6 +31,8 @@ pub struct IndexSnapshot<'db> {
     snapshot: SnapshotWithThreadMode<'db, DB>,
     table: TableId,
     state: TableState,
+    /// Lazy remaps visible in this snapshot may exist.
+    remaps: Option<&'db RemapCache>,
 }
 
 impl IndexSnapshot<'_> {
@@ -69,7 +72,7 @@ impl IndexSnapshot<'_> {
     ) -> Result<Vec<Option<RowLocation>>> {
         let mut options = ReadOptions::default();
         options.set_snapshot(&self.snapshot);
-        lookup_many(self.db, table, keys, &options)
+        lookup_many(self.db, table, keys, &options, self.remaps)
     }
 }
 
@@ -102,6 +105,7 @@ impl StateStore {
             snapshot,
             table: *table,
             state,
+            remaps: self.remaps_possible().then_some(&self.0.remap_cache),
         })
     }
 
@@ -111,11 +115,22 @@ impl StateStore {
         table: &TableId,
         keys: &[PrimaryKey],
     ) -> Result<Vec<Option<RowLocation>>> {
-        lookup_many(&self.0.db, table, keys, &ReadOptions::default())
+        if !self.remaps_possible() {
+            return lookup_many(&self.0.db, table, keys, &ReadOptions::default(), None);
+        }
+        // Read raw entries and remaps from one view, so a concurrent
+        // materialization cannot hide a remap from an entry read before it.
+        let snapshot = self.0.db.snapshot();
+        let mut options = ReadOptions::default();
+        options.set_snapshot(&snapshot);
+        lookup_many(&self.0.db, table, keys, &options, Some(&self.0.remap_cache))
     }
 
     /// Ordered reverse scan, bounded by the caller's consumption. Deleted rows
     /// are removed from this index atomically with their primary-key mapping.
+    /// Rows moved by a lazy remap stay under their retired file until
+    /// [`StateStore::materialize_remaps`]; call it before relying on this scan
+    /// for a table where [`StateStore::has_remaps`] holds.
     pub fn file_rows<'a>(
         &'a self,
         table: &TableId,
@@ -168,19 +183,38 @@ fn lookup_many<'k>(
     table: &TableId,
     keys: impl IntoIterator<Item = &'k PrimaryKey>,
     options: &ReadOptions,
+    remaps: Option<&RemapCache>,
 ) -> Result<Vec<Option<RowLocation>>> {
     let cf = db.cf_handle(PK).expect("opened column family");
     let encoded: Vec<_> = keys.into_iter().map(|key| pk_key(table, key)).collect();
     // Callers usually pass canonical key order; RocksDB then skips its own sort.
     let sorted = encoded.is_sorted();
-    db.batched_multi_get_cf_opt(&cf, encoded.iter(), sorted, options)
+    let mut locations = db
+        .batched_multi_get_cf_opt(&cf, encoded.iter(), sorted, options)
         .into_iter()
         .map(|item| {
             item.map_err(Error::from)?
                 .map(|value| decode(&value))
                 .transpose()
         })
-        .collect()
+        .collect::<Result<Vec<Option<RowLocation>>>>()?;
+    if let Some(cache) = remaps {
+        let mut resolver = Resolver::new(db, cache, *table, options);
+        for location in locations.iter_mut().flatten() {
+            resolver.resolve_in_place(location)?;
+        }
+    }
+    Ok(locations)
+}
+
+/// Raw reverse entries, without lazy-remap translation.
+pub(crate) fn file_rows_raw<'a>(
+    db: &'a DB,
+    table: &TableId,
+    file: &FileId,
+    options: ReadOptions,
+) -> impl Iterator<Item = Result<(u64, PrimaryKey)>> + Send + 'a + use<'a> {
+    file_rows(db, table, file, options)
 }
 
 fn file_rows<'a>(

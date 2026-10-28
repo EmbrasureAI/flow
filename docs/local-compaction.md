@@ -106,6 +106,43 @@ shutdown and restart recovery still apply. The pooled-HTTP regression test holds
 a request across the first worker's completion and parent shutdown, then
 releases the response and joins the surviving worker.
 
+## Experimental lazy index remap
+
+`[compaction] lazy_index_remap = true` (default `false`) makes background data
+builds of keyed tables commit one remap per input file instead of one index
+delta per moved row. The strict path, keyless tables and every other rewrite
+keep per-row deltas; with the flag off nothing changes.
+
+- The worker writes each input file's survivors in input order, so it records
+  only runs `(old start, output file, new start, length)`. Runs break at
+  positions deleted at the build base and at output-file rotation: the remap is
+  O(files + deleted positions), not O(rows).
+- Catch-up no longer looks up or verifies each moved row. It translates late
+  position deletes through the remap into output masks and requires, per input
+  file, that the live count at H equals the base survivors minus the effective
+  late deletes. Flow never leaves an index entry on a deleted row, so equal
+  counts mean the same row set. Output live counts are record counts minus masks.
+- Activation stages the remap in the operation's delta namespace instead of
+  per-row deltas. The final apply batch stores one `file_remaps` record per
+  retired input, deletes the input counts, adds the output counts and checks
+  that both sums agree, atomically with the table transition. Ambiguous commit,
+  discard and restart recovery are unchanged; the staged remap is replayed or
+  dropped with its operation.
+- Primary-key and reverse entries keep their raw location. Every forward read
+  (`lookup`, `lookup_many`, index snapshots, collapse binding and the apply
+  compare-and-swap) translates a raw location in a retired file, following
+  chained remaps, to the location per-row apply would have stored. Snapshot
+  readers consult only remaps visible in their RocksDB snapshot. A later CDC
+  change or per-row rewrite of a key replaces its raw entry and deletes the raw
+  reverse entry.
+- Reverse scans of a file do not include rows a remap moved into it. External
+  rewrite reconciliation and checkpoint catch-up therefore first call
+  `materialize_remaps`, which rewrites the remaining raw entries per row in
+  crash-safe batches and then drops the table's remaps. A full rebuild starts a
+  generation without remaps.
+- Remaps are not garbage collected until materialization or a rebuild, and the
+  `file_remaps` column family is new in this generation format.
+
 ## Bounded delete dependencies
 
 The planner tries feasible subsets without increasing data or delete read budgets.

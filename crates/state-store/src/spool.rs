@@ -3,6 +3,7 @@ use crate::{Error, PK, Result, SPOOL, StateStore, append_component, decode, pk_k
 use flow_model::{
     PrimaryKey, Row, RowLocation, TableId, carry_forward_unchanged, row_has_unchanged,
 };
+use rocksdb::ReadOptions;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -196,16 +197,33 @@ impl StateStore {
             .into_iter();
         let bind_started = Instant::now();
         let mut batch = WriteBatch::default();
+        let remap_options = ReadOptions::default();
+        let mut resolvers = std::collections::HashMap::new();
         for ((key, (table_id, primary_key, pending)), existing) in pending.into_iter().zip(existing)
         {
             let (original, present) = match existing {
                 Some(existing) => existing,
                 None => {
-                    let original: Option<RowLocation> = originals
+                    let mut original: Option<RowLocation> = originals
                         .next()
                         .expect("one index result per missing spool key")?
                         .map(|value| decode(&value))
                         .transpose()?;
+                    if let Some(location) = &mut original
+                        && self.remaps_possible()
+                    {
+                        resolvers
+                            .entry(table_id)
+                            .or_insert_with(|| {
+                                crate::remap::Resolver::new(
+                                    &self.0.db,
+                                    &self.0.remap_cache,
+                                    table_id,
+                                    &remap_options,
+                                )
+                            })
+                            .resolve_in_place(location)?;
+                    }
                     let present = original.is_some();
                     (original, present)
                 }
@@ -255,9 +273,16 @@ impl StateStore {
         let keys: Vec<_> = rows.iter().map(|(key, _)| pk_key(table, key)).collect();
         let originals = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), true);
         let mut batch = WriteBatch::default();
+        let remap_options = ReadOptions::default();
+        let mut resolver = self.remaps_possible().then(|| {
+            crate::remap::Resolver::new(&self.0.db, &self.0.remap_cache, *table, &remap_options)
+        });
         for ((key, pending), original) in rows.into_iter().zip(originals) {
-            let original: Option<RowLocation> =
+            let mut original: Option<RowLocation> =
                 original?.map(|value| decode(&value)).transpose()?;
+            if let (Some(location), Some(resolver)) = (&mut original, &mut resolver) {
+                resolver.resolve_in_place(location)?;
+            }
             let present = original.is_some();
             pending.validate_initial(present)?;
             let encoded = mutation_key(transaction, table, &key);

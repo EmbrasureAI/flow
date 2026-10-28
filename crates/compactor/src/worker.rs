@@ -11,7 +11,9 @@ use flow_materializer::{
     DataWriter, DeleteWriter, WriterConfig, rows_from_batch, writer_arrow_schema,
 };
 use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value};
-use flow_state_store::{IndexDelta, OperationKind, PreparedOperation, RowIndex, StateStore};
+use flow_state_store::{
+    FileRemap, IndexDelta, LazyRemap, OperationKind, PreparedOperation, RowIndex, StateStore,
+};
 use iceberg::{io::FileIO, spec::DataFile, table::Table};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use std::collections::{BTreeSet, HashSet};
@@ -28,10 +30,25 @@ pub struct WorkerOutput {
     pub scratch: StateStore,
     pub(crate) masked_inputs: Option<String>,
     pub(crate) table_id: TableId,
+    /// Per-input remaps of a lazy build, before catch-up.
+    pub(crate) lazy_files: Option<Vec<FileRemap>>,
+    /// The complete lazy remap, after catch-up derived exact output counts.
+    pub(crate) lazy: Option<LazyRemap>,
 }
 impl WorkerOutput {
     pub fn table_id(&self) -> TableId {
         self.table_id
+    }
+
+    /// Whether this build replaces per-row index deltas with a lazy remap.
+    pub fn is_lazy(&self) -> bool {
+        self.lazy_files.is_some() || self.lazy.is_some()
+    }
+
+    /// The lazy remap to stage instead of [`Self::index_deltas`]. Only a
+    /// caught-up build has one; publishing a lazy build without it is an error.
+    pub fn lazy_remap(&self) -> Option<&LazyRemap> {
+        self.lazy.as_ref()
     }
 
     pub fn index_deltas(
@@ -117,6 +134,9 @@ pub async fn compact(
     read_limits: &ReadLimits,
     cache: &ManifestCache,
 ) -> Result<WorkerOutput> {
+    // The strict path publishes without catch-up; it keeps per-row deltas.
+    let mut plan = plan;
+    plan.lazy_index_remap = false;
     let built = build_data(
         table,
         schema.clone(),
@@ -295,6 +315,14 @@ pub async fn build_data(
     >;
     let mut reverse_rows: Option<ReverseRows<'_>> = None;
     let mut mapped_rows = 0u64;
+    // Keyless tables rely on exact reverse scans of every input file.
+    let mut lazy = (plan.lazy_index_remap && !schema.primary_key.is_empty())
+        .then(std::collections::BTreeMap::<FileId, FileRemap>::new);
+    let output_sequence = table
+        .metadata()
+        .current_snapshot()
+        .expect("validated base snapshot")
+        .sequence_number();
     let mut stager = Stager::spawn(scratch.clone(), operation_id.clone())?;
     scan_staged_live_columns(
         table,
@@ -370,6 +398,22 @@ pub async fn build_data(
                 )
                 .await?;
             check_cancelled(Some(cancelled))?;
+            if let Some(remaps) = &mut lazy {
+                // Survivors are written in input order, so each input file's
+                // rows form a few contiguous runs of the outputs.
+                ensure!(
+                    written.locations.len() == live.positions.len(),
+                    "writer returned a location per row"
+                );
+                let remap = remaps
+                    .entry(live.file_id.clone())
+                    .or_insert_with(|| FileRemap::new(live.file_id.clone()));
+                for (position, location) in live.positions.iter().zip(&written.locations) {
+                    remap.push(*position, location, output_sequence)?;
+                }
+                mapped_rows += rows as u64;
+                return Ok(());
+            }
             let deltas = keys.into_iter().zip(originals).zip(written.locations).map(
                 |((key, original), mut replacement)| {
                     replacement.data_sequence_number = table
@@ -432,6 +476,8 @@ pub async fn build_data(
             scratch,
             masked_inputs: None,
             table_id: schema.table_id,
+            lazy_files: lazy.map(|files| files.into_values().collect()),
+            lazy: None,
         },
     })
 }

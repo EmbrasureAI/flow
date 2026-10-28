@@ -40,7 +40,33 @@ struct BorrowedRowLocation<'a> {
     row_fingerprint: [u8; 16],
 }
 
-impl BorrowedRowLocation<'_> {
+impl<'a> BorrowedRowLocation<'a> {
+    fn from_owned(location: &'a RowLocation) -> Self {
+        Self {
+            data_file_id: BorrowedFileId(&location.data_file_id.0),
+            row_position: location.row_position,
+            data_sequence_number: location.data_sequence_number,
+            spec_id: location.spec_id,
+            partition: &location.partition,
+            source_commit_lsn: location.source_commit_lsn,
+            row_version: location.row_version,
+            row_fingerprint: location.row_fingerprint,
+        }
+    }
+
+    fn to_owned_location(&self) -> RowLocation {
+        RowLocation {
+            data_file_id: FileId(self.data_file_id.0.to_owned()),
+            row_position: self.row_position,
+            data_sequence_number: self.data_sequence_number,
+            spec_id: self.spec_id,
+            partition: self.partition.to_vec(),
+            source_commit_lsn: self.source_commit_lsn,
+            row_version: self.row_version,
+            row_fingerprint: self.row_fingerprint,
+        }
+    }
+
     fn matches(&self, expected: &RowLocation) -> bool {
         let RowLocation {
             data_file_id,
@@ -93,9 +119,9 @@ impl ApplyBatchOutcome {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FileCountShadow {
-    initial: u64,
-    current: u64,
+pub(crate) struct FileCountShadow {
+    pub(crate) initial: u64,
+    pub(crate) current: u64,
 }
 
 impl StateStore {
@@ -228,6 +254,15 @@ impl StateStore {
             stats.reverse_lookup += reverse_lookup_started.elapsed();
 
             let mutation_started = Instant::now();
+            let remap_options = ReadOptions::default();
+            let mut resolver = self.remaps_possible().then(|| {
+                crate::remap::Resolver::new(
+                    &self.0.db,
+                    &self.0.remap_cache,
+                    record.operation.table_id,
+                    &remap_options,
+                )
+            });
             let mut targets = targets.into_iter();
             let mut encoded = Vec::new();
             let mut chunk_file_counts = BTreeMap::<FileId, i64>::new();
@@ -245,6 +280,24 @@ impl StateStore {
                     .as_deref()
                     .map(decode_borrowed_row_location)
                     .transpose()?;
+                // A raw entry in a lazily retired file compares by its translated
+                // location; its reverse entry stays at the raw location.
+                let mut raw_reverse = None;
+                let translated = match (&mut resolver, &current) {
+                    (Some(resolver), Some(raw)) => {
+                        let owned = raw.to_owned_location();
+                        let translated = resolver.resolve(&owned)?;
+                        if translated.is_some() {
+                            raw_reverse = Some(reverse_key(&record.operation.table_id, &owned));
+                        }
+                        translated
+                    }
+                    _ => None,
+                };
+                let current = match &translated {
+                    Some(location) => Some(BorrowedRowLocation::from_owned(location)),
+                    None => current,
+                };
                 if !matches_expected(current.as_ref(), delta.expected.as_ref()) {
                     // Never overwrite an ingestion version from after the worker's
                     // read. Catalog validation is still mandatory before this point.
@@ -269,7 +322,9 @@ impl StateStore {
                 // Every owner lookup observes the committed index from before this
                 // outer batch. A delete in an earlier lookup chunk cannot free a
                 // physical row for a later chunk in the same atomic commit.
-                if let Some(old) = &delta.expected {
+                if let Some(raw) = raw_reverse {
+                    batch.delete_cf(&reverse_cf, raw);
+                } else if let Some(old) = &delta.expected {
                     batch.delete_cf(&reverse_cf, reverse_key(&record.operation.table_id, old));
                 }
                 match (&delta.replacement, target) {
@@ -354,6 +409,18 @@ impl StateStore {
         records.status()?;
         drop(records);
 
+        let complete = end == record.delta_count;
+        if complete
+            && record.operation.kind == OperationKind::Rewrite
+            && let Some(remap) = self.staged_remap(id)?
+        {
+            self.commit_remap(
+                &mut batch,
+                &record.operation.table_id,
+                &remap,
+                &mut file_counts,
+            )?;
+        }
         let file_count_started = Instant::now();
         for (file, count) in file_counts {
             if count.current == count.initial {
@@ -368,7 +435,6 @@ impl StateStore {
         }
         stats.file_count += file_count_started.elapsed();
         record.applied_count = end;
-        let complete = end == record.delta_count;
         if complete {
             record.phase = OperationPhase::Applied;
             state.snapshot_id = record.snapshot_id;

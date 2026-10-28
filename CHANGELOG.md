@@ -76,6 +76,12 @@ This will be the initial public release, `0.1.0`.
 - `embrasure-flow metadata-import` adopts existing catalog metadata JSON into
   grace-delayed collection.
 - Maintenance failures back off per table instead of stopping the daemon.
+- Experimental `[compaction] lazy_index_remap = true` (default `false`) makes
+  background data builds of keyed tables commit one index remap per input file
+  instead of rewriting every moved row's index entries, and reads translate
+  through the remaps. In service benchmarks it cut the table's compaction stall
+  by 70–96% and commit-to-catalog p95 at 30,000 mutations/s from 3.1 s to
+  1.0 s. See [local compaction](docs/local-compaction.md#experimental-lazy-index-remap).
 
 **Commands and configuration**
 

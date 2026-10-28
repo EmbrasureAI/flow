@@ -119,118 +119,162 @@ pub async fn catch_up(
     .await?;
     let late_scan_finished = Instant::now();
 
-    let mut positions = Vec::with_capacity(batch_rows);
-    let mut mapping_lookup = Duration::ZERO;
-    let mut mask_spool = Duration::ZERO;
-    let mut late = output
-        .scratch
-        .position_deletes(&late_scan, &schema.table_id)
-        .peekable();
-    let mut deltas = output
-        .scratch
-        .prepared_deltas(&output.operation_id)?
-        .peekable();
-    let mut accepted = BTreeMap::<FileId, u64>::new();
-    let mut mapped_rows = 0u64;
-    let mut masked_rows = 0u64;
-    let mut previous = None::<(FileId, u64)>;
-    let mapping = stage_mapping_batches(stage_deltas, || {
-        let batch = mapping_batch(&mut deltas, batch_rows, batch_bytes)?;
-        if batch.is_empty() {
-            return Ok(None);
-        }
-        mapped_rows += batch.len() as u64;
-        let keys = batch
-            .iter()
-            .map(|delta| delta.key.clone())
-            .collect::<Vec<_>>();
-        let lookup_started = Instant::now();
-        let current = live_index.lookup_many(&schema.table_id, &keys)?;
-        mapping_lookup += lookup_started.elapsed();
-        let mut accepted_deltas = Vec::with_capacity(batch.len());
-        for (delta, current) in batch.into_iter().zip(current) {
-            let old = delta
-                .expected
-                .ok_or_else(|| anyhow::anyhow!("worker mapping lacks original"))?;
-            let replacement = delta
-                .replacement
-                .ok_or_else(|| anyhow::anyhow!("worker mapping lacks replacement"))?;
-            if let Some((file, position)) = &mut previous {
-                ensure!(
-                    (&*file, *position) < physical(&old),
-                    "worker mappings are not in input order"
-                );
-                if *file != old.data_file_id {
-                    file.0.clone_from(&old.data_file_id.0);
-                }
-                *position = old.row_position;
-            } else {
-                previous = Some((old.data_file_id.clone(), old.row_position));
-            }
-            let deleted = loop {
-                match late.peek() {
-                    Some(Err(_)) => {
-                        return Err(late.next().expect("peeked delete").unwrap_err().into());
-                    }
-                    Some(Ok(position)) if physical(position) < physical(&old) => {
-                        late.next();
-                    }
-                    Some(Ok(position)) => break physical(position) == physical(&old),
-                    None => break false,
-                }
-            };
-            if !deleted {
-                ensure!(
-                    current.as_ref() == Some(&old),
-                    CatchUpRejected("index moved without an effective position delete")
-                );
-                if let Some(count) = accepted.get_mut(&old.data_file_id) {
-                    *count += 1;
-                } else {
-                    accepted.insert(old.data_file_id.clone(), 1);
-                }
-                accepted_deltas.push(IndexDelta {
-                    key: delta.key,
-                    expected: Some(old),
-                    replacement: Some(replacement),
-                });
-            } else {
-                ensure!(
-                    current.as_ref().is_none_or(|current| {
-                        !output.plan.input_files.contains(&current.data_file_id)
-                            && current.source_commit_lsn > old.source_commit_lsn
-                    }),
-                    CatchUpRejected("late delete and indexed row disagree")
-                );
-                // Delete/reinsert can reset row_version. Source LSN and the
-                // effective physical delete prove replacement, not that counter.
-                ensure!(
-                    sequence.is_some_and(|sequence| sequence >= base.sequence_number),
-                    CatchUpRejected("late delete cannot mask output at its build sequence")
-                );
-                positions.push(replacement);
-                masked_rows += 1;
-            }
-        }
-        if !positions.is_empty() {
+    let lazy = output.lazy_files.take();
+    let (mapping, mapping_lookup, mask_spool, mapped_rows, accepted_rows, masked_rows) =
+        if let Some(files) = lazy {
             let spool_started = Instant::now();
-            output.scratch.put_position_deletes(
+            let (lazy, mapped_rows, masked_rows) = lazy_catch_up(
+                &output,
+                files,
+                &late_scan,
                 &output_scan,
-                &schema.table_id,
-                positions.drain(..),
+                live_counts,
+                sequence,
+                base.sequence_number,
+                batch_rows,
             )?;
-            mask_spool += spool_started.elapsed();
-        }
-        Ok(Some(accepted_deltas))
-    })?;
-    for file in &output.plan.input_files {
-        ensure!(
-            live_counts.get(file).copied() == Some(accepted.get(file).copied().unwrap_or(0)),
-            CatchUpRejected("current index coverage differs from replacement mappings")
-        );
-    }
-    drop(deltas);
-    drop(late);
+            let mask_spool = spool_started.elapsed();
+            let accepted_rows = lazy.output_live_rows.iter().map(|(_, rows)| rows).sum();
+            output.lazy = Some(lazy);
+            (
+                // Report translation as compute so the derived verify time is zero.
+                MappingTimings {
+                    compute: mask_spool,
+                    ..MappingTimings::default()
+                },
+                Duration::ZERO,
+                mask_spool,
+                mapped_rows,
+                accepted_rows,
+                masked_rows,
+            )
+        } else {
+            let mut positions = Vec::with_capacity(batch_rows);
+            let mut mapping_lookup = Duration::ZERO;
+            let mut mask_spool = Duration::ZERO;
+            let mut late = output
+                .scratch
+                .position_deletes(&late_scan, &schema.table_id)
+                .peekable();
+            let mut deltas = output
+                .scratch
+                .prepared_deltas(&output.operation_id)?
+                .peekable();
+            let mut accepted = BTreeMap::<FileId, u64>::new();
+            let mut mapped_rows = 0u64;
+            let mut masked_rows = 0u64;
+            let mut previous = None::<(FileId, u64)>;
+            let mapping = stage_mapping_batches(stage_deltas, || {
+                let batch = mapping_batch(&mut deltas, batch_rows, batch_bytes)?;
+                if batch.is_empty() {
+                    return Ok(None);
+                }
+                mapped_rows += batch.len() as u64;
+                let keys = batch
+                    .iter()
+                    .map(|delta| delta.key.clone())
+                    .collect::<Vec<_>>();
+                let lookup_started = Instant::now();
+                let current = live_index.lookup_many(&schema.table_id, &keys)?;
+                mapping_lookup += lookup_started.elapsed();
+                let mut accepted_deltas = Vec::with_capacity(batch.len());
+                for (delta, current) in batch.into_iter().zip(current) {
+                    let old = delta
+                        .expected
+                        .ok_or_else(|| anyhow::anyhow!("worker mapping lacks original"))?;
+                    let replacement = delta
+                        .replacement
+                        .ok_or_else(|| anyhow::anyhow!("worker mapping lacks replacement"))?;
+                    if let Some((file, position)) = &mut previous {
+                        ensure!(
+                            (&*file, *position) < physical(&old),
+                            "worker mappings are not in input order"
+                        );
+                        if *file != old.data_file_id {
+                            file.0.clone_from(&old.data_file_id.0);
+                        }
+                        *position = old.row_position;
+                    } else {
+                        previous = Some((old.data_file_id.clone(), old.row_position));
+                    }
+                    let deleted = loop {
+                        match late.peek() {
+                            Some(Err(_)) => {
+                                return Err(late
+                                    .next()
+                                    .expect("peeked delete")
+                                    .unwrap_err()
+                                    .into());
+                            }
+                            Some(Ok(position)) if physical(position) < physical(&old) => {
+                                late.next();
+                            }
+                            Some(Ok(position)) => break physical(position) == physical(&old),
+                            None => break false,
+                        }
+                    };
+                    if !deleted {
+                        ensure!(
+                            current.as_ref() == Some(&old),
+                            CatchUpRejected("index moved without an effective position delete")
+                        );
+                        if let Some(count) = accepted.get_mut(&old.data_file_id) {
+                            *count += 1;
+                        } else {
+                            accepted.insert(old.data_file_id.clone(), 1);
+                        }
+                        accepted_deltas.push(IndexDelta {
+                            key: delta.key,
+                            expected: Some(old),
+                            replacement: Some(replacement),
+                        });
+                    } else {
+                        ensure!(
+                            current.as_ref().is_none_or(|current| {
+                                !output.plan.input_files.contains(&current.data_file_id)
+                                    && current.source_commit_lsn > old.source_commit_lsn
+                            }),
+                            CatchUpRejected("late delete and indexed row disagree")
+                        );
+                        // Delete/reinsert can reset row_version. Source LSN and the
+                        // effective physical delete prove replacement, not that counter.
+                        ensure!(
+                            sequence.is_some_and(|sequence| sequence >= base.sequence_number),
+                            CatchUpRejected("late delete cannot mask output at its build sequence")
+                        );
+                        positions.push(replacement);
+                        masked_rows += 1;
+                    }
+                }
+                if !positions.is_empty() {
+                    let spool_started = Instant::now();
+                    output.scratch.put_position_deletes(
+                        &output_scan,
+                        &schema.table_id,
+                        positions.drain(..),
+                    )?;
+                    mask_spool += spool_started.elapsed();
+                }
+                Ok(Some(accepted_deltas))
+            })?;
+            for file in &output.plan.input_files {
+                ensure!(
+                    live_counts.get(file).copied()
+                        == Some(accepted.get(file).copied().unwrap_or(0)),
+                    CatchUpRejected("current index coverage differs from replacement mappings")
+                );
+            }
+            drop(deltas);
+            drop(late);
+            (
+                mapping,
+                mapping_lookup,
+                mask_spool,
+                mapped_rows,
+                accepted.values().sum::<u64>(),
+                masked_rows,
+            )
+        };
     // The effective late-delete set is already ordered by original physical
     // position. Reuse it to filter mappings instead of writing every unchanged
     // row into a second selector on the publication path.
@@ -280,7 +324,7 @@ pub async fn catch_up(
         late_delete_files = late_deletes.len(),
         scanned_late_delete_rows,
         mapped_rows,
-        accepted_rows = accepted.values().sum::<u64>(),
+        accepted_rows,
         masked_rows,
         output_data_files = output.data_files.len(),
         output_data_rows = output.data_files.iter().map(|file| file.record_count()).sum::<u64>(),
@@ -302,6 +346,100 @@ pub async fn catch_up(
         "compaction catch-up validated and staged"
     );
     Ok(output)
+}
+
+/// Lazy remap catch-up: translate late deletes through the per-file remaps and
+/// prove, per input file, that the index at H holds exactly the base survivors
+/// that no late delete removed. Index entries keep pointing at the inputs, so no
+/// per-row lookup or verification is needed; Flow never leaves an index entry on
+/// a deleted row, so equal counts imply the same row set.
+#[allow(clippy::too_many_arguments)]
+fn lazy_catch_up(
+    output: &WorkerOutput,
+    files: Vec<flow_state_store::FileRemap>,
+    late_scan: &str,
+    output_scan: &str,
+    live_counts: &BTreeMap<FileId, u64>,
+    sequence: Option<i64>,
+    build_sequence: i64,
+    batch_rows: usize,
+) -> Result<(flow_state_store::LazyRemap, u64, u64)> {
+    let remaps: BTreeMap<&FileId, &flow_state_store::FileRemap> =
+        files.iter().map(|remap| (&remap.source, remap)).collect();
+    ensure!(
+        remaps
+            .keys()
+            .all(|file| output.plan.input_files.contains(*file)),
+        "lazy remap names a file outside the plan"
+    );
+    let mut late_by_input = BTreeMap::<&FileId, u64>::new();
+    let mut masked_by_output = BTreeMap::<FileId, u64>::new();
+    let mut positions = Vec::with_capacity(batch_rows);
+    let mut masked_rows = 0u64;
+    for position in output.scratch.position_deletes(late_scan, &output.table_id) {
+        let position = position?;
+        let Some(remap) = remaps.get(&position.data_file_id) else {
+            continue;
+        };
+        // Positions already deleted at the base were never written.
+        let Some(replacement) = remap.translate(&position) else {
+            continue;
+        };
+        ensure!(
+            sequence.is_some_and(|sequence| sequence >= build_sequence),
+            CatchUpRejected("late delete cannot mask output at its build sequence")
+        );
+        *late_by_input.entry(&remap.source).or_default() += 1;
+        *masked_by_output
+            .entry(replacement.data_file_id.clone())
+            .or_default() += 1;
+        positions.push(replacement);
+        masked_rows += 1;
+        if positions.len() == batch_rows {
+            output.scratch.put_position_deletes(
+                output_scan,
+                &output.table_id,
+                positions.drain(..),
+            )?;
+        }
+    }
+    if !positions.is_empty() {
+        output
+            .scratch
+            .put_position_deletes(output_scan, &output.table_id, positions.drain(..))?;
+    }
+    let mut mapped_rows = 0u64;
+    for file in &output.plan.input_files {
+        let survivors = remaps.get(file).map_or(0, |remap| remap.survivors());
+        mapped_rows += survivors;
+        let late = late_by_input.get(file).copied().unwrap_or(0);
+        ensure!(
+            live_counts.get(file).copied() == Some(survivors - late),
+            CatchUpRejected("current index coverage differs from replacement mappings")
+        );
+    }
+    let mut output_live_rows = Vec::with_capacity(output.data_files.len());
+    for file in &output.data_files {
+        let id = FileId(file.file_path().to_owned());
+        let masked = masked_by_output.remove(&id).unwrap_or(0);
+        let live = file
+            .record_count()
+            .checked_sub(masked)
+            .ok_or_else(|| anyhow::anyhow!("masked rows exceed an output file"))?;
+        output_live_rows.push((id, live));
+    }
+    ensure!(
+        masked_by_output.is_empty(),
+        "lazy remap targets an unknown output file"
+    );
+    Ok((
+        flow_state_store::LazyRemap {
+            files,
+            output_live_rows,
+        },
+        mapped_rows,
+        masked_rows,
+    ))
 }
 
 // Charge the owned decoded payload, including fixed slots and both paths.

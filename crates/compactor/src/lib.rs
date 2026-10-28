@@ -68,6 +68,9 @@ pub struct Policy {
     pub l1_target_bytes: u64,
     pub l2_target_bytes: u64,
     pub min_file_age_ms: u64,
+    /// Experimental: background data builds of keyed tables commit one remap
+    /// per input file instead of rewriting every moved row's index entries.
+    pub lazy_index_remap: bool,
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -93,6 +96,7 @@ impl Default for Policy {
             l1_target_bytes: 128 << 20,
             l2_target_bytes: 512 << 20,
             min_file_age_ms: 1_000,
+            lazy_index_remap: false,
         }
     }
 }
@@ -130,6 +134,8 @@ pub struct CompactionPlan {
     pub input_bytes: u64,
     pub delete_input_bytes: u64,
     pub delete_input_rows: u64,
+    /// Build a lazy index remap instead of per-row mappings (background builds).
+    pub lazy_index_remap: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -436,6 +442,7 @@ impl Policy {
                         input_bytes: total,
                         delete_input_bytes,
                         delete_input_rows,
+                        lazy_index_remap: self.lazy_index_remap,
                     }));
                 }
             }

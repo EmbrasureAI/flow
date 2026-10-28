@@ -8,6 +8,7 @@ mod apply;
 mod buffer;
 mod control;
 mod reader;
+mod remap;
 mod spool;
 #[cfg(all(test, feature = "sst-profile"))]
 #[path = "../tests/profiles/sst_staging.rs"]
@@ -15,6 +16,7 @@ mod sst_staging_profile;
 pub use buffer::{Bound, BufferResult, CollapseBuffer, MemoryRows};
 pub use control::{CheckpointRecord, ControlMirror, ControlRestore, ControlStore, GenerationState};
 pub use reader::{IndexSnapshot, RowIndex};
+pub use remap::{FileRemap, LazyRemap, RemapRun, RemapTarget};
 pub use spool::{Change, CollapsedMutation};
 
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId};
@@ -44,7 +46,9 @@ const DELTAS: &str = "index_deltas";
 const TABLES: &str = "table_state";
 const SPOOL: &str = "transaction_mutations";
 const SOURCE: &str = "source_transactions";
-const STATE_COLUMN_FAMILIES: [&str; 8] = [
+// Experimental lazy rewrite remaps, keyed like FILE_COUNTS by retired file.
+const REMAPS: &str = "file_remaps";
+const STATE_COLUMN_FAMILIES: [&str; 9] = [
     PK,
     REVERSE,
     FILE_COUNTS,
@@ -53,6 +57,7 @@ const STATE_COLUMN_FAMILIES: [&str; 8] = [
     TABLES,
     SPOOL,
     SOURCE,
+    REMAPS,
 ];
 // Version 3 adds exact per-file counts; older indexes require reconstruction.
 const FORMAT_VERSION: u8 = 3;
@@ -292,6 +297,9 @@ struct Inner {
     revision: AtomicU64,
     failed: AtomicBool,
     ephemeral: bool,
+    /// Set once any lazy remap is committed; until then readers skip remaps.
+    remaps: AtomicBool,
+    remap_cache: remap::RemapCache,
 }
 #[derive(Clone)]
 pub struct StateStore(Arc<Inner>);
@@ -403,6 +411,7 @@ impl StateStore {
         // Legacy adoption must preserve readable control records even when
         // the old row/delta encoding needs rebuilding after authority import.
         validate_operation_records(&db, !authority_import)?;
+        let remaps = remap::any_remaps(&db)?;
         Ok(Self(Arc::new(Inner {
             db,
             cache,
@@ -413,6 +422,8 @@ impl StateStore {
             revision: AtomicU64::new(revision),
             failed: AtomicBool::new(false),
             ephemeral: config.ephemeral,
+            remaps: AtomicBool::new(remaps),
+            remap_cache: remap::RemapCache::default(),
         })))
     }
 
@@ -464,7 +475,14 @@ impl StateStore {
     }
 
     pub fn lookup(&self, table: &TableId, key: &PrimaryKey) -> Result<Option<RowLocation>> {
-        self.get(PK, &pk_key(table, key))
+        if !self.remaps_possible() {
+            return self.get(PK, &pk_key(table, key));
+        }
+        // One snapshot keeps the raw entry and its remaps consistent.
+        Ok(self
+            .lookup_many(table, std::slice::from_ref(key))?
+            .pop()
+            .flatten())
     }
 
     pub fn index_is_empty(&self, table: &TableId) -> Result<bool> {
@@ -699,7 +717,7 @@ impl StateStore {
         // against nothing else. The first unordered batch backfills full
         // markers from the staged deltas, and the operation stays dense.
         let mut dense_flag = operation_prefix(id);
-        dense_flag.push(3);
+        dense_flag.push(DENSE_MARKERS_MARKER);
         let mut dense = self.0.db.get_pinned_cf(&cf, &dense_flag)?.is_some();
         let mut ordinal = delta_key(id, 0);
         let ordinal_offset = ordinal.len() - size_of::<u64>();
@@ -1570,6 +1588,14 @@ fn location_marker(prefix: &[u8], location: &RowLocation) -> Vec<u8> {
     target.extend_from_slice(&location.row_position.to_be_bytes());
     target
 }
+// Bytes after `operation_prefix` that separate an operation's staged records.
+// They share one key space in DELTAS, so every kind needs its own byte.
+// 0 = deltas, 1 = key markers, 2 = location markers, 3 = dense-marker flag.
+const DENSE_MARKERS_MARKER: u8 = 3;
+/// Staged lazy remap records of a rewrite.
+pub(crate) const REMAP_MARKER: u8 = 4;
+/// Staged output live-row counts of a lazy remap.
+pub(crate) const OUTPUT_COUNT_MARKER: u8 = 5;
 fn operation_prefix(id: &OperationId) -> Vec<u8> {
     // Delta keys append a marker and ordinal to this prefix.
     let mut result = Vec::with_capacity(2 * size_of::<u64>() + 1 + id.0.len());
