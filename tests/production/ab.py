@@ -14,8 +14,10 @@ git revision built from a detached worktree under target/ab/trees. Identical
 sources build once, so the same binary can compare configuration flags.
 
 Builds use the `bench-fast` profile by default: no LTO and incremental, so a
-one-file change rebuilds in seconds. Use it to rank changes; confirm a result
-with `--profile release` (or `profiling`) before publishing numbers.
+one-file change rebuilds in seconds. They link jemalloc, like the service
+integration builds; pass `--features ""` for the system allocator. Use it to rank
+changes; confirm a result with `--profile release` (or `profiling`) before
+publishing numbers.
 
 Runs alternate base and candidate (B C, C B, ...) so host drift affects both.
 Every run executes this checkout's benchmark harness, verifies every row and
@@ -43,6 +45,8 @@ AB = ROOT / "target" / "ab"
 # Outside the checkout so every worktree and checkout on the machine shares it.
 CARGO = Path(os.environ.get("FLOW_AB_CARGO_DIR", Path.home() / ".cache" / "flow-ab" / "cargo"))
 DEFAULT_ARGS = "--rate 30000 --duration 30 --warmup 5"
+# The service integration builds and the jemalloc benchmark reports use it too.
+DEFAULT_FEATURES = "flow-daemon/jemalloc"
 KEEP_STATE = {"metrics.prom", "status.json"}
 
 
@@ -68,12 +72,13 @@ def source_tree(revision):
     return tree
 
 
-def build(tree, profile):
+def build(tree, profile, features):
     identity = repository_identity(tree)
     label = identity["head"][:12]
     if identity["dirty"]:
         label += "-dirty-" + identity["dirty_diff_sha256"][:12]
-    output = AB / "builds" / f"{label}-{profile}"
+    suffix = "".join(f"-{feature.split('/')[-1]}" for feature in features)
+    output = AB / "builds" / f"{label}-{profile}{suffix}"
     manifest = output / "build-manifest.json"
     if manifest.exists():
         if json.loads(manifest.read_text())["source"] == identity:
@@ -81,7 +86,7 @@ def build(tree, profile):
             return output
         shutil.rmtree(output)
     print(f"building {tree} ({label}, {profile})", flush=True)
-    freeze(output, profile=profile, source=tree, target_dir=CARGO / profile)
+    freeze(output, profile=profile, features=features, source=tree, target_dir=CARGO / profile)
     return output
 
 
@@ -137,6 +142,9 @@ def main():
     parser.add_argument("--candidate", default=".", help="git revision, or . for this working tree")
     parser.add_argument("--runs", type=int, default=2, help="runs per side")
     parser.add_argument("--profile", choices=("bench-fast", "profiling", "release"), default="bench-fast")
+    parser.add_argument("--features", default=DEFAULT_FEATURES,
+                        help=f"comma-separated cargo features for both sides (default: {DEFAULT_FEATURES})")
+    parser.add_argument("--base-features", help="features for the base side instead, e.g. \"\" to compare allocators")
     parser.add_argument("--args", default=DEFAULT_ARGS, help=f"benchmark.py arguments for both sides (default: {DEFAULT_ARGS})")
     parser.add_argument("--base-args", default="", help="extra benchmark.py arguments for the base side")
     parser.add_argument("--candidate-args", default="", help="extra benchmark.py arguments for the candidate side")
@@ -147,8 +155,13 @@ def main():
                              "using each side's own local_compactor")
     parser.add_argument("--warm", metavar="REVISION", help="only build REVISION, to fill the build cache")
     args = parser.parse_args()
+    def split(value):
+        return [feature for feature in value.split(",") if feature]
+    features = {side: split(args.features) for side in ("base", "candidate")}
+    if args.base_features is not None:
+        features["base"] = split(args.base_features)
     if args.warm:
-        print(build(source_tree(args.warm), args.profile))
+        print(build(source_tree(args.warm), args.profile, features["candidate"]))
         return
 
     artifacts = (args.artifacts or AB / "runs" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S")).resolve()
@@ -156,7 +169,7 @@ def main():
         parser.error(f"artifacts already exist: {artifacts}")
     sides = {}
     for side, revision in (("base", args.base), ("candidate", args.candidate)):
-        sides[side] = build(source_tree(revision), args.profile)
+        sides[side] = build(source_tree(revision), args.profile, features[side])
     fixture("status")
     free = shutil.disk_usage(ROOT).free / 2**30
     if free < 15:
@@ -187,7 +200,9 @@ def main():
             prune(directory)
 
     summary = "\n\n".join((
-        f"# A/B: {args.base} → {args.candidate} ({args.profile} profile, {args.runs} runs per side)",
+        f"# A/B: {args.base} → {args.candidate} ({args.profile} profile, "
+        f"features `{args.features}`, {args.runs} runs per side)"
+        + (f"; base features `{args.base_features}`" if args.base_features is not None else ""),
         f"Common arguments: `{args.args}`"
         + (f"; base `{args.base_args}`" if args.base_args else "")
         + (f"; candidate `{args.candidate_args}`" if args.candidate_args else ""),
