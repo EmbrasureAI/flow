@@ -1179,6 +1179,7 @@ mod columnar;
 mod parquet_scan;
 pub use parquet_scan::{ReadLimits, read_positions};
 mod catchup;
+mod residual;
 pub use catchup::{CatchUpRejected, catch_up};
 mod worker;
 pub use worker::{

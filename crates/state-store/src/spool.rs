@@ -1,5 +1,5 @@
 use crate::StateBatch as WriteBatch;
-use crate::{Error, PK, Result, SPOOL, StateStore, append_component, decode, pk_key};
+use crate::{Error, PK, Result, SPOOL, StateStore, append_component, decode, pk_key, prefix_end};
 use flow_model::{
     PrimaryKey, Row, RowLocation, TableId, carry_forward_unchanged, row_has_unchanged,
 };
@@ -385,6 +385,30 @@ impl StateStore {
             })
     }
 
+    /// [`Self::position_deletes`] as a cursor that borrows each record from
+    /// the store instead of decoding an owned [`RowLocation`].
+    pub fn position_delete_cursor(
+        &self,
+        transaction: &str,
+        table: &TableId,
+    ) -> PositionDeleteCursor<'_> {
+        let prefix = delete_prefix(transaction, table);
+        let mut options = ReadOptions::default();
+        options.fill_cache(false);
+        options.set_iterate_upper_bound(
+            prefix_end(&prefix).expect("length-prefixed internal key always has an upper bound"),
+        );
+        let mut records = self.0.db.raw_iterator_cf_opt(
+            &self.0.db.cf_handle(SPOOL).expect("opened column family"),
+            options,
+        );
+        records.seek(&prefix);
+        PositionDeleteCursor {
+            records,
+            prefix: prefix.len(),
+        }
+    }
+
     pub fn file_position_deletes<'a>(
         &'a self,
         transaction: &str,
@@ -460,6 +484,84 @@ impl StateStore {
         let mut batch = WriteBatch::default();
         self.delete_prefix(&mut batch, SPOOL, &transaction_prefix(transaction));
         self.write(batch)
+    }
+}
+
+/// Forward cursor over one staged position-delete set, in path and then
+/// position order. It can skip the rest of a target file with one seek.
+pub struct PositionDeleteCursor<'a> {
+    records: rocksdb::DBRawIteratorWithThreadMode<'a, rocksdb::DB>,
+    prefix: usize,
+}
+
+impl PositionDeleteCursor<'_> {
+    /// The current target's encoded key part and the row position, or `None`
+    /// after the last record. Encoded targets compare as their paths do, and
+    /// equal only for the same path.
+    pub fn current(&self) -> Result<Option<(&[u8], u64)>> {
+        let Some(key) = self.records.key() else {
+            self.records.status()?;
+            return Ok(None);
+        };
+        let Some((target, position)) = key
+            .len()
+            .checked_sub(size_of::<u64>())
+            .filter(|split| *split >= self.prefix + 2 && key[split - 2..*split] == [0, 0])
+            .map(|split| key.split_at(split))
+        else {
+            return Err(Error::InvalidState("malformed staged delete key".into()));
+        };
+        Ok(Some((
+            &target[self.prefix..],
+            u64::from_be_bytes(position.try_into().expect("eight position bytes")),
+        )))
+    }
+
+    /// The current record, borrowed from the store.
+    pub fn record(&self) -> Result<StagedPosition<'_>> {
+        let value = self
+            .records
+            .value()
+            .ok_or_else(|| Error::InvalidState("staged delete cursor is exhausted".into()))?;
+        Ok(bincode::deserialize(value)?)
+    }
+
+    pub fn advance(&mut self) {
+        self.records.next();
+    }
+
+    /// Move past the current target's remaining positions.
+    pub fn skip_target(&mut self) {
+        let Some(key) = self.records.key() else {
+            return;
+        };
+        // Each target ends with the terminator `0, 0`; `0, 1` follows every
+        // position of this target and precedes the next target.
+        let mut next = key[..key.len().saturating_sub(size_of::<u64>())].to_vec();
+        if let Some(last) = next.last_mut() {
+            *last = 1;
+        }
+        self.records.seek(next);
+    }
+}
+
+/// The leading fields of a staged [`RowLocation`], borrowed from its
+/// encoding: what a position-delete file records and its writer checks. The
+/// identity fields that follow are not decoded.
+#[derive(Debug, Deserialize)]
+pub struct StagedPosition<'a> {
+    data_file_id: &'a [u8],
+    pub row_position: u64,
+    pub data_sequence_number: i64,
+    pub spec_id: i32,
+    pub partition: &'a [u8],
+}
+
+impl StagedPosition<'_> {
+    /// The target data file's path.
+    pub fn path(&self) -> Result<&str> {
+        std::str::from_utf8(self.data_file_id)
+            .map_err(|_| Error::InvalidState("staged delete path is not UTF-8".into()))
     }
 }
 

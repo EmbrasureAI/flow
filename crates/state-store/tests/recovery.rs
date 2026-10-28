@@ -836,6 +836,93 @@ fn abort_noop_and_position_delete_sort_are_disk_backed() {
 }
 
 #[test]
+fn position_delete_cursor_matches_records_and_skips_whole_targets() {
+    let dir = TempDir::new().unwrap();
+    let store = open_with_apply_limits(dir.path(), 64, 64);
+    let table = TableId(7);
+    // Paths that extend another path, including with a NUL byte, sort after it.
+    let paths = ["a", "a\0", "a\0b", "aa", "b"];
+    let mut staged = Vec::new();
+    for (ordinal, path) in paths.iter().enumerate() {
+        for position in [0, 255, 256, u64::MAX >> 1] {
+            let mut row = location(path, position, ordinal as u64 + 1);
+            row.partition = vec![ordinal as u8; ordinal];
+            staged.push(row);
+        }
+    }
+    store
+        .put_position_deletes("delete", &table, staged.iter().cloned())
+        .unwrap();
+    // Another table and spool share the key space but not the cursor.
+    store
+        .put_position_deletes("delete", &TableId(8), [location("a", 1, 1)])
+        .unwrap();
+    store
+        .put_position_deletes("other", &table, [location("a", 1, 1)])
+        .unwrap();
+    let expected: Vec<_> = store
+        .position_deletes("delete", &table)
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(expected.len(), staged.len());
+
+    let mut cursor = store.position_delete_cursor("delete", &table);
+    let mut read = Vec::new();
+    let mut targets = Vec::<Vec<u8>>::new();
+    while let Some((target, position)) = cursor.current().unwrap() {
+        if targets.last().is_none_or(|last| last.as_slice() != target) {
+            assert!(targets.last().is_none_or(|last| last.as_slice() < target));
+            targets.push(target.to_vec());
+        }
+        let record = cursor.record().unwrap();
+        assert_eq!(record.row_position, position);
+        read.push((
+            record.path().unwrap().to_owned(),
+            record.row_position,
+            record.data_sequence_number,
+            record.spec_id,
+            record.partition.to_vec(),
+        ));
+        cursor.advance();
+    }
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|row| {
+            (
+                row.data_file_id.0,
+                row.row_position,
+                row.data_sequence_number,
+                row.spec_id,
+                row.partition,
+            )
+        })
+        .collect();
+    assert_eq!(read, expected);
+    assert_eq!(targets.len(), paths.len());
+
+    // Skipping a target lands on the first position of the next one.
+    let mut cursor = store.position_delete_cursor("delete", &table);
+    let mut firsts = Vec::new();
+    while cursor.current().unwrap().is_some() {
+        let record = cursor.record().unwrap();
+        firsts.push((record.path().unwrap().to_owned(), record.row_position));
+        cursor.skip_target();
+    }
+    assert_eq!(
+        firsts,
+        paths.map(|path| (path.to_owned(), 0)).to_vec(),
+        "one seek per target"
+    );
+    assert!(
+        store
+            .position_delete_cursor("missing", &table)
+            .current()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn abrupt_process_exit_preserves_synced_prepare_and_apply_cursor() {
     for phase in ["prepared", "committed", "applying", "applied"] {
         let temp = TempDir::new().unwrap();

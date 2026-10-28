@@ -2,6 +2,7 @@ use crate::{
     CompactionPlan, ReadLimits,
     columnar::{RowEncoder, conform},
     parquet_scan::{Input, Prefetch, read_input_batches},
+    residual::{ResidualInput, ResidualMerge},
 };
 use anyhow::{Result, bail, ensure};
 use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
@@ -612,13 +613,12 @@ pub(crate) async fn write_residuals(
     scan: &str,
     config: WriterConfig,
 ) -> Result<(Vec<DataFile>, u64)> {
-    let positions = output
-        .scratch
-        .position_deletes(scan, &schema.table_id)
-        .filter(|position| match position {
-            Ok(position) => !output.plan.input_files.contains(&position.data_file_id),
-            Err(_) => true,
-        });
+    let positions = ResidualMerge::new(vec![ResidualInput::new(
+        output
+            .scratch
+            .position_delete_cursor(scan, &schema.table_id),
+        |file| !output.plan.input_files.contains(file),
+    )]);
     write_residual_positions(table, output, positions, config).await
 }
 
@@ -628,7 +628,7 @@ pub(crate) async fn write_residuals(
 pub(crate) async fn write_residual_positions(
     table: &Table,
     output: &WorkerOutput,
-    positions: impl Iterator<Item = flow_state_store::Result<RowLocation>>,
+    mut positions: ResidualMerge<'_>,
     mut config: WriterConfig,
 ) -> Result<(Vec<DataFile>, u64)> {
     // A shared residual must not grow into one globally charged dependency.
@@ -670,49 +670,62 @@ pub(crate) async fn write_residual_positions(
         .iter()
         .map(DataFile::file_path)
         .collect::<HashSet<_>>();
+    // Batch slots keep their allocations; the first `filled` are pending.
     let mut batch = Vec::with_capacity(batch_rows);
+    let mut filled = 0;
     let mut total_rows = 0u64;
     let mut current_rows = 0u64;
     let mut residual_rows = 0u64;
+    let mut residual_target = false;
     let mut target = None::<FileId>;
-    for position in positions {
-        let position = position?;
+    loop {
+        if filled == batch.len() {
+            batch.push(crate::residual::empty_location());
+        }
+        let Some(starts) = positions.next_into(&mut batch[filled])? else {
+            break;
+        };
+        let position = &batch[filled];
         total_rows += 1;
         ensure!(
             total_rows <= output.plan.delete_input_rows,
             "residual positions exceed admitted delete inputs"
         );
-        residual_rows += u64::from(!outputs.contains(position.data_file_id.0.as_str()));
+        if starts {
+            residual_target = !outputs.contains(position.data_file_id.0.as_str());
+        }
+        residual_rows += u64::from(residual_target);
         if per_target {
-            if target.as_ref() != Some(&position.data_file_id) {
+            if starts {
                 if let Some(previous) = &target
                     && !ranges.continues(previous, &position.data_file_id)
                 {
-                    writer.write(&batch).await?;
-                    batch.clear();
+                    writer.write(&batch[..filled]).await?;
+                    batch.swap(0, filled);
+                    filled = 0;
                     writer.finish_target().await?;
                 }
-                target = Some(position.data_file_id.clone());
+                target = Some(batch[filled].data_file_id.clone());
             }
-            batch.push(position);
-            if batch.len() == batch_rows {
-                writer.write(&batch).await?;
-                batch.clear();
+            filled += 1;
+            if filled == batch_rows {
+                writer.write(&batch[..filled]).await?;
+                filled = 0;
             }
             continue;
         }
         current_rows += 1;
-        batch.push(position);
-        if batch.len() == batch_rows || current_rows == cohort_rows {
-            writer.write(&batch).await?;
-            batch.clear();
+        filled += 1;
+        if filled == batch_rows || current_rows == cohort_rows {
+            writer.write(&batch[..filled]).await?;
+            filled = 0;
         }
         if current_rows == cohort_rows {
             writer.finish_file().await?;
             current_rows = 0;
         }
     }
-    writer.write(&batch).await?;
+    writer.write(&batch[..filled]).await?;
     Ok((writer.close().await?, residual_rows))
 }
 

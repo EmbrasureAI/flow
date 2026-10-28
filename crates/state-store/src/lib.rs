@@ -19,7 +19,7 @@ pub use reader::{IndexSnapshot, RowIndex};
 pub use remap::{
     FileRemap, LazyRemap, RemapCleanup, RemapLimits, RemapRun, RemapStats, RemapTarget,
 };
-pub use spool::{Change, CollapsedMutation};
+pub use spool::{Change, CollapsedMutation, PositionDeleteCursor, StagedPosition};
 
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId};
 use rocksdb::{

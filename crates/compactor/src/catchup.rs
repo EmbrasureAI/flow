@@ -1,7 +1,11 @@
 //! Correct a completed data build using an exact catalog and index head.
 //! Only additive position deletes and unrelated physical changes are accepted.
 
-use crate::{BuiltData, DeleteReadLimits, Policy, ReadLimits, WorkerOutput, stage_delete_files};
+use crate::{
+    BuiltData, DeleteReadLimits, Policy, ReadLimits, WorkerOutput,
+    residual::{ResidualInput, ResidualMerge},
+    stage_delete_files,
+};
 use anyhow::{Result, ensure};
 use flow_iceberg_ext::{CommitBase, ManifestCache, SnapshotView};
 use flow_materializer::WriterConfig;
@@ -293,14 +297,7 @@ pub async fn catch_up(
     (output.delete_files, output.residual_delete_rows) = crate::worker::write_residual_positions(
         table,
         &output,
-        residual_positions(&output, &late_scan, &output_scan, &data).filter(|position| {
-            !v3 || position.as_ref().map_or(true, |position| {
-                output
-                    .data_files
-                    .iter()
-                    .any(|file| file.file_path() == position.data_file_id.0)
-            })
-        }),
+        residual_positions(&output, &late_scan, &output_scan, &data, v3),
         config,
     )
     .await?;
@@ -562,53 +559,39 @@ fn stage_mapping_batches(
     })
 }
 
-/// Each spool is ordered and unique by physical position, using bytewise path
-/// order followed by the ordinal. Merge with three lookaheads; overlapping input
-/// deletes need neither another encoding pass nor a second scratch write.
+/// Merge the original input deletes, late deletes and output masks; each
+/// spool is already ordered, so overlapping input deletes need neither another
+/// encoding pass nor a second scratch write. With `outputs_only` (format v3,
+/// whose vectors are per target) only positions on this rewrite's output remain.
 fn residual_positions<'a>(
     output: &'a WorkerOutput,
-    late_scan: &'a str,
-    mask_scan: &'a str,
+    late_scan: &str,
+    mask_scan: &str,
     live_data: &'a BTreeSet<FileId>,
-) -> impl Iterator<Item = flow_state_store::Result<RowLocation>> + 'a {
-    let mut inputs = [&output.operation_id.0, late_scan, mask_scan]
-        .map(|scan| output.scratch.position_deletes(scan, &output.table_id));
-    let mut heads: [Option<RowLocation>; 3] = [None, None, None];
-    std::iter::from_fn(move || {
-        for (index, (input, head)) in inputs.iter_mut().zip(&mut heads).enumerate() {
-            while head.is_none() {
-                let position = match input.next() {
-                    Some(Ok(position)) => position,
-                    Some(Err(error)) => return Some(Err(error)),
-                    None => break,
-                };
-                // Original and late residuals must still target live H files.
-                // Masks target the replacement data, which is not published yet.
-                if index == 2
-                    || (!output.plan.input_files.contains(&position.data_file_id)
-                        && live_data.contains(&position.data_file_id))
-                {
-                    *head = Some(position);
-                }
-            }
-        }
-        let next = heads
-            .iter()
-            .enumerate()
-            .filter_map(|(index, head)| head.as_ref().map(|head| (index, head)))
-            .min_by(|(_, left), (_, right)| physical(left).cmp(&physical(right)))?
-            .0;
-        let position = heads[next].take().expect("selected residual");
-        for head in &mut heads {
-            if head
-                .as_ref()
-                .is_some_and(|head| physical(head) == physical(&position))
-            {
-                *head = None;
-            }
-        }
-        Some(Ok(position))
-    })
+    outputs_only: bool,
+) -> ResidualMerge<'a> {
+    let on_output = move |file: &FileId| {
+        !outputs_only
+            || output
+                .data_files
+                .iter()
+                .any(|data| data.file_path() == file.0)
+    };
+    // Original and late residuals must still target live H files. Masks
+    // target the replacement data, which is not published yet.
+    let carried = move |file: &FileId| {
+        !output.plan.input_files.contains(file) && live_data.contains(file) && on_output(file)
+    };
+    let cursor = |scan: &str| {
+        output
+            .scratch
+            .position_delete_cursor(scan, &output.table_id)
+    };
+    ResidualMerge::new(vec![
+        ResidualInput::new(cursor(&output.operation_id.0), carried),
+        ResidualInput::new(cursor(late_scan), carried),
+        ResidualInput::new(cursor(mask_scan), on_output),
+    ])
 }
 
 fn physical(position: &RowLocation) -> (&FileId, u64) {
@@ -823,5 +806,274 @@ mod tests {
         assert!(error.to_string().contains("exceeds writer batch limit"));
         assert_eq!(input.next().unwrap().unwrap(), values[3]);
         assert!(input.next().is_none());
+    }
+
+    /// Residual spools in the shape of a typical catch-up: positions carried
+    /// forward to data files outside the rewrite dominate; others target the
+    /// inputs, a file removed before the head, and this rewrite's output.
+    struct ResidualFixture {
+        _directory: tempfile::TempDir,
+        table: Table,
+        live: BTreeSet<FileId>,
+        outputs: Vec<WorkerOutput>,
+    }
+
+    /// 78,000 carried positions, 2,000 late ones (660 repeat an original
+    /// position) and 500 masks; 6,300 more target inputs or a removed file.
+    const RESIDUAL_ROWS: u64 = 78_000 + 2_000 - 660;
+    const MASK_ROWS: u64 = 500;
+
+    async fn residual_fixture(outputs: usize, per_target: bool) -> ResidualFixture {
+        use flow_state_store::StateStoreOptions;
+        use iceberg::{
+            Catalog, CatalogBuilder, NamespaceIdent, TableCreation,
+            memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
+            spec::{
+                DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema, Struct, Type,
+            },
+        };
+        let directory = tempfile::TempDir::new().unwrap();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "residual",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://residual".into())]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("bench".into());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .schema(schema)
+                    .format_version(iceberg::spec::FormatVersion::V2)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let path = |name: &str, file: usize| {
+            FileId(format!(
+                "s3://flow-bench/warehouse/cdc.db/orders/data/{name}-{file:05}-0-8d4f3c2a-91b7-4e6d-a0c5-{file:012}-00001.parquet"
+            ))
+        };
+        // 20 carried targets, 3 inputs and one file removed before the head.
+        let carried: Vec<_> = (0..20).map(|file| path("ingest", file)).collect();
+        let inputs: BTreeSet<_> = (20..23).map(|file| path("ingest", file)).collect();
+        let removed = path("ingest", 23);
+        let mut live: BTreeSet<_> = carried.iter().cloned().collect();
+        live.extend(inputs.iter().cloned());
+        let location = |file: &FileId, position: u64| RowLocation {
+            data_file_id: file.clone(),
+            row_position: position,
+            data_sequence_number: 3,
+            spec_id: 0,
+            partition: Vec::new(),
+            source_commit_lsn: PgLsn(0),
+            row_version: 0,
+            row_fingerprint: [0; 16],
+        };
+        let mut built = Vec::new();
+        for ordinal in 0..outputs {
+            let operation = OperationId(format!("residual-{ordinal}"));
+            // Each build has its own scratch store, small enough to stay in
+            // its memtable.
+            let scratch = StateStore::open(
+                directory.path().join(&operation.0),
+                StateStoreOptions {
+                    apply_batch_rows: 8192,
+                    ..StateStoreOptions::scratch()
+                },
+            )
+            .unwrap();
+            let stage = |scan: &str, positions: Vec<RowLocation>| {
+                for batch in positions.chunks(8192) {
+                    scratch
+                        .put_position_deletes(scan, &TableId(1), batch.iter().cloned())
+                        .unwrap();
+                }
+            };
+            let output_file = path(&format!("{}-out", operation.0), 0);
+            let mut original = Vec::new();
+            for file in &carried {
+                original.extend((0..3_900).map(|row| location(file, row * 3)));
+            }
+            for file in &inputs {
+                original.extend((0..2_000).map(|row| location(file, row * 2)));
+            }
+            original.extend((0..1_000).map(|row| location(&removed, row)));
+            stage(&operation.0, original);
+            let mut late = Vec::new();
+            for file in carried.iter().chain(&inputs) {
+                late.extend((0..100).map(|row| location(file, row * 5 + 1)));
+            }
+            stage(&format!("{}-late", operation.0), late);
+            stage(
+                &format!("{}-output", operation.0),
+                (0..MASK_ROWS)
+                    .map(|row| location(&output_file, row * 7))
+                    .collect(),
+            );
+            let data = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(output_file.0.clone())
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::empty())
+                .partition_spec_id(0)
+                .file_size_in_bytes(1 << 20)
+                .record_count(10_000)
+                .build()
+                .unwrap();
+            built.push(WorkerOutput {
+                plan: crate::CompactionPlan {
+                    base_snapshot_id: 1,
+                    schema_id: 0,
+                    input_files: inputs.clone(),
+                    delete_files: BTreeSet::new(),
+                    spec_id: 0,
+                    partition: Vec::new(),
+                    output_level: crate::Level::L1,
+                    target_file_bytes: 128 << 20,
+                    input_bytes: 0,
+                    delete_input_bytes: 0,
+                    delete_input_rows: 200_000,
+                    lazy_index_remap: false,
+                    per_target_deletes: per_target,
+                    target_ranges: crate::TargetRanges {
+                        pooled: BTreeSet::new(),
+                        breaks: live.clone(),
+                        full_size_bytes: 1,
+                    },
+                    reason: crate::PlanReason::Promotion,
+                },
+                data_files: vec![data],
+                delete_files: Vec::new(),
+                delete_sequence: Some(3),
+                residual_delete_rows: 0,
+                operation_id: operation,
+                scratch: scratch.clone(),
+                masked_inputs: None,
+                table_id: TableId(1),
+                lazy_files: None,
+                lazy: None,
+            });
+        }
+        ResidualFixture {
+            _directory: directory,
+            table,
+            live,
+            outputs: built,
+        }
+    }
+
+    async fn write_fixture_residuals(
+        table: &Table,
+        output: &WorkerOutput,
+        live: &BTreeSet<FileId>,
+    ) -> (Vec<iceberg::spec::DataFile>, u64) {
+        let late = format!("{}-late", output.operation_id.0);
+        let mask = format!("{}-output", output.operation_id.0);
+        crate::worker::write_residual_positions(
+            table,
+            output,
+            residual_positions(output, &late, &mask, live, false),
+            WriterConfig {
+                batch_rows: 8192,
+                ..WriterConfig::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn residual_digest(table: &Table, files: &[iceberg::spec::DataFile]) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for file in files {
+            let bytes = table
+                .file_io()
+                .new_input(file.file_path())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            hasher.update(file.file_path().as_bytes());
+            hasher.update(&file.record_count().to_be_bytes());
+            hasher.update(&bytes);
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Times the residual merge and its Parquet write over a scratch spool.
+    /// Run with `cargo test --release -p flow-compactor --lib
+    /// residual_merge_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "focused timing workload; run explicitly with --release --ignored --nocapture"]
+    fn residual_merge_benchmark() {
+        let iterations = std::env::var("RESIDUAL_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for per_target in [false, true] {
+            let fixture = runtime.block_on(residual_fixture(iterations + 1, per_target));
+            let mut samples = Vec::new();
+            let mut merges = Vec::new();
+            let mut digest = None;
+            for output in &fixture.outputs {
+                let started = Instant::now();
+                let (files, residual) = runtime.block_on(write_fixture_residuals(
+                    &fixture.table,
+                    output,
+                    &fixture.live,
+                ));
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                let rows: u64 = files.iter().map(|file| file.record_count()).sum();
+                assert_eq!((rows, residual), (RESIDUAL_ROWS + MASK_ROWS, RESIDUAL_ROWS));
+                // The merge alone, without encoding or writing.
+                let started = Instant::now();
+                let late = format!("{}-late", output.operation_id.0);
+                let mask = format!("{}-output", output.operation_id.0);
+                let mut merge = residual_positions(output, &late, &mask, &fixture.live, false);
+                let mut slot = crate::residual::empty_location();
+                let mut merged = 0u64;
+                while merge.next_into(&mut slot).unwrap().is_some() {
+                    merged += 1;
+                }
+                let merge_elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(merged, RESIDUAL_ROWS + MASK_ROWS);
+                if digest.is_none() {
+                    // The first run warms up; its digest identifies the bytes.
+                    digest = Some(runtime.block_on(residual_digest(&fixture.table, &files)));
+                    continue;
+                }
+                samples.push(elapsed);
+                merges.push(merge_elapsed);
+            }
+            samples.sort_by(f64::total_cmp);
+            merges.sort_by(f64::total_cmp);
+            println!(
+                "residual_merge per_target={per_target} rows={} runs={} median_ms={:.2} min_ms={:.2} max_ms={:.2} merge_only_median_ms={:.2} digest={}",
+                RESIDUAL_ROWS + MASK_ROWS,
+                samples.len(),
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1],
+                merges[merges.len() / 2],
+                digest.expect("one run")
+            );
+        }
     }
 }

@@ -170,7 +170,18 @@ async fn resolve_maintenance_operation_inner(
     if record.phase == OperationPhase::Building {
         return Ok(MaintenanceResolution::new(None, "building", false));
     }
-    let head = catalog.load_table(table.identifier()).await?;
+    // A fresh data rewrite was sealed in this process after its caller loaded
+    // `table`, and no commit has been attempted. The checks below then only
+    // fail fast: the action reloads the head and repeats them, and its catalog
+    // commit requires the exact base snapshot.
+    let head = if fresh.is_some()
+        && record.phase == OperationPhase::Prepared
+        && record.operation.kind == OperationKind::Rewrite
+    {
+        table.clone()
+    } else {
+        catalog.load_table(table.identifier()).await?
+    };
     if record.operation.kind == OperationKind::Reconcile {
         let plan: ReconcileRecovery = serde_json::from_slice(&record.operation.payload)?;
         if matches!(
