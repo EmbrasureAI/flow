@@ -285,6 +285,7 @@ impl TableMaintenance {
             Level::L2 => "l2",
         };
         let operation = OperationId(format!("flow-{level}-rewrite-{}", uuid::Uuid::new_v4()));
+        let selection_reason = plan.reason.as_str();
         let base = CommitBase::new(&table);
         let ownership = BuildRegistration::begin(
             self.store.clone(),
@@ -328,7 +329,7 @@ impl TableMaintenance {
         match ready.await {
             Ok(indexed) => {
                 tracing::info!(event = "compaction_build_started", operation_id = %ownership.operation_id().0,
-                    base_snapshot_id = snapshot, materialized_lsn = %indexed.materialized_lsn,
+                    base_snapshot_id = snapshot, materialized_lsn = %indexed.materialized_lsn, selection_reason,
                     "captured speculative compaction index snapshot");
                 Ok(Some(RunningCompaction {
                     worker,

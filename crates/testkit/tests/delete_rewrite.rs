@@ -1516,3 +1516,303 @@ async fn byte_failed_target_does_not_exhaust_a_shared_delete_input() {
     assert_eq!(sorted(scan(&head, &f.schema).await.unwrap()), f.expected);
     assert_eq!(sorted(scan(&f.head, &f.schema).await.unwrap()), f.expected);
 }
+
+/// Zipf-like CDC: every epoch updates one more row of a mostly-live L2 base and
+/// the same hot key again. Each epoch adds a position-delete file against the
+/// base until delete-file count alone reaches the hard limit. With
+/// `delete_debt = "consolidate"` the debt is paid by delete-only consolidation:
+/// the base and every index location stay unchanged, the table leaves hard
+/// pressure, and data maintenance later reclaims only dense files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_updates_past_the_hard_delete_limit_recover_by_consolidation() {
+    use flow_compactor::{DeleteDebt, Level, PlanReason, PublicationPressure};
+    use flow_coordinator::TablePublisher;
+    use flow_model::{Row, SourceId};
+    use flow_state_store::{Change, ControlStore, IndexDelta};
+    use std::collections::BTreeMap;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let catalog: std::sync::Arc<dyn Catalog> =
+        std::sync::Arc::new(flow_testkit::catalog(&temp.path().join("warehouse")).await);
+    let schema = flow_testkit::schema(1);
+    let mut head = flow_testkit::table(catalog.as_ref(), &schema).await;
+    let value = |id: i64, version: u64| -> Row {
+        vec![Value::Int64(id), Value::String(format!("v{version}"))]
+    };
+    let mut expected = (0..200)
+        .map(|id| (id, value(id, 0)))
+        .collect::<BTreeMap<_, _>>();
+    let mut writer = DataWriter::new(
+        head.file_io().clone(),
+        head.metadata().location(),
+        &OperationId("flow-l2-base".into()),
+        schema.clone(),
+        0,
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let mut locations = writer
+        .write(&expected.values().cloned().collect::<Vec<_>>(), PgLsn(80))
+        .await
+        .unwrap()
+        .locations;
+    let base_files = writer.close().await.unwrap();
+    assert_eq!(base_files.len(), 1);
+    let base = FileId(base_files[0].file_path().to_owned());
+    let committed = RowDeltaAction::new(&head, "base-data")
+        .add_data_files(base_files)
+        .commit(catalog.as_ref(), &head)
+        .await
+        .unwrap();
+    for location in &mut locations {
+        location.data_sequence_number = committed.sequence_number;
+    }
+    head = committed.table;
+    let control = ControlStore::open(temp.path().join("control")).unwrap();
+    let index = control
+        .initialize_index(temp.path().join("index"), options())
+        .unwrap();
+    let seed = OperationId("seed-index".into());
+    index
+        .prepare(
+            PreparedOperation {
+                id: seed.clone(),
+                table_id: schema.table_id,
+                kind: OperationKind::Ingest,
+                base_snapshot_id: None,
+                last_lsn: PgLsn(80),
+                schema_version: schema.version,
+                artifacts: vec![],
+                payload: vec![],
+            },
+            expected
+                .values()
+                .zip(&locations)
+                .map(|(row, location)| IndexDelta {
+                    key: schema.encode_key(row).unwrap(),
+                    expected: None,
+                    replacement: Some(location.clone()),
+                }),
+        )
+        .unwrap();
+    index
+        .mark_committed(
+            &seed,
+            head.metadata().current_snapshot_id().unwrap(),
+            head.metadata()
+                .current_snapshot()
+                .unwrap()
+                .sequence_number(),
+        )
+        .unwrap();
+    index.apply_committed(&seed).unwrap();
+    index.forget_applied(&seed).unwrap();
+
+    let tuned = Policy {
+        min_file_age_ms: 0,
+        // Isolate delete debt: keep the hot L0 output's file count and age
+        // below their own limits, also on slow machines.
+        l0_soft_files: 200,
+        l0_hard_files: 400,
+        oldest_l0_soft_ms: 600_000,
+        oldest_l0_hard_ms: 1_200_000,
+        ..Policy::default()
+    };
+    let policy = Policy {
+        delete_debt: DeleteDebt::Consolidate,
+        ..tuned.clone()
+    };
+    let maintenance = TableMaintenance::new(
+        index.clone(),
+        catalog.clone(),
+        policy.clone(),
+        WriterConfig::default(),
+    )
+    .unwrap();
+    // The daemon's consolidation limits for this policy.
+    let consolidation = DeleteRewritePolicy {
+        min_input_files: policy.delete_files_soft.min(32),
+        ..Default::default()
+    };
+    let publisher = TablePublisher::new(
+        index.clone(),
+        catalog.clone(),
+        WriterConfig::default(),
+        2,
+        1 << 20,
+    )
+    .unwrap();
+    let base_entry = SnapshotView::current(&head).await.unwrap().live_files[&base.0].clone();
+    let lookups = |index: &StateStore, expected: &BTreeMap<i64, Row>| {
+        expected
+            .values()
+            .map(|row| {
+                index
+                    .lookup(&schema.table_id, &schema.encode_key(row).unwrap())
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut consolidations = 0;
+    for epoch in 1..=40u64 {
+        let changes = [0, epoch as i64]
+            .into_iter()
+            .map(|id| {
+                let row = value(id, epoch);
+                expected.insert(id, row.clone());
+                (schema.encode_key(&row).unwrap(), Change::Update(row))
+            })
+            .collect::<Vec<_>>();
+        let (operation, collapsed) = flow_testkit::collapse_fixture(
+            &index,
+            &head,
+            &schema,
+            SourceId("fixture".into()),
+            PgLsn(100 + epoch * 10),
+            changes,
+        );
+        publisher.publish(&head, &schema, collapsed).await.unwrap();
+        index.forget_applied(&operation.id).unwrap();
+        head = catalog.load_table(head.identifier()).await.unwrap();
+
+        let inventory = maintenance.inventory(&head, schema.table_id).await.unwrap();
+        let debt = &inventory.debt;
+        if debt.pressure != PublicationPressure::Pause {
+            continue;
+        }
+        // Hard pressure comes from delete-file count alone; the dense hot
+        // L0 files contribute only soft debt.
+        assert_eq!(policy.pressure_reasons(debt), ["delete_file_count"]);
+        assert_eq!(
+            policy.layout_pressure(debt),
+            PublicationPressure::Healthy,
+            "{debt:?}"
+        );
+        assert!(debt.max_delete_files >= policy.delete_files_hard);
+        assert!(debt.dense_delete_files > 0);
+        assert!(policy.consolidates_delete_debt(debt));
+        let snapshot = head.metadata().current_snapshot_id().unwrap();
+        let schema_id = head.metadata().current_schema_id();
+        // The current policy pays this debt by rewriting the whole base.
+        let current = tuned
+            .plan(snapshot, schema_id, &inventory.files, &inventory.deletes)
+            .unwrap()
+            .unwrap();
+        assert!(current.input_files.contains(&base));
+        assert_eq!(current.reason, PlanReason::DeleteFileCount);
+        // Consolidation-first planning never moves the mostly-live base.
+        if let Some(plan) = policy
+            .plan(snapshot, schema_id, &inventory.files, &inventory.deletes)
+            .unwrap()
+        {
+            assert!(!plan.input_files.contains(&base));
+        }
+
+        let before = SnapshotView::current(&head).await.unwrap();
+        let located = lookups(&index, &expected);
+        let deletes_before = inventory.delete_file_count;
+        maintenance
+            .compact_deletes(
+                &head,
+                &schema,
+                StateStore::open(temp.path().join(format!("consolidate-{epoch}")), options())
+                    .unwrap(),
+                &consolidation,
+            )
+            .await
+            .unwrap()
+            .expect("delete-file count debt is consolidated");
+        consolidations += 1;
+        head = catalog.load_table(head.identifier()).await.unwrap();
+        let after = SnapshotView::current(&head).await.unwrap();
+        // No data file moved and no row-index delta was applied.
+        for (path, entry) in &before.live_files {
+            if entry.content_type() == DataContentType::Data {
+                assert_eq!(&after.live_files[path], entry);
+            }
+        }
+        assert_eq!(
+            after
+                .live_files
+                .values()
+                .filter(|entry| entry.content_type() == DataContentType::Data)
+                .count(),
+            before
+                .live_files
+                .values()
+                .filter(|entry| entry.content_type() == DataContentType::Data)
+                .count()
+        );
+        assert_eq!(lookups(&index, &expected), located);
+        assert!(index.pending_operations().unwrap().is_empty());
+        // The consolidated files are counted once; the table leaves hard
+        // pressure instead of immediately re-entering it.
+        let inventory = maintenance.inventory(&head, schema.table_id).await.unwrap();
+        assert!(inventory.delete_file_count < deletes_before);
+        assert!(inventory.delete_file_count < policy.delete_files_soft);
+        assert_eq!(
+            inventory.debt.shared_delete_files,
+            inventory.delete_file_count
+        );
+        assert!(inventory.debt.max_delete_files < policy.delete_files_soft);
+        assert_eq!(
+            policy.delete_file_pressure(&inventory.debt),
+            PublicationPressure::Healthy
+        );
+        assert_ne!(inventory.debt.pressure, PublicationPressure::Pause);
+        assert!(!policy.consolidates_delete_debt(&inventory.debt));
+        assert_eq!(
+            sorted(scan(&head, &schema).await.unwrap()),
+            expected.values().cloned().collect::<Vec<_>>()
+        );
+    }
+    assert!(consolidations >= 2, "{consolidations} consolidations");
+    let view = SnapshotView::current(&head).await.unwrap();
+    assert_eq!(view.live_files[&base.0], base_entry);
+
+    // Remaining soft debt is dense hot L0 output. Data maintenance reclaims it
+    // without selecting the mostly-live base.
+    let inventory = maintenance.inventory(&head, schema.table_id).await.unwrap();
+    let base_candidate = inventory.files.iter().find(|file| file.id == base).unwrap();
+    assert_eq!(base_candidate.level, Level::L2);
+    assert!(!policy.needs_delete_reclamation(base_candidate));
+    let plan = policy
+        .plan(
+            head.metadata().current_snapshot_id().unwrap(),
+            head.metadata().current_schema_id(),
+            &inventory.files,
+            &inventory.deletes,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!plan.input_files.contains(&base));
+    maintenance
+        .compact(
+            &head,
+            &schema,
+            StateStore::open(temp.path().join("dense-l0"), options()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    head = catalog.load_table(head.identifier()).await.unwrap();
+    let view = SnapshotView::current(&head).await.unwrap();
+    assert_eq!(view.live_files[&base.0], base_entry);
+    let rows = expected.values().cloned().collect::<Vec<_>>();
+    assert_eq!(sorted(scan(&head, &schema).await.unwrap()), rows);
+    for (row, location) in expected.values().zip(lookups(&index, &expected)) {
+        assert!(
+            view.live_files.contains_key(&location.data_file_id.0),
+            "{row:?}"
+        );
+    }
+    assert_eq!(
+        index
+            .table_state(&schema.table_id)
+            .unwrap()
+            .materialized_lsn,
+        PgLsn(500)
+    );
+}

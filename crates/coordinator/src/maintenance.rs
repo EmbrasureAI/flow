@@ -410,17 +410,12 @@ impl TableMaintenance {
                     && entry.file_format() != iceberg::spec::DataFileFormat::Puffin
             })
             .count();
-        let mut debt = self.policy.debt(&files)?;
         // Legacy shared/dangling files add planning work across targets. A DV
         // is scoped to one file; sparse vectors on healthy files are not global
         // debt. Per-file density still schedules reclamation.
-        if legacy_delete_count >= self.policy.delete_files_hard {
-            debt.pressure = flow_compactor::PublicationPressure::Pause;
-        } else if legacy_delete_count >= self.policy.delete_files_soft {
-            debt.pressure = debt
-                .pressure
-                .max(flow_compactor::PublicationPressure::Delay);
-        }
+        let debt = self
+            .policy
+            .debt_with_shared_deletes(&files, legacy_delete_count)?;
         Ok(Inventory {
             files,
             deletes,
@@ -634,6 +629,7 @@ impl TableMaintenance {
             payload: serde_json::to_vec(&recovery)?,
         };
         let id = operation.id.clone();
+        let selection_reason = output.plan.reason;
         // Physical output includes rows masked during catch-up. It is not the
         // number of surviving mappings or the catalog's logical row count.
         let output_data_files = output.data_files.len();
@@ -714,6 +710,7 @@ impl TableMaintenance {
             table_id = table_id.0,
             operation_id = %id.0,
             candidate_kind = "data_rewrite",
+            selection_reason = selection_reason.as_str(),
             snapshot_id = snapshot,
             output_level = level,
             output_data_files,

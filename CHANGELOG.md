@@ -82,6 +82,14 @@ This will be the initial public release, `0.1.0`.
   through the remaps. In service benchmarks it cut the table's compaction stall
   by 70–96% and commit-to-catalog p95 at 30,000 mutations/s from 3.1 s to
   1.0 s. See [local compaction](docs/local-compaction.md#experimental-lazy-index-remap).
+- Experimental `[compaction] delete_debt = "consolidate"` (default
+  `"current"`) pays delete-file count debt, including hard pressure, with the
+  delete-only consolidation instead of rewriting a mostly-live base; data
+  rewrites for deletes then select only files past `deleted_rows_percent`. With
+  Zipf-skewed updates at 30,000 mutations/s, commit-to-catalog p95 fell from
+  5.9 s to 1.5 s. A `maintenance_action_chosen` debug event and a
+  `selection_reason` field on build and rewrite events record why each action
+  ran.
 
 **Commands and configuration**
 

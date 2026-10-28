@@ -243,6 +243,7 @@ pub async fn build_data(
         table_id = schema.table_id.0,
         build_snapshot_id = plan.base_snapshot_id,
         output_level = ?plan.output_level,
+        selection_reason = plan.reason.as_str(),
         input_data_files = plan.input_files.len(),
         input_data_rows,
         input_data_bytes = plan.input_bytes,

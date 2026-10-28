@@ -101,6 +101,9 @@ prefetch_file_bytes = 4194304
 # delete_files_hard = 16
 # Rewrite a data file once this share of its rows is deleted.
 # deleted_rows_percent = 30
+# "consolidate" pays delete-file count debt with a delete-only consolidation
+# before any data rewrite; "current" lets count debt drive data rewrites.
+# delete_debt = "current"
 # Bounds of one rewrite group and its applicable delete inputs.
 # min_group_files = 2
 # max_group_files = 32

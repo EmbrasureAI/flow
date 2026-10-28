@@ -143,6 +143,34 @@ keep per-row deltas; with the flag off nothing changes.
 - Remaps are not garbage collected until materialization or a rebuild, and the
   `file_remaps` column family is new in this generation format.
 
+## Experimental consolidation-first delete debt
+
+`[compaction] delete_debt = "consolidate"` (default `"current"`) pays
+delete-file count debt with the delete-only consolidation before any data
+rewrite. Delete-file count is the most delete files applying to one data file,
+or the table-wide count of shared position-delete files. With `"current"`
+nothing changes.
+
+- A table visit runs the bounded consolidation (at most 32 inputs, 32 MiB and
+  one million positions, at least `min(delete_files_soft, 32)` inputs) whenever
+  that count reaches `delete_files_soft`, even if some files also need delete
+  reclamation. Under hard pressure CDC publishes as soon as the consolidation
+  clears it; no rows move and no row-index deltas are written. A soft build
+  probe runs the same consolidation instead of yielding. If hard pressure from
+  delete-file count alone meets a running build, the consolidation still runs;
+  a build whose delete inputs it replaced is invalidated at catch-up.
+- Delete-file count no longer makes a data file a rewrite candidate. Data
+  rewrites for deletes select files whose own deleted fraction reaches
+  `deleted_rows_percent`, and an L1 or L2 seed admits only companions that also
+  do. L0 and small-file debt keep their grouping.
+- If consolidation cannot reduce the count, no other group exists and the count
+  stays at `delete_files_hard`, planning falls back to the count-driven rewrite.
+- Each choice emits a `maintenance_action_chosen` debug event on the
+  `flow_events` target with `action`, `reason`, the path (`publication`,
+  `idle`, `probe` or `build_active`) and the debt counts. Build and rewrite
+  events carry the planner's `selection_reason` (`deleted_rows`,
+  `delete_file_count`, `small_files`, `l0_debt` or `promotion`) in both modes.
+
 ## Bounded delete dependencies
 
 The planner tries feasible subsets without increasing data or delete read budgets.

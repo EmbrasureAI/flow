@@ -566,12 +566,37 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(keys.len(), 22);
+        assert_eq!(keys.len(), 23);
         let documented: Config =
             toml::from_str(&format!("{example}\n[compaction]\n{}\n", keys.join("\n"))).unwrap();
         assert_eq!(
             format!("{:?}", documented.compaction),
             format!("{:?}", flow_compactor::Policy::default())
+        );
+    }
+
+    #[test]
+    fn delete_debt_defaults_to_current_and_accepts_consolidate() {
+        let example = include_str!("../../../examples/flow.toml");
+        assert_eq!(
+            valid_config().compaction.delete_debt,
+            flow_compactor::DeleteDebt::Current
+        );
+        for (value, expected) in [
+            ("current", flow_compactor::DeleteDebt::Current),
+            ("consolidate", flow_compactor::DeleteDebt::Consolidate),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "{example}\n[compaction]\ndelete_debt = \"{value}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.compaction.delete_debt, expected);
+        }
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "{example}\n[compaction]\ndelete_debt = \"rewrite\"\n"
+            ))
+            .is_err()
         );
     }
 

@@ -22,6 +22,48 @@ pub enum DataRewriteScope {
     All,
 }
 
+/// How delete-file count debt is paid.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeleteDebt {
+    /// A data file with `delete_files_soft` applicable delete files is a data
+    /// rewrite candidate, and delete-only consolidation runs only when no file
+    /// needs delete reclamation.
+    #[default]
+    Current,
+    /// Delete-file count debt, soft or hard, is paid first by a delete-only
+    /// consolidation. Data rewrites for deletes select only files whose own
+    /// deleted fraction reaches `deleted_rows_percent`.
+    Consolidate,
+}
+
+/// Why the planner selected a data rewrite group, from its seed file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanReason {
+    /// The seed's own deleted fraction reached `deleted_rows_percent`.
+    DeletedRows,
+    /// The seed had at least `delete_files_soft` applicable delete files.
+    DeleteFileCount,
+    /// Files outside L0 below `l1_target_bytes` reached their soft limit.
+    SmallFiles,
+    /// An L0 file under publication pressure.
+    L0Debt,
+    /// An ordinary full-size group promoted to the next level.
+    Promotion,
+}
+
+impl PlanReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeletedRows => "deleted_rows",
+            Self::DeleteFileCount => "delete_file_count",
+            Self::SmallFiles => "small_files",
+            Self::L0Debt => "l0_debt",
+            Self::Promotion => "promotion",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileCandidate {
     pub id: FileId,
@@ -71,6 +113,8 @@ pub struct Policy {
     /// Experimental: background data builds of keyed tables commit one remap
     /// per input file instead of rewriting every moved row's index entries.
     pub lazy_index_remap: bool,
+    /// How delete-file count debt is paid. See [`DeleteDebt`].
+    pub delete_debt: DeleteDebt,
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -97,6 +141,7 @@ impl Default for Policy {
             l2_target_bytes: 512 << 20,
             min_file_age_ms: 1_000,
             lazy_index_remap: false,
+            delete_debt: DeleteDebt::Current,
         }
     }
 }
@@ -117,6 +162,11 @@ pub struct Debt {
     pub l0_bytes: u64,
     pub oldest_l0_ms: u64,
     pub max_delete_files: usize,
+    /// Table-wide position-delete files other than deletion vectors. Shared
+    /// and dangling files add planning work across targets.
+    pub shared_delete_files: usize,
+    /// Data files whose own deleted fraction reaches `deleted_rows_percent`.
+    pub dense_delete_files: usize,
     pub reclaimable_bytes: u64,
     pub pressure: PublicationPressure,
 }
@@ -136,6 +186,8 @@ pub struct CompactionPlan {
     pub delete_input_rows: u64,
     /// Build a lazy index remap instead of per-row mappings (background builds).
     pub lazy_index_remap: bool,
+    /// Why this group was selected, for attribution only.
+    pub reason: PlanReason,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -199,6 +251,8 @@ impl Policy {
             l0_bytes: 0,
             oldest_l0_ms: 0,
             max_delete_files: 0,
+            shared_delete_files: 0,
+            dense_delete_files: 0,
             reclaimable_bytes: 0,
             pressure: PublicationPressure::Healthy,
         };
@@ -220,7 +274,9 @@ impl Policy {
             }
             debt.max_delete_files = debt.max_delete_files.max(file.delete_file_count);
             if file.row_count > 0 {
-                dense_deletes |= self.needs_delete_reclamation(file);
+                let dense = self.needs_delete_reclamation(file);
+                dense_deletes |= dense;
+                debt.dense_delete_files += usize::from(dense);
                 let reclaimable = (file.size_bytes as u128 * file.deleted_rows as u128
                     / file.row_count as u128) as u64;
                 debt.reclaimable_bytes = debt.reclaimable_bytes.saturating_add(reclaimable);
@@ -246,15 +302,139 @@ impl Policy {
         Ok(debt)
     }
 
+    /// [`Self::debt`] including the table-wide count of shared (non-vector)
+    /// position-delete files, to which the same soft and hard limits apply.
+    pub fn debt_with_shared_deletes(
+        &self,
+        files: &[FileCandidate],
+        shared_delete_files: usize,
+    ) -> Result<Debt> {
+        let mut debt = self.debt(files)?;
+        debt.shared_delete_files = shared_delete_files;
+        if shared_delete_files >= self.delete_files_hard {
+            debt.pressure = PublicationPressure::Pause;
+        } else if shared_delete_files >= self.delete_files_soft {
+            debt.pressure = debt.pressure.max(PublicationPressure::Delay);
+        }
+        Ok(debt)
+    }
+
+    /// Pressure from delete-file count alone: the most delete files applying
+    /// to one data file, or the table-wide shared delete-file count.
+    pub fn delete_file_pressure(&self, debt: &Debt) -> PublicationPressure {
+        let count = debt.max_delete_files.max(debt.shared_delete_files);
+        if count >= self.delete_files_hard {
+            PublicationPressure::Pause
+        } else if count >= self.delete_files_soft {
+            PublicationPressure::Delay
+        } else {
+            PublicationPressure::Healthy
+        }
+    }
+
+    /// Pressure from L0 and small-file limits alone, excluding delete debt.
+    pub fn layout_pressure(&self, debt: &Debt) -> PublicationPressure {
+        if debt.l0_files >= self.l0_hard_files
+            || debt.small_files >= self.stable_small_hard_files
+            || debt.l0_bytes >= self.l0_hard_bytes
+            || debt.oldest_l0_ms >= self.oldest_l0_hard_ms
+        {
+            PublicationPressure::Pause
+        } else if debt.l0_files >= self.l0_soft_files
+            || debt.small_files >= self.stable_small_soft_files
+            || debt.l0_bytes >= self.l0_soft_bytes
+            || debt.oldest_l0_ms >= self.oldest_l0_soft_ms
+        {
+            PublicationPressure::Delay
+        } else {
+            PublicationPressure::Healthy
+        }
+    }
+
+    /// Whether a delete-only consolidation should pay this debt before any
+    /// data rewrite: only with [`DeleteDebt::Consolidate`], once delete-file
+    /// count reaches its soft limit.
+    pub fn consolidates_delete_debt(&self, debt: &Debt) -> bool {
+        self.delete_debt == DeleteDebt::Consolidate
+            && self.delete_file_pressure(debt) != PublicationPressure::Healthy
+    }
+
+    /// The limits that set `debt.pressure`, for attribution. Empty when healthy.
+    pub fn pressure_reasons(&self, debt: &Debt) -> Vec<&'static str> {
+        let hard = match debt.pressure {
+            PublicationPressure::Healthy => return Vec::new(),
+            PublicationPressure::Delay => false,
+            PublicationPressure::Pause => true,
+        };
+        let deletes = self.delete_file_pressure(debt);
+        [
+            (
+                "l0_files",
+                debt.l0_files >= self.l0_soft_files,
+                debt.l0_files >= self.l0_hard_files,
+            ),
+            (
+                "l0_bytes",
+                debt.l0_bytes >= self.l0_soft_bytes,
+                debt.l0_bytes >= self.l0_hard_bytes,
+            ),
+            (
+                "oldest_l0",
+                debt.oldest_l0_ms >= self.oldest_l0_soft_ms,
+                debt.oldest_l0_ms >= self.oldest_l0_hard_ms,
+            ),
+            (
+                "small_files",
+                debt.small_files >= self.stable_small_soft_files,
+                debt.small_files >= self.stable_small_hard_files,
+            ),
+            (
+                "delete_file_count",
+                deletes != PublicationPressure::Healthy,
+                deletes == PublicationPressure::Pause,
+            ),
+            ("deleted_rows", debt.dense_delete_files > 0, false),
+        ]
+        .into_iter()
+        .filter(|&(_, soft, hard_limit)| if hard { hard_limit } else { soft })
+        .map(|(reason, ..)| reason)
+        .collect()
+    }
+
     /// Return at most one partition-local group. Prioritizes deletion debt, then
     /// old L0 files, then full-sized L1 groups. Singleton rewrites are permitted
     /// for delete debt; old singleton L0 files become L1 to retire age debt.
+    ///
+    /// With [`DeleteDebt::Consolidate`], delete-file count alone does not make
+    /// a file a rewrite candidate; the delete-only consolidation pays it. Only
+    /// when no other group exists while one file or the dependency set is at
+    /// the hard delete-file limit does planning fall back to count-driven
+    /// selection, so debt that consolidation cannot reduce still makes progress.
     pub fn plan(
         &self,
         base_snapshot_id: i64,
         schema_id: i32,
         files: &[FileCandidate],
         deletes: &[DeleteDependency],
+    ) -> Result<Option<CompactionPlan>> {
+        let count_driven = self.delete_debt == DeleteDebt::Current;
+        let plan = self.plan_with(base_snapshot_id, schema_id, files, deletes, count_driven)?;
+        if plan.is_none()
+            && !count_driven
+            && self.debt(files)?.max_delete_files.max(deletes.len()) >= self.delete_files_hard
+        {
+            return self.plan_with(base_snapshot_id, schema_id, files, deletes, true);
+        }
+        Ok(plan)
+    }
+
+    fn plan_with(
+        &self,
+        base_snapshot_id: i64,
+        schema_id: i32,
+        files: &[FileCandidate],
+        deletes: &[DeleteDependency],
+        count_driven: bool,
     ) -> Result<Option<CompactionPlan>> {
         let debt = self.debt(files)?;
         let by_id: BTreeMap<_, _> = files.iter().map(|file| (&file.id, file)).collect();
@@ -276,7 +456,8 @@ impl Policy {
             }
         }
         let needs_delete_rewrite = |f: &FileCandidate| {
-            f.delete_file_count >= self.delete_files_soft || self.needs_delete_reclamation(f)
+            (count_driven && f.delete_file_count >= self.delete_files_soft)
+                || self.needs_delete_reclamation(f)
         };
         let needs_small_file_rewrite = |file: &FileCandidate| {
             debt.small_files >= self.stable_small_soft_files
@@ -345,6 +526,21 @@ impl Policy {
             let forced = needs_delete_rewrite(seed)
                 || (seed.level == Level::L0 && debt.pressure != PublicationPressure::Healthy);
             let small_group = needs_small_file_rewrite(seed);
+            let reason = if self.needs_delete_reclamation(seed) {
+                PlanReason::DeletedRows
+            } else if needs_delete_rewrite(seed) {
+                PlanReason::DeleteFileCount
+            } else if small_group {
+                PlanReason::SmallFiles
+            } else if forced {
+                PlanReason::L0Debt
+            } else {
+                PlanReason::Promotion
+            };
+            // A stable file selected for its own deleted rows must not pull in
+            // mostly-live companions. L0 debt keeps its existing grouping.
+            let dense_only =
+                !count_driven && reason == PlanReason::DeletedRows && seed.level != Level::L0;
             let useful = |count, bytes| {
                 forced
                     || count >= self.min_group_files
@@ -352,6 +548,7 @@ impl Policy {
             };
             let companions = eligible.iter().copied().filter(|file| {
                 if file.id == seed.id
+                    || dense_only && !self.needs_delete_reclamation(file)
                     || small_group && !needs_small_file_rewrite(file)
                     || (file.level != seed.level
                         && !(small_group && needs_small_file_rewrite(file)))
@@ -443,6 +640,7 @@ impl Policy {
                         delete_input_bytes,
                         delete_input_rows,
                         lazy_index_remap: self.lazy_index_remap,
+                        reason,
                     }));
                 }
             }

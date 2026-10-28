@@ -1088,11 +1088,25 @@ impl TableWork {
         }
         let inventory = self.maintenance.inventory(&current, id).await?;
         crate::observation::table_inventory(id, &inventory);
-        if inventory.debt.pressure != flow_compactor::PublicationPressure::Delay
-            || self.prefers_delete_rewrite(&inventory)
-        {
+        if inventory.debt.pressure != flow_compactor::PublicationPressure::Delay {
             return Ok(TableOutcome::ProbeComplete);
         }
+        if self.prefers_delete_rewrite(&inventory) {
+            // Soft delete-file count debt under a continuous CDC backlog would
+            // otherwise wait for hard pressure. The consolidation is bounded
+            // and changes no row locations, so this visit can pay it.
+            if self
+                .config
+                .compaction
+                .consolidates_delete_debt(&inventory.debt)
+            {
+                self.choose_maintenance(id, &inventory, "delete_consolidation", "probe");
+                self.compact(&current, &schema, CompactionKind::Deletes)
+                    .await?;
+            }
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        self.choose_maintenance(id, &inventory, "background_build", "probe");
         Ok(match self.start_build(&current, &schema).await? {
             Some(build) => TableOutcome::Build(Box::new(build)),
             None => TableOutcome::ProbeComplete,
@@ -1100,12 +1114,49 @@ impl TableWork {
     }
 
     fn prefers_delete_rewrite(&self, inventory: &flow_coordinator::Inventory) -> bool {
-        inventory.delete_file_count >= self.config.compaction.delete_files_soft
-            && (self.config.compaction.data_rewrite_scope != flow_compactor::DataRewriteScope::All
-                || !inventory
-                    .files
-                    .iter()
-                    .any(|file| self.config.compaction.needs_delete_reclamation(file)))
+        let policy = &self.config.compaction;
+        policy.consolidates_delete_debt(&inventory.debt)
+            || inventory.delete_file_count >= policy.delete_files_soft
+                && (policy.data_rewrite_scope != flow_compactor::DataRewriteScope::All
+                    || !inventory
+                        .files
+                        .iter()
+                        .any(|file| policy.needs_delete_reclamation(file)))
+    }
+
+    /// Record which maintenance action a table visit chose and the debt that
+    /// drove it, so benchmark runs can attribute their stalls.
+    fn choose_maintenance(
+        &self,
+        id: TableId,
+        inventory: &flow_coordinator::Inventory,
+        action: &'static str,
+        path: &'static str,
+    ) {
+        let policy = &self.config.compaction;
+        let debt = &inventory.debt;
+        let reasons = policy.pressure_reasons(debt);
+        // Consolidation pays delete-file count; other actions pay whatever
+        // limits set the current pressure.
+        let reason = if action == "delete_consolidation" {
+            "delete_file_count".to_owned()
+        } else if reasons.is_empty() {
+            "none".to_owned()
+        } else {
+            reasons.join("+")
+        };
+        tracing::debug!(target: "flow_events", event = "maintenance_action_chosen",
+            table_id = id.0, action, reason, path,
+            pressure = ?debt.pressure,
+            pressure_reasons = reasons.join("+"),
+            delete_debt = ?policy.delete_debt,
+            delete_files = inventory.delete_file_count,
+            shared_delete_files = debt.shared_delete_files,
+            max_delete_files = debt.max_delete_files,
+            dense_delete_files = debt.dense_delete_files,
+            l0_files = debt.l0_files,
+            small_files = debt.small_files,
+            "chose table maintenance action");
     }
 
     /// CDC does only mandatory maintenance. Optional work runs in its own job,
@@ -1123,9 +1174,46 @@ impl TableWork {
         crate::observation::table_inventory(id, &inventory);
         let mut pressure = inventory.debt.pressure;
         if options.build_active && pressure == flow_compactor::PublicationPressure::Pause {
-            // Release the actor instead of retrying while a completed build
-            // waits to acquire that same actor for finalization.
-            return Ok(MaintenanceOutcome::Deferred);
+            // Hard pressure from delete-file count alone does not need to wait
+            // for the build: one bounded consolidation can clear it without
+            // moving rows. A build whose delete inputs it replaces is
+            // invalidated at catch-up and rescheduled.
+            if self.compaction
+                && self
+                    .config
+                    .compaction
+                    .consolidates_delete_debt(&inventory.debt)
+                && self.config.compaction.layout_pressure(&inventory.debt)
+                    != flow_compactor::PublicationPressure::Pause
+            {
+                self.choose_maintenance(id, &inventory, "delete_consolidation", "build_active");
+                match self
+                    .compact(&current, schema, CompactionKind::Deletes)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        current = self.catalog.load_table(current.identifier()).await?;
+                        inventory = self.maintenance.inventory(&current, id).await?;
+                        crate::observation::table_inventory(id, &inventory);
+                        pressure = inventory.debt.pressure;
+                    }
+                    Ok(None) => {}
+                    // The build remains the way out; recovery settles any
+                    // unfinished consolidation on the next visit.
+                    Err(error) if retry_table_work(&error) => {
+                        tracing::debug!(target: "flow_events",
+                            event = "delete_consolidation_deferred", table_id = id.0, %error,
+                            "consolidation beside a running build will be retried");
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if pressure == flow_compactor::PublicationPressure::Pause {
+                // Release the actor instead of retrying while a completed build
+                // waits to acquire that same actor for finalization.
+                self.choose_maintenance(id, &inventory, "defer_for_build", "build_active");
+                return Ok(MaintenanceOutcome::Deferred);
+            }
         }
         while self.compaction
             && (pressure == flow_compactor::PublicationPressure::Pause
@@ -1133,7 +1221,9 @@ impl TableWork {
         {
             let before = current.metadata().current_snapshot_id();
             let data_rewrite_scope = self.config.compaction.data_rewrite_scope;
+            let path = if optional { "idle" } else { "publication" };
             let rewritten = if self.prefers_delete_rewrite(&inventory) {
+                self.choose_maintenance(id, &inventory, "delete_consolidation", path);
                 self.compact(&current, schema, CompactionKind::Deletes)
                     .await?
             } else {
@@ -1154,14 +1244,22 @@ impl TableWork {
                         inventory.manifest_count,
                     ));
                 }
+                let background = soft && options.build_admission == BuildAdmission::Start;
+                if data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled {
+                    self.choose_maintenance(
+                        id,
+                        &inventory,
+                        if background {
+                            "background_build"
+                        } else {
+                            "data_rewrite"
+                        },
+                        path,
+                    );
+                }
                 if data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
                     && let Some(build) = self
-                        .maintain_data(
-                            &current,
-                            schema,
-                            soft && options.build_admission == BuildAdmission::Start,
-                            repair_cursor,
-                        )
+                        .maintain_data(&current, schema, background, repair_cursor)
                         .await?
                 {
                     return Ok(MaintenanceOutcome::Build(build));
