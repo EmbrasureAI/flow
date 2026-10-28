@@ -15,7 +15,7 @@
 //! indexed key are checked against the generator, so a change that breaks
 //! publication cannot report a faster epoch.
 
-use flow_coordinator::{CollapseLimits, Epoch, TablePublisher, collapse_epoch};
+use flow_coordinator::{CollapseLimits, Epoch, Prefold, TablePublisher, collapse_epoch_prefolded};
 use flow_iceberg_ext::SnapshotView;
 use flow_ingress_journal::{Journal, JournalConfig, JournalReader};
 use flow_materializer::{WriterConfig, iceberg_schema, rows_from_batch};
@@ -57,6 +57,10 @@ struct Settings {
     batch_rows: usize,
     batch_bytes: usize,
     seed: u64,
+    /// Percent of each next epoch's leading transactions folded while the
+    /// current epoch commits and applies, as the daemon's prefold does with
+    /// whatever has arrived by then; zero collapses every epoch cold.
+    prefold_percent: usize,
 }
 
 fn env(name: &str, default: usize) -> usize {
@@ -82,6 +86,7 @@ impl Settings {
             batch_rows: env("BATCH_ROWS", 1024),
             batch_bytes: env("BATCH_BYTES", 8 << 20),
             seed: env("SEED", 20_260_905) as u64,
+            prefold_percent: env("PREFOLD_PERCENT", 0),
         }
     }
 }
@@ -339,6 +344,8 @@ struct Sample {
     epoch: usize,
     mutations: usize,
     mode: &'static str,
+    prefolded_transactions: usize,
+    /// Collapse, including any wait for the prefold to finish.
     collapse_ms: f64,
     /// Publisher preparation: Parquet, index/delete staging and the plan.
     prepare_ms: f64,
@@ -352,6 +359,8 @@ struct Sample {
     /// Collapse through local completion.
     epoch_ms: f64,
 }
+
+type Fold = tokio::task::JoinHandle<Option<Prefold>>;
 
 struct Lane {
     model: Model,
@@ -472,7 +481,7 @@ impl Bench {
         };
         // The initial copy is not timed; it publishes the seed through the same path.
         for (lane, seed) in lanes.iter_mut().zip(seeds) {
-            bench.epoch(lane, &seed).await;
+            bench.epoch(lane, &seed, None, None).await;
         }
         eprintln!(
             "ingest benchmark: journaled and seeded {} tables in {:.1}s",
@@ -484,10 +493,32 @@ impl Bench {
 
     /// The table actor's cycle: collapse on a blocking task, publish, then
     /// release the spool and applied operation as completion does.
-    async fn epoch(&self, lane: &mut Lane, transactions: &[SourceTransaction]) -> Sample {
+    fn limits(&self) -> CollapseLimits {
+        CollapseLimits {
+            batch_rows: self.settings.batch_rows,
+            batch_bytes: self.settings.batch_bytes,
+            memory_bytes: self.settings.collapse_memory_bytes,
+        }
+    }
+
+    /// The table actor's cycle: collapse on a blocking task, continuing
+    /// `prefold`, publish, then release the spool and applied operation as
+    /// completion does. Once this epoch's rows are consumed, the leading part
+    /// of `next` starts folding on a blocking task.
+    async fn epoch(
+        &self,
+        lane: &mut Lane,
+        transactions: &[SourceTransaction],
+        prefold: Option<Fold>,
+        next: Option<&[SourceTransaction]>,
+    ) -> (Sample, Option<Fold>) {
         let id = lane.model.schema.table_id;
         let epoch = Epoch::new(self.source.clone(), id, transactions).unwrap();
         let started = Instant::now();
+        let prefold = match prefold {
+            Some(task) => task.await.unwrap(),
+            None => None,
+        };
         let collapsed = {
             let (store, reader, head, schema, epoch, transactions) = (
                 self.store.clone(),
@@ -497,13 +528,9 @@ impl Bench {
                 epoch.clone(),
                 transactions.to_vec(),
             );
-            let limits = CollapseLimits {
-                batch_rows: self.settings.batch_rows,
-                batch_bytes: self.settings.batch_bytes,
-                memory_bytes: self.settings.collapse_memory_bytes,
-            };
+            let limits = self.limits();
             tokio::task::spawn_blocking(move || {
-                collapse_epoch(
+                collapse_epoch_prefolded(
                     &store,
                     &reader,
                     &head,
@@ -511,6 +538,7 @@ impl Bench {
                     &epoch,
                     &transactions,
                     limits,
+                    prefold,
                 )
             })
             .await
@@ -519,8 +547,28 @@ impl Bench {
         };
         let collapse = started.elapsed();
         let mode = collapsed.mode();
+        let prefolded_transactions = collapsed.prefolded_transactions();
+        let mut next_fold = None;
+        let leading = next
+            .map(|next| next[..next.len() * self.settings.prefold_percent.min(100) / 100].to_vec());
         self.publisher
-            .publish(&lane.head, &lane.model.schema, collapsed)
+            .publish_observed(&lane.head, &lane.model.schema, collapsed, || {
+                let Some(leading) = leading.filter(|leading| !leading.is_empty()) else {
+                    return;
+                };
+                let (store, reader, schema, limits) = (
+                    self.store.clone(),
+                    self.reader.clone(),
+                    lane.model.schema.clone(),
+                    self.limits(),
+                );
+                let source = self.source.clone();
+                next_fold = Some(tokio::task::spawn_blocking(move || {
+                    Prefold::new(source, schema, limits)?
+                        .extend(&store, &reader, &leading, limits)
+                        .unwrap()
+                }));
+            })
             .await
             .unwrap();
         let published = Instant::now();
@@ -551,7 +599,7 @@ impl Bench {
             .prepared_at
             .zip(reported.published_at)
             .expect("publisher reported its commit");
-        Sample {
+        let sample = Sample {
             table: id.0,
             epoch: 0,
             mutations: transactions
@@ -559,6 +607,7 @@ impl Bench {
                 .filter_map(|transaction| transaction.mutation_count(id))
                 .sum::<u64>() as usize,
             mode,
+            prefolded_transactions,
             collapse_ms: ms(collapse),
             prepare_ms: reported.prepare_ms,
             index_delete_stage_ms: reported.index_delete_stage_ms,
@@ -567,7 +616,8 @@ impl Bench {
             commit_ms: ms(published_at - prepared_at),
             apply_ms: ms(published - published_at),
             epoch_ms: ms(total),
-        }
+        };
+        (sample, next_fold)
     }
 
     /// Run every lane's epochs, at most `workers` at once and never two of one
@@ -581,9 +631,14 @@ impl Bench {
             tasks.push(tokio::spawn(async move {
                 let mut samples = Vec::new();
                 let epochs = std::mem::take(&mut lane.epochs);
+                let mut prefold = None;
                 for (number, transactions) in epochs.iter().enumerate() {
                     let _worker = workers.acquire().await.unwrap();
-                    let mut sample = bench.epoch(&mut lane, transactions).await;
+                    let next = epochs.get(number + 1).map(Vec::as_slice);
+                    let (mut sample, fold) = bench
+                        .epoch(&mut lane, transactions, prefold.take(), next)
+                        .await;
+                    prefold = fold;
                     sample.epoch = number;
                     samples.push(sample);
                 }
@@ -710,6 +765,7 @@ async fn benchmark(name: &str, settings: Settings) {
         "settings": settings,
         "epochs_measured": measured.len(),
         "collapse_modes": modes,
+        "prefolded_transactions": stage(|s| s.prefolded_transactions as f64),
         "median_ms": stages
             .iter()
             .map(|(name, value)| (name.trim().to_owned(), serde_json::json!(value)))
