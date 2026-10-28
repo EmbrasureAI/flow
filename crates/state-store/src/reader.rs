@@ -2,11 +2,12 @@
 
 use crate::{
     Error, FILE_COUNTS, PK, REVERSE, Result, StateStore, TABLES, TableState, decode,
-    decode_file_count, file_prefix, pk_key, prefix_end,
+    decode_file_count, file_prefix, prefix_end,
     remap::{RemapCache, Resolver},
 };
-use flow_model::{FileId, PrimaryKey, RowLocation, TableId};
-use rocksdb::{DB, Direction, IteratorMode, ReadOptions, SnapshotWithThreadMode};
+use flow_model::{FileId, PgLsn, PrimaryKey, RowLocation, TableId};
+use rocksdb::{DB, DBPinnableSlice, Direction, IteratorMode, ReadOptions, SnapshotWithThreadMode};
+use serde::Deserialize;
 
 /// The worker's read-only index surface. Scratch writes remain separate.
 pub trait RowIndex: Sync {
@@ -74,6 +75,69 @@ impl IndexSnapshot<'_> {
         options.set_snapshot(&self.snapshot);
         lookup_many(self.db, table, keys, &options, self.remaps)
     }
+
+    /// Like [`Self::lookup_keys`], but passes each original in key order to
+    /// `visit`, borrowed from the pinned value when no lazy remap can apply.
+    /// Every key is read and decoded before the first call.
+    pub(crate) fn visit_keys<'k>(
+        &self,
+        table: &TableId,
+        keys: impl IntoIterator<Item = &'k PrimaryKey>,
+        visit: impl FnMut(Option<LocationRef<'_>>) -> Result<()>,
+    ) -> Result<()> {
+        let mut options = ReadOptions::default();
+        options.set_snapshot(&self.snapshot);
+        if self.remaps.is_some() {
+            return lookup_many(self.db, table, keys, &options, self.remaps)?
+                .iter()
+                .map(|location| location.as_ref().map(LocationRef::from))
+                .try_for_each(visit);
+        }
+        // The pinned values outlive the borrowed decodes; errors keep key order.
+        let values = multi_get(self.db, table, keys, &options);
+        values
+            .iter()
+            .map(|item| match item {
+                Ok(value) => value.as_deref().map(decode_ref).transpose(),
+                Err(error) => Err(error.clone().into()),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .try_for_each(visit)
+    }
+}
+
+/// A [`RowLocation`] decoded in place, borrowing its path and partition.
+/// Bincode encodes a string or byte vector and its borrowed form identically.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub(crate) struct LocationRef<'a> {
+    pub data_file_id: &'a str,
+    pub row_position: u64,
+    pub data_sequence_number: i64,
+    pub spec_id: i32,
+    pub partition: &'a [u8],
+    pub source_commit_lsn: PgLsn,
+    pub row_version: u64,
+    pub row_fingerprint: [u8; 16],
+}
+
+impl<'a> From<&'a RowLocation> for LocationRef<'a> {
+    fn from(location: &'a RowLocation) -> Self {
+        Self {
+            data_file_id: &location.data_file_id.0,
+            row_position: location.row_position,
+            data_sequence_number: location.data_sequence_number,
+            spec_id: location.spec_id,
+            partition: &location.partition,
+            source_commit_lsn: location.source_commit_lsn,
+            row_version: location.row_version,
+            row_fingerprint: location.row_fingerprint,
+        }
+    }
+}
+
+fn decode_ref(value: &[u8]) -> Result<LocationRef<'_>> {
+    Ok(bincode::deserialize(value)?)
 }
 
 impl StateStore {
@@ -185,12 +249,7 @@ fn lookup_many<'k>(
     options: &ReadOptions,
     remaps: Option<&RemapCache>,
 ) -> Result<Vec<Option<RowLocation>>> {
-    let cf = db.cf_handle(PK).expect("opened column family");
-    let encoded: Vec<_> = keys.into_iter().map(|key| pk_key(table, key)).collect();
-    // Callers usually pass canonical key order; RocksDB then skips its own sort.
-    let sorted = encoded.is_sorted();
-    let mut locations = db
-        .batched_multi_get_cf_opt(&cf, encoded.iter(), sorted, options)
+    let mut locations = multi_get(db, table, keys, options)
         .into_iter()
         .map(|item| {
             item.map_err(Error::from)?
@@ -205,6 +264,31 @@ fn lookup_many<'k>(
         }
     }
     Ok(locations)
+}
+
+/// Raw primary-key entries in input order. The encoded keys share one buffer.
+fn multi_get<'db, 'k>(
+    db: &'db DB,
+    table: &TableId,
+    keys: impl IntoIterator<Item = &'k PrimaryKey>,
+    options: &ReadOptions,
+) -> Vec<std::result::Result<Option<DBPinnableSlice<'db>>, rocksdb::Error>> {
+    let cf = db.cf_handle(PK).expect("opened column family");
+    let mut encoded = Vec::new();
+    let mut ends = Vec::new();
+    for key in keys {
+        encoded.extend_from_slice(&table.0.to_be_bytes());
+        encoded.extend_from_slice(&key.0);
+        ends.push(encoded.len());
+    }
+    let keys: Vec<&[u8]> = std::iter::once(0)
+        .chain(ends.iter().copied())
+        .zip(&ends)
+        .map(|(start, end)| &encoded[start..*end])
+        .collect();
+    // Callers usually pass canonical key order; RocksDB then skips its own sort.
+    let sorted = keys.is_sorted();
+    db.batched_multi_get_cf_opt(&cf, keys, sorted, options)
 }
 
 /// Raw reverse entries, without lazy-remap translation.
@@ -246,4 +330,26 @@ fn file_rows<'a>(
             .map_err(|_| Error::InvalidState("invalid reverse index key".into()))?;
         Ok((u64::from_be_bytes(bytes), decode(&value)?))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_borrowed_location_decodes_the_stored_encoding() {
+        let location = RowLocation {
+            data_file_id: FileId("s3://bucket/δ/data.parquet".into()),
+            row_position: u64::MAX - 1,
+            data_sequence_number: -7,
+            spec_id: -3,
+            partition: vec![0, 255, 1, 128],
+            source_commit_lsn: PgLsn(u64::MAX - 2),
+            row_version: u64::MAX - 3,
+            row_fingerprint: [0xa5; 16],
+        };
+        let stored = bincode::serialize(&location).unwrap();
+        assert_eq!(decode_ref(&stored).unwrap(), LocationRef::from(&location));
+        assert!(decode_ref(&stored[..stored.len() - 1]).is_err());
+    }
 }

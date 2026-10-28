@@ -2,9 +2,15 @@
 //! spilled to the transaction spool and the epoch continues on disk; nothing
 //! already folded is replayed.
 
-use crate::{Change, CollapsedMutation, Error, Result, StateStore, TableState, spool::PendingRow};
+use crate::{
+    Change, CollapsedMutation, Error, IndexSnapshot, Result, StateStore, TableState,
+    spool::PendingRow,
+};
 use flow_model::{FileId, PgLsn, PrimaryKey, Row, RowLocation, TableId, Value};
-use std::collections::{BTreeMap, HashMap, btree_map};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque, btree_map},
+    sync::{OnceLock, mpsc},
+};
 
 // Originals exist only after binding, and only for keys already indexed. Boxing
 // keeps the inline entry small, which the per-entry allowance below multiplies.
@@ -31,14 +37,14 @@ struct Original {
 /// Paths and partitions seen while binding, each stored once.
 #[derive(Debug, Default)]
 struct Interned {
-    files: HashMap<FileId, u32>,
+    files: HashMap<String, u32>,
     partitions: HashMap<Vec<u8>, u32>,
 }
 
 /// Interned values indexed by id, for expanding originals after binding.
 #[derive(Debug, Default)]
 struct Expanded {
-    files: Vec<FileId>,
+    files: Vec<String>,
     partitions: Vec<Vec<u8>>,
 }
 
@@ -64,29 +70,134 @@ fn by_id<T>(ids: HashMap<T, u32>) -> Vec<T> {
     values.into_iter().map(|(value, _)| value).collect()
 }
 
-impl Interned {
-    /// The compact original and the bytes newly retained to bind it.
-    fn bind(&mut self, location: RowLocation) -> Result<(Original, usize)> {
-        let file_bytes = location.data_file_id.0.capacity();
-        let (file, file_added) = intern(&mut self.files, location.data_file_id, file_bytes)?;
-        let partition_bytes = location.partition.capacity();
-        let (partition, partition_added) =
-            intern(&mut self.partitions, location.partition, partition_bytes)?;
-        Ok((
-            Original {
-                file,
-                partition,
-                row_position: location.row_position,
-                data_sequence_number: location.data_sequence_number,
-                spec_id: location.spec_id,
-                source_commit_lsn: location.source_commit_lsn,
-                row_version: location.row_version,
-                row_fingerprint: location.row_fingerprint,
-            },
-            file_added + partition_added + size_of::<Original>(),
-        ))
+/// The id of a borrowed value, copying it only the first time it is seen.
+fn local_id<Q, T>(ids: &mut HashMap<T, u32>, value: &Q) -> Result<u32>
+where
+    Q: ToOwned<Owned = T> + std::hash::Hash + Eq + ?Sized,
+    T: std::borrow::Borrow<Q> + std::hash::Hash + Eq,
+{
+    if let Some(id) = ids.get(value) {
+        return Ok(*id);
+    }
+    let id = u32::try_from(ids.len())
+        .map_err(|_| Error::InvalidState("too many interned original locations".into()))?;
+    ids.insert(value.to_owned(), id);
+    Ok(id)
+}
+
+/// One chunk's originals, read by a lookup thread. Their path and partition
+/// ids are local to the chunk until [`bind_chunk`] interns them for the fold.
+#[derive(Default)]
+struct Chunk {
+    originals: Vec<Option<Original>>,
+    files: HashMap<String, u32>,
+    partitions: HashMap<Vec<u8>, u32>,
+}
+
+impl Chunk {
+    fn read(snapshot: &IndexSnapshot<'_>, table: &TableId, keys: &[&PrimaryKey]) -> Result<Self> {
+        let mut chunk = Self {
+            originals: Vec::with_capacity(keys.len()),
+            ..Self::default()
+        };
+        snapshot.visit_keys(table, keys.iter().copied(), |location| {
+            let original = match location {
+                Some(location) => Some(Original {
+                    file: local_id(&mut chunk.files, location.data_file_id)?,
+                    partition: local_id(&mut chunk.partitions, location.partition)?,
+                    row_position: location.row_position,
+                    data_sequence_number: location.data_sequence_number,
+                    spec_id: location.spec_id,
+                    source_commit_lsn: location.source_commit_lsn,
+                    row_version: location.row_version,
+                    row_fingerprint: location.row_fingerprint,
+                }),
+                None => None,
+            };
+            chunk.originals.push(original);
+            Ok(())
+        })?;
+        Ok(chunk)
+    }
+}
+
+/// Chunk-local values and, once interned, their ids in the fold.
+struct Local<T> {
+    values: Vec<T>,
+    ids: Vec<Option<u32>>,
+}
+
+impl<T: std::hash::Hash + Eq + Default> Local<T> {
+    fn new(ids: HashMap<T, u32>) -> Self {
+        let values = by_id(ids);
+        Self {
+            ids: vec![None; values.len()],
+            values,
+        }
     }
 
+    /// The fold's id for a chunk-local id and the bytes newly retained, as
+    /// if the value had been interned at this original.
+    fn intern(
+        &mut self,
+        local: u32,
+        ids: &mut HashMap<T, u32>,
+        capacity: fn(&T) -> usize,
+    ) -> Result<(u32, usize)> {
+        let local = local as usize;
+        if let Some(id) = self.ids[local] {
+            return Ok((id, 0));
+        }
+        let value = std::mem::take(&mut self.values[local]);
+        let bytes = capacity(&value);
+        let (id, added) = intern(ids, value, bytes)?;
+        self.ids[local] = Some(id);
+        Ok((id, added))
+    }
+}
+
+/// Validate and bind one chunk in key order, charging each original as it is
+/// bound. Returns false at the first original that does not fit; it and the
+/// remaining entries stay unbound.
+fn bind_chunk(
+    interned: &mut Interned,
+    bytes: &mut usize,
+    peak: &mut usize,
+    limit: usize,
+    entries: Vec<&mut Entry>,
+    chunk: Chunk,
+) -> Result<bool> {
+    let mut files = Local::new(chunk.files);
+    let mut partitions = Local::new(chunk.partitions);
+    for ((pending, bound), original) in entries.into_iter().zip(chunk.originals) {
+        pending.validate_initial(original.is_some())?;
+        let (original, extra) = match original {
+            Some(mut original) => {
+                let (file, file_added) =
+                    files.intern(original.file, &mut interned.files, String::capacity)?;
+                let (partition, partition_added) = partitions.intern(
+                    original.partition,
+                    &mut interned.partitions,
+                    Vec::capacity,
+                )?;
+                original.file = file;
+                original.partition = partition;
+                let extra = file_added + partition_added + size_of::<Original>();
+                (Some(Box::new(original)), extra)
+            }
+            None => (None, 0),
+        };
+        let Some(next) = bytes.checked_add(extra).filter(|next| *next <= limit) else {
+            return Ok(false);
+        };
+        *bytes = next;
+        *peak = (*peak).max(next);
+        *bound = original;
+    }
+    Ok(true)
+}
+
+impl Interned {
     fn finish(self) -> Expanded {
         Expanded {
             files: by_id(self.files),
@@ -98,7 +209,7 @@ impl Interned {
 impl Expanded {
     fn location(&self, original: &Original) -> RowLocation {
         RowLocation {
-            data_file_id: self.files[original.file as usize].clone(),
+            data_file_id: FileId(self.files[original.file as usize].clone()),
             row_position: original.row_position,
             data_sequence_number: original.data_sequence_number,
             spec_id: original.spec_id,
@@ -108,6 +219,16 @@ impl Expanded {
             row_fingerprint: original.row_fingerprint,
         }
     }
+}
+
+/// Lookup threads for one bind. A fold of one chunk is read on the caller.
+const BIND_THREADS: usize = 4;
+
+fn bind_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |threads| threads.get().min(BIND_THREADS))
+    })
 }
 
 // Account conservatively for partially occupied tree nodes and their links.
@@ -252,38 +373,74 @@ impl StateStore {
             ));
         }
         let mut interned = Interned::default();
-        let overflow = 'bind: {
-            let mut entries = buffer.rows.iter_mut();
+        let table = buffer.table;
+        let rows = self.batch_rows();
+        let threads = bind_threads().min(buffer.rows.len().div_ceil(rows));
+        let (bytes, peak, limit) = (&mut buffer.bytes, &mut buffer.peak, buffer.limit);
+        let mut entries = buffer.rows.iter_mut();
+        let mut next_batch = || {
+            let (keys, entries): (Vec<_>, Vec<_>) = entries.by_ref().take(rows).unzip();
+            (!keys.is_empty()).then_some((keys, entries))
+        };
+        let fits = if threads < 2 {
             loop {
-                let batch: Vec<_> = entries.by_ref().take(self.batch_rows()).collect();
-                if batch.is_empty() {
-                    break 'bind false;
-                }
-                let originals =
-                    snapshot.lookup_keys(&buffer.table, batch.iter().map(|(key, _)| *key))?;
-                for ((_, (pending, bound)), original) in batch.into_iter().zip(originals) {
-                    pending.validate_initial(original.is_some())?;
-                    let (original, extra) = match original {
-                        Some(location) => {
-                            let (original, extra) = interned.bind(location)?;
-                            (Some(Box::new(original)), extra)
-                        }
-                        None => (None, 0),
-                    };
-                    let Some(bytes) = buffer
-                        .bytes
-                        .checked_add(extra)
-                        .filter(|bytes| *bytes <= buffer.limit)
-                    else {
-                        break 'bind true;
-                    };
-                    buffer.bytes = bytes;
-                    buffer.peak = buffer.peak.max(bytes);
-                    *bound = original;
+                let Some((keys, entries)) = next_batch() else {
+                    break true;
+                };
+                let chunk = Chunk::read(&snapshot, &table, &keys)?;
+                if !bind_chunk(&mut interned, bytes, peak, limit, entries, chunk)? {
+                    break false;
                 }
             }
+        } else {
+            // Workers read chunks round-robin, at most two each ahead of the
+            // in-order bind, so results, accounting and the first error match
+            // the serial loop above. Returning early drops the channels, which
+            // stops the workers after their current read.
+            let snapshot = &snapshot;
+            std::thread::scope(|scope| -> Result<bool> {
+                let workers: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let (jobs, inbox) = mpsc::sync_channel::<Vec<&PrimaryKey>>(1);
+                        let (outbox, results) = mpsc::sync_channel(1);
+                        scope.spawn(move || {
+                            for keys in inbox {
+                                if outbox.send(Chunk::read(snapshot, &table, &keys)).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        (jobs, results)
+                    })
+                    .collect();
+                let mut pending = VecDeque::with_capacity(2 * threads);
+                let (mut sent, mut received) = (0, 0);
+                loop {
+                    while pending.len() < 2 * threads
+                        && let Some((keys, entries)) = next_batch()
+                    {
+                        workers[sent % threads]
+                            .0
+                            .send(keys)
+                            .expect("bind lookup thread");
+                        pending.push_back(entries);
+                        sent += 1;
+                    }
+                    let Some(entries) = pending.pop_front() else {
+                        return Ok(true);
+                    };
+                    let chunk = workers[received % threads]
+                        .1
+                        .recv()
+                        .expect("bind lookup thread")?;
+                    received += 1;
+                    if !bind_chunk(&mut interned, bytes, peak, limit, entries, chunk)? {
+                        return Ok(false);
+                    }
+                }
+            })?
         };
-        if overflow {
+        if !fits {
             // Spilling looks up every original again under the row lock.
             buffer.exhausted = true;
             return Ok(Bound::Overflow(buffer));

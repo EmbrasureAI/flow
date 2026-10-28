@@ -301,6 +301,51 @@ proptest! {
     }
 }
 
+/// Chunks are read concurrently but bound in key order: the rows match the
+/// disk path, a conflict in the last chunk fails the bind, and an overflow in
+/// the first chunk wins over that later conflict, as in a serial bind.
+#[test]
+fn a_fold_of_many_chunks_binds_in_key_order() {
+    let present: Vec<u8> = (0..200).step_by(2).collect();
+    let steps: Vec<_> = (0..240u8)
+        .map(|key| Step::Write(key, i64::from(key), key % 3 == 0))
+        .collect();
+    let input = changes(&present, &steps);
+    let temp = TempDir::new().unwrap();
+    let store = seeded(temp.path(), &present);
+    assert_eq!(bind(&store, fold(&input)), disk(&store, "disk", &input));
+
+    let conflicted = |limit| {
+        let mut buffer = CollapseBuffer::new(TABLE, limit);
+        let absent = Change::Update(vec![Value::Int64(1), Value::String("v1".into())]);
+        for (_, key, change) in
+            input
+                .iter()
+                .cloned()
+                .chain([(TABLE, PrimaryKey(vec![250]), absent)])
+        {
+            assert!(matches!(
+                buffer.push(key, change).unwrap(),
+                BufferResult::Ready(())
+            ));
+        }
+        buffer
+    };
+    let expected = store.table_state(&TABLE).unwrap();
+    assert!(
+        store
+            .bind_collapse_buffer(conflicted(64 << 20), &expected)
+            .is_err()
+    );
+    let folded = conflicted(64 << 20).peak_accounted_bytes();
+    assert!(matches!(
+        store
+            .bind_collapse_buffer(conflicted(folded + 1024), &expected)
+            .unwrap(),
+        Bound::Overflow(_)
+    ));
+}
+
 #[test]
 fn a_tiny_budget_spills_every_epoch_and_still_matches_disk() {
     let present = [1, 2, 3, 4, 5, 6];
