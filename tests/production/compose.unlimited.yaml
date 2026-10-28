@@ -1,0 +1,13 @@
+# Overlay for hosts that cannot apply cgroup CPU or memory limits, such as
+# some nested or sandboxed VMs. Services then run unbounded and share the host;
+# record that with any measurement. fixture.sh applies it automatically.
+services:
+  postgres:
+    cpus: !reset null
+    mem_limit: !reset null
+  minio:
+    cpus: !reset null
+    mem_limit: !reset null
+  rest:
+    cpus: !reset null
+    mem_limit: !reset null

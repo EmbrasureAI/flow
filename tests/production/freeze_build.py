@@ -12,59 +12,93 @@ import tempfile
 from provenance import ROOT, repository_identity, sha256_file
 
 
-def capture(*command, env=None):
-    return subprocess.check_output(command, cwd=ROOT, env=env, text=True).strip()
+def capture(*command, env=None, cwd=ROOT):
+    # Run from the built tree so its rust-toolchain.toml selects the recorded toolchain.
+    return subprocess.check_output(command, cwd=cwd, env=env, text=True).strip()
 
 
-def ensure_repository_unchanged(source):
-    if repository_identity() != source:
+def ensure_repository_unchanged(source, root=ROOT):
+    if repository_identity(root) != source:
         raise RuntimeError(
             "repository changed during the build; discard it and build again "
             "from a stable source tree"
         )
 
 
+PROFILES = ("release", "profiling", "bench-fast")
+# A comparison build: the release profile without LTO, with parallel codegen and
+# incremental compilation. Expressed as recorded overrides rather than a Cargo
+# profile so that any historical revision can be built the same way.
+BENCH_FAST = {
+    "CARGO_PROFILE_RELEASE_LTO": "false",
+    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+    "CARGO_PROFILE_RELEASE_INCREMENTAL": "true",
+    "CARGO_PROFILE_RELEASE_DEBUG": "line-tables-only",
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("release", "profiling"), default="release")
+    parser.add_argument("--profile", choices=PROFILES, default="release",
+                        help="bench-fast builds quickly for comparisons; qualify results with release")
     parser.add_argument("--target", help="Rust target triple; defaults to the active rustc host")
     parser.add_argument("--features", action="append", default=[])
     parser.add_argument("--no-default-features", action="store_true")
+    parser.add_argument("--source", type=Path, default=ROOT,
+                        help="source tree to build, such as a git worktree; defaults to this checkout")
+    parser.add_argument("--target-dir", type=Path,
+                        help="reuse this Cargo target directory instead of a fresh temporary one")
     args = parser.parse_args()
+    if args.output.resolve().exists():
+        parser.error(f"output already exists: {args.output.resolve()}")
+    print(freeze(args.output, profile=args.profile, target=args.target, features=args.features,
+                 no_default_features=args.no_default_features, source=args.source,
+                 target_dir=args.target_dir))
 
-    source = repository_identity()
-    output = args.output.resolve()
+
+def freeze(output, *, profile="release", target=None, features=(), no_default_features=False,
+           source=ROOT, target_dir=None):
+    """Build `source` and write self-identifying binaries plus a manifest to `output`."""
+    root = Path(source).resolve()
+    features = list(features)
+    identity = repository_identity(root)
+    output = Path(output).resolve()
     if output.exists():
-        parser.error(f"output already exists: {output}")
-    with tempfile.TemporaryDirectory(prefix="embrasure-flow-qualification-") as staging:
-        staging = Path(staging)
+        raise FileExistsError(f"output already exists: {output}")
+    with tempfile.TemporaryDirectory(prefix="embrasure-flow-qualification-") as temporary:
+        staging = Path(target_dir).resolve() if target_dir else Path(temporary)
         environment = os.environ.copy()
         environment["CARGO_TARGET_DIR"] = str(staging)
-        if args.profile == "profiling":
+        cargo_profile = profile
+        if profile == "bench-fast":
+            cargo_profile = "release"
+            environment.update(BENCH_FAST)
+        if profile in ("profiling", "bench-fast"):
             if environment.get("CARGO_ENCODED_RUSTFLAGS"):
-                parser.error("profiling builds require CARGO_ENCODED_RUSTFLAGS to be unset")
+                raise ValueError(f"{profile} builds require CARGO_ENCODED_RUSTFLAGS to be unset")
             flags = environment.get("RUSTFLAGS", "").strip()
             environment["RUSTFLAGS"] = (flags + " -C force-frame-pointers=yes").strip()
 
-        rustc = capture("rustc", "-Vv", env=environment)
-        target = args.target or next(
+        rustc = capture("rustc", "-Vv", env=environment, cwd=root)
+        explicit_target = target is not None
+        target = target or next(
             line.removeprefix("host: ")
             for line in rustc.splitlines()
             if line.startswith("host: ")
         )
-        command = ["cargo", "build", "--locked", "--profile", args.profile,
+        command = ["cargo", "build", "--locked", "--profile", cargo_profile,
                    "--target", target]
-        if args.no_default_features:
+        if no_default_features:
             command.append("--no-default-features")
-        for features in args.features:
-            command += ["--features", features]
+        for feature in features:
+            command += ["--features", feature]
         command += ["-p", "flow-daemon", "-p", "flow-testkit", "--bin", "embrasure-flow",
                     "--example", "local_compactor"]
-        subprocess.run(command, cwd=ROOT, env=environment, check=True)
-        ensure_repository_unchanged(source)
+        subprocess.run(command, cwd=root, env=environment, check=True)
+        ensure_repository_unchanged(identity, root)
 
-        build_dir = staging / target / args.profile
+        build_dir = staging / target / cargo_profile
         staged_binaries = {
             "daemon": build_dir / "embrasure-flow",
             "external_compactor": build_dir / "examples/local_compactor",
@@ -82,24 +116,24 @@ def main():
         }
         manifest = {
             "schema": 1,
-            "source": source,
+            "source": identity,
             "build": {
-                "cargo_profile": args.profile,
+                "cargo_profile": cargo_profile,
                 "target": target,
-                "target_explicit": args.target is not None,
-                "features": args.features,
-                "no_default_features": args.no_default_features,
+                "target_explicit": explicit_target,
+                "features": features,
+                "no_default_features": no_default_features,
                 "command": command,
                 "environment": relevant_environment,
                 "rustc": rustc,
-                "cargo": capture("cargo", "-V", env=environment),
-                "cargo_lock_sha256": sha256_file(ROOT / "Cargo.lock"),
+                "cargo": capture("cargo", "-V", env=environment, cwd=root),
+                "cargo_lock_sha256": sha256_file(root / "Cargo.lock"),
             },
             "binaries": binaries,
         }
 
         # This is the last source-tree read before the frozen artifact is written.
-        ensure_repository_unchanged(source)
+        ensure_repository_unchanged(identity, root)
         created_output = False
         try:
             output.mkdir(parents=True)
@@ -119,7 +153,7 @@ def main():
             if created_output:
                 shutil.rmtree(output)
             raise
-        print(manifest_path)
+        return manifest_path
 
 
 if __name__ == "__main__":

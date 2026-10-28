@@ -4,6 +4,26 @@ Use the [fault suite](FAULTS.md) for recovery and outage checks, `benchmark.py` 
 
 This is a reproducible local qualification harness, not a claim that one machine reproduces a cloud region. Docker services, the daemon, the producer, and DuckDB share the host's CPU, disk, network stack, and memory. Run the suites serially, record the host and service resource limits, and repeat representative results before comparing changes.
 
+## Fast A/B comparisons
+
+Use `ab.py` to decide whether a change helps. It builds two revisions, runs them alternately against the fixture, verifies every row of every run and compares the medians:
+
+```sh
+tests/production/fixture.sh up        # once per machine
+tests/production/ab.py --base origin/main --candidate .
+tests/production/ab.py --base HEAD --candidate HEAD \
+  --candidate-args "--limit collapse_memory_bytes=33554432 --compaction delete_files_soft=16"
+```
+
+- `.` is the working tree, including uncommitted changes; other values are git revisions built in detached worktrees under `target/ab/trees`. Identical sources build once, so configuration-only comparisons reuse one binary. `benchmark.py --limit KEY=VALUE` and `--compaction KEY=VALUE` override any generated `[limits]` or `[compaction]` key.
+- The default `bench-fast` build is the release profile without LTO, with 16 codegen units and incremental compilation, plus frame pointers. A cold build takes about 12 minutes on an 8-vCPU VM and a one-file change about 8 seconds, against about 16 minutes and 5 minutes for `profiling`. Its CDC service time matched the LTO build within 3% on the default mixed workload. Rank changes with it, then confirm with `--profile release` or `profiling` before publishing numbers.
+- The defaults are two 30-second runs per side at 30,000 mutations/s with 5 seconds of warmup (`--args` changes them). On the 8-vCPU VM each 30-second run takes about a minute including seeding and verification, so a comparison finishes in about 5 minutes after the build. Runs alternate base and candidate because the same binary drifted by up to 20% over several hours on a shared host.
+- `target/ab/runs/<time>/summary.md` holds per-run rows and the median comparison from `epoch_report.py`. Compare **CDC service time per mutation** first: the summed collapse-to-completion time of every epoch divided by the mutations it published. It excludes queueing, so 30- and 60-second runs agree within about 1%. Drain throughput and latency vary by ±15% between identical runs. The report also splits each epoch into collapse, prepare, commit and apply, and shows compaction stall, collapse fallbacks and peak RSS. Run `epoch_report.py` on any benchmark artifact directory for the same breakdown.
+- Each run's report and logs stay; its index, journal and spool copies are deleted unless `--keep-state` is given. The fixture keeps every run's target data and slot. `ab.py` drops inactive `flow_test_*` slots between runs, and `fixture.sh reset` recreates the services to reclaim their disk.
+- Only one benchmark can run on a machine at a time. Run independent experiments on separate machines.
+
+`fixture.sh up` starts Docker detached from the calling shell, loads the MinIO images from the newest unexpired `minio-images` artifact of the service integration workflow (kept for a day) when `gh` is authenticated, otherwise builds them from source in a few minutes, and adds `compose.unlimited.yaml` when the host cannot apply cgroup limits. Record that the services then run unbounded. On a fresh dnf-based VM, run `cloud_setup.sh` once before benchmarking. It installs the toolchain and prerequisites, starts the fixture, and warms the `bench-fast` build of `origin/main` in the background. Setup takes about 3 minutes; the background build takes about 9 more.
+
 ## Start persistent services
 
 Choose three free loopback ports. If a port is occupied, select another; do not stop the existing process. Save the selected values in an ignored local environment file:
@@ -78,6 +98,8 @@ uv run tests/production/benchmark.py \
   --artifacts target/production-1000-001 \
   --rate 1000 --duration 60 --warmup 10
 ```
+
+By default each freeze compiles in a fresh temporary target directory. `--target-dir DIR` reuses a Cargo target directory, and `--source DIR` builds another checkout such as a worktree; the manifest records both. `--profile bench-fast` is the comparison build described under [fast A/B comparisons](#fast-ab-comparisons).
 
 The endpoints are examples; configure the actual disposable deployment. Leave PostgreSQL durability enabled: `fsync`, `full_page_writes`, and synchronous commit. The [local Compose fixture](../local/README.md) also retains PostgreSQL durability defaults; use this production fixture for explicit resource budgets and persistent service state. Do not compare release and profiling builds as equivalent results. Every artifact directory must be new. Directory names are labels, not run identity. Each report embeds the build manifest and records its hash, source commit/tree/dirty-diff digest, exact binary hashes by process role, build-time Rust toolchain/profile/target/features/environment, harness/config hashes, run-time toolchain, machine capacity, and compactor topology. The harness rejects a binary that does not match the manifest and rechecks each executable immediately before spawning it. The harness retains logs and durable state and stops only processes it started; it does not delete service data or replication slots.
 

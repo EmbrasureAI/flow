@@ -40,6 +40,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "local"))
 from run import Run, lsn  # noqa: E402
 
 
+def override_config(text, section, assignments):
+    """Replace or add `key = value` lines in one generated TOML section."""
+    lines = text.split("\n")
+    for assignment in assignments:
+        key, separator, value = assignment.partition("=")
+        key, value = key.strip(), value.strip()
+        if not separator or not key or not value:
+            raise ValueError(f"--{section.rstrip('s')} expects KEY=VALUE, got {assignment!r}")
+        start = lines.index(f"[{section}]")
+        end = next((index for index in range(start + 1, len(lines))
+                    if lines[index].startswith("[")), len(lines))
+        line = f"{key} = {value}"
+        existing = [index for index in range(start + 1, end)
+                    if lines[index].split("=", 1)[0].strip() == key]
+        if existing:
+            lines[existing[0]] = line
+        else:
+            lines.insert(end if lines[end - 1] else end - 1, line)
+    return "\n".join(lines)
+
+
 def micros():
     return time.time_ns() // 1000
 
@@ -192,6 +213,8 @@ columns = [
   {{ field_id = 3, name = "payload", data_type = "String", nullable = false }},
 ]
 '''
+        text = override_config(text, "compaction", self.args.compaction)
+        text = override_config(text, "limits", self.args.limit)
         self.config = self.directory / "flow.toml"
         self.config.write_text(text)
         # Timing events are required evidence, independent of the caller's logging preference.
@@ -804,14 +827,35 @@ columns = [
         started_at_ms = micros() // 1000
         status_path = self.directory / "state" / "status.json"
 
+        # An idle daemon may acknowledge a newer position before it rewrites
+        # status.json. Compare each slot reading only with a status written after
+        # it, which then covers everything the daemon had acknowledged.
+        slot = None
+
+        def read_slot():
+            read_at_ms = micros() // 1000
+            row = self.pg.execute(
+                "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name=%s",
+                (self.name,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                raise AssertionError("replication slot or confirmed flush LSN is missing")
+            return read_at_ms, row[0]
+
         def aligned():
+            nonlocal slot
+            if slot is None:
+                slot = read_slot()
             if not status_path.exists():
                 return None
             status = json.loads(status_path.read_text())
             if status["source_id"] != self.name or status["process_id"] != self.process.pid:
                 raise AssertionError("status observation does not belong to the current daemon")
-            if not status["ready"] or status["updated_at_ms"] <= started_at_ms:
+            if (not status["ready"] or status["updated_at_ms"] <= started_at_ms
+                    or status["updated_at_ms"] <= slot[0]):
                 return None
+            read_at_ms, confirmed_text = slot
+            slot = None
             watermarks = status["watermarks"]
             materialized = watermarks["materialized_lsn"]
             locally_drained = (
@@ -822,20 +866,15 @@ columns = [
             )
             if not locally_drained:
                 return None
-            row = self.pg.execute(
-                "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name=%s",
-                (self.name,),
-            ).fetchone()
-            if row is None or row[0] is None:
-                raise AssertionError("replication slot or confirmed flush LSN is missing")
-            confirmed = lsn(row[0])
+            confirmed = lsn(confirmed_text)
             if confirmed > materialized:
                 raise AssertionError("PostgreSQL acknowledged beyond the materialized watermark")
             if confirmed < materialized:
                 return None
-            return {"confirmed_flush_lsn": row[0], "confirmed_flush_lsn_u64": confirmed,
+            return {"confirmed_flush_lsn": confirmed_text, "confirmed_flush_lsn_u64": confirmed,
                     "materialized_lsn": materialized, "pending_transactions": 0,
-                    "matched_materialized": True}
+                    "matched_materialized": True, "slot_read_at_ms": read_at_ms,
+                    "status_updated_at_ms": status["updated_at_ms"]}
 
         return self.until("PostgreSQL did not acknowledge the exact materialized prefix", aligned)
 
@@ -1128,6 +1167,10 @@ def main():
     parser.add_argument("--stable-small-soft-files", type=int)
     parser.add_argument("--stable-small-hard-files", type=int)
     parser.add_argument("--manifest-max-count", type=int, default=64)
+    parser.add_argument("--limit", action="append", default=[], metavar="KEY=VALUE",
+                        help="override a [limits] key with a TOML value; repeatable")
+    parser.add_argument("--compaction", action="append", default=[], metavar="KEY=VALUE",
+                        help="override a [compaction] key with a TOML value; repeatable")
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--setup-timeout", type=float, default=600,

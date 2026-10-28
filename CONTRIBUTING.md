@@ -53,6 +53,9 @@ Performance claims need the environment, offered and admitted workload,
 duration, publication and reader latency, read amplification and resource use.
 Record missed arrivals and failed gates. Local memory-catalog timings are not
 cloud publication latency. The current results are in [Performance](docs/performance.md).
+To rank a change before collecting such results, use the
+[fast A/B comparison](tests/production/README.md#fast-ab-comparisons).
+[AGENTS.md](AGENTS.md) summarizes the build, test and measurement workflow.
 
 ## Dependencies and licensing
 
