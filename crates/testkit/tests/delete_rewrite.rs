@@ -483,7 +483,9 @@ async fn dangling_delete_group_can_commit_without_output_files_or_index_deltas()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_rewrite_preserves_base_and_residuals_through_lost_response_and_index_loss() {
-    for lose_index in [false, true] {
+    // The strict rewrite commits per-row deltas or, with lazy_index_remap, a
+    // remap; either must survive a lost catalog response and a lost index.
+    for (lazy, lose_index) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut f = Fixture::new().await;
         let before = SnapshotView::current(&f.head).await.unwrap();
         let base_path = f.locations[0].data_file_id.0.clone();
@@ -500,6 +502,7 @@ async fn l0_rewrite_preserves_base_and_residuals_through_lost_response_and_index
             oldest_l0_hard_ms: 2,
             deleted_rows_percent: 100,
             min_file_age_ms: 0,
+            lazy_index_remap: lazy,
             ..Default::default()
         };
         let maintenance = TableMaintenance::new(
@@ -522,8 +525,9 @@ async fn l0_rewrite_preserves_base_and_residuals_through_lost_response_and_index
         let pending = f.index.pending_operations().unwrap().remove(0);
         assert_eq!(pending.phase, OperationPhase::Prepared);
         assert_eq!(
-            pending.delta_count, 4,
-            "only live rows from the L0 file should move"
+            pending.delta_count,
+            if lazy { 0 } else { 4 },
+            "only live rows from the L0 file should move, through a staged remap if lazy"
         );
         let payload: serde_json::Value =
             serde_json::from_slice(&pending.operation.payload).unwrap();
@@ -581,7 +585,13 @@ async fn l0_rewrite_preserves_base_and_residuals_through_lost_response_and_index
                 .recover(&committed, &pending.operation.id)
                 .await
                 .unwrap();
+            assert_eq!(
+                f.index.has_remaps(&f.schema.table_id).unwrap(),
+                lazy,
+                "recovery applies the staged remap of the committed rewrite"
+            );
         }
+        assert!(f.index.pending_operations().unwrap().is_empty());
         assert_eq!(
             f.catalog
                 .load_table(f.head.identifier())

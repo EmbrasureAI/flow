@@ -1429,3 +1429,207 @@ async fn stale_checkpoint_catches_up_through_replaced_vectors() {
         index_contents(&rebuilt, &f.schema, &view)
     );
 }
+
+/// Every live row is indexed at its exact physical location and data sequence,
+/// through any lazy remap, and per-file live counts equal the effective rows.
+async fn assert_index_exact(f: &Fixture) {
+    let view = SnapshotView::current(&f.head).await.unwrap();
+    let files: BTreeSet<_> = view
+        .live_files
+        .values()
+        .filter(|entry| entry.content_type() == DataContentType::Data)
+        .map(|entry| FileId(entry.file_path().into()))
+        .collect();
+    let mut live = Vec::new();
+    scan_live_files(
+        &f.head,
+        &f.schema,
+        &view,
+        &files,
+        &f.scratch(),
+        "index-audit",
+        2,
+        &ReadLimits::default(),
+        async |batch| {
+            for (row, position) in batch.rows.iter().zip(&batch.positions) {
+                live.push((
+                    f.schema.encode_key(row).unwrap(),
+                    batch.file_id.clone(),
+                    *position,
+                ));
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let keys: Vec<_> = live.iter().map(|(key, _, _)| key.clone()).collect();
+    let located = f.store.lookup_many(&f.schema.table_id, &keys).unwrap();
+    for ((key, file, position), location) in live.iter().zip(located) {
+        let location = location.unwrap_or_else(|| panic!("{key:?} is not indexed"));
+        assert_eq!(
+            (&location.data_file_id, location.row_position),
+            (file, *position),
+            "{key:?} is indexed at a different row"
+        );
+        assert_eq!(
+            Some(location.data_sequence_number),
+            view.live_files[&file.0].sequence_number
+        );
+    }
+    let files: Vec<_> = files.into_iter().collect();
+    let counts = f
+        .store
+        .file_live_row_counts(
+            &f.schema.table_id,
+            f.head.metadata().current_snapshot_id(),
+            &files,
+        )
+        .unwrap();
+    for (file, count) in files.iter().zip(counts) {
+        assert_eq!(
+            count,
+            live.iter().filter(|(_, owner, _)| owner == file).count() as u64,
+            "live count of {}",
+            file.0
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_rewrites_with_or_without_lazy_remap_keep_vectors_and_index_exact() {
+    for lazy in [false, true] {
+        let mut f = Fixture::new(FormatVersion::V3).await;
+        let maintenance = f.maintenance_with(
+            &f.store,
+            Policy {
+                lazy_index_remap: lazy,
+                ..Policy::default()
+            },
+        );
+        for (lsn, ids) in [(10, 1..=6), (20, 7..=12)] {
+            f.publish(
+                lsn,
+                ids.map(|id| (id, Change::Insert(row(id, "initial"))))
+                    .collect(),
+            )
+            .await;
+        }
+        // Deletion vectors on both inputs at the build base.
+        f.publish(30, vec![(1, Change::Delete), (7, Change::Delete)])
+            .await;
+        let ready = maintenance
+            .start_compaction(&f.head, &f.schema, f.scratch())
+            .await
+            .unwrap()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        // Late changes replace both inputs' vectors cumulatively; catch-up
+        // translates them into masks on the outputs.
+        f.publish(
+            40,
+            vec![
+                (2, Change::Update(row(2, "late"))),
+                (8, Change::Delete),
+                (13, Change::Insert(row(13, "new"))),
+            ],
+        )
+        .await;
+        maintenance
+            .finish_compaction(&f.head, &f.schema, ready)
+            .await
+            .unwrap()
+            .unwrap();
+        f.refresh().await;
+        assert_eq!(f.store.has_remaps(&f.schema.table_id).unwrap(), lazy);
+        let mut expected: BTreeMap<i64, Row> = [3, 4, 5, 6, 9, 10, 11, 12]
+            .into_iter()
+            .map(|id| (id, row(id, "initial")))
+            .collect();
+        expected.insert(2, row(2, "late"));
+        expected.insert(13, row(13, "new"));
+        f.assert_rows(expected.values().cloned().collect()).await;
+        assert_index_exact(&f).await;
+
+        // CDC on moved rows merges each output's prior vector (the catch-up
+        // mask) with new positions at the translated locations.
+        let before = f.live().await;
+        f.publish(
+            50,
+            vec![
+                (3, Change::Update(row(3, "after"))),
+                (9, Change::Delete),
+                (12, Change::Update(row(12, "after"))),
+                (4, Change::Delete),
+            ],
+        )
+        .await;
+        for id in [9, 4] {
+            expected.remove(&id);
+        }
+        for id in [3, 12] {
+            expected.insert(id, row(id, "after"));
+        }
+        f.assert_rows(expected.values().cloned().collect()).await;
+        assert_index_exact(&f).await;
+        let after = f.live().await;
+        for id in [5, 6, 10, 11] {
+            assert_eq!(after[&id], before[&id], "untouched rows keep their lineage");
+        }
+        let view = SnapshotView::current(&f.head).await.unwrap();
+        let mut targets = BTreeSet::new();
+        for entry in view
+            .live_files
+            .values()
+            .filter(|entry| entry.file_format() == DataFileFormat::Puffin)
+        {
+            let target = entry.data_file().referenced_data_file().unwrap();
+            assert!(
+                view.live_files.contains_key(&target),
+                "vector of a live file"
+            );
+            assert!(
+                targets.insert(target),
+                "one cumulative vector per data file"
+            );
+        }
+
+        // A strict rewrite of the outputs chains a second remap, then more CDC.
+        assert!(
+            maintenance
+                .compact(&f.head, &f.schema, f.scratch())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        f.refresh().await;
+        f.assert_rows(expected.values().cloned().collect()).await;
+        assert_index_exact(&f).await;
+        f.publish(
+            60,
+            vec![
+                (5, Change::Delete),
+                (10, Change::Update(row(10, "last"))),
+                (14, Change::Insert(row(14, "new"))),
+            ],
+        )
+        .await;
+        expected.remove(&5);
+        expected.insert(10, row(10, "last"));
+        expected.insert(14, row(14, "new"));
+        f.assert_rows(expected.values().cloned().collect()).await;
+        assert_index_exact(&f).await;
+
+        // Cleanup materializes every remap without changing any lookup.
+        f.store.materialize_remaps(&f.schema.table_id).unwrap();
+        assert!(!f.store.has_remaps(&f.schema.table_id).unwrap());
+        assert_index_exact(&f).await;
+        f.publish(70, vec![(6, Change::Update(row(6, "final")))])
+            .await;
+        expected.insert(6, row(6, "final"));
+        f.assert_rows(expected.values().cloned().collect()).await;
+        assert_index_exact(&f).await;
+    }
+}

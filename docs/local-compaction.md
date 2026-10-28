@@ -106,13 +106,20 @@ shutdown and restart recovery still apply. The pooled-HTTP regression test holds
 a request across the first worker's completion and parent shutdown, then
 releases the response and joins the surviving worker.
 
-## Experimental lazy index remap
+## Lazy index remap
 
-`[compaction] lazy_index_remap = true` (default `false`) makes background data
-builds of keyed tables commit one remap per input file instead of one index
-delta per moved row. The strict path, keyless tables and every other rewrite
-keep per-row deltas; with the flag off nothing changes.
+By default (`[compaction] lazy_index_remap = true`) data rewrites of keyed
+tables, background builds and strict rewrites under hard publication pressure
+alike, commit one remap per input file instead of one index delta per moved
+row. A rewrite then holds the table fence for O(files) index work instead of
+O(rows). Keyless tables and external rewrite reconciliation keep per-row
+deltas, and delete-file rewrites move no rows. With the flag off, rewrites
+commit per-row deltas again; remaps already committed keep being translated
+and cleaned up.
 
+- A strict rewrite fences the table from its build base through publication,
+  so it needs no catch-up: its remap is the worker's runs and every output row
+  is live.
 - The worker writes each input file's survivors in input order, so it records
   only runs `(old start, output file, new start, length)`. Runs break at
   positions deleted at the build base and at output-file rotation: the remap is
@@ -140,8 +147,45 @@ keep per-row deltas; with the flag off nothing changes.
   `materialize_remaps`, which rewrites the remaining raw entries per row in
   crash-safe batches and then drops the table's remaps. A full rebuild starts a
   generation without remaps.
-- Remaps are not garbage collected until materialization or a rebuild, and the
-  `file_remaps` column family is new in this generation format.
+- Iceberg v3 tables work the same way. Lookups return translated locations, so
+  CDC deletes and updates write deletion vectors for the output files, merged
+  with any catch-up mask already there, and never for a retired input.
+
+### Remap cleanup
+
+Each remap stays until no raw entry or other remap needs it, and every hop of a
+chain costs a forward read one translation. Periodic maintenance bounds both
+in each full visit, without the table fence:
+
+1. It drops every remap whose file has no raw entry and that no other remap
+   translates into, which costs one seek per file. CDC that updates or deletes
+   the moved rows makes most remaps free this way.
+2. While more than `remap_max_files` (default 512) retired files keep a remap,
+   or a chain is longer than `remap_max_depth` (default 8) hops, it
+   materializes the retired file at the root of the longest chain: raw entries
+   are rewritten to their translated location in row-lock batches of
+   `limits.batch_rows`, like an apply, and the remap is dropped once the file is
+   empty. A visit rewrites at most `remap_cleanup_rows` (default 32,768)
+   entries, then yields and is continued like a garbage page.
+
+Each batch is a self-consistent index rewrite and a remap is deleted only after
+nothing needs it, so a crash at any point leaves a translatable index and the
+next pass resumes. A remap's targets are always fresh outputs, so a remap never
+gains a referrer and a retired file never gains raw entries; dropping a root
+changes no other chain. Cold rows are therefore rewritten about once per
+`remap_max_depth + 1` rewrites of their data instead of once per rewrite.
+`flow_index_remap_files` and `flow_index_remap_max_depth` report the current
+size, and `index_remaps_cleaned` events the work done.
+
+### Downgrade
+
+Every row index this release opens has the `file_remaps` column family, even
+with `lazy_index_remap = false` and no remaps. A binary that predates the
+family lists only the older ones, and RocksDB refuses to open the index
+(`Column families not opened: file_remaps`) before anything is read or
+written, so an older binary fails at startup instead of misreading raw entries
+in retired files. Run this release or a newer one on that state directory; the
+flag does not make an index readable by older binaries.
 
 ## Experimental consolidation-first delete debt
 

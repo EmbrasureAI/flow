@@ -110,12 +110,22 @@ pub struct Policy {
     pub l1_target_bytes: u64,
     pub l2_target_bytes: u64,
     pub min_file_age_ms: u64,
-    /// Experimental: background data builds of keyed tables commit one remap
-    /// per input file instead of rewriting every moved row's index entries.
+    /// Data rewrites of keyed tables commit one remap per input file instead
+    /// of rewriting every moved row's index entries.
     pub lazy_index_remap: bool,
     /// How delete-file count debt is paid. See [`DeleteDebt`].
     pub delete_debt: DeleteDebt,
+    /// Periodic maintenance materializes a table's remaps while more retired
+    /// files than this keep one.
+    pub remap_max_files: u64,
+    /// ... or while a translation chain has more hops than this.
+    pub remap_max_depth: u64,
+    /// Index entries one periodic visit may rewrite while materializing.
+    pub remap_cleanup_rows: u64,
 }
+/// Well below the state store's translation hop limit.
+const MAX_REMAP_DEPTH: u64 = 1024;
+
 impl Default for Policy {
     fn default() -> Self {
         Self {
@@ -140,8 +150,11 @@ impl Default for Policy {
             l1_target_bytes: 128 << 20,
             l2_target_bytes: 512 << 20,
             min_file_age_ms: 1_000,
-            lazy_index_remap: false,
+            lazy_index_remap: true,
             delete_debt: DeleteDebt::Current,
+            remap_max_files: 512,
+            remap_max_depth: 8,
+            remap_cleanup_rows: 32_768,
         }
     }
 }
@@ -184,7 +197,7 @@ pub struct CompactionPlan {
     pub input_bytes: u64,
     pub delete_input_bytes: u64,
     pub delete_input_rows: u64,
-    /// Build a lazy index remap instead of per-row mappings (background builds).
+    /// Build a lazy index remap instead of per-row mappings (keyed tables).
     pub lazy_index_remap: bool,
     /// Why this group was selected, for attribution only.
     pub reason: PlanReason,
@@ -240,7 +253,24 @@ impl Policy {
                 "invalid group, output-size, or deletion-density limits",
             ));
         }
+        if self.remap_max_depth == 0
+            || self.remap_max_depth > MAX_REMAP_DEPTH
+            || self.remap_cleanup_rows == 0
+        {
+            return Err(Error::InvalidPolicy(
+                "remap_max_depth must be 1..=1024 and remap_cleanup_rows positive",
+            ));
+        }
         Ok(())
+    }
+
+    /// Bounds of one periodic remap cleanup pass.
+    pub fn remap_limits(&self) -> flow_state_store::RemapLimits {
+        flow_state_store::RemapLimits {
+            max_files: self.remap_max_files,
+            max_depth: self.remap_max_depth,
+            max_rows: self.remap_cleanup_rows,
+        }
     }
 
     pub fn debt(&self, files: &[FileCandidate]) -> Result<Debt> {

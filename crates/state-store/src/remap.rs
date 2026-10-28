@@ -1,4 +1,4 @@
-//! Lazy row-index remaps for data rewrites (experimental, `lazy_index_remap`).
+//! Lazy row-index remaps for data rewrites (`lazy_index_remap`, on by default).
 //!
 //! A rewrite that writes the survivors of each input file in input order can
 //! describe every moved row with O(files + deleted positions) runs instead of
@@ -14,6 +14,9 @@
 //! RocksDB snapshot. Reverse entries stay at the raw location; callers that need
 //! an exact reverse scan of a file first call [`StateStore::materialize_remaps`],
 //! which rewrites the remaining raw entries per row and drops the remaps.
+//! Periodic maintenance bounds the remaps with [`StateStore::clean_remaps`]:
+//! it drops remaps nothing needs and materializes the longest chains in
+//! bounded batches while a table exceeds its [`RemapLimits`].
 
 use crate::{
     DELTAS, Error, FILE_COUNTS, OUTPUT_COUNT_MARKER, OperationKind, OperationPhase, PK,
@@ -179,7 +182,131 @@ pub struct LazyRemap {
 /// Decoded remaps are immutable once committed. Visibility is still decided
 /// by a read in the caller's view; the cache only avoids decoding again.
 #[derive(Default)]
-pub(crate) struct RemapCache(Mutex<HashMap<(TableId, FileId), Arc<FileRemap>>>);
+pub(crate) struct RemapCache {
+    decoded: Mutex<HashMap<(TableId, FileId), Arc<FileRemap>>>,
+    /// Per-table graph sizes, computed and invalidated under the row lock.
+    stats: Mutex<HashMap<TableId, RemapStats>>,
+}
+
+impl RemapCache {
+    /// Decode `bytes`, the committed remap of `file`, at most once.
+    fn decoded(&self, table: TableId, file: &FileId, bytes: &[u8]) -> Result<Arc<FileRemap>> {
+        let key = (table, file.clone());
+        if let Some(remap) = self.decoded.lock().map_err(|_| Error::Poisoned)?.get(&key) {
+            return Ok(remap.clone());
+        }
+        let remap = Arc::new(decode::<FileRemap>(bytes)?);
+        self.decoded
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .insert(key, remap.clone());
+        Ok(remap)
+    }
+
+    pub(crate) fn forget_stats(&self, table: &TableId) -> Result<()> {
+        self.stats
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .remove(table);
+        Ok(())
+    }
+}
+
+/// Size of one table's lazy remaps, which bounds forward-read translation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemapStats {
+    /// Retired data files with a remap record.
+    pub files: u64,
+    /// Longest translation chain, in hops, from any retired file.
+    pub max_depth: u64,
+}
+
+/// Bounds of one [`StateStore::clean_remaps`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemapLimits {
+    /// Materialize while more retired files than this keep a remap.
+    pub max_files: u64,
+    /// Materialize while a translation chain is longer than this.
+    pub max_depth: u64,
+    /// Raw entries one pass may rewrite before it yields.
+    pub max_rows: u64,
+}
+
+/// What one cleanup pass did and what remains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemapCleanup {
+    /// Remap records dropped because no raw entry or other remap needs them.
+    pub dropped_files: u64,
+    /// Raw entries rewritten to their translated location.
+    pub rewritten_rows: u64,
+    /// The table's remaps after the pass.
+    pub stats: RemapStats,
+    /// The pass stopped at `max_rows` while still over its limits.
+    pub continuation: bool,
+}
+
+impl RemapStats {
+    pub fn exceeds(&self, limits: &RemapLimits) -> bool {
+        self.files > limits.max_files || self.max_depth > limits.max_depth
+    }
+}
+
+/// The table's retired files and the remaps that translate into them. Remap
+/// targets are fresh outputs, so a committed remap never gains a referrer and
+/// a retired file never gains raw entries; only roots (files no other remap
+/// targets) can be dropped, and dropping one changes no other depth.
+struct RemapGraph {
+    nodes: BTreeMap<FileId, RemapNode>,
+}
+
+struct RemapNode {
+    key: Vec<u8>,
+    /// Retired files this remap translates into.
+    retired_targets: Vec<FileId>,
+    referrers: u64,
+    depth: u64,
+}
+
+impl RemapGraph {
+    fn stats(&self) -> RemapStats {
+        RemapStats {
+            files: self.nodes.len() as u64,
+            max_depth: self
+                .nodes
+                .values()
+                .map(|node| node.depth)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn roots(&self) -> Vec<FileId> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| node.referrers == 0)
+            .map(|(file, _)| file.clone())
+            .collect()
+    }
+
+    /// The root on the longest chain; deterministic so passes resume it.
+    fn deepest_root(&self) -> Option<FileId> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| node.referrers == 0)
+            .max_by_key(|(_, node)| node.depth)
+            .map(|(file, _)| file.clone())
+    }
+
+    fn remove(&mut self, file: &FileId) -> Option<RemapNode> {
+        let node = self.nodes.remove(file)?;
+        for target in &node.retired_targets {
+            if let Some(target) = self.nodes.get_mut(target) {
+                target.referrers -= 1;
+            }
+        }
+        Some(node)
+    }
+}
 
 /// One reader's view of retired files, memoized per call.
 pub(crate) struct Resolver<'a> {
@@ -217,28 +344,7 @@ impl<'a> Resolver<'a> {
                 .get_pinned_cf_opt(&cf, file_prefix(&self.table, file), self.options)?
             {
                 None => None,
-                Some(bytes) => {
-                    let key = (self.table, file.clone());
-                    let cached = self
-                        .cache
-                        .0
-                        .lock()
-                        .map_err(|_| Error::Poisoned)?
-                        .get(&key)
-                        .cloned();
-                    Some(match cached {
-                        Some(remap) => remap,
-                        None => {
-                            let remap = Arc::new(decode::<FileRemap>(&bytes)?);
-                            self.cache
-                                .0
-                                .lock()
-                                .map_err(|_| Error::Poisoned)?
-                                .insert(key, remap.clone());
-                            remap
-                        }
-                    })
-                }
+                Some(bytes) => Some(self.cache.decoded(self.table, file, &bytes)?),
             };
         self.memo.insert(file.clone(), remap.clone());
         Ok(remap)
@@ -453,88 +559,310 @@ impl StateStore {
     /// Rewrite every raw entry of the table's retired files to its translated
     /// location and drop the table's remaps, restoring exact reverse scans.
     /// Progress is crash-safe: each batch is a self-consistent index rewrite and
-    /// remaps are deleted only after no raw entry needs them.
+    /// a remap is deleted only after no raw entry or other remap needs it.
     pub fn materialize_remaps(&self, table: &TableId) -> Result<u64> {
-        if !self.has_remaps(table)? {
-            return Ok(0);
+        let cleanup = self.clean_remaps(
+            table,
+            &RemapLimits {
+                max_files: 0,
+                max_depth: 0,
+                max_rows: u64::MAX,
+            },
+        )?;
+        if cleanup.stats.files != 0 {
+            return Err(Error::InvalidState(
+                "lazy remaps remain after materialization".into(),
+            ));
         }
-        let mut retired = Vec::new();
+        Ok(cleanup.rewritten_rows)
+    }
+
+    /// Size of the table's lazy remaps. Cached until a remap commits or a
+    /// cleanup pass changes them.
+    pub fn remap_stats(&self, table: &TableId) -> Result<RemapStats> {
+        if !self.remaps_possible() {
+            return Ok(RemapStats::default());
+        }
+        let cached = self
+            .0
+            .remap_cache
+            .stats
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .get(table)
+            .copied();
+        if let Some(stats) = cached {
+            return Ok(stats);
+        }
+        // Under the row lock, so no remap commit lands between this read and
+        // caching its result.
+        let _guard = self.lock()?;
+        let stats = self.remap_graph(table)?.stats();
+        self.0
+            .remap_cache
+            .stats
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .insert(*table, stats);
+        Ok(stats)
+    }
+
+    /// Bounded, crash-safe cleanup. First drops every remap that no raw entry
+    /// or other remap needs, which is free. While the table still exceeds
+    /// `limits`, it then rewrites the raw entries of the root on the longest
+    /// chain, in row-lock batches like an apply, and drops that root once it is
+    /// empty, until `max_rows` entries were rewritten. No table fence is held;
+    /// translated reads, compare-and-swap and live counts are unchanged.
+    pub fn clean_remaps(&self, table: &TableId, limits: &RemapLimits) -> Result<RemapCleanup> {
+        let mut cleanup = RemapCleanup::default();
+        // Sizes are recomputed under the row lock on the next read, so a remap
+        // committed during this pass is never hidden by a stale cache entry.
+        self.0.remap_cache.forget_stats(table)?;
+        if !self.has_remaps(table)? {
+            return Ok(cleanup);
+        }
+        let mut graph = {
+            let _guard = self.lock()?;
+            self.remap_graph(table)?
+        };
+        let mut budget = limits.max_rows;
+        loop {
+            cleanup.dropped_files += self.drop_unneeded_remaps(table, &mut graph)?;
+            if !graph.stats().exceeds(limits) || budget == 0 {
+                break;
+            }
+            let root = graph.deepest_root().ok_or_else(|| {
+                Error::RecoveryRequired("lazy remaps form a cycle; rebuild the index".into())
+            })?;
+            let (rewritten, drained) = self.drain_retired_file(table, &root, budget)?;
+            cleanup.rewritten_rows += rewritten;
+            budget = budget.saturating_sub(rewritten);
+            if !drained && budget != 0 {
+                return Err(Error::InvalidState(
+                    "remap drain stopped before its budget".into(),
+                ));
+            }
+        }
+        cleanup.stats = graph.stats();
+        cleanup.continuation = cleanup.stats.exceeds(limits);
+        self.0.remap_cache.forget_stats(table)?;
+        Ok(cleanup)
+    }
+
+    /// Every committed remap of the table. The caller holds the row lock or
+    /// tolerates a graph that misses remaps committed after this read, which is
+    /// conservative: new remaps only add roots.
+    fn remap_graph(&self, table: &TableId) -> Result<RemapGraph> {
+        let prefix_len = size_of::<u32>() + size_of::<u64>();
+        let mut nodes = BTreeMap::new();
+        let mut targets = Vec::new();
         for entry in self.scan(REMAPS, table.0.to_be_bytes().to_vec()) {
             let (key, value) = entry?;
-            retired.push((key, decode::<FileRemap>(&value)?.source));
+            let file = key
+                .get(prefix_len..)
+                .and_then(|name| String::from_utf8(name.to_vec()).ok())
+                .map(FileId)
+                .ok_or_else(|| Error::InvalidState("malformed lazy remap key".into()))?;
+            let remap = self.0.remap_cache.decoded(*table, &file, &value)?;
+            if remap.source != file {
+                return Err(Error::InvalidState(
+                    "lazy remap key and source differ".into(),
+                ));
+            }
+            targets.push((
+                file.clone(),
+                remap
+                    .targets
+                    .iter()
+                    .map(|target| target.data_file_id.clone())
+                    .collect::<Vec<_>>(),
+            ));
+            nodes.insert(
+                file,
+                RemapNode {
+                    key: key.to_vec(),
+                    retired_targets: Vec::new(),
+                    referrers: 0,
+                    depth: 0,
+                },
+            );
         }
+        for (file, files) in targets {
+            let retired: Vec<_> = files
+                .into_iter()
+                .filter(|target| nodes.contains_key(target))
+                .collect();
+            for target in &retired {
+                nodes.get_mut(target).expect("retired target").referrers += 1;
+            }
+            nodes.get_mut(&file).expect("loaded node").retired_targets = retired;
+        }
+        // Depth is one hop plus the deepest retired target. Remaps only
+        // translate into newer files, so this terminates unless the records are
+        // corrupt, which the visit bound reports.
+        let mut depths = HashMap::<FileId, u64>::new();
+        for file in nodes.keys() {
+            let mut stack = vec![(file.clone(), false)];
+            let mut visits = 0usize;
+            while let Some((current, expanded)) = stack.pop() {
+                if depths.contains_key(&current) {
+                    continue;
+                }
+                visits += 1;
+                if visits > nodes.len().saturating_mul(2) + MAX_REMAP_HOPS {
+                    return Err(Error::RecoveryRequired(
+                        "lazy remaps form a cycle; rebuild the index".into(),
+                    ));
+                }
+                let node = &nodes[&current];
+                if expanded {
+                    let depth = 1 + node
+                        .retired_targets
+                        .iter()
+                        .map(|target| depths[target])
+                        .max()
+                        .unwrap_or(0);
+                    depths.insert(current, depth);
+                } else {
+                    stack.push((current.clone(), true));
+                    for target in &node.retired_targets {
+                        if !depths.contains_key(target) {
+                            stack.push((target.clone(), false));
+                        }
+                    }
+                }
+            }
+        }
+        for (file, node) in &mut nodes {
+            node.depth = depths[file];
+        }
+        Ok(RemapGraph { nodes })
+    }
+
+    /// Drop remaps of roots without raw entries until none remains; each drop
+    /// may expose its targets as new roots.
+    fn drop_unneeded_remaps(&self, table: &TableId, graph: &mut RemapGraph) -> Result<u64> {
+        let remaps_cf = self.0.db.cf_handle(REMAPS).expect("opened column family");
+        let mut dropped = 0u64;
+        let mut candidates = graph.roots();
+        while !candidates.is_empty() {
+            let _guard = self.lock()?;
+            let mut batch = StateBatch::default();
+            let mut removed = Vec::new();
+            for file in candidates.drain(..) {
+                let raw =
+                    crate::reader::file_rows_raw(&self.0.db, table, &file, ReadOptions::default())
+                        .next()
+                        .transpose()?;
+                if raw.is_none() {
+                    let node = graph.remove(&file).expect("candidate root");
+                    batch.delete_cf(&remaps_cf, &node.key);
+                    removed.push((file, node));
+                }
+            }
+            if removed.is_empty() {
+                break;
+            }
+            self.write(batch)?;
+            let mut cache = self
+                .0
+                .remap_cache
+                .decoded
+                .lock()
+                .map_err(|_| Error::Poisoned)?;
+            for (file, node) in removed {
+                dropped += 1;
+                cache.remove(&(*table, file));
+                candidates.extend(
+                    node.retired_targets
+                        .into_iter()
+                        .filter(|target| graph.nodes.get(target).is_some_and(|n| n.referrers == 0)),
+                );
+            }
+            candidates.sort();
+            candidates.dedup();
+        }
+        Ok(dropped)
+    }
+
+    /// Rewrite up to `budget` raw entries of one retired file to their
+    /// translated locations. Returns the rows rewritten and whether the file
+    /// has no raw entry left.
+    fn drain_retired_file(
+        &self,
+        table: &TableId,
+        file: &FileId,
+        budget: u64,
+    ) -> Result<(u64, bool)> {
         let pk_cf = self.0.db.cf_handle(PK).expect("opened column family");
         let reverse_cf = self.0.db.cf_handle(REVERSE).expect("opened column family");
         let mut rewritten = 0u64;
-        for (_, file) in &retired {
-            loop {
-                // Scan under the row lock so concurrent applies cannot move a row
-                // between this read and the rewrite below.
-                let _guard = self.lock()?;
-                let rows: Vec<(u64, PrimaryKey)> =
-                    crate::reader::file_rows_raw(&self.0.db, table, file, ReadOptions::default())
-                        .take(self.0.batch_rows)
-                        .collect::<Result<_>>()?;
-                if rows.is_empty() {
-                    break;
-                }
-                let keys: Vec<_> = rows.iter().map(|(_, key)| pk_key(table, key)).collect();
-                let current = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), false);
-                let options = ReadOptions::default();
-                let mut resolver = Resolver::new(&self.0.db, &self.0.remap_cache, *table, &options);
-                let mut batch = StateBatch::default();
-                for (((position, key), pk), current) in rows.iter().zip(&keys).zip(current) {
-                    let raw = reverse_key(
-                        table,
-                        &RowLocation {
-                            data_file_id: file.clone(),
-                            row_position: *position,
-                            data_sequence_number: 0,
-                            spec_id: 0,
-                            partition: Vec::new(),
-                            source_commit_lsn: Default::default(),
-                            row_version: 0,
-                            row_fingerprint: [0; 16],
-                        },
-                    );
-                    let Some(current) = current? else {
-                        return Err(Error::RecoveryRequired(
-                            "reverse index has no forward entry; rebuild the index".into(),
-                        ));
-                    };
-                    let location: RowLocation = decode(&current)?;
-                    if &location.data_file_id != file || location.row_position != *position {
-                        return Err(Error::RecoveryRequired(
-                            "forward and reverse index disagree; rebuild the index".into(),
-                        ));
-                    }
-                    let translated = resolver
-                        .resolve(&location)?
-                        .ok_or_else(|| Error::InvalidState("retired file lost its remap".into()))?;
-                    batch.delete_cf(&reverse_cf, raw);
-                    batch.put_cf(&pk_cf, pk, bincode::serialize(&translated)?);
-                    batch.put_cf(
-                        &reverse_cf,
-                        reverse_key(table, &translated),
-                        bincode::serialize(key)?,
-                    );
-                    rewritten += 1;
-                }
-                self.write_staged(batch)?;
+        while rewritten < budget {
+            let remaining = budget - rewritten;
+            // Scan under the row lock so concurrent applies cannot move a row
+            // between this read and the rewrite below.
+            let _guard = self.lock()?;
+            let rows: Vec<(u64, PrimaryKey)> =
+                crate::reader::file_rows_raw(&self.0.db, table, file, ReadOptions::default())
+                    .take(
+                        self.0
+                            .batch_rows
+                            .min(usize::try_from(remaining).unwrap_or(usize::MAX)),
+                    )
+                    .collect::<Result<_>>()?;
+            if rows.is_empty() {
+                return Ok((rewritten, true));
             }
+            let keys: Vec<_> = rows.iter().map(|(_, key)| pk_key(table, key)).collect();
+            let current = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), false);
+            let options = ReadOptions::default();
+            let mut resolver = Resolver::new(&self.0.db, &self.0.remap_cache, *table, &options);
+            let mut batch = StateBatch::default();
+            for (((position, key), pk), current) in rows.iter().zip(&keys).zip(current) {
+                let raw = reverse_key(
+                    table,
+                    &RowLocation {
+                        data_file_id: file.clone(),
+                        row_position: *position,
+                        data_sequence_number: 0,
+                        spec_id: 0,
+                        partition: Vec::new(),
+                        source_commit_lsn: Default::default(),
+                        row_version: 0,
+                        row_fingerprint: [0; 16],
+                    },
+                );
+                let Some(current) = current? else {
+                    return Err(Error::RecoveryRequired(
+                        "reverse index has no forward entry; rebuild the index".into(),
+                    ));
+                };
+                let location: RowLocation = decode(&current)?;
+                if &location.data_file_id != file || location.row_position != *position {
+                    return Err(Error::RecoveryRequired(
+                        "forward and reverse index disagree; rebuild the index".into(),
+                    ));
+                }
+                let translated = resolver
+                    .resolve(&location)?
+                    .ok_or_else(|| Error::InvalidState("retired file lost its remap".into()))?;
+                batch.delete_cf(&reverse_cf, raw);
+                batch.put_cf(&pk_cf, pk, bincode::serialize(&translated)?);
+                batch.put_cf(
+                    &reverse_cf,
+                    reverse_key(table, &translated),
+                    bincode::serialize(key)?,
+                );
+                rewritten += 1;
+            }
+            self.write_staged(batch)?;
         }
-        let _guard = self.lock()?;
-        let remaps_cf = self.0.db.cf_handle(REMAPS).expect("opened column family");
-        let mut batch = StateBatch::default();
-        for (key, _) in &retired {
-            batch.delete_cf(&remaps_cf, key);
-        }
-        self.write(batch)?;
-        let mut cache = self.0.remap_cache.0.lock().map_err(|_| Error::Poisoned)?;
-        for (_, file) in retired {
-            cache.remove(&(*table, file));
-        }
-        Ok(rewritten)
+        // The budget ran out exactly at a batch boundary; check for more rows.
+        let drained = crate::reader::file_rows_raw(&self.0.db, table, file, ReadOptions::default())
+            .next()
+            .transpose()?
+            .is_none();
+        Ok((rewritten, drained))
     }
 }
 
@@ -1013,5 +1341,316 @@ mod tests {
             store.apply_committed(&id),
             Err(Error::IndexConflict { .. })
         ));
+    }
+
+    const UNBOUNDED: RemapLimits = RemapLimits {
+        max_files: u64::MAX,
+        max_depth: u64::MAX,
+        max_rows: 0,
+    };
+
+    fn next_sequence(store: &StateStore) -> i64 {
+        store.table_state(&TABLE).unwrap().snapshot_id.unwrap_or(0) + 1
+    }
+
+    /// Index `keys` at consecutive positions of `file`, returning the model.
+    fn insert(store: &StateStore, file: &str, keys: &[u8]) -> BTreeMap<u8, RowLocation> {
+        let sequence = next_sequence(store);
+        let model: BTreeMap<_, _> = keys
+            .iter()
+            .enumerate()
+            .map(|(position, value)| (*value, location(file, position as u64, sequence, 1)))
+            .collect();
+        commit(
+            store,
+            &format!("insert-{file}"),
+            OperationKind::Ingest,
+            model
+                .iter()
+                .map(|(value, location)| IndexDelta {
+                    key: key(*value),
+                    expected: None,
+                    replacement: Some(location.clone()),
+                })
+                .collect(),
+            None,
+        );
+        model
+    }
+
+    /// Lazily rewrite every live file of the model into `output`, in physical
+    /// order, as a background build would.
+    fn rewrite_all(store: &StateStore, model: &mut BTreeMap<u8, RowLocation>, output: &str) {
+        let sequence = next_sequence(store);
+        let mut rows: Vec<_> = model
+            .iter()
+            .map(|(value, location)| (location.data_file_id.clone(), location.row_position, *value))
+            .collect();
+        rows.sort();
+        let mut files = BTreeMap::<FileId, FileRemap>::new();
+        for (position, (file, old, value)) in rows.iter().enumerate() {
+            let replacement = location(output, position as u64, sequence, 0);
+            files
+                .entry(file.clone())
+                .or_insert_with(|| FileRemap::new(file.clone()))
+                .push(*old, &replacement, sequence)
+                .unwrap();
+            let moved = model.get_mut(value).unwrap();
+            moved.data_file_id = replacement.data_file_id;
+            moved.row_position = replacement.row_position;
+            moved.data_sequence_number = sequence;
+        }
+        let remap = LazyRemap {
+            files: files.into_values().collect(),
+            output_live_rows: vec![(FileId(output.into()), rows.len() as u64)],
+        };
+        commit(
+            store,
+            &format!("rewrite-{output}"),
+            OperationKind::Rewrite,
+            vec![],
+            Some(&remap),
+        );
+    }
+
+    fn update(store: &StateStore, model: &mut BTreeMap<u8, RowLocation>, value: u8, file: &str) {
+        let sequence = next_sequence(store);
+        let replacement = location(file, 0, sequence, sequence as u64);
+        commit(
+            store,
+            &format!("update-{file}"),
+            OperationKind::Ingest,
+            vec![IndexDelta {
+                key: key(value),
+                expected: model.get(&value).cloned(),
+                replacement: Some(replacement.clone()),
+            }],
+            None,
+        );
+        model.insert(value, replacement);
+    }
+
+    fn assert_model(store: &StateStore, model: &BTreeMap<u8, RowLocation>) {
+        let keys: Vec<_> = model.keys().map(|value| key(*value)).collect();
+        assert_eq!(
+            store.lookup_many(&TABLE, &keys).unwrap(),
+            model.values().cloned().map(Some).collect::<Vec<_>>()
+        );
+    }
+
+    /// Reverse entries of drained files are exact; the rest stay raw.
+    fn raw_rows(store: &StateStore, file: &str) -> usize {
+        store.file_rows(&TABLE, &FileId(file.into())).count()
+    }
+
+    #[test]
+    fn binaries_without_the_remap_family_refuse_to_open_the_index() {
+        // Every index this binary opens has the family, with or without
+        // remaps. A binary that predates it lists only the older families and
+        // RocksDB refuses the open, so it can never ignore remaps and misread
+        // raw entries in retired files.
+        let directory = tempfile::tempdir().unwrap();
+        drop(StateStore::open(directory.path(), StateStoreOptions::default()).unwrap());
+        let older: Vec<_> = crate::STATE_COLUMN_FAMILIES
+            .into_iter()
+            .filter(|name| *name != REMAPS)
+            .collect();
+        assert_eq!(older.len(), crate::STATE_COLUMN_FAMILIES.len() - 1);
+        let Err(error) = DB::open_cf(&rocksdb::Options::default(), directory.path(), older) else {
+            panic!("an older family list must not open the index");
+        };
+        assert!(error.to_string().contains(REMAPS), "{error}");
+    }
+
+    #[test]
+    fn cleanup_drops_unneeded_remaps_but_keeps_referenced_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        let mut model = insert(&store, "a", &[0, 1, 2, 3]);
+        rewrite_all(&store, &mut model, "b");
+        // CDC replaces every row of `b` that came from `a`; `a` is then free.
+        for value in 0..4 {
+            update(&store, &mut model, value, &format!("n{value}"));
+        }
+        let cleanup = store.clean_remaps(&TABLE, &UNBOUNDED).unwrap();
+        assert_eq!(
+            (cleanup.dropped_files, cleanup.rewritten_rows),
+            (1, 0),
+            "a remap without raw entries is dropped for free"
+        );
+        assert!(!store.has_remaps(&TABLE).unwrap());
+        assert_model(&store, &model);
+
+        // a2 -> c -> d: c has no raw entries, but a2's remap translates into it.
+        model.extend(insert(&store, "a2", &[10, 11, 12]));
+        rewrite_all(&store, &mut model, "c");
+        rewrite_all(&store, &mut model, "d");
+        assert_eq!(
+            store.remap_stats(&TABLE).unwrap(),
+            RemapStats {
+                // n0..n3 and a2 retired into c, c into d.
+                files: 6,
+                max_depth: 2,
+            }
+        );
+        let cleanup = store.clean_remaps(&TABLE, &UNBOUNDED).unwrap();
+        assert_eq!(cleanup.dropped_files, 0, "n* and a2 hold raw entries");
+        assert_eq!(cleanup.stats, store.remap_stats(&TABLE).unwrap());
+        assert_model(&store, &model);
+
+        // Drain at most two rows: progress, continuation, nothing dropped.
+        let limits = RemapLimits {
+            max_files: 0,
+            max_depth: 0,
+            max_rows: 2,
+        };
+        let cleanup = store.clean_remaps(&TABLE, &limits).unwrap();
+        assert_eq!(cleanup.rewritten_rows, 2);
+        assert!(cleanup.continuation);
+        assert_model(&store, &model);
+        // Finish: every raw entry moves to `d`, and every remap is dropped
+        // once nothing needs it, the referenced `c` last.
+        let cleanup = store
+            .clean_remaps(
+                &TABLE,
+                &RemapLimits {
+                    max_rows: u64::MAX,
+                    ..limits
+                },
+            )
+            .unwrap();
+        assert_eq!(cleanup.rewritten_rows, 5);
+        assert_eq!(cleanup.stats, RemapStats::default());
+        assert!(!cleanup.continuation);
+        assert!(!store.has_remaps(&TABLE).unwrap());
+        assert_eq!(store.remap_stats(&TABLE).unwrap(), RemapStats::default());
+        assert_model(&store, &model);
+        assert_eq!(raw_rows(&store, "d"), 7);
+        assert_eq!(raw_rows(&store, "a2") + raw_rows(&store, "n0"), 0);
+    }
+
+    #[test]
+    fn cleanup_bounds_remaps_over_many_rewrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path(),
+            StateStoreOptions {
+                apply_batch_rows: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Cold keys are never updated; hot keys are updated between rewrites.
+        let mut model = insert(&store, "base", &(0..32).collect::<Vec<_>>());
+        let limits = RemapLimits {
+            max_files: 4,
+            max_depth: 2,
+            max_rows: 8,
+        };
+        let (mut dropped, mut rewritten) = (0, 0);
+        for round in 0..24u8 {
+            // Each round retires the previous output and one hot file.
+            update(&store, &mut model, round % 4, &format!("hot-{round}"));
+            rewrite_all(&store, &mut model, &format!("out-{round}"));
+            // One bounded pass per rewrite, like a periodic visit.
+            let mut cleanup = store.clean_remaps(&TABLE, &limits).unwrap();
+            assert!(cleanup.rewritten_rows <= limits.max_rows);
+            // Continuations run until the table is within its limits.
+            loop {
+                dropped += cleanup.dropped_files;
+                rewritten += cleanup.rewritten_rows;
+                if !cleanup.continuation {
+                    break;
+                }
+                cleanup = store.clean_remaps(&TABLE, &limits).unwrap();
+            }
+            let stats = store.remap_stats(&TABLE).unwrap();
+            assert_eq!(stats, cleanup.stats);
+            assert!(
+                stats.files <= limits.max_files && stats.max_depth <= limits.max_depth,
+                "round {round}: {stats:?}"
+            );
+            assert_model(&store, &model);
+        }
+        // 48 retired files without cleanup; most are dropped for free. Cold rows
+        // are rewritten once per `max_depth + 1` rewrites instead of each one.
+        assert!(dropped >= 40, "{dropped}");
+        assert!(
+            rewritten <= 32 * (24 / (limits.max_depth + 1) + 1),
+            "{rewritten}"
+        );
+        // The hop limit was never approached, and translation stays exact
+        // after a reopen.
+        drop(store);
+        let store = StateStore::open(directory.path(), StateStoreOptions::default()).unwrap();
+        assert_model(&store, &model);
+        store.materialize_remaps(&TABLE).unwrap();
+        assert!(!store.has_remaps(&TABLE).unwrap());
+        assert_model(&store, &model);
+        assert_eq!(raw_rows(&store, "out-23"), 32);
+    }
+
+    #[test]
+    fn crash_during_cleanup_keeps_a_consistent_translatable_index() {
+        use crate::tests::SIMULATE_POWER_LOSS;
+        let crash_image = |path: &std::path::Path| {
+            let image = tempfile::tempdir().unwrap();
+            std::fs::remove_dir(image.path()).unwrap();
+            crate::control::copy_directory_tree(path, image.path()).unwrap();
+            image
+        };
+        SIMULATE_POWER_LOSS.set(true);
+        let directory = tempfile::tempdir().unwrap();
+        let options = StateStoreOptions {
+            apply_batch_rows: 2,
+            ..Default::default()
+        };
+        let store = StateStore::open(directory.path(), options.clone()).unwrap();
+        let mut model = insert(&store, "a", &(0..9).collect::<Vec<_>>());
+        rewrite_all(&store, &mut model, "b");
+        rewrite_all(&store, &mut model, "c");
+        let drain = RemapLimits {
+            max_files: 0,
+            max_depth: 0,
+            max_rows: 5,
+        };
+        // Unsynced drain batches are lost by the crash.
+        assert_eq!(
+            store.clean_remaps(&TABLE, &drain).unwrap().rewritten_rows,
+            5
+        );
+        let lost = crash_image(directory.path());
+        // A later synced write makes the drained prefix durable.
+        update(&store, &mut model, 8, "n");
+        let kept = crash_image(directory.path());
+        drop(store);
+        SIMULATE_POWER_LOSS.set(false);
+        for (image, drained) in [(lost, 0), (kept, 5)] {
+            let store = StateStore::open(image.path(), options.clone()).unwrap();
+            let mut expected = model.clone();
+            if drained == 0 {
+                // The update after the image is not part of it.
+                expected.insert(8, location("c", 8, 3, 1));
+            }
+            assert_model(&store, &expected);
+            assert!(store.has_remaps(&TABLE).unwrap());
+            assert_eq!(raw_rows(&store, "c"), drained);
+            assert_eq!(
+                store.remap_stats(&TABLE).unwrap(),
+                RemapStats {
+                    files: 2,
+                    max_depth: 2
+                }
+            );
+            // Cleanup resumes and finishes from either state.
+            store.materialize_remaps(&TABLE).unwrap();
+            assert!(!store.has_remaps(&TABLE).unwrap());
+            assert_model(&store, &expected);
+            assert_eq!(raw_rows(&store, "a") + raw_rows(&store, "b"), 0);
+            assert_eq!(
+                raw_rows(&store, "c") + raw_rows(&store, "n"),
+                expected.len()
+            );
+        }
     }
 }

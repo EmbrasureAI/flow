@@ -410,6 +410,7 @@ impl StateStore {
         drop(records);
 
         let complete = end == record.delta_count;
+        let mut remapped = false;
         if complete
             && record.operation.kind == OperationKind::Rewrite
             && let Some(remap) = self.staged_remap(id)?
@@ -420,6 +421,7 @@ impl StateStore {
                 &remap,
                 &mut file_counts,
             )?;
+            remapped = true;
         }
         let file_count_started = Instant::now();
         for (file, count) in file_counts {
@@ -456,6 +458,12 @@ impl StateStore {
         } else {
             self.write_staged_observed(batch)
         }?;
+        if remapped {
+            // Still under the row lock, so no stale size is cached afterwards.
+            self.0
+                .remap_cache
+                .forget_stats(&record.operation.table_id)?;
+        }
         stats.write = write_started.elapsed();
         stats.write_batch_bytes = observation.bytes;
         stats.write_batch_operations = observation.operations;

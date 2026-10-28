@@ -13,6 +13,15 @@ No release has been tagged yet; the first will be `0.1.0`.
 
 This will be the initial public release, `0.1.0`.
 
+### Upgrade
+
+From earlier development builds of `main`:
+
+- The row index gains a `file_remaps` column family on first start, with or
+  without lazy remaps. Earlier builds refuse to open such an index
+  (`Column families not opened: file_remaps`) without changing it. To go
+  back, restore the `state_dir` copied before the upgrade.
+
 ### Added
 
 **Capture and publication**
@@ -76,12 +85,20 @@ This will be the initial public release, `0.1.0`.
 - `embrasure-flow metadata-import` adopts existing catalog metadata JSON into
   grace-delayed collection.
 - Maintenance failures back off per table instead of stopping the daemon.
-- Experimental `[compaction] lazy_index_remap = true` (default `false`) makes
-  background data builds of keyed tables commit one index remap per input file
-  instead of rewriting every moved row's index entries, and reads translate
-  through the remaps. In service benchmarks it cut the table's compaction stall
-  by 70–96% and commit-to-catalog p95 at 30,000 mutations/s from 3.1 s to
-  1.0 s. See [local compaction](docs/local-compaction.md#experimental-lazy-index-remap).
+- Data rewrites of keyed tables, background and strict, commit one index
+  remap per input file instead of rewriting every moved row's index entries,
+  and reads translate through the remaps (`[compaction] lazy_index_remap`,
+  default `true`; `false` restores per-row deltas). In service benchmarks the
+  table's compaction stall fell by 70–96%, and commit-to-catalog p95 at 30,000
+  mutations/s fell from 3.2 s to 1.2 s for the default mixed workload and from
+  41.7 s to 5.8 s for Zipf-skewed updates. Periodic maintenance drops remaps
+  nothing needs, and while a table keeps more than `remap_max_files` (512)
+  remaps or a chain longer than `remap_max_depth` (8) hops, materializes the
+  longest chain, at most `remap_cleanup_rows` (32,768) entries per visit,
+  without the table fence. `flow_index_remap_files`,
+  `flow_index_remap_max_depth`, `flow_index_remaps_dropped_total` and
+  `flow_index_remap_rows_materialized_total` report it. See
+  [local compaction](docs/local-compaction.md#lazy-index-remap).
 - Experimental `[compaction] delete_debt = "consolidate"` (default
   `"current"`) pays delete-file count debt, including hard pressure, with the
   delete-only consolidation instead of rewriting a mostly-live base; data

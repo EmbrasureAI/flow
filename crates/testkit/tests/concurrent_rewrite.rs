@@ -26,6 +26,8 @@ fn compaction_policy() -> Policy {
         oldest_l0_hard_ms: 2,
         deleted_rows_percent: 100,
         min_file_age_ms: 0,
+        // These tests cover the per-row path; lazy_maintenance covers remaps.
+        lazy_index_remap: false,
         ..Default::default()
     }
 }
@@ -220,6 +222,11 @@ async fn verify(f: &Fixture, base: &Table, late: &Table, committed: &Table, rebu
                 .unwrap()
                 .is_none()
         );
+    }
+    assert_index_exact(f, committed, &format!("verify-{}", uuid::Uuid::new_v4())).await;
+    if f.index.has_remaps(&f.schema.table_id).unwrap() {
+        // Reverse scans of retired files stay raw until materialization.
+        return;
     }
     let inventory = maintenance(f)
         .inventory(committed, f.schema.table_id)
@@ -745,9 +752,22 @@ async fn preparation_past_stall_budget_can_activate_without_rebuilding_unchanged
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_prepared_recovery_survives_lost_response_and_complete_index_loss() {
-    for lose_index in [false, true] {
+    // The catalog commits the rewrite but its response is lost. Restart
+    // recovery must resolve it, applying either per-row deltas or the staged
+    // lazy remap, or rebuild the whole index.
+    for (lazy, lose_index) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut f = Fixture::new().await;
-        let (ready, base, late) = build_with_late_changes(&mut f).await;
+        let maintenance = |f: &Fixture| {
+            if lazy {
+                lazy_maintenance(f)
+            } else {
+                maintenance(f)
+            }
+        };
+        let builder = maintenance(&f);
+        let (ready, base, late) = build_with_late_changes_using(&mut f, &builder).await;
+        // The restart below must be able to reopen the index.
+        drop(builder);
         f.catalog.lose_next_response_and_disconnect();
         assert!(
             maintenance(&f)
@@ -757,6 +777,11 @@ async fn concurrent_prepared_recovery_survives_lost_response_and_complete_index_
         );
         let pending = f.index.pending_operations().unwrap().remove(0);
         assert_eq!(pending.phase, OperationPhase::Prepared);
+        assert_eq!(
+            pending.delta_count == 0,
+            lazy,
+            "a lazy rewrite stages a remap instead of row deltas"
+        );
         assert_eq!(pending.operation.last_lsn, PgLsn(110));
         assert!(
             f.index
@@ -816,6 +841,7 @@ async fn concurrent_prepared_recovery_survives_lost_response_and_complete_index_
                 .recover(&committed, &pending.operation.id)
                 .await
                 .unwrap();
+            assert_eq!(f.index.has_remaps(&f.schema.table_id).unwrap(), lazy);
         }
         assert_eq!(
             f.catalog
@@ -828,6 +854,22 @@ async fn concurrent_prepared_recovery_survives_lost_response_and_complete_index_
             snapshot_count
         );
         verify(&f, &base, &late, &committed, lose_index).await;
+        // CDC after recovery updates and deletes rows the rewrite moved.
+        f.head = committed.clone();
+        cdc(
+            &mut f,
+            120,
+            vec![(16, Change::Update(updated(16))), (17, Change::Delete)],
+        )
+        .await;
+        let mut rows = expected();
+        rows.retain(|row| ![16, 17].contains(&id_of(row)));
+        rows.push(updated(16));
+        assert_eq!(
+            sorted(scan(&f.head, &f.schema).await.unwrap()),
+            sorted(rows)
+        );
+        assert_index_exact(&f, &f.head, &format!("after-recovery-{lazy}-{lose_index}")).await;
     }
 }
 
@@ -1443,4 +1485,112 @@ async fn lazy_remap_build_catches_up_and_later_cdc_targets_translated_rows() {
         indexed += rows;
     }
     assert_eq!(indexed, expected_rows.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_lazy_compaction_commits_a_remap_instead_of_row_deltas() {
+    let mut f = Fixture::new().await;
+    let lazy = lazy_maintenance(&f);
+    let table_id = f.schema.table_id;
+    cdc(
+        &mut f,
+        90,
+        vec![(16, Change::Insert(row(16))), (17, Change::Insert(row(17)))],
+    )
+    .await;
+    let mut expected_rows = f.expected.clone();
+    expected_rows.extend([row(16), row(17)]);
+    let minor = f.locations[6].data_file_id.clone();
+    let raw_minor = f
+        .index
+        .file_rows(&table_id, &minor)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!raw_minor.is_empty());
+
+    // The strict path fences the table for the whole rewrite; with the flag on
+    // it publishes a remap, so no moved row is rewritten in the index.
+    let head = f.head.clone();
+    lazy.compact(&head, &f.schema, f.scratch("strict-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(head.identifier()).await.unwrap();
+    assert!(f.index.has_remaps(&table_id).unwrap());
+    assert!(
+        !SnapshotView::current(&f.head)
+            .await
+            .unwrap()
+            .live_files
+            .contains_key(&minor.0),
+        "the L0 input was rewritten"
+    );
+    assert_eq!(
+        f.index
+            .file_rows(&table_id, &minor)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        raw_minor,
+        "no per-row delta moved the retired input's entries"
+    );
+    assert!(f.index.pending_operations().unwrap().is_empty());
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "strict-audit-1").await;
+
+    // CDC updates and deletes moved rows; position deletes must target the
+    // translated locations in the strict output.
+    cdc(
+        &mut f,
+        100,
+        vec![
+            (10, Change::Update(updated(10))),
+            (13, Change::Delete),
+            (16, Change::Update(updated(16))),
+            (18, Change::Insert(row(18))),
+        ],
+    )
+    .await;
+    expected_rows.retain(|row| ![10, 13, 16].contains(&id_of(row)));
+    expected_rows.extend([updated(10), updated(16), row(18)]);
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "strict-audit-2").await;
+
+    // A second strict rewrite chains through the first remap.
+    let head = f.head.clone();
+    lazy.compact(&head, &f.schema, f.scratch("strict-2"))
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(head.identifier()).await.unwrap();
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "strict-audit-3").await;
+    cdc(
+        &mut f,
+        110,
+        vec![
+            (14, Change::Delete),
+            (17, Change::Update(updated(17))),
+            (18, Change::Delete),
+        ],
+    )
+    .await;
+    expected_rows.retain(|row| ![14, 17, 18].contains(&id_of(row)));
+    expected_rows.push(updated(17));
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "strict-audit-4").await;
+    f.index.materialize_remaps(&table_id).unwrap();
+    assert!(!f.index.has_remaps(&table_id).unwrap());
+    assert_index_exact(&f, &f.head, "strict-audit-5").await;
 }

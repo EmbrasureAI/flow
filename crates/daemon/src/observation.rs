@@ -469,6 +469,13 @@ pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
     }
 }
 
+/// Lazy index remaps that forward reads of the table may translate through.
+pub(crate) fn table_remaps(table: TableId, stats: &flow_state_store::RemapStats) {
+    let table = table.0.to_string();
+    metrics::gauge!("flow_index_remap_files", "table_id" => table.clone()).set(stats.files as f64);
+    metrics::gauge!("flow_index_remap_max_depth", "table_id" => table).set(stats.max_depth as f64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

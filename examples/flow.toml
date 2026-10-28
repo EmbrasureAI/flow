@@ -116,10 +116,15 @@ prefetch_file_bytes = 4194304
 # l2_target_bytes = 536870912
 # Files younger than this are not rewritten unless publication is paused.
 # min_file_age_ms = 1000
-# Experimental: background data builds of keyed tables record one remap per
-# input file instead of rewriting each moved row's index entry. See
-# docs/local-compaction.md.
-# lazy_index_remap = false
+# Data rewrites of keyed tables record one remap per input file instead of
+# rewriting each moved row's index entry. See docs/local-compaction.md.
+# lazy_index_remap = true
+# Periodic maintenance materializes remaps while more retired files keep one,
+# or a lookup may translate through more hops, rewriting at most
+# remap_cleanup_rows index entries per visit.
+# remap_max_files = 512
+# remap_max_depth = 8
+# remap_cleanup_rows = 32768
 
 # Optional: replicate the journal and control state to object storage, so a
 # worker and its whole state volume can be replaced without losing changes

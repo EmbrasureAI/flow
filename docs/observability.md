@@ -138,6 +138,8 @@ No separate export task is created.
 | `flow_table_l0_files`, `flow_table_l0_bytes`, `flow_table_oldest_l0_seconds`, `flow_table_small_files`, `flow_table_*delete_files`, `flow_table_reclaimable_bytes`, `flow_table_manifest*`, `flow_table_publication_pressure` | L0 count, bytes and oldest-file age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
+| `flow_index_remap_files`, `flow_index_remap_max_depth` | Retired data files whose lazy index remap is still kept, and the longest translation chain in hops; periodic maintenance keeps them within `remap_max_files` and `remap_max_depth` |
+| `flow_index_remaps_dropped_total`, `flow_index_remap_rows_materialized_total` | Remaps dropped by cleanup, and index entries it rewrote to their translated location |
 | `flow_compaction_finalization_actor_lane_hold_seconds` | Completed data-build finalization from actual table-lane reservation through cleanup and lane release |
 | `flow_compaction_preparation_handoff_actor_lane_hold_seconds` | Actor time used to validate and hand a completed build to detached preparation; separate from finalization |
 | `flow_compaction_publication_stall_seconds` | Same-table publication gate from preparation handoff through activation, invalidation or preparation deadline expiry |

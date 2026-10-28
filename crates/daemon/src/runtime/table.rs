@@ -1431,7 +1431,48 @@ impl TableWork {
     async fn metadata_due(&self, table: &Table, id: TableId, manifests: usize) -> Result<bool> {
         Ok(self.manifests_due(id, manifests, MetadataScope::Full)?
             || self.garbage_due(id)?
+            || self.remaps_due(id)?
             || self.history_due(table, id, MetadataScope::Full).await?)
+    }
+
+    /// Whether the table's lazy index remaps exceed their limits, from sizes
+    /// the index caches until the next remap commit or cleanup.
+    fn remaps_due(&self, id: TableId) -> Result<bool> {
+        let stats = self.store.remap_stats(&id)?;
+        crate::observation::table_remaps(id, &stats);
+        Ok(stats.exceeds(&self.config.compaction.remap_limits()))
+    }
+
+    /// One bounded remap cleanup pass on the table actor. Dropping remaps
+    /// nothing needs is free; materializing rows is limited to
+    /// `remap_cleanup_rows` in row-lock batches and needs no table fence.
+    /// Returns whether another pass is due.
+    async fn clean_remaps(&self, id: TableId) -> Result<bool> {
+        let store = self.store.clone();
+        let limits = self.config.compaction.remap_limits();
+        let started = Instant::now();
+        let cleanup =
+            tokio::task::spawn_blocking(move || store.clean_remaps(&id, &limits)).await??;
+        crate::observation::table_remaps(id, &cleanup.stats);
+        if cleanup.dropped_files > 0 || cleanup.rewritten_rows > 0 {
+            let table = id.0.to_string();
+            metrics::counter!("flow_index_remaps_dropped_total", "table_id" => table.clone())
+                .increment(cleanup.dropped_files);
+            metrics::counter!("flow_index_remap_rows_materialized_total", "table_id" => table)
+                .increment(cleanup.rewritten_rows);
+            tracing::info!(
+                event = "index_remaps_cleaned",
+                table_id = id.0,
+                dropped_files = cleanup.dropped_files,
+                rewritten_rows = cleanup.rewritten_rows,
+                remap_files = cleanup.stats.files,
+                remap_max_depth = cleanup.stats.max_depth,
+                continuation = cleanup.continuation,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "lazy index remaps cleaned"
+            );
+        }
+        Ok(cleanup.continuation)
     }
 
     /// Record the outcome of one metadata maintenance task. A table-scoped
@@ -1496,8 +1537,9 @@ impl TableWork {
     }
 
     /// Run on the table actor independently of soft data debt. Garbage collection
-    /// visits one bounded page, then yields before its continuation is admitted.
-    /// Returns the head, whether garbage collection continues, and the head's
+    /// visits one bounded page, and a full visit one bounded remap cleanup pass,
+    /// then yields before its continuation is admitted. Returns the head,
+    /// whether garbage collection or remap cleanup continues, and the head's
     /// manifest count.
     async fn maintain_metadata(
         &self,
@@ -1595,7 +1637,9 @@ impl TableWork {
                     .record(started.elapsed().as_secs_f64());
             }
         }
-        Ok((current, garbage_pending, manifests))
+        // Remaps are local index state; their cleanup needs no catalog.
+        let remaps_pending = scope == MetadataScope::Full && self.clean_remaps(id).await?;
+        Ok((current, garbage_pending || remaps_pending, manifests))
     }
 }
 
@@ -2747,5 +2791,107 @@ mod metadata_maintenance_tests {
             .unwrap_err();
         assert_eq!(publication_error_code(&error), Some("maintenance_pressure"));
         assert!(retry_table_work(&error));
+    }
+
+    /// Remaps over their limits make a periodic visit due; each visit runs
+    /// one bounded cleanup pass and continues until the remaps are gone.
+    #[tokio::test]
+    async fn periodic_visits_materialize_remaps_in_bounded_passes() {
+        let mut f = fixture(|_| {}, 4).await;
+        let id = f.schema.table_id;
+        let keys: Vec<_> = (1..=4)
+            .map(|n| {
+                f.schema
+                    .encode_key(&vec![Value::Int64(n), Value::String("kept".into())])
+                    .unwrap()
+            })
+            .collect();
+        // A strict lazy rewrite of the four one-row seed files.
+        let policy = flow_compactor::Policy {
+            l0_soft_files: 2,
+            stable_small_soft_files: 2,
+            min_file_age_ms: 0,
+            lazy_index_remap: true,
+            ..Default::default()
+        };
+        let scratch = StateStore::open(
+            f._root.path().join("compaction-scratch"),
+            StateStoreOptions::default(),
+        )
+        .unwrap();
+        TableMaintenance::new(
+            f.work.store.clone(),
+            f.work.catalog.clone(),
+            policy,
+            crate::services::writer_config(&f.work.config),
+        )
+        .unwrap()
+        .compact(&f.head, &f.schema, scratch)
+        .await
+        .unwrap()
+        .unwrap();
+        f.head = load(&f).await;
+        assert!(f.work.store.has_remaps(&id).unwrap());
+        let locations = f.work.store.lookup_many(&id, &keys).unwrap();
+        assert!(locations.iter().all(Option::is_some));
+
+        // Within the default limits nothing is due.
+        f.work
+            .garbage_checked
+            .lock()
+            .unwrap()
+            .insert(id, Instant::now());
+        assert!(!f.work.remaps_due(id).unwrap());
+        let mut config = (*f.work.config).clone();
+        config.compaction.remap_max_files = 0;
+        config.compaction.remap_cleanup_rows = 1;
+        f.work.config = Arc::new(config);
+        assert!(f.work.remaps_due(id).unwrap());
+        assert!(f.work.metadata_due(&f.head, id, 1).await.unwrap());
+
+        let mut visits = 0;
+        loop {
+            visits += 1;
+            let completion = f
+                .work
+                .clone()
+                .run(
+                    f.schema.clone(),
+                    vec![],
+                    WorkOptions {
+                        periodic_maintenance: true,
+                        ..options()
+                    },
+                    None,
+                    None,
+                    PrefoldLink::default(),
+                )
+                .await
+                .unwrap();
+            let TableOutcome::PeriodicComplete { next_due } = completion.outcome else {
+                panic!("expected a periodic visit");
+            };
+            if next_due.is_none() {
+                break;
+            }
+            assert!(visits < 10, "cleanup must make progress");
+        }
+        // One row per visit; the last visit also drops the drained remaps.
+        assert_eq!(visits, 4);
+        assert!(!f.work.store.has_remaps(&id).unwrap());
+        assert!(!f.work.remaps_due(id).unwrap());
+        assert_eq!(f.work.store.lookup_many(&id, &keys).unwrap(), locations);
+        for location in locations.into_iter().flatten() {
+            assert_eq!(
+                f.work
+                    .store
+                    .file_rows(&id, &location.data_file_id)
+                    .filter_map(|row| row.ok())
+                    .filter(|(position, _)| *position == location.row_position)
+                    .count(),
+                1,
+                "reverse entries are exact after materialization"
+            );
+        }
     }
 }

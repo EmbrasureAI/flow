@@ -134,9 +134,6 @@ pub async fn compact(
     read_limits: &ReadLimits,
     cache: &ManifestCache,
 ) -> Result<WorkerOutput> {
-    // The strict path publishes without catch-up; it keeps per-row deltas.
-    let mut plan = plan;
-    plan.lazy_index_remap = false;
     let built = build_data(
         table,
         schema.clone(),
@@ -151,6 +148,11 @@ pub async fn compact(
     )
     .await?;
     let mut output = built.output;
+    if let Some(files) = output.lazy_files.take() {
+        // The table stays fenced from the build base through publication, so
+        // there is no late change to catch up: every output row is live.
+        output.lazy = Some(strict_lazy_remap(&output, files)?);
+    }
     if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
         retain_shared_legacy_deletes(&mut output, &built.base)?;
         return Ok(output);
@@ -158,6 +160,32 @@ pub async fn compact(
     output.delete_files =
         write_residuals(table, &schema, &output, &output.operation_id.0, config).await?;
     Ok(output)
+}
+
+/// The lazy remap of a strict build: the worker's per-input runs at the base,
+/// with every output row live. Apply still requires the retired inputs'
+/// indexed counts at the fenced head to equal the outputs' rows.
+fn strict_lazy_remap(output: &WorkerOutput, files: Vec<FileRemap>) -> Result<LazyRemap> {
+    ensure!(
+        files
+            .iter()
+            .all(|remap| output.plan.input_files.contains(&remap.source)),
+        "lazy remap names a file outside the plan"
+    );
+    let output_live_rows: Vec<_> = output
+        .data_files
+        .iter()
+        .map(|file| (FileId(file.file_path().to_owned()), file.record_count()))
+        .collect();
+    ensure!(
+        files.iter().map(FileRemap::survivors).sum::<u64>()
+            == output_live_rows.iter().map(|(_, rows)| rows).sum::<u64>(),
+        "lazy remap and output files disagree on the moved rows"
+    );
+    Ok(LazyRemap {
+        files,
+        output_live_rows,
+    })
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {

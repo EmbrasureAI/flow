@@ -16,7 +16,9 @@ mod sst_staging_profile;
 pub use buffer::{Bound, BufferResult, CollapseBuffer, MemoryRows};
 pub use control::{CheckpointRecord, ControlMirror, ControlRestore, ControlStore, GenerationState};
 pub use reader::{IndexSnapshot, RowIndex};
-pub use remap::{FileRemap, LazyRemap, RemapRun, RemapTarget};
+pub use remap::{
+    FileRemap, LazyRemap, RemapCleanup, RemapLimits, RemapRun, RemapStats, RemapTarget,
+};
 pub use spool::{Change, CollapsedMutation};
 
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId};
@@ -46,7 +48,8 @@ const DELTAS: &str = "index_deltas";
 const TABLES: &str = "table_state";
 const SPOOL: &str = "transaction_mutations";
 const SOURCE: &str = "source_transactions";
-// Experimental lazy rewrite remaps, keyed like FILE_COUNTS by retired file.
+// Lazy rewrite remaps, keyed like FILE_COUNTS by retired file. Every index
+// has this family, so binaries that predate it refuse to open the index.
 const REMAPS: &str = "file_remaps";
 const STATE_COLUMN_FAMILIES: [&str; 9] = [
     PK,
