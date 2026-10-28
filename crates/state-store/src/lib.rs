@@ -12,7 +12,7 @@ mod spool;
 #[cfg(all(test, feature = "sst-profile"))]
 #[path = "../tests/profiles/sst_staging.rs"]
 mod sst_staging_profile;
-pub use buffer::{BufferResult, CollapseBuffer, MemoryRows};
+pub use buffer::{Bound, BufferResult, CollapseBuffer, MemoryRows};
 pub use control::{CheckpointRecord, ControlMirror, ControlRestore, ControlStore, GenerationState};
 pub use reader::{IndexSnapshot, RowIndex};
 pub use spool::{Change, CollapsedMutation};
@@ -113,6 +113,10 @@ pub struct StateStoreOptions {
     /// demand, so a large index cannot exhaust the process descriptor limit.
     /// `-1` keeps every table file open.
     pub max_open_files: i32,
+    /// Skip the write-ahead log and fsyncs. Only for scratch stores that are
+    /// deleted rather than reopened after a crash; they cannot have a control
+    /// store. A clean close still flushes, so reopening in-process is safe.
+    pub ephemeral: bool,
 }
 impl Default for StateStoreOptions {
     fn default() -> Self {
@@ -122,17 +126,20 @@ impl Default for StateStoreOptions {
             apply_batch_rows: 1024,
             apply_lookup_rows: 1024,
             max_open_files: 4096,
+            ephemeral: false,
         }
     }
 }
 impl StateStoreOptions {
-    /// A short-lived store that one build writes once and then reads, such as
-    /// compaction scratch. Larger memtables flush a quarter as often, so
-    /// RocksDB rewrites the staged mappings far fewer times before the build
-    /// ends. Each running build may hold up to two such memtables.
+    /// A short-lived store that one build writes once, reads and then
+    /// discards, such as compaction scratch, which startup deletes after a
+    /// crash. Larger memtables flush a quarter as often, so RocksDB rewrites
+    /// the staged mappings far fewer times before the build ends. Each running
+    /// build may hold up to two such memtables.
     pub fn scratch() -> Self {
         Self {
             write_buffer_bytes: 64 << 20,
+            ephemeral: true,
             ..Self::default()
         }
     }
@@ -284,6 +291,7 @@ struct Inner {
     control: Option<ControlStore>,
     revision: AtomicU64,
     failed: AtomicBool,
+    ephemeral: bool,
 }
 #[derive(Clone)]
 pub struct StateStore(Arc<Inner>);
@@ -319,6 +327,11 @@ impl StateStore {
                 "state store budgets must be positive".into(),
             ));
         }
+        if config.ephemeral && control.is_some() {
+            return Err(Error::InvalidState(
+                "a controlled index cannot skip its write-ahead log".into(),
+            ));
+        }
         if let Some(authority) = &control {
             authority.validate_index_path(path)?;
         }
@@ -350,6 +363,17 @@ impl StateStore {
             cf.set_write_buffer_size(config.write_buffer_bytes);
             cf.set_max_write_buffer_number(2);
             cf.set_compression_type(DBCompressionType::Lz4);
+            // L0 and L1 hold recent, short-lived data that compaction rewrites
+            // soon; compressing it costs flush and compaction CPU for little disk.
+            cf.set_compression_per_level(&[
+                DBCompressionType::None,
+                DBCompressionType::None,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+            ]);
             ColumnFamilyDescriptor::new(name, cf)
         });
         let db = DB::open_cf_descriptors(&options, path, columns)?;
@@ -388,6 +412,7 @@ impl StateStore {
             control,
             revision: AtomicU64::new(revision),
             failed: AtomicBool::new(false),
+            ephemeral: config.ephemeral,
         })))
     }
 
@@ -669,6 +694,13 @@ impl StateStore {
         let mut location_prefix = operation_prefix(id);
         location_prefix.push(2);
         location_prefix.extend_from_slice(&record.operation.table_id.0.to_be_bytes());
+        // While every batch sorts after the previous one, only each batch's
+        // largest key and location are kept: the next ordered batch compares
+        // against nothing else. The first unordered batch backfills full
+        // markers from the staged deltas, and the operation stays dense.
+        let mut dense_flag = operation_prefix(id);
+        dense_flag.push(3);
+        let mut dense = self.0.db.get_pinned_cf(&cf, &dense_flag)?.is_some();
         let mut ordinal = delta_key(id, 0);
         let ordinal_offset = ordinal.len() - size_of::<u64>();
         let mut encoded = Vec::new();
@@ -690,14 +722,7 @@ impl StateStore {
                     ));
                 }
                 if let Some(location) = &delta.replacement {
-                    let mut target = Vec::with_capacity(
-                        location_prefix.len()
-                            + 2 * size_of::<u64>()
-                            + location.data_file_id.0.len(),
-                    );
-                    target.extend_from_slice(&location_prefix);
-                    append_component(&mut target, location.data_file_id.0.as_bytes());
-                    target.extend_from_slice(&location.row_position.to_be_bytes());
+                    let target = location_marker(&location_prefix, location);
                     if !batch_locations.insert(target) {
                         return Err(Error::InvalidState("duplicate output row location".into()));
                     }
@@ -715,11 +740,6 @@ impl StateStore {
             if record.delta_count == start {
                 return Ok(());
             }
-            // The sets retain marker bytes for both validation and the write;
-            // WriteBatch copies them, so staging needs no per-marker clone.
-            for marker in batch_keys.iter().chain(&batch_locations) {
-                batch.put_cf(&cf, marker, []);
-            }
             self.put(&mut batch, OPERATIONS, id.0.as_bytes(), &record)?;
             let build = build_started.elapsed();
             let lookup_started = Instant::now();
@@ -733,6 +753,22 @@ impl StateStore {
                 &location_prefix,
                 batch_locations.first().map(Vec::as_slice),
             )?;
+            if (check_keys || check_locations) && !dense {
+                self.backfill_delta_markers(&cf, &record, start, &unique_prefix, &location_prefix)?;
+                batch.put_cf(&cf, &dense_flag, []);
+                dense = true;
+            }
+            // The sets retain marker bytes for both validation and the write;
+            // WriteBatch copies them, so staging needs no per-marker clone.
+            if dense {
+                for marker in batch_keys.iter().chain(&batch_locations) {
+                    batch.put_cf(&cf, marker, []);
+                }
+            } else {
+                for marker in batch_keys.last().into_iter().chain(batch_locations.last()) {
+                    batch.put_cf(&cf, marker, []);
+                }
+            }
             if check_keys || check_locations {
                 // PK marker 1 sorts before location marker 2. Only families
                 // whose fresh range was not proven need the full sorted lookup.
@@ -770,6 +806,38 @@ impl StateStore {
                 .record(write_started.elapsed().as_secs_f64());
             result?;
         }
+    }
+
+    /// Write a marker for every delta staged before `end`. Rewriting a marker
+    /// that already exists is harmless, so this needs no record of which do.
+    fn backfill_delta_markers(
+        &self,
+        cf: &impl rocksdb::AsColumnFamilyRef,
+        record: &OperationRecord,
+        end: u64,
+        unique_prefix: &[u8],
+        location_prefix: &[u8],
+    ) -> Result<()> {
+        let mut staged = record.clone();
+        staged.delta_count = end;
+        let mut batch = StateBatch::default();
+        let mut pending = 0;
+        for delta in sealed_deltas(&self.0.db, &staged) {
+            let delta = delta?;
+            let mut unique = Vec::with_capacity(unique_prefix.len() + delta.key.0.len());
+            unique.extend_from_slice(unique_prefix);
+            unique.extend_from_slice(&delta.key.0);
+            batch.put_cf(cf, unique, []);
+            if let Some(location) = &delta.replacement {
+                batch.put_cf(cf, location_marker(location_prefix, location), []);
+            }
+            pending += 1;
+            if pending == self.0.batch_rows {
+                self.write_staged(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+        }
+        self.write_staged(batch)
     }
 
     // Callers hold the row writer lock and separately validate batch uniqueness.
@@ -1264,7 +1332,7 @@ impl StateStore {
             control.commit_index(self, &mut batch)
         } else {
             let observation = WriteObservation::capture(&batch.index);
-            self.0.db.write_opt(batch.index, &durable_write())?;
+            self.0.db.write_opt(batch.index, &self.durable_write())?;
             Ok(observation)
         }
     }
@@ -1272,14 +1340,29 @@ impl StateStore {
     /// The next revision-bearing write syncs the index WAL, including this
     /// prefix, before any control revision names it. Staged batches after the
     /// last such write may be lost and are replayed or discarded under their
-    /// durable publication fence. Never disable the WAL here.
+    /// durable publication fence. Never disable the WAL here, except for an
+    /// ephemeral scratch store, which is deleted instead of recovered.
     fn write_staged(&self, batch: StateBatch) -> Result<()> {
         self.write_staged_observed(batch).map(|_| ())
     }
     fn write_staged_observed(&self, batch: StateBatch) -> Result<WriteObservation> {
         let observation = WriteObservation::capture(&batch.index);
-        self.0.db.write_opt(batch.index, &WriteOptions::default())?;
+        self.0.db.write_opt(batch.index, &self.staged_write())?;
         Ok(observation)
+    }
+
+    fn durable_write(&self) -> WriteOptions {
+        if self.0.ephemeral {
+            self.staged_write()
+        } else {
+            durable_write()
+        }
+    }
+
+    fn staged_write(&self) -> WriteOptions {
+        let mut options = WriteOptions::default();
+        options.disable_wal(self.0.ephemeral);
+        options
     }
 
     fn scan(&self, cf: &str, prefix: Vec<u8>) -> impl Iterator<Item = Result<RawEntry>> + '_ {
@@ -1478,6 +1561,14 @@ fn reverse_key(table: &TableId, location: &RowLocation) -> Vec<u8> {
     let mut result = file_prefix(table, &location.data_file_id);
     result.extend_from_slice(&location.row_position.to_be_bytes());
     result
+}
+fn location_marker(prefix: &[u8], location: &RowLocation) -> Vec<u8> {
+    let mut target =
+        Vec::with_capacity(prefix.len() + 2 * size_of::<u64>() + location.data_file_id.0.len());
+    target.extend_from_slice(prefix);
+    append_component(&mut target, location.data_file_id.0.as_bytes());
+    target.extend_from_slice(&location.row_position.to_be_bytes());
+    target
 }
 fn operation_prefix(id: &OperationId) -> Vec<u8> {
     // Delta keys append a marker and ordinal to this prefix.
