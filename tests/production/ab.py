@@ -142,6 +142,9 @@ def main():
     parser.add_argument("--candidate-args", default="", help="extra benchmark.py arguments for the candidate side")
     parser.add_argument("--artifacts", type=Path, help="output directory (default target/ab/runs/<time>)")
     parser.add_argument("--keep-state", action="store_true", help="keep each run's state directory")
+    parser.add_argument("--reader-compare", action="store_true",
+                        help="also compare each final layout with an independently compacted copy, "
+                             "using each side's own local_compactor")
     parser.add_argument("--warm", metavar="REVISION", help="only build REVISION, to fill the build cache")
     args = parser.parse_args()
     if args.warm:
@@ -171,7 +174,9 @@ def main():
         fixture("gc-slots")
         directory = artifacts / f"{side}-{index}"
         print(f"[{datetime.datetime.now():%H:%M:%S}] {side} run {index}", flush=True)
-        code = run(sides[side], directory, common + extra[side])
+        reader = (["--reader-baseline-compactor", str(sides[side] / "local_compactor")]
+                  if args.reader_compare else [])
+        code = run(sides[side], directory, common + extra[side] + reader)
         if not (directory / "report.json").exists():
             raise SystemExit(f"{side} run {index} produced no report (exit {code}); see {directory}.log")
         row = summarize(directory)
