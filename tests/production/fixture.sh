@@ -10,7 +10,9 @@
 # Environment: FLOW_FIXTURE_PROJECT (default flow-production-local), the ports
 # in target/production-local/ports.env (created with defaults if absent) and
 # FLOW_FIXTURE_REPOSITORY (default EmbrasureAI/flow), whose CI artifacts supply
-# prebuilt MinIO images.
+# prebuilt MinIO images. FLOW_PRODUCTION_WAREHOUSE=s3://bucket/prefix/ points
+# the catalog at real S3 with the caller's AWS credentials; see
+# compose.aws-s3.yaml.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -52,6 +54,9 @@ compose() {
   # Some VMs cannot apply cgroup CPU or memory limits. Record that the services then run unbounded.
   if ! docker run --rm --cpus 1 --memory 64m "$minio_image" --version >/dev/null 2>&1; then
     files+=(-f "$root/tests/production/compose.unlimited.yaml")
+  fi
+  if [[ -n ${FLOW_PRODUCTION_WAREHOUSE:-} ]]; then
+    files+=(-f "$root/tests/production/compose.aws-s3.yaml")
   fi
   docker compose --env-file "$ports" -p "$project" "${files[@]}" "$@"
 }
@@ -113,7 +118,7 @@ case ${1:-} in
     "$0" up
     ;;
   *)
-    sed -n '2,13p' "$0" >&2
+    sed -n '2,15p' "$0" >&2
     exit 2
     ;;
 esac

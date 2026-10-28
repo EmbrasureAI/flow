@@ -26,6 +26,8 @@ tests/production/ab.py --base HEAD --candidate HEAD \
 
 `fixture.sh up` starts Docker detached from the calling shell, loads the MinIO images from the newest unexpired `minio-images` artifact of the service integration workflow (kept for a day) when `gh` is authenticated, otherwise builds them from source in a few minutes, and adds `compose.unlimited.yaml` when the host cannot apply cgroup limits. Record that the services then run unbounded. On a fresh dnf-based VM, run `cloud_setup.sh` once before benchmarking. It installs the toolchain and prerequisites, starts the fixture, and warms the `bench-fast` build of `origin/main` in the background. Setup takes about 3 minutes; the background build takes about 9 more.
 
+To measure against real Amazon S3 instead of MinIO, export AWS credentials and `FLOW_PRODUCTION_WAREHOUSE=s3://bucket/prefix/` before `fixture.sh up`; it then adds `compose.aws-s3.yaml`, which points the REST catalog's warehouse at that location. Pass the same URL as `--warehouse` and `--s3-endpoint https://s3.<region>.amazonaws.com` to `benchmark.py` (through `--args` for `ab.py`). The reader's DuckDB secret includes `AWS_SESSION_TOKEN` when it is set, so temporary credentials work, but the catalog container keeps the credentials it started with: rerun `fixture.sh up` with fresh ones before they expire. Runs leave their data under the prefix; remove it yourself.
+
 ## Start persistent services
 
 Choose three free loopback ports. If a port is occupied, select another; do not stop the existing process. Save the selected values in an ignored local environment file:
