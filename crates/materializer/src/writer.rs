@@ -6,6 +6,7 @@ use flow_iceberg_ext::{ArtifactSet, ArtifactTracker};
 use flow_model::{
     ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableSchema, Value, fingerprint,
 };
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use iceberg::{
     arrow::schema_to_arrow_schema,
     io::FileIO,
@@ -522,7 +523,14 @@ pub(crate) struct ParquetDeleteWriter {
     last: Option<(String, u64)>,
     file_paths: Option<(String, String)>,
     spec_id: i32,
+    /// Files closing concurrently; see [`Self::finish_file_concurrently`].
+    closing: FuturesUnordered<BoxFuture<'static, Result<Vec<DataFile>>>>,
+    closed_concurrently: bool,
 }
+
+/// Small per-target files cost one object upload each. Overlap that many.
+const MAX_CONCURRENT_CLOSES: usize = 8;
+
 impl ParquetDeleteWriter {
     pub fn new(
         file_io: FileIO,
@@ -570,6 +578,8 @@ impl ParquetDeleteWriter {
             last: None,
             file_paths: None,
             spec_id,
+            closing: FuturesUnordered::new(),
+            closed_concurrently: false,
         })
     }
     pub async fn write(&mut self, positions: &[RowLocation]) -> Result<()> {
@@ -671,12 +681,40 @@ impl ParquetDeleteWriter {
     /// Calling this without an open file is a no-op. Global path/position ordering
     /// and uniqueness remain enforced across rotations; artifact names are never reused.
     pub async fn finish_file(&mut self) -> Result<()> {
-        if let Some(writer) = self.current.take() {
-            let (first, last) = self.file_paths.take().context("delete file has no rows")?;
+        if let Some(close) = self.take_file()? {
+            self.files.extend(close.await?);
+        }
+        Ok(())
+    }
+
+    /// [`Self::finish_file`], but the closed file's upload overlaps later
+    /// writes, up to [`MAX_CONCURRENT_CLOSES`] at once. `close` waits for all
+    /// of them; dropping the writer cancels unfinished uploads.
+    pub async fn finish_file_concurrently(&mut self) -> Result<()> {
+        if let Some(close) = self.take_file()? {
+            self.closing.push(close);
+            self.closed_concurrently = true;
+            while self.closing.len() >= MAX_CONCURRENT_CLOSES {
+                let files = self.closing.next().await.expect("pending close")?;
+                self.files.extend(files);
+            }
+        }
+        Ok(())
+    }
+
+    fn take_file(&mut self) -> Result<Option<BoxFuture<'static, Result<Vec<DataFile>>>>> {
+        self.row_group = RowGroupBudget::default();
+        let Some(writer) = self.current.take() else {
+            return Ok(None);
+        };
+        let (first, last) = self.file_paths.take().context("delete file has no rows")?;
+        let spec_id = self.spec_id;
+        Ok(Some(Box::pin(async move {
+            let mut files = Vec::new();
             for mut file in writer.close().await? {
                 file.content(DataContentType::PositionDeletes)
                     .partition(Struct::empty())
-                    .partition_spec_id(self.spec_id);
+                    .partition_spec_id(spec_id);
                 // Parquet's string statistics can be omitted or truncated. These
                 // exact bounds let readers exclude unrelated delete-file ranges.
                 let metadata = file.build()?;
@@ -685,14 +723,22 @@ impl ParquetDeleteWriter {
                 lower.insert(RESERVED_FIELD_ID_DELETE_FILE_PATH, Datum::string(&first));
                 upper.insert(RESERVED_FIELD_ID_DELETE_FILE_PATH, Datum::string(&last));
                 file.lower_bounds(lower).upper_bounds(upper);
-                self.files.push(file.build()?);
+                files.push(file.build()?);
             }
-        }
-        self.row_group = RowGroupBudget::default();
-        Ok(())
+            Ok(files)
+        })))
     }
+
     pub async fn close(mut self) -> Result<Vec<DataFile>> {
         self.finish_file().await?;
+        while let Some(files) = self.closing.next().await {
+            self.files.extend(files?);
+        }
+        if self.closed_concurrently {
+            // Uploads finish in any order; artifact names follow write order.
+            self.files
+                .sort_by(|left, right| left.file_path().cmp(right.file_path()));
+        }
         Ok(self.files)
     }
 }

@@ -105,6 +105,10 @@ prefetch_file_bytes = 4194304
 # rewrite; "current" restores the previous count-driven data rewrites. Format
 # v3 tables always use "current".
 # delete_debt = "consolidate"
+# "per_target" makes delete consolidation and data-rewrite residuals write one
+# position-delete file per target data file, merging a target's files by size
+# tier, instead of shared files. Format v3 tables always use "shared".
+# delete_layout = "shared"
 # Bounds of one rewrite group and its applicable delete inputs.
 # min_group_files = 2
 # max_group_files = 32

@@ -405,20 +405,25 @@ impl TableMaintenance {
             .map(|entry| entry.file_path())
             .collect::<BTreeSet<_>>()
             .len();
+        let policy = self
+            .policy
+            .for_format_version(table.metadata().format_version());
+        let per_target = policy.delete_layout == flow_compactor::DeleteLayout::PerTarget;
         let legacy_delete_count = view
             .live_files
             .values()
             .filter(|entry| {
                 entry.content_type() == DataContentType::PositionDeletes
                     && entry.file_format() != iceberg::spec::DataFileFormat::Puffin
+                    && !(per_target && view.single_target(entry).is_some())
             })
             .count();
         // Legacy shared/dangling files add planning work across targets. A DV
         // is scoped to one file; sparse vectors on healthy files are not global
-        // debt. Per-file density still schedules reclamation.
-        let debt = self
-            .policy
-            .debt_with_shared_deletes(&files, legacy_delete_count)?;
+        // debt. Per-file density still schedules reclamation. With the
+        // per-target layout, a file whose every position targets one live data
+        // file is charged to that file's count alone, like a vector.
+        let debt = policy.debt_with_shared_deletes(&files, legacy_delete_count)?;
         Ok(Inventory {
             files,
             deletes,
@@ -637,6 +642,7 @@ impl TableMaintenance {
         };
         let id = operation.id.clone();
         let selection_reason = output.plan.reason;
+        let residual_delete_rows = output.residual_delete_rows;
         // Physical output includes rows masked during catch-up. It is not the
         // number of surviving mappings or the catalog's logical row count.
         let output_data_files = output.data_files.len();
@@ -725,6 +731,7 @@ impl TableMaintenance {
             output_data_bytes,
             output_delete_files,
             output_delete_rows,
+            residual_delete_rows,
             output_delete_bytes,
             worker_ms = context.worker_ms,
             prepare_ms,

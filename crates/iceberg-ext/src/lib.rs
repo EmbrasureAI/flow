@@ -25,7 +25,7 @@ pub use artifacts::{
 };
 pub use manifests::{ManifestRewritePolicy, RewriteManifestsAction};
 pub use plan::{ArtifactPlan, read_artifact_plan, write_artifact_plan};
-pub use snapshot::{ManifestCache, SnapshotView, position_delete_may_apply};
+pub use snapshot::{ManifestCache, SnapshotView, exact_delete_target, position_delete_may_apply};
 pub use validation::{CommitBase, find_operation};
 
 fn invalid(message: impl Into<String>) -> iceberg::Error {

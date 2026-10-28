@@ -128,6 +128,19 @@ impl DeleteWriter {
         }
     }
 
+    /// Close the current position-delete file at a target boundary, letting
+    /// its upload overlap the next targets' files. V3 already writes one
+    /// vector per target and rotates like [`Self::finish_file`].
+    pub async fn finish_target(&mut self) -> Result<()> {
+        match &mut self.inner {
+            Writer::Parquet(writer) => writer.finish_file_concurrently().await,
+            Writer::Puffin(writer) => {
+                writer.rotate = true;
+                Ok(())
+            }
+        }
+    }
+
     pub async fn close(self) -> Result<Vec<DataFile>> {
         match self.inner {
             Writer::Parquet(writer) => writer.close().await,

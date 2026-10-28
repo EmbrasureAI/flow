@@ -1124,8 +1124,14 @@ impl TableWork {
 
     fn prefers_delete_rewrite(&self, inventory: &flow_coordinator::Inventory) -> bool {
         let policy = self.delete_policy(inventory);
+        // Per-target files are charged to their own target's count, not
+        // table-wide, so only shared files make consolidation preferable here.
+        let table_wide = match policy.delete_layout {
+            flow_compactor::DeleteLayout::Shared => inventory.delete_file_count,
+            flow_compactor::DeleteLayout::PerTarget => inventory.debt.shared_delete_files,
+        };
         policy.consolidates_delete_debt(&inventory.debt)
-            || inventory.delete_file_count >= policy.delete_files_soft
+            || table_wide >= policy.delete_files_soft
                 && (policy.data_rewrite_scope != flow_compactor::DataRewriteScope::All
                     || !inventory
                         .files
@@ -1159,6 +1165,7 @@ impl TableWork {
             pressure = ?debt.pressure,
             pressure_reasons = reasons.join("+"),
             delete_debt = ?policy.delete_debt,
+            delete_layout = policy.delete_layout.as_str(),
             delete_files = inventory.delete_file_count,
             shared_delete_files = debt.shared_delete_files,
             max_delete_files = debt.max_delete_files,

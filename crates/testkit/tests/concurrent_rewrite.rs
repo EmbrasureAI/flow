@@ -1368,6 +1368,56 @@ fn id_of(row: &Row) -> i64 {
     }
 }
 
+/// With `delete_layout = "per_target"`, a caught-up build writes its residuals
+/// for unselected files and its masks for late deletes on its output as one
+/// single-target file per data file, and the rows and index stay exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_target_catch_up_writes_residuals_and_masks_per_data_file() {
+    let mut f = Fixture::new().await;
+    let per_target = TableMaintenance::new(
+        f.index.clone(),
+        f.catalog.clone(),
+        Policy {
+            lazy_index_remap: true,
+            delete_layout: flow_compactor::DeleteLayout::PerTarget,
+            ..compaction_policy()
+        },
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let (ready, base, late) = build_with_late_changes_using(&mut f, &per_target).await;
+    let prepared = per_target
+        .start_compaction_preparation(&late, &f.schema, ready)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    per_target
+        .activate_compaction(&late, &f.schema, prepared)
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(late.identifier()).await.unwrap();
+    assert_eq!(sorted(scan(&f.head, &f.schema).await.unwrap()), expected());
+    assert_index_exact(&f, &f.head, "per-target-audit").await;
+    let before = SnapshotView::current(&late).await.unwrap();
+    let after = SnapshotView::current(&f.head).await.unwrap();
+    let mut targets = std::collections::BTreeSet::new();
+    for (id, entry) in &after.live_files {
+        if entry.content_type() == DataContentType::PositionDeletes
+            && !before.live_files.contains_key(id)
+        {
+            let target = after
+                .single_target(entry)
+                .expect("residuals and masks target one data file");
+            assert!(targets.insert(target.file_path().to_owned()));
+        }
+    }
+    assert!(!targets.is_empty(), "late deletes leave masks or residuals");
+    verify(&f, &base, &late, &f.head, false).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lazy_remap_build_catches_up_and_later_cdc_targets_translated_rows() {
     let mut f = Fixture::new().await;

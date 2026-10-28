@@ -114,6 +114,17 @@ From earlier development builds of `main`:
   vector, so consolidation cannot lower its count. A
   `maintenance_action_chosen` debug event and a `selection_reason` field on
   build and rewrite events record why each action ran.
+- Opt-in `[compaction] delete_layout = "per_target"` (default `"shared"`;
+  format v3 tables always use `"shared"`) makes v2 delete-only consolidation
+  and data-rewrite residuals write one position-delete file per target data
+  file. Consolidation merges a target's files by size tier, so it reads about
+  the new deletes instead of every accumulated one, and data rewrites of inputs
+  with only single-target deletes write no residual. On the default mixed
+  workload at 30,000 mutations/s for five minutes, commit-to-catalog p95 fell
+  from 7.6 s to 2.5 s and compaction stall by two thirds. CDC epochs still
+  write one shared delete file each. `delete_rewrite_completed`,
+  `compaction_completed` and `compaction_catch_up_completed` report the
+  layout, input kinds and residual rows.
 
 **Commands and configuration**
 

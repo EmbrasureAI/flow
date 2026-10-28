@@ -267,7 +267,12 @@ does not dilute finalization samples. Candidate invalidation events include stag
 bounded reason and the complete error chain.
 `delete_rewrite_completed` similarly
 records admitted rows, scanned rows and produced file/row/byte totals with its
-operation and catalog snapshot. These file sizes exclude metadata artifacts and
+operation and catalog snapshot. Its `delete_layout`, `shared_input_files`,
+`target_input_files`, `largest_rewritten_rows`, `output_targets` and
+`largest_output_rows` show whether a consolidation re-read accumulated
+single-target files. `compaction_completed` and `compaction_catch_up_completed`
+report `residual_delete_rows`, the output delete positions for unselected data
+files rather than masks on the rewrite's output. These file sizes exclude metadata artifacts and
 SDK traffic; process-wide storage counters remain a separate observation. `ingest_prepared`, `epoch_collapsed` and `epoch_completed`
 carry operation IDs in logs for correlation; operation IDs are never metric
 labels. ACK feedback timing ends when the coordinator sends feedback, before

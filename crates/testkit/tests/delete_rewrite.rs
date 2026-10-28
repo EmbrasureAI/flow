@@ -1827,3 +1827,474 @@ async fn repeated_updates_past_the_hard_delete_limit_recover_by_consolidation() 
         PgLsn(500)
     );
 }
+
+/// A keyed table with a 400-row L2 base under Zipf-like CDC: every epoch
+/// updates the same four hot keys again and three cold base rows for the first
+/// time. Deletes against the base accumulate, while hot deletes target the
+/// previous epoch's L0 file.
+struct Skewed {
+    temp: tempfile::TempDir,
+    catalog: std::sync::Arc<dyn Catalog>,
+    schema: flow_model::TableSchema,
+    head: iceberg::table::Table,
+    index: StateStore,
+    publisher: flow_coordinator::TablePublisher,
+    policy: Policy,
+    maintenance: TableMaintenance,
+    expected: std::collections::BTreeMap<i64, flow_model::Row>,
+    base: FileId,
+    epochs: u64,
+}
+
+/// What one consolidation read, by kind of input.
+#[derive(Debug)]
+struct Consolidated {
+    shared_rows: u64,
+    target_rows: u64,
+    /// Base deletes before it, in every file applying to the base.
+    accumulated_base_rows: u64,
+}
+
+impl Skewed {
+    async fn new(layout: flow_compactor::DeleteLayout) -> Self {
+        use flow_state_store::{ControlStore, IndexDelta};
+        let temp = tempfile::TempDir::new().unwrap();
+        let catalog: std::sync::Arc<dyn Catalog> =
+            std::sync::Arc::new(flow_testkit::catalog(&temp.path().join("warehouse")).await);
+        let schema = flow_testkit::schema(1);
+        let head = flow_testkit::table(catalog.as_ref(), &schema).await;
+        let expected = (0..400)
+            .map(|id| (id, Self::value(id, 0)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut writer = DataWriter::new(
+            head.file_io().clone(),
+            head.metadata().location(),
+            &OperationId("flow-l2-base".into()),
+            schema.clone(),
+            0,
+            WriterConfig::default(),
+        )
+        .unwrap();
+        let mut locations = writer
+            .write(&expected.values().cloned().collect::<Vec<_>>(), PgLsn(80))
+            .await
+            .unwrap()
+            .locations;
+        let base_files = writer.close().await.unwrap();
+        let base = FileId(base_files[0].file_path().to_owned());
+        let committed = RowDeltaAction::new(&head, "base-data")
+            .add_data_files(base_files)
+            .commit(catalog.as_ref(), &head)
+            .await
+            .unwrap();
+        for location in &mut locations {
+            location.data_sequence_number = committed.sequence_number;
+        }
+        let head = committed.table;
+        let control = ControlStore::open(temp.path().join("control")).unwrap();
+        let index = control
+            .initialize_index(temp.path().join("index"), options())
+            .unwrap();
+        let seed = OperationId("seed-index".into());
+        index
+            .prepare(
+                PreparedOperation {
+                    id: seed.clone(),
+                    table_id: schema.table_id,
+                    kind: OperationKind::Ingest,
+                    base_snapshot_id: None,
+                    last_lsn: PgLsn(80),
+                    schema_version: schema.version,
+                    artifacts: vec![],
+                    payload: vec![],
+                },
+                expected
+                    .values()
+                    .zip(&locations)
+                    .map(|(row, location)| IndexDelta {
+                        key: schema.encode_key(row).unwrap(),
+                        expected: None,
+                        replacement: Some(location.clone()),
+                    }),
+            )
+            .unwrap();
+        index
+            .mark_committed(
+                &seed,
+                head.metadata().current_snapshot_id().unwrap(),
+                head.metadata()
+                    .current_snapshot()
+                    .unwrap()
+                    .sequence_number(),
+            )
+            .unwrap();
+        index.apply_committed(&seed).unwrap();
+        index.forget_applied(&seed).unwrap();
+        let policy = Policy {
+            min_file_age_ms: 0,
+            // Isolate delete debt from L0 file count and age.
+            l0_soft_files: 200,
+            l0_hard_files: 400,
+            oldest_l0_soft_ms: 600_000,
+            oldest_l0_hard_ms: 1_200_000,
+            delete_layout: layout,
+            ..Policy::default()
+        };
+        let maintenance = TableMaintenance::new(
+            index.clone(),
+            catalog.clone(),
+            policy.clone(),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        let publisher = flow_coordinator::TablePublisher::new(
+            index.clone(),
+            catalog.clone(),
+            WriterConfig::default(),
+            2,
+            1 << 20,
+        )
+        .unwrap();
+        Self {
+            temp,
+            catalog,
+            schema,
+            head,
+            index,
+            publisher,
+            policy,
+            maintenance,
+            expected,
+            base,
+            epochs: 0,
+        }
+    }
+
+    fn value(id: i64, version: u64) -> flow_model::Row {
+        vec![Value::Int64(id), Value::String(format!("v{version}"))]
+    }
+
+    async fn reload(&mut self) {
+        self.head = self
+            .catalog
+            .load_table(self.head.identifier())
+            .await
+            .unwrap();
+    }
+
+    async fn epoch(&mut self) {
+        use flow_state_store::Change;
+        self.epochs += 1;
+        let epoch = self.epochs;
+        let cold = 100 + 3 * epoch as i64;
+        let changes = (0..4)
+            .chain(cold..cold + 3)
+            .map(|id| {
+                let row = Self::value(id, epoch);
+                self.expected.insert(id, row.clone());
+                (self.schema.encode_key(&row).unwrap(), Change::Update(row))
+            })
+            .collect::<Vec<_>>();
+        let (operation, collapsed) = flow_testkit::collapse_fixture(
+            &self.index,
+            &self.head,
+            &self.schema,
+            flow_model::SourceId("fixture".into()),
+            PgLsn(100 + epoch * 10),
+            changes,
+        );
+        self.publisher
+            .publish(&self.head, &self.schema, collapsed)
+            .await
+            .unwrap();
+        self.index.forget_applied(&operation.id).unwrap();
+        self.reload().await;
+    }
+
+    async fn consolidate(&mut self, min_input_files: usize) -> Option<Consolidated> {
+        let before = SnapshotView::current(&self.head).await.unwrap();
+        let accumulated_base_rows = before
+            .applicable_deletes(&self.base.0)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.data_file.record_count())
+            .sum();
+        self.maintenance
+            .compact_deletes(
+                &self.head,
+                &self.schema,
+                StateStore::open(
+                    self.temp
+                        .path()
+                        .join(format!("consolidate-{}", uuid::Uuid::new_v4())),
+                    options(),
+                )
+                .unwrap(),
+                &DeleteRewritePolicy {
+                    min_input_files,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()?;
+        self.reload().await;
+        let after = SnapshotView::current(&self.head).await.unwrap();
+        let (mut shared_rows, mut target_rows) = (0, 0);
+        for (id, entry) in &before.live_files {
+            if entry.content_type() != DataContentType::PositionDeletes
+                || after.live_files.contains_key(id)
+            {
+                continue;
+            }
+            if before.single_target(entry).is_some() {
+                target_rows += entry.data_file.record_count();
+            } else {
+                shared_rows += entry.data_file.record_count();
+            }
+        }
+        // Consolidation moves no data file and no row-index entry.
+        for (path, entry) in &before.live_files {
+            if entry.content_type() == DataContentType::Data {
+                assert_eq!(&after.live_files[path], entry);
+            }
+        }
+        if self.policy.delete_layout == flow_compactor::DeleteLayout::PerTarget {
+            // One output per target data file, each with exact bounds.
+            let mut targets = BTreeSet::new();
+            for (id, entry) in &after.live_files {
+                if entry.content_type() == DataContentType::PositionDeletes
+                    && !before.live_files.contains_key(id)
+                {
+                    let target = after.single_target(entry).expect("single-target output");
+                    assert!(targets.insert(target.file_path().to_owned()));
+                }
+            }
+        }
+        Some(Consolidated {
+            shared_rows,
+            target_rows,
+            accumulated_base_rows,
+        })
+    }
+
+    /// An ordinary Iceberg scan applies every delete, and every key's index
+    /// location is a live data file.
+    async fn check(&self) {
+        assert_eq!(
+            sorted(scan(&self.head, &self.schema).await.unwrap()),
+            self.expected.values().cloned().collect::<Vec<_>>()
+        );
+        let view = SnapshotView::current(&self.head).await.unwrap();
+        for row in self.expected.values() {
+            let location = self
+                .index
+                .lookup(&self.schema.table_id, &self.schema.encode_key(row).unwrap())
+                .unwrap()
+                .unwrap();
+            assert!(
+                view.live_files.contains_key(&location.data_file_id.0),
+                "{row:?}"
+            );
+        }
+        // Indexed live counts never exceed physical rows.
+        self.maintenance
+            .inventory(&self.head, self.schema.table_id)
+            .await
+            .unwrap();
+        assert!(self.index.pending_operations().unwrap().is_empty());
+    }
+
+    /// Run `epochs` of CDC, consolidating whenever delete-file count is due.
+    async fn run(&mut self, epochs: u64) -> Vec<Consolidated> {
+        let mut runs = Vec::new();
+        for _ in 0..epochs {
+            self.epoch().await;
+            let inventory = self
+                .maintenance
+                .inventory(&self.head, self.schema.table_id)
+                .await
+                .unwrap();
+            if !self.policy.consolidates_delete_debt(&inventory.debt) {
+                continue;
+            }
+            let run = self
+                .consolidate(self.policy.delete_files_soft.min(32))
+                .await
+                .expect("due delete-file count debt is consolidated");
+            let inventory = self
+                .maintenance
+                .inventory(&self.head, self.schema.table_id)
+                .await
+                .unwrap();
+            assert!(!self.policy.consolidates_delete_debt(&inventory.debt));
+            if self.policy.delete_layout == flow_compactor::DeleteLayout::PerTarget {
+                assert_eq!(inventory.debt.shared_delete_files, 0);
+                assert!(inventory.debt.max_delete_files <= self.policy.target_delete_files());
+            }
+            self.check().await;
+            runs.push(run);
+        }
+        runs
+    }
+}
+
+/// Under the skewed workload, shared consolidation re-reads every accumulated
+/// base delete each time. Per-target consolidation reads the new shared files
+/// and at most the smallest of a target's files, so its reads follow new
+/// deletes, and it keeps each data file within the per-target file cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_target_consolidation_reads_new_deletes_not_accumulated_ones() {
+    use flow_compactor::DeleteLayout;
+    let mut shared = Skewed::new(DeleteLayout::Shared).await;
+    let mut per_target = Skewed::new(DeleteLayout::PerTarget).await;
+    let shared_runs = shared.run(56).await;
+    let target_runs = per_target.run(56).await;
+    assert!(shared_runs.len() >= 5, "{shared_runs:?}");
+    assert!(target_runs.len() >= 5, "{target_runs:?}");
+    // Shared consolidation reads its previous output again, so each run reads
+    // at least every base delete accumulated so far.
+    for run in &shared_runs[1..] {
+        assert!(run.shared_rows >= run.accumulated_base_rows, "{run:?}");
+    }
+    // Per target, the rows rewritten from existing files stay within the new
+    // rows plus one forced merge of the smallest of four base tiers.
+    let cap = per_target.policy.target_delete_files() as u64;
+    for run in &target_runs {
+        assert!(
+            run.target_rows <= run.shared_rows + run.accumulated_base_rows / cap,
+            "{run:?}"
+        );
+    }
+    let last_shared = shared_runs.last().unwrap();
+    let last_target = target_runs.last().unwrap();
+    assert!(
+        (last_target.shared_rows + last_target.target_rows) * 2
+            < last_shared.shared_rows + last_shared.target_rows,
+        "{last_target:?} {last_shared:?}"
+    );
+    let total = |runs: &[Consolidated]| {
+        runs.iter()
+            .map(|run| run.shared_rows + run.target_rows)
+            .sum::<u64>()
+    };
+    assert!(
+        total(&target_runs) < total(&shared_runs),
+        "{target_runs:?} {shared_runs:?}"
+    );
+    eprintln!("shared: {shared_runs:?}\nper_target: {target_runs:?}");
+}
+
+/// A data rewrite whose inputs have only single-target delete files consumes
+/// exactly those and writes no residual. With a CDC epoch's shared file among
+/// its inputs, the residual positions for unselected files become one
+/// single-target file per such data file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_target_inputs_leave_no_residual_and_shared_residuals_stay_per_target() {
+    use flow_compactor::DeleteLayout;
+    let mut table = Skewed::new(DeleteLayout::PerTarget).await;
+    table.run(20).await;
+    // Pay any remaining shared files first.
+    if table
+        .maintenance
+        .inventory(&table.head, table.schema.table_id)
+        .await
+        .unwrap()
+        .debt
+        .shared_delete_files
+        > 0
+    {
+        table.consolidate(1).await.unwrap();
+    }
+    let compactor = TableMaintenance::new(
+        table.index.clone(),
+        table.catalog.clone(),
+        Policy {
+            l0_soft_files: 2,
+            ..table.policy.clone()
+        },
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let rewrite = |table: &Skewed| {
+        StateStore::open(
+            table
+                .temp
+                .path()
+                .join(format!("rewrite-{}", uuid::Uuid::new_v4())),
+            options(),
+        )
+        .unwrap()
+    };
+    let before = SnapshotView::current(&table.head).await.unwrap();
+    let base_deletes = before.applicable_deletes(&table.base.0).unwrap().len();
+    assert!(base_deletes > 0);
+    compactor
+        .compact(&table.head, &table.schema, rewrite(&table))
+        .await
+        .unwrap()
+        .expect("an L0 rewrite");
+    table.reload().await;
+    let after = SnapshotView::current(&table.head).await.unwrap();
+    let added = |before: &SnapshotView, after: &SnapshotView| {
+        after
+            .live_files
+            .iter()
+            .filter(|(id, entry)| {
+                entry.content_type() == DataContentType::PositionDeletes
+                    && !before.live_files.contains_key(*id)
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>()
+    };
+    let removed_data = before
+        .live_files
+        .iter()
+        .filter(|(id, entry)| {
+            entry.content_type() == DataContentType::Data && !after.live_files.contains_key(*id)
+        })
+        .count();
+    assert!(removed_data >= 2);
+    assert!(after.live_files.contains_key(&table.base.0));
+    // Every consumed delete file applied to a selected input only: nothing
+    // was rewritten for the base or any other unselected file.
+    assert!(added(&before, &after).is_empty());
+    assert_eq!(
+        after.applicable_deletes(&table.base.0).unwrap().len(),
+        base_deletes
+    );
+    table.check().await;
+
+    // Two more epochs add two L0 files and two shared files over the base and
+    // the hot rows' previous file: the L1 output, then the first new L0 file.
+    table.epoch().await;
+    table.epoch().await;
+    let before = SnapshotView::current(&table.head).await.unwrap();
+    let shared = |view: &SnapshotView| {
+        view.live_files
+            .values()
+            .filter(|entry| {
+                entry.content_type() == DataContentType::PositionDeletes
+                    && view.single_target(entry).is_none()
+            })
+            .count()
+    };
+    assert_eq!(shared(&before), 2);
+    compactor
+        .compact(&table.head, &table.schema, rewrite(&table))
+        .await
+        .unwrap()
+        .expect("an L0 rewrite of the two new files");
+    table.reload().await;
+    let after = SnapshotView::current(&table.head).await.unwrap();
+    // The consumed shared file's positions on unselected files are kept as
+    // one single-target residual per data file, the base among them.
+    let residuals = added(&before, &after);
+    let mut targets = BTreeSet::new();
+    for entry in &residuals {
+        let target = after.single_target(entry).expect("single-target residual");
+        assert!(targets.insert(target.file_path().to_owned()));
+    }
+    assert!(targets.contains(&table.base.0), "{targets:?}");
+    assert!(shared(&after) < shared(&before));
+    table.check().await;
+}

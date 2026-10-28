@@ -40,6 +40,32 @@ pub enum DeleteDebt {
     Consolidate,
 }
 
+/// How Flow lays out the format v2 position-delete files it rewrites.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteLayout {
+    /// Delete-only consolidation merges its inputs into shared files and data
+    /// rewrites keep residual positions in at most eight shared ranges.
+    #[default]
+    Shared,
+    /// Delete-only consolidation and data-rewrite residuals write one file per
+    /// target data file, with exact single-path bounds, and consolidation
+    /// merges a target's existing files by size tier. CDC epochs still write
+    /// one shared file. Format v3 tables keep one deletion vector per data file
+    /// and use [`DeleteLayout::Shared`]; see [`Policy::for_format_version`].
+    #[serde(alias = "per-target")]
+    PerTarget,
+}
+
+impl DeleteLayout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::PerTarget => "per_target",
+        }
+    }
+}
+
 /// Why the planner selected a data rewrite group, from its seed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanReason {
@@ -89,6 +115,35 @@ pub struct DeleteDependency {
     pub row_count: u64,
 }
 
+/// A single-target position-delete file considered by
+/// [`Policy::select_target_merges`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetDeleteFile {
+    pub id: FileId,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+/// One live data file's delete files in a per-target consolidation.
+#[derive(Debug, Clone)]
+pub struct TargetDeletes {
+    pub target: FileId,
+    /// Existing files whose every position targets this data file.
+    pub files: Vec<TargetDeleteFile>,
+    /// Effective positions for this target staged from the selected shared inputs.
+    pub new_rows: u64,
+    /// Applicable shared delete files the consolidation leaves in place.
+    pub other_files: usize,
+}
+
+/// Input a consolidation may still read after its shared inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeBudget {
+    pub files: usize,
+    pub bytes: u64,
+    pub rows: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
@@ -118,6 +173,8 @@ pub struct Policy {
     pub lazy_index_remap: bool,
     /// How delete-file count debt is paid. See [`DeleteDebt`].
     pub delete_debt: DeleteDebt,
+    /// How rewritten v2 position deletes are laid out. See [`DeleteLayout`].
+    pub delete_layout: DeleteLayout,
     /// Periodic maintenance materializes a table's remaps while more retired
     /// files than this keep one.
     pub remap_max_files: u64,
@@ -155,6 +212,7 @@ impl Default for Policy {
             min_file_age_ms: 1_000,
             lazy_index_remap: true,
             delete_debt: DeleteDebt::Consolidate,
+            delete_layout: DeleteLayout::Shared,
             remap_max_files: 512,
             remap_max_depth: 8,
             remap_cleanup_rows: 32_768,
@@ -202,6 +260,9 @@ pub struct CompactionPlan {
     pub delete_input_rows: u64,
     /// Build a lazy index remap instead of per-row mappings (keyed tables).
     pub lazy_index_remap: bool,
+    /// Write residual position deletes one file per target data file
+    /// ([`DeleteLayout::PerTarget`]) instead of in shared ranges.
+    pub per_target_deletes: bool,
     /// Why this group was selected, for attribution only.
     pub reason: PlanReason,
 }
@@ -388,11 +449,16 @@ impl Policy {
     /// deletion vector per data file, merged at publication, so a delete-only
     /// consolidation can repack Puffin objects but never lowers a file's
     /// delete-file count. Only a data rewrite pays that debt, so v3 tables
-    /// keep [`DeleteDebt::Current`].
+    /// keep [`DeleteDebt::Current`]. Their vectors are already per target, so
+    /// they also keep [`DeleteLayout::Shared`] for legacy position deletes.
     pub fn for_format_version(&self, version: FormatVersion) -> Cow<'_, Self> {
-        if version >= FormatVersion::V3 && self.delete_debt != DeleteDebt::Current {
+        if version >= FormatVersion::V3
+            && (self.delete_debt != DeleteDebt::Current
+                || self.delete_layout != DeleteLayout::Shared)
+        {
             Cow::Owned(Self {
                 delete_debt: DeleteDebt::Current,
+                delete_layout: DeleteLayout::Shared,
                 ..self.clone()
             })
         } else {
@@ -470,11 +536,109 @@ impl Policy {
         let plan = self.plan_with(base_snapshot_id, schema_id, files, deletes, count_driven)?;
         if plan.is_none()
             && !count_driven
-            && self.debt(files)?.max_delete_files.max(deletes.len()) >= self.delete_files_hard
+            && self
+                .debt(files)?
+                .max_delete_files
+                .max(self.table_delete_files(deletes))
+                >= self.delete_files_hard
         {
             return self.plan_with(base_snapshot_id, schema_id, files, deletes, true);
         }
         Ok(plan)
+    }
+
+    /// Delete files charged table-wide by planning: every dependency with the
+    /// shared layout, but only those applying to more than one data file with
+    /// [`DeleteLayout::PerTarget`], whose single-target files are charged to
+    /// their target's own delete-file count instead.
+    fn table_delete_files(&self, deletes: &[DeleteDependency]) -> usize {
+        match self.delete_layout {
+            DeleteLayout::Shared => deletes.len(),
+            DeleteLayout::PerTarget => deletes
+                .iter()
+                .filter(|delete| delete.targets.len() > 1)
+                .count(),
+        }
+    }
+
+    /// Most delete files one data file keeps after a per-target
+    /// consolidation, its new output included: half of `delete_files_soft`,
+    /// so CDC can add as many shared files again before the next one is due.
+    pub fn target_delete_files(&self) -> usize {
+        (self.delete_files_soft / 2).max(1)
+    }
+
+    /// Choose which existing single-target files a per-target consolidation
+    /// merges into each target's new output, within `budget`.
+    ///
+    /// Per target, files are taken smallest first while their rows total at
+    /// most the target's new rows, so the rewrite stays proportional to new
+    /// deletes: a large accumulated file is merged only once new deletes reach
+    /// its size. Then, while the target would keep more than
+    /// [`Self::target_delete_files`], the next smallest are taken too. A lone
+    /// file without new rows is never rewritten, since that would not lower
+    /// its target's count. Targets with the most applicable files are served
+    /// first; a file that exceeds the remaining budget ends its target's
+    /// selection.
+    pub fn select_target_merges(
+        &self,
+        targets: &[TargetDeletes],
+        mut budget: MergeBudget,
+    ) -> BTreeSet<FileId> {
+        let cap = self.target_delete_files();
+        let mut order = targets.iter().collect::<Vec<_>>();
+        order.sort_by(|a, b| {
+            (b.files.len() + b.other_files)
+                .cmp(&(a.files.len() + a.other_files))
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        let mut selected = BTreeSet::new();
+        for target in order {
+            let mut files = target.files.iter().collect::<Vec<_>>();
+            files.sort_by(|a, b| a.rows.cmp(&b.rows).then_with(|| a.id.cmp(&b.id)));
+            let mut take = 0;
+            let mut merged = 0u64;
+            while let Some(file) = files.get(take) {
+                match merged.checked_add(file.rows) {
+                    Some(rows) if rows <= target.new_rows => {
+                        merged = rows;
+                        take += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let remaining = |take: usize| {
+                files.len() - take
+                    + usize::from(target.new_rows > 0 || take > 0)
+                    + target.other_files
+            };
+            while take < files.len() && remaining(take) > cap {
+                take += 1;
+            }
+            let mut next = budget;
+            let mut admitted = Vec::new();
+            for file in &files[..take] {
+                let (Some(count), Some(bytes), Some(rows)) = (
+                    next.files.checked_sub(1),
+                    next.bytes.checked_sub(file.bytes),
+                    next.rows.checked_sub(file.rows),
+                ) else {
+                    break;
+                };
+                next = MergeBudget {
+                    files: count,
+                    bytes,
+                    rows,
+                };
+                admitted.push(&file.id);
+            }
+            if admitted.len() == 1 && target.new_rows == 0 {
+                continue;
+            }
+            budget = next;
+            selected.extend(admitted.into_iter().cloned());
+        }
+        selected
     }
 
     fn plan_with(
@@ -519,7 +683,7 @@ impl Policy {
         let hard_l0_debt = debt.l0_files >= self.l0_hard_files
             || debt.l0_bytes >= self.l0_hard_bytes
             || debt.oldest_l0_ms >= self.oldest_l0_hard_ms;
-        let prioritize_reclamation = (deletes.len() >= self.delete_files_soft
+        let prioritize_reclamation = (self.table_delete_files(deletes) >= self.delete_files_soft
             || debt.max_delete_files >= self.delete_files_soft)
             && !hard_l0_debt;
         let mut eligible: Vec<_> = files
@@ -689,6 +853,7 @@ impl Policy {
                         delete_input_bytes,
                         delete_input_rows,
                         lazy_index_remap: self.lazy_index_remap,
+                        per_target_deletes: self.delete_layout == DeleteLayout::PerTarget,
                         reason,
                     }));
                 }

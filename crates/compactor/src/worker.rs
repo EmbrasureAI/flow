@@ -26,6 +26,9 @@ pub struct WorkerOutput {
     pub data_files: Vec<DataFile>,
     pub delete_files: Vec<DataFile>,
     pub delete_sequence: Option<i64>,
+    /// Positions in `delete_files` that target unselected data files, as
+    /// opposed to masks on this rewrite's output.
+    pub residual_delete_rows: u64,
     pub operation_id: OperationId,
     pub scratch: StateStore,
     pub(crate) masked_inputs: Option<String>,
@@ -157,7 +160,7 @@ pub async fn compact(
         retain_shared_legacy_deletes(&mut output, &built.base)?;
         return Ok(output);
     }
-    output.delete_files =
+    (output.delete_files, output.residual_delete_rows) =
         write_residuals(table, &schema, &output, &output.operation_id.0, config).await?;
     Ok(output)
 }
@@ -501,6 +504,7 @@ pub async fn build_data(
             data_files,
             delete_files: Vec::new(),
             delete_sequence,
+            residual_delete_rows: 0,
             operation_id,
             scratch,
             masked_inputs: None,
@@ -607,7 +611,7 @@ pub(crate) async fn write_residuals(
     output: &WorkerOutput,
     scan: &str,
     config: WriterConfig,
-) -> Result<Vec<DataFile>> {
+) -> Result<(Vec<DataFile>, u64)> {
     let positions = output
         .scratch
         .position_deletes(scan, &schema.table_id)
@@ -619,12 +623,14 @@ pub(crate) async fn write_residuals(
 }
 
 /// Consume a sorted, unique union without restaging its already ordered inputs.
+/// Also returns how many positions target unselected data files rather than
+/// this rewrite's output.
 pub(crate) async fn write_residual_positions(
     table: &Table,
     output: &WorkerOutput,
     positions: impl Iterator<Item = flow_state_store::Result<RowLocation>>,
     mut config: WriterConfig,
-) -> Result<Vec<DataFile>> {
+) -> Result<(Vec<DataFile>, u64)> {
     // A shared residual must not grow into one globally charged dependency.
     // At most eight sorted ranges bound both file fanout and each read charge.
     // Input admission already bounds total rows; row-group memory limits remain
@@ -646,9 +652,20 @@ pub(crate) async fn write_residual_positions(
         config,
         table.metadata().format_version(),
     )?;
+    // Per-target residuals rotate at each target instead, so no data file
+    // gains a shared dependency. Format v3 vectors are per target already.
+    let per_target = output.plan.per_target_deletes
+        && table.metadata().format_version() < iceberg::spec::FormatVersion::V3;
+    let outputs = output
+        .data_files
+        .iter()
+        .map(DataFile::file_path)
+        .collect::<HashSet<_>>();
     let mut batch = Vec::with_capacity(batch_rows);
     let mut total_rows = 0u64;
     let mut current_rows = 0u64;
+    let mut residual_rows = 0u64;
+    let mut target = None::<FileId>;
     for position in positions {
         let position = position?;
         total_rows += 1;
@@ -656,6 +673,23 @@ pub(crate) async fn write_residual_positions(
             total_rows <= output.plan.delete_input_rows,
             "residual positions exceed admitted delete inputs"
         );
+        residual_rows += u64::from(!outputs.contains(position.data_file_id.0.as_str()));
+        if per_target {
+            if target.as_ref() != Some(&position.data_file_id) {
+                if target.is_some() {
+                    writer.write(&batch).await?;
+                    batch.clear();
+                    writer.finish_target().await?;
+                }
+                target = Some(position.data_file_id.clone());
+            }
+            batch.push(position);
+            if batch.len() == batch_rows {
+                writer.write(&batch).await?;
+                batch.clear();
+            }
+            continue;
+        }
         current_rows += 1;
         batch.push(position);
         if batch.len() == batch_rows || current_rows == cohort_rows {
@@ -668,7 +702,7 @@ pub(crate) async fn write_residual_positions(
         }
     }
     writer.write(&batch).await?;
-    writer.close().await
+    Ok((writer.close().await?, residual_rows))
 }
 
 /// Physical ordinals refer to the input file, before filtering position deletes.

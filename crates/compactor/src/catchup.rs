@@ -290,7 +290,7 @@ pub async fn catch_up(
         crate::worker::retain_shared_legacy_deletes(&mut output, &head)?;
     }
     let mapping_finished = Instant::now();
-    output.delete_files = crate::worker::write_residual_positions(
+    (output.delete_files, output.residual_delete_rows) = crate::worker::write_residual_positions(
         table,
         &output,
         residual_positions(&output, &late_scan, &output_scan, &data).filter(|position| {
@@ -332,6 +332,11 @@ pub async fn catch_up(
         output_delete_files,
         output_delete_rows = output.delete_files.iter().map(|file| file.record_count()).sum::<u64>(),
         output_delete_bytes,
+        residual_delete_rows = output.residual_delete_rows,
+        shared_input_delete_files = output.plan.delete_files.iter().filter(|id| {
+            head.single_target(&head.live_files[&id.0]).is_none()
+        }).count(),
+        per_target_deletes = output.plan.per_target_deletes,
         inner_elapsed_ms = finished.duration_since(started).as_secs_f64() * 1000.0,
         validation_setup_ms = validation_finished.duration_since(started).as_secs_f64() * 1000.0,
         late_delete_scan_stage_ms = late_scan_finished.duration_since(validation_finished).as_secs_f64() * 1000.0,

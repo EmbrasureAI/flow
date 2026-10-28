@@ -566,7 +566,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(keys.len(), 26);
+        assert_eq!(keys.len(), 27);
         let documented: Config =
             toml::from_str(&format!("{example}\n[compaction]\n{}\n", keys.join("\n"))).unwrap();
         assert_eq!(
@@ -595,6 +595,32 @@ mod tests {
         assert!(
             toml::from_str::<Config>(&format!(
                 "{example}\n[compaction]\ndelete_debt = \"rewrite\"\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delete_layout_defaults_to_shared_and_accepts_per_target() {
+        let example = include_str!("../../../examples/flow.toml");
+        assert_eq!(
+            valid_config().compaction.delete_layout,
+            flow_compactor::DeleteLayout::Shared
+        );
+        for (value, expected) in [
+            ("shared", flow_compactor::DeleteLayout::Shared),
+            ("per_target", flow_compactor::DeleteLayout::PerTarget),
+            ("per-target", flow_compactor::DeleteLayout::PerTarget),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "{example}\n[compaction]\ndelete_layout = \"{value}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.compaction.delete_layout, expected);
+        }
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "{example}\n[compaction]\ndelete_layout = \"vector\"\n"
             ))
             .is_err()
         );

@@ -5,7 +5,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use iceberg::Result;
 use iceberg::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
 use iceberg::spec::{
-    DataContentType, DataFileFormat, Datum, Manifest, ManifestEntry, ManifestEntryRef,
+    DataContentType, DataFile, DataFileFormat, Datum, Manifest, ManifestEntry, ManifestEntryRef,
     ManifestFile, PrimitiveLiteral, SnapshotRef,
 };
 use iceberg::table::Table;
@@ -283,20 +283,7 @@ impl SnapshotView {
             .values()
             .filter(|entry| entry.content_type() == DataContentType::PositionDeletes)
         {
-            let file = entry.data_file();
-            let exact_target = file.referenced_data_file().or_else(|| {
-                let lower = file
-                    .lower_bounds()
-                    .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
-                let upper = file
-                    .upper_bounds()
-                    .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
-                match lower.literal() {
-                    PrimitiveLiteral::String(path) if lower == upper => Some(path.clone()),
-                    _ => None,
-                }
-            });
-            if let Some(path) = exact_target {
+            if let Some(path) = exact_delete_target(entry.data_file()) {
                 deletes_by_target
                     .entry(path)
                     .or_default()
@@ -355,6 +342,34 @@ impl SnapshotView {
         deletes.sort_unstable_by_key(|entry| content_file_id(entry.data_file()));
         Ok(deletes)
     }
+
+    /// The live data file a position-delete file applies to when it targets
+    /// exactly one: an exact target that is live and that the delete's sequence
+    /// reaches. Shared, unbounded and dangling delete files return `None`.
+    pub fn single_target(&self, delete: &ManifestEntry) -> Option<&ManifestEntry> {
+        let target = exact_delete_target(delete.data_file())?;
+        self.live_files
+            .get(&target)
+            .map(AsRef::as_ref)
+            .filter(|data| position_delete_may_apply(delete, data))
+    }
+}
+
+/// The one data file every position of a delete file targets: its referenced
+/// data file, or equal lower and upper `file_path` bounds.
+pub fn exact_delete_target(file: &DataFile) -> Option<String> {
+    file.referenced_data_file().or_else(|| {
+        let lower = file
+            .lower_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
+        let upper = file
+            .upper_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
+        match lower.literal() {
+            PrimitiveLiteral::String(path) if lower == upper => Some(path.clone()),
+            _ => None,
+        }
+    })
 }
 
 /// The v2 position-delete applicability rules for the supported single spec: matching partition, an

@@ -228,6 +228,50 @@ depend on that rewrite retiring sparse vectors.
   events carry the planner's `selection_reason` (`deleted_rows`,
   `delete_file_count`, `small_files`, `l0_debt` or `promotion`) in both modes.
 
+## Per-target delete layout
+
+With `[compaction] delete_layout = "per_target"` (default `"shared"`), format
+v2 tables keep rewritten position deletes in one file per target data file,
+whose equal lower and upper `file_path` bounds name that file. Format v3
+tables already keep one deletion vector per data file and always use
+`"shared"`. CDC epochs still write one shared file each: splitting them would
+add one file per touched data file to every epoch commit without lowering any
+data file's count.
+
+- Delete-only consolidation reads the smallest shared files (CDC epochs,
+  legacy shared or dangling files) within its 32-file, 32 MiB and
+  one-million-row bounds, and counts their effective positions per target.
+  For each target it then also reads its existing single-target files,
+  smallest first, while their rows total at most that target's new rows. A
+  large accumulated file is merged only once new deletes reach its size, so
+  a run reads about the new deletes rather than every accumulated one. While
+  a target would keep more than `delete_files_soft / 2` files (4 by default),
+  its next smallest files are merged too. Output rotates at every target.
+- A single-target file is charged to its data file's delete-file count, not
+  to the table-wide shared count, and a consolidation is published only if
+  it lowers the shared count or the largest per-file count. Delete-file count
+  debt stays per data file: after a run each data file has at most
+  `delete_files_soft / 2` files plus the shared files left unread.
+- A data rewrite whose inputs have only single-target delete files consumes
+  exactly those and writes no residual. Shared inputs from recent CDC epochs
+  leave their positions for unselected files, and catch-up masks for the
+  output, as one single-target file per data file instead of eight shared
+  ranges. Uploads of these small files overlap, eight at a time.
+- `delete_rewrite_completed` reports `delete_layout`, `shared_input_files`,
+  `target_input_files`, `largest_rewritten_rows`, `output_targets` and
+  `largest_output_rows`. `compaction_completed` and
+  `compaction_catch_up_completed` report `residual_delete_rows`, the
+  positions written for unselected data files; catch-up also reports
+  `shared_input_delete_files`.
+
+With a 400-row base under skewed updates (four hot keys and three new cold
+rows per epoch, 56 epochs), shared consolidation re-read every accumulated
+delete each time, up to 350 rows per run and 1,414 in total. Per-target
+consolidation read 28-49 new rows plus at most one small tier, 550 rows in
+total, but ran 11 times instead of 7: each base file keeps up to four delete
+files, so fewer CDC files fit before the next run is due. This is a local
+memory-catalog test, not a service benchmark.
+
 ## Bounded delete dependencies
 
 The planner tries feasible subsets without increasing data or delete read budgets.

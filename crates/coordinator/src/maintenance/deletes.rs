@@ -2,13 +2,17 @@ use super::{RewriteRecovery, TableMaintenance};
 use crate::artifacts::WriterRegistration;
 use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
-use flow_compactor::{DeleteReadLimits, Level, PublicationPressure, stage_delete_files};
+use flow_compactor::{
+    DeleteLayout, DeleteReadLimits, Level, MergeBudget, PublicationPressure, TargetDeleteFile,
+    TargetDeletes, stage_delete_files,
+};
 use flow_iceberg_ext::{CommitBase, SnapshotView, position_delete_may_apply, write_artifact_plan};
 use flow_materializer::{DeleteWriter, iceberg_schema};
-use flow_model::{FileId, OperationId, TableSchema};
+use flow_model::{FileId, OperationId, RowLocation, TableSchema};
 use flow_state_store::{OperationKind, PreparedOperation, StateStore};
 use iceberg::{spec::DataContentType, table::Table};
-use std::collections::{BTreeSet, HashMap};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Limits one position-delete consolidation. Sorting and deduplication spill to
 /// the worker's scratch index; neither data files nor the live row index are read.
@@ -134,6 +138,17 @@ impl TableMaintenance {
             return Err(ReplanRequired.into());
         }
         let view = SnapshotView::current_with_cache(&table, &self.cache).await?;
+        if !repair
+            && self
+                .policy
+                .for_format_version(table.metadata().format_version())
+                .delete_layout
+                == DeleteLayout::PerTarget
+        {
+            return self
+                .rewrite_deletes_per_target(&table, schema, scratch, policy, base, indexed, view)
+                .await;
+        }
         let repair_input = if let Some(cursor) = &cursor {
             let inventory = self.inventory(&table, table_id).await?;
             match self
@@ -461,8 +476,346 @@ impl TableMaintenance {
             }
             return Ok(None);
         };
-        let path = crate::artifacts::prepared_plan_path(&table, &id);
-        write_artifact_plan(&table, &path, &[], &output).await?;
+        let stats = RewriteStats {
+            repair,
+            layout: flow_compactor::DeleteLayout::Shared,
+            input_files,
+            input_bytes,
+            input_rows,
+            scanned_rows,
+            shared_input_files: removed_deletes
+                .iter()
+                .filter(|id| view.single_target(&view.live_files[*id]).is_none())
+                .count(),
+            largest_rewritten_rows: largest_rows(&view, &removed_deletes),
+            started,
+        };
+        self.publish_delete_rewrite(
+            &table,
+            table_id,
+            id,
+            &ownership,
+            base,
+            indexed.materialized_lsn,
+            output,
+            removed_deletes,
+            sequence,
+            stats,
+        )
+        .await
+    }
+
+    /// [`DeleteLayout::PerTarget`] consolidation. Read the bounded smallest
+    /// shared delete files (CDC epochs, legacy shared or dangling files), count
+    /// their effective positions per target, then also read only the existing
+    /// single-target files that [`flow_compactor::Policy::select_target_merges`]
+    /// picks for each target. Write one file per target data file, so the
+    /// rewrite costs about the new deletes, not a target's accumulated ones.
+    /// Publish only if the table-wide shared count or the largest per-file
+    /// delete-file count falls.
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_deletes_per_target(
+        &self,
+        table: &Table,
+        schema: &TableSchema,
+        scratch: StateStore,
+        policy: &DeleteRewritePolicy,
+        base: CommitBase,
+        indexed: flow_state_store::TableState,
+        view: SnapshotView,
+    ) -> Result<Option<i64>> {
+        let table_id = schema.table_id;
+        let cap = self.policy.target_delete_files();
+        let mut shared = Vec::new();
+        let mut targeted = BTreeMap::<FileId, Vec<TargetDeleteFile>>::new();
+        for (id, entry) in &view.live_files {
+            if entry.content_type() != DataContentType::PositionDeletes {
+                continue;
+            }
+            match view.single_target(entry) {
+                Some(data) => targeted
+                    .entry(FileId(data.file_path().to_owned()))
+                    .or_default()
+                    .push(TargetDeleteFile {
+                        id: FileId(id.clone()),
+                        rows: entry.data_file.record_count(),
+                        bytes: flow_iceberg_ext::delete_content_size(&entry.data_file),
+                    }),
+                None => shared.push((id, entry)),
+            }
+        }
+        shared.sort_by_key(|(_, entry)| {
+            (
+                flow_iceberg_ext::delete_content_size(&entry.data_file),
+                entry.file_path(),
+            )
+        });
+        let mut input_bytes = 0u64;
+        let mut input_rows = 0u64;
+        let mut selected = BTreeSet::new();
+        for (id, entry) in &shared {
+            let bytes =
+                input_bytes.saturating_add(flow_iceberg_ext::delete_content_size(&entry.data_file));
+            let rows = input_rows.saturating_add(entry.data_file.record_count());
+            if bytes > policy.max_input_bytes || rows > policy.max_input_rows {
+                continue;
+            }
+            input_bytes = bytes;
+            input_rows = rows;
+            selected.insert(FileId((*id).clone()));
+            if selected.len() == policy.max_input_files {
+                break;
+            }
+        }
+        let mut other_files = HashMap::<FileId, usize>::new();
+        let mut data_files = BTreeSet::new();
+        for (path, entry) in &view.live_files {
+            if entry.content_type() != DataContentType::Data {
+                continue;
+            }
+            let kept = view
+                .applicable_deletes(path)?
+                .into_iter()
+                .filter(|delete| {
+                    view.single_target(delete).is_none()
+                        && !selected.contains(&FileId(flow_iceberg_ext::content_file_id(
+                            &delete.data_file,
+                        )))
+                })
+                .count();
+            other_files.insert(FileId(path.clone()), kept);
+            data_files.insert(FileId(path.clone()));
+        }
+        let before = delete_file_debt(&view, &BTreeSet::new(), &[], 0);
+        let over_cap = targeted.iter().any(|(target, files)| {
+            files.len() >= 2 && files.len() + other_files.get(target).copied().unwrap_or(0) > cap
+        });
+        if selected.is_empty() && !over_cap
+            || before.0.max(before.1).max(selected.len()) < policy.min_input_files
+        {
+            return Ok(None);
+        }
+        let id = OperationId(format!("delete-rewrite-{}", uuid::Uuid::new_v4()));
+        let ownership =
+            WriterRegistration::new(self.store.clone(), table, table_id, id.clone(), &id)?;
+        let reservation = ownership.record().await?;
+        let operation = PreparedOperation {
+            id: id.clone(),
+            table_id,
+            kind: OperationKind::Rewrite,
+            base_snapshot_id: indexed.snapshot_id,
+            last_lsn: indexed.materialized_lsn,
+            schema_version: indexed.schema_version,
+            artifacts: Vec::new(),
+            payload: Vec::new(),
+        };
+        let store = self.store.clone();
+        blocking(move || {
+            Ok(store
+                .begin_prepare_with_record(operation, Some((&reservation.0, &reservation.1)))?)
+        })
+        .await?;
+        let worker_table = table.clone();
+        let worker_schema = schema.clone();
+        let worker_id = id.clone();
+        let limits = DeleteReadLimits {
+            max_bytes: policy.max_input_bytes,
+            max_rows: policy.max_input_rows,
+        };
+        let budget = MergeBudget {
+            files: policy.max_input_files.saturating_sub(selected.len()),
+            bytes: policy.max_input_bytes.saturating_sub(input_bytes),
+            rows: policy.max_input_rows.saturating_sub(input_rows),
+        };
+        let mut writer_config = self.writer.clone();
+        writer_config.target_file_bytes = policy.target_file_bytes;
+        writer_config.artifact_tracker = Some(ownership.clone());
+        let read_limits = self.read_limits.clone();
+        let worker_view = view.clone();
+        let compaction = self.policy.clone();
+        let worker_selected = selected.clone();
+        let started = std::time::Instant::now();
+        let (output, scanned_rows, merged) = tokio::task::spawn_blocking(move || {
+            super::worker_runtime()?.block_on(async move {
+                let batch_rows = scratch.batch_rows().min(8192);
+                let mut scanned_rows = stage_delete_files(
+                    &worker_table,
+                    &worker_schema,
+                    &worker_view,
+                    &data_files,
+                    &worker_selected,
+                    &scratch,
+                    &worker_id.0,
+                    batch_rows,
+                    limits,
+                    &read_limits,
+                )
+                .await?;
+                let mut new_rows = HashMap::<FileId, u64>::new();
+                for position in scratch.position_deletes(&worker_id.0, &table_id) {
+                    *new_rows.entry(position?.data_file_id).or_default() += 1;
+                }
+                let targets = targeted
+                    .into_iter()
+                    .map(|(target, files)| TargetDeletes {
+                        new_rows: new_rows.get(&target).copied().unwrap_or(0),
+                        other_files: other_files.get(&target).copied().unwrap_or(0),
+                        target,
+                        files,
+                    })
+                    .collect::<Vec<_>>();
+                let merged = compaction.select_target_merges(&targets, budget);
+                let merge_scan = format!("{}-targets", worker_id.0);
+                if !merged.is_empty() {
+                    scanned_rows += stage_delete_files(
+                        &worker_table,
+                        &worker_schema,
+                        &worker_view,
+                        &data_files,
+                        &merged,
+                        &scratch,
+                        &merge_scan,
+                        batch_rows,
+                        DeleteReadLimits {
+                            max_bytes: budget.bytes,
+                            max_rows: budget.rows,
+                        },
+                        &read_limits,
+                    )
+                    .await?;
+                }
+                let mut writer = DeleteWriter::new_for_version(
+                    worker_table.file_io().clone(),
+                    worker_table.metadata().location(),
+                    &worker_id,
+                    worker_table.metadata().default_partition_spec_id(),
+                    writer_config,
+                    worker_table.metadata().format_version(),
+                )?;
+                let merged_positions = (!merged.is_empty())
+                    .then(|| scratch.position_deletes(&merge_scan, &table_id))
+                    .into_iter()
+                    .flatten();
+                let mut batch = Vec::with_capacity(batch_rows);
+                let mut target = None::<FileId>;
+                for position in merge_positions(
+                    scratch.position_deletes(&worker_id.0, &table_id),
+                    merged_positions,
+                ) {
+                    let position = position?;
+                    if target.as_ref() != Some(&position.data_file_id) {
+                        if target.is_some() {
+                            writer.write(&batch).await?;
+                            batch.clear();
+                            writer.finish_target().await?;
+                        }
+                        target = Some(position.data_file_id.clone());
+                    }
+                    batch.push(position);
+                    if batch.len() == batch_rows {
+                        writer.write(&batch).await?;
+                        batch.clear();
+                    }
+                }
+                writer.write(&batch).await?;
+                Ok::<_, anyhow::Error>((writer.close().await?, scanned_rows, merged))
+            })
+        })
+        .await??;
+        let removed_deletes = selected
+            .iter()
+            .chain(&merged)
+            .map(|id| id.0.clone())
+            .collect::<BTreeSet<_>>();
+        let sequence = removed_deletes
+            .iter()
+            .map(|id| view.live_files[id].sequence_number)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow::anyhow!("missing delete data sequence"))?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        ensure!(
+            output
+                .iter()
+                .all(|file| flow_iceberg_ext::exact_delete_target(file).is_some()),
+            "per-target delete output spans more than one data file"
+        );
+        let after = delete_file_debt(&view, &removed_deletes, &output, sequence);
+        if !(after.1 < before.1 || after.0 < before.0)
+            || !preserves_delete_locality(&view, &removed_deletes, &output, sequence, &self.policy)
+        {
+            // The rewrite would not lower delete-file count debt. Ownership
+            // records retain the unused output for GC.
+            let store = self.store.clone();
+            blocking(move || Ok(store.discard_uncommitted(&id)?)).await?;
+            return Ok(None);
+        }
+        let (input_bytes, input_rows) =
+            removed_deletes
+                .iter()
+                .fold((0u64, 0u64), |(bytes, rows), id| {
+                    let file = &view.live_files[id].data_file;
+                    (
+                        bytes.saturating_add(flow_iceberg_ext::delete_content_size(file)),
+                        rows.saturating_add(file.record_count()),
+                    )
+                });
+        let stats = RewriteStats {
+            repair: false,
+            layout: DeleteLayout::PerTarget,
+            input_files: removed_deletes.len(),
+            input_bytes,
+            input_rows,
+            scanned_rows,
+            shared_input_files: selected.len(),
+            largest_rewritten_rows: largest_rows(&view, &removed_deletes),
+            started,
+        };
+        self.publish_delete_rewrite(
+            table,
+            table_id,
+            id,
+            &ownership,
+            base,
+            indexed.materialized_lsn,
+            output,
+            removed_deletes,
+            sequence,
+            stats,
+        )
+        .await
+    }
+
+    /// Commit a delete-only rewrite whose outputs are complete and viable,
+    /// then report it.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_delete_rewrite(
+        &self,
+        table: &Table,
+        table_id: flow_model::TableId,
+        id: OperationId,
+        ownership: &std::sync::Arc<WriterRegistration>,
+        base: CommitBase,
+        materialized_lsn: flow_model::PgLsn,
+        output: Vec<iceberg::spec::DataFile>,
+        removed_deletes: BTreeSet<String>,
+        sequence: i64,
+        stats: RewriteStats,
+    ) -> Result<Option<i64>> {
+        let RewriteStats {
+            repair,
+            layout,
+            input_files,
+            input_bytes,
+            input_rows,
+            scanned_rows,
+            shared_input_files,
+            largest_rewritten_rows,
+            started,
+        } = stats;
+        let path = crate::artifacts::prepared_plan_path(table, &id);
+        write_artifact_plan(table, &path, &[], &output).await?;
         let payload = serde_json::to_vec(&RewriteRecovery {
             output_data_sequence: None,
             base,
@@ -481,10 +834,7 @@ impl TableMaintenance {
                     }
                     .into(),
                 ),
-                (
-                    "streaming.last-lsn".into(),
-                    indexed.materialized_lsn.to_string(),
-                ),
+                ("streaming.last-lsn".into(), materialized_lsn.to_string()),
             ]),
         })?;
         let artifacts = output
@@ -505,7 +855,7 @@ impl TableMaintenance {
             )?)
         })
         .await?;
-        let snapshot = self.recover(&table, &id).await?;
+        let snapshot = self.recover(table, &id).await?;
         let store = self.store.clone();
         let operation_id = id.clone();
         blocking(move || Ok(store.forget_applied(&operation_id)?)).await?;
@@ -515,18 +865,130 @@ impl TableMaintenance {
             operation_id = %id.0,
             snapshot_id = snapshot,
             repair,
+            delete_layout = layout.as_str(),
             input_files,
+            shared_input_files,
+            target_input_files = input_files - shared_input_files,
+            largest_rewritten_rows,
             input_bytes,
             input_rows,
             scanned_rows,
             output_files,
+            output_targets = output
+                .iter()
+                .filter_map(flow_iceberg_ext::exact_delete_target)
+                .collect::<BTreeSet<_>>()
+                .len(),
             output_rows = output.iter().map(|file| file.record_count()).sum::<u64>(),
+            largest_output_rows = output.iter().map(|file| file.record_count()).max().unwrap_or(0),
             output_bytes,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
             "position-delete files consolidated"
         );
         Ok(snapshot)
     }
+}
+
+/// What a delete-only rewrite read, for its completion event.
+struct RewriteStats {
+    repair: bool,
+    layout: flow_compactor::DeleteLayout,
+    input_files: usize,
+    input_bytes: u64,
+    input_rows: u64,
+    scanned_rows: u64,
+    /// Inputs that do not target exactly one live data file.
+    shared_input_files: usize,
+    /// The largest input's rows: the most one rewrite re-reads of one file.
+    largest_rewritten_rows: u64,
+    started: std::time::Instant,
+}
+
+fn largest_rows(view: &SnapshotView, files: &BTreeSet<String>) -> u64 {
+    files
+        .iter()
+        .map(|id| view.live_files[id].data_file.record_count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Delete-file count debt once `removed` is replaced by `output` at
+/// `sequence`: the most delete files applying to one live data file, and the
+/// table-wide count of files that do not target exactly one live data file.
+fn delete_file_debt(
+    view: &SnapshotView,
+    removed: &BTreeSet<String>,
+    output: &[iceberg::spec::DataFile],
+    sequence: i64,
+) -> (usize, usize) {
+    let output = removed
+        .first()
+        .and_then(|path| view.live_files.get(path))
+        .map(|template| {
+            output
+                .iter()
+                .map(|file| iceberg::spec::ManifestEntry {
+                    data_file: file.clone(),
+                    sequence_number: Some(sequence),
+                    ..template.as_ref().clone()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let deletes = view
+        .live_files
+        .iter()
+        .filter(|(id, entry)| {
+            entry.content_type() == DataContentType::PositionDeletes && !removed.contains(*id)
+        })
+        .map(|(_, entry)| entry.as_ref())
+        .collect::<Vec<_>>();
+    let shared = deletes
+        .iter()
+        .filter(|entry| view.single_target(entry).is_none())
+        .count();
+    let most = view
+        .live_files
+        .values()
+        .filter(|entry| entry.content_type() == DataContentType::Data)
+        .map(|data| {
+            deletes
+                .iter()
+                .copied()
+                .chain(&output)
+                .filter(|delete| position_delete_may_apply(delete, data))
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    (most, shared)
+}
+
+/// Merge two position streams, each sorted and unique by path and position,
+/// into one, keeping a position present in both once.
+fn merge_positions<E>(
+    left: impl Iterator<Item = std::result::Result<RowLocation, E>>,
+    right: impl Iterator<Item = std::result::Result<RowLocation, E>>,
+) -> impl Iterator<Item = std::result::Result<RowLocation, E>> {
+    let mut left = left.peekable();
+    let mut right = right.peekable();
+    std::iter::from_fn(move || {
+        let order = match (left.peek(), right.peek()) {
+            (None, None) => return None,
+            (Some(Err(_)), _) | (Some(_), None) => Ordering::Less,
+            (_, Some(Err(_))) | (None, Some(_)) => Ordering::Greater,
+            (Some(Ok(left)), Some(Ok(right))) => (&left.data_file_id, left.row_position)
+                .cmp(&(&right.data_file_id, right.row_position)),
+        };
+        match order {
+            Ordering::Less => left.next(),
+            Ordering::Greater => right.next(),
+            Ordering::Equal => {
+                right.next();
+                left.next()
+            }
+        }
+    })
 }
 
 /// A smaller delete-file count can still widen path bounds enough to make an
