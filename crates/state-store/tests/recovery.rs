@@ -1483,3 +1483,98 @@ fn applied_delta_stream_accepts_complete_payload_then_atomic_retirement() {
     assert!(store.operation(&id).unwrap().is_none());
     assert!(store.prepared_deltas(&id).is_err());
 }
+
+#[test]
+fn parallel_apply_matches_serial_apply_and_rejects_late_conflicts_atomically() {
+    let key = |n: u16| PrimaryKey(n.to_be_bytes().to_vec());
+    // The location apply stored: commit sequence numbers replace the placeholder.
+    let stored = |file: &str, n: u16, lsn: u64, sequence: i64| RowLocation {
+        data_sequence_number: sequence,
+        ..location(file, u64::from(n), lsn)
+    };
+    let file = |n: u16| if n.is_multiple_of(2) { "a" } else { "b" };
+    let table = TableId(7);
+    let mut outcomes = Vec::new();
+    for threads in [1, 4] {
+        let temp = TempDir::new().unwrap();
+        let store = StateStore::open(
+            temp.path(),
+            StateStoreOptions {
+                apply_batch_rows: 1024,
+                apply_lookup_rows: 1024,
+                apply_threads: threads,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let initial = (0..3000).map(|n| IndexDelta {
+            key: key(n),
+            expected: None,
+            replacement: Some(location(file(n), u64::from(n), 10)),
+        });
+        store
+            .prepare(operation("initial", None, 10), initial)
+            .unwrap();
+        let id = OperationId("initial".into());
+        store.mark_committed(&id, 1, 1).unwrap();
+        store.apply_committed(&id).unwrap();
+
+        // Updates move rows to c, deletes drop them, rewrites keep their file
+        // and inserts add new keys.
+        let changes = (0..3500).map(|n| IndexDelta {
+            key: key(n),
+            expected: (n < 3000).then(|| stored(file(n), n, 10, 1)),
+            replacement: match n {
+                0..1500 | 3000.. => Some(location("c", u64::from(n), 20)),
+                1500..2000 => None,
+                _ => Some(location(file(n), u64::from(n), 10)),
+            },
+        });
+        store
+            .prepare(operation("changes", Some(1), 20), changes)
+            .unwrap();
+        let id = OperationId("changes".into());
+        store.mark_committed(&id, 2, 2).unwrap();
+        let applied = store.apply_committed(&id).unwrap();
+
+        let keys: Vec<_> = (0..3500).map(key).collect();
+        let rows = |name: &str| {
+            store
+                .file_rows(&table, &FileId(name.into()))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        outcomes.push((
+            applied.applied_rows,
+            store.lookup_many(&table, &keys).unwrap(),
+            [rows("a"), rows("b"), rows("c")],
+            file_counts(&store, 2, &["a", "b", "c"]),
+        ));
+
+        // A conflict deep in the last part leaves the whole batch unapplied.
+        let conflict = (2000..3000).map(|n| IndexDelta {
+            key: key(n),
+            expected: Some(stored(file(n), n, if n == 2990 { 11 } else { 10 }, 2)),
+            replacement: None,
+        });
+        store
+            .prepare(operation("conflict", Some(2), 30), conflict)
+            .unwrap();
+        let id = OperationId("conflict".into());
+        store.mark_committed(&id, 3, 3).unwrap();
+        let error = store.apply_committed_batch(&id).unwrap_err();
+        assert!(
+            matches!(error, flow_state_store::Error::IndexConflict { key: conflict, .. }
+            if conflict == key(2990))
+        );
+        assert_eq!(store.operation(&id).unwrap().unwrap().applied_count, 0);
+        assert_eq!(
+            store.lookup_many(&table, &keys).unwrap(),
+            outcomes.last().unwrap().1
+        );
+    }
+    let serial = &outcomes[0];
+    assert_eq!(serial.0, 3500);
+    assert_eq!(serial.3, [500, 500, 2000]);
+    assert_eq!(&outcomes[1], serial);
+}

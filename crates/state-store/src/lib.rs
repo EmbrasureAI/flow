@@ -117,6 +117,9 @@ pub struct StateStoreOptions {
     /// Maximum prepared deltas decoded and looked up together while building an
     /// atomic apply batch.
     pub apply_lookup_rows: usize,
+    /// Threads that look up and check one lookup chunk's rows. The batch is
+    /// still written once, in row order, under the store lock.
+    pub apply_threads: usize,
     /// RocksDB table-file descriptor cache. Files beyond it are reopened on
     /// demand, so a large index cannot exhaust the process descriptor limit.
     /// `-1` keeps every table file open.
@@ -133,6 +136,7 @@ impl Default for StateStoreOptions {
             write_buffer_bytes: 16 << 20,
             apply_batch_rows: 1024,
             apply_lookup_rows: 1024,
+            apply_threads: std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
             max_open_files: 4096,
             ephemeral: false,
         }
@@ -296,6 +300,7 @@ struct Inner {
     writer: Mutex<()>,
     batch_rows: usize,
     lookup_rows: usize,
+    apply_threads: usize,
     control: Option<ControlStore>,
     revision: AtomicU64,
     failed: AtomicBool,
@@ -330,6 +335,7 @@ impl StateStore {
     ) -> Result<Self> {
         if config.apply_batch_rows == 0
             || config.apply_lookup_rows == 0
+            || config.apply_threads == 0
             || config.write_buffer_bytes == 0
             || config.block_cache_bytes == 0
             || (config.max_open_files != -1 && config.max_open_files <= 0)
@@ -421,6 +427,7 @@ impl StateStore {
             writer: Mutex::new(()),
             batch_rows: config.apply_batch_rows,
             lookup_rows: config.apply_lookup_rows,
+            apply_threads: config.apply_threads,
             control,
             revision: AtomicU64::new(revision),
             failed: AtomicBool::new(false),

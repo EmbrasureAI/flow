@@ -227,152 +227,67 @@ impl StateStore {
             }
             stats.decode += decode_started.elapsed();
 
-            let pk_lookup_started = Instant::now();
             let keys: Vec<_> = deltas
                 .iter()
                 .map(|delta| pk_key(&record.operation.table_id, &delta.key))
                 .collect();
-            let current = self
-                .0
-                .db
-                .batched_multi_get_cf(&pk_cf, keys.iter(), keys.is_sorted());
-            stats.pk_lookup += pk_lookup_started.elapsed();
-
             let reverse_lookup_started = Instant::now();
             let targets: Vec<_> = deltas
                 .iter()
                 .filter_map(|delta| delta.replacement.as_ref())
                 .map(|location| reverse_key(&record.operation.table_id, location))
                 .collect();
-            let mut owners = (!self.reverse_targets_are_fresh(&reverse_cf, &targets)).then(|| {
+            let fresh = self.reverse_targets_are_fresh(&reverse_cf, &targets);
+            if !fresh {
                 stats.reverse_owner_reads += targets.len();
-                self.0
-                    .db
-                    .batched_multi_get_cf(&reverse_cf, targets.iter(), targets.is_sorted())
-                    .into_iter()
-            });
+            }
             stats.reverse_lookup += reverse_lookup_started.elapsed();
 
-            let mutation_started = Instant::now();
-            let remap_options = ReadOptions::default();
-            let mut resolver = self.remaps_possible().then(|| {
-                crate::remap::Resolver::new(
-                    &self.0.db,
-                    &self.0.remap_cache,
-                    record.operation.table_id,
-                    &remap_options,
-                )
-            });
-            let mut targets = targets.into_iter();
-            let mut encoded = Vec::new();
+            // Every lookup of every part observes the index from before this
+            // batch, as the serial path does; parts are merged in key order.
+            let parts = split_parts(deltas, keys, targets, self.0.apply_threads);
+            let outputs = if parts.len() == 1 {
+                let part = parts.into_iter().next().expect("one part");
+                vec![build_part(self, &record, part, fresh)]
+            } else {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = parts
+                        .into_iter()
+                        .map(|part| scope.spawn(|| build_part(self, &record, part, fresh)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().expect("apply part panicked"))
+                        .collect::<Vec<_>>()
+                })
+            };
             let mut chunk_file_counts = BTreeMap::<FileId, i64>::new();
-            for ((mut delta, current), key) in deltas.into_iter().zip(current).zip(keys) {
-                let target = delta.replacement.as_ref().map(|_| {
-                    let owner = owners.as_mut().map(|owners| {
-                        owners
-                            .next()
-                            .expect("one reverse-owner result per replacement")
-                    });
-                    (owner, targets.next().expect("one target per replacement"))
-                });
-                let current = current?;
-                let current = current
-                    .as_deref()
-                    .map(decode_borrowed_row_location)
-                    .transpose()?;
-                // A raw entry in a lazily retired file compares by its translated
-                // location; its reverse entry stays at the raw location.
-                let mut raw_reverse = None;
-                let translated = match (&mut resolver, &current) {
-                    (Some(resolver), Some(raw)) => {
-                        let owned = raw.to_owned_location();
-                        let translated = resolver.resolve(&owned)?;
-                        if translated.is_some() {
-                            raw_reverse = Some(reverse_key(&record.operation.table_id, &owned));
+            for output in outputs {
+                let output = output?;
+                for operation in output.operations {
+                    match operation {
+                        PartOperation::PutPk(key, value) => batch.put_cf(&pk_cf, key, value),
+                        PartOperation::DeletePk(key) => batch.delete_cf(&pk_cf, key),
+                        PartOperation::PutReverse(key, value) => {
+                            batch.put_cf(&reverse_cf, key, value)
                         }
-                        translated
+                        PartOperation::DeleteReverse(key) => batch.delete_cf(&reverse_cf, key),
                     }
-                    _ => None,
-                };
-                let current = match &translated {
-                    Some(location) => Some(BorrowedRowLocation::from_owned(location)),
-                    None => current,
-                };
-                if !matches_expected(current.as_ref(), delta.expected.as_ref()) {
-                    // Never overwrite an ingestion version from after the worker's
-                    // read. Catalog validation is still mandatory before this point.
-                    if record.operation.kind == OperationKind::Rewrite
-                        && is_obsolete(current.as_ref(), delta.expected.as_ref())
-                    {
-                        obsolete += 1;
-                        continue;
-                    }
-                    return Err(Error::IndexConflict {
-                        table: record.operation.table_id,
-                        key: delta.key,
-                    });
                 }
-                if let Some(replacement) = &mut delta.replacement
-                    && replacement.data_sequence_number == -1
-                {
-                    replacement.data_sequence_number = record.sequence_number.ok_or_else(|| {
-                        Error::InvalidState("committed sequence number is missing".into())
+                for (file, change) in output.file_counts {
+                    let count = chunk_file_counts.entry(file).or_insert(0);
+                    *count = count.checked_add(change).ok_or_else(|| {
+                        Error::InvalidState(
+                            "file count delta exceeds the bounded lookup chunk".into(),
+                        )
                     })?;
                 }
-                // Every owner lookup observes the committed index from before this
-                // outer batch. A delete in an earlier lookup chunk cannot free a
-                // physical row for a later chunk in the same atomic commit.
-                if let Some(raw) = raw_reverse {
-                    batch.delete_cf(&reverse_cf, raw);
-                } else if let Some(old) = &delta.expected {
-                    batch.delete_cf(&reverse_cf, reverse_key(&record.operation.table_id, old));
-                }
-                match (&delta.replacement, target) {
-                    (Some(new), Some((owner, target))) => {
-                        let owner: Option<PrimaryKey> = owner
-                            .transpose()?
-                            .flatten()
-                            .map(|value| decode(&value))
-                            .transpose()?;
-                        if owner.as_ref().is_some_and(|owner| owner != &delta.key) {
-                            return Err(Error::InvalidState(
-                                "two live keys claim the same physical row".into(),
-                            ));
-                        }
-                        // WriteBatch copies bytes, so one buffer serves every row
-                        // without repeated allocation or column-family lookups.
-                        encoded.clear();
-                        bincode::serialize_into(&mut encoded, new)?;
-                        batch.put_cf(&pk_cf, key, &encoded);
-                        encoded.clear();
-                        bincode::serialize_into(&mut encoded, &delta.key)?;
-                        batch.put_cf(&reverse_cf, target, &encoded);
-                    }
-                    (None, None) => batch.delete_cf(&pk_cf, key),
-                    _ => unreachable!("one reverse-owner result per replacement"),
-                }
-                let old = delta.expected.as_ref().map(|row| &row.data_file_id);
-                let new = delta.replacement.as_ref().map(|row| &row.data_file_id);
-                if old != new {
-                    for (file, change) in old
-                        .into_iter()
-                        .map(|file| (file, -1))
-                        .chain(new.into_iter().map(|file| (file, 1)))
-                    {
-                        if let Some(count) = chunk_file_counts.get_mut(file) {
-                            *count = count.checked_add(change).ok_or_else(|| {
-                                Error::InvalidState(
-                                    "file count delta exceeds the bounded lookup chunk".into(),
-                                )
-                            })?;
-                        } else {
-                            chunk_file_counts.insert(file.clone(), change);
-                        }
-                    }
-                }
-                applied += 1;
+                applied += output.applied;
+                obsolete += output.obsolete;
+                stats.pk_lookup += output.pk_lookup;
+                stats.reverse_lookup += output.reverse_lookup;
+                stats.mutation_build += output.mutation_build;
             }
-            stats.mutation_build += mutation_started.elapsed();
 
             let file_count_started = Instant::now();
             for (file, change) in chunk_file_counts {
@@ -530,6 +445,226 @@ fn record_apply_batch_metrics(
         metrics::histogram!("flow_state_apply_batch_size", "role" => role, "kind" => kind, "measurement" => measurement)
             .record(value as f64);
     }
+}
+
+/// Rows of one lookup chunk handled by one thread.
+struct PartInput {
+    deltas: Vec<IndexDelta>,
+    keys: Vec<Vec<u8>>,
+    targets: Vec<Vec<u8>>,
+}
+
+enum PartOperation {
+    PutPk(Vec<u8>, Vec<u8>),
+    DeletePk(Vec<u8>),
+    PutReverse(Vec<u8>, Vec<u8>),
+    DeleteReverse(Vec<u8>),
+}
+
+struct PartOutput {
+    operations: Vec<PartOperation>,
+    file_counts: BTreeMap<FileId, i64>,
+    applied: u64,
+    obsolete: u64,
+    pk_lookup: Duration,
+    reverse_lookup: Duration,
+    mutation_build: Duration,
+}
+
+/// Split a chunk into up to `threads` contiguous parts of at least 128 rows.
+fn split_parts(
+    deltas: Vec<IndexDelta>,
+    keys: Vec<Vec<u8>>,
+    targets: Vec<Vec<u8>>,
+    threads: usize,
+) -> Vec<PartInput> {
+    let parts = threads.clamp(1, deltas.len().div_ceil(128).max(1));
+    if parts == 1 {
+        return vec![PartInput {
+            deltas,
+            keys,
+            targets,
+        }];
+    }
+    let size = deltas.len().div_ceil(parts);
+    let mut result = Vec::with_capacity(parts);
+    let mut deltas = deltas.into_iter();
+    let mut keys = keys.into_iter();
+    let mut targets = targets.into_iter();
+    loop {
+        let part: Vec<_> = deltas.by_ref().take(size).collect();
+        if part.is_empty() {
+            break;
+        }
+        let replacements = part
+            .iter()
+            .filter(|delta| delta.replacement.is_some())
+            .count();
+        result.push(PartInput {
+            keys: keys.by_ref().take(part.len()).collect(),
+            targets: targets.by_ref().take(replacements).collect(),
+            deltas: part,
+        });
+    }
+    result
+}
+
+fn build_part(
+    store: &StateStore,
+    record: &crate::OperationRecord,
+    part: PartInput,
+    fresh: bool,
+) -> Result<PartOutput> {
+    let PartInput {
+        deltas,
+        keys,
+        targets,
+    } = part;
+    let db = &store.0.db;
+    let pk_cf = db.cf_handle(PK).expect("opened column family");
+    let reverse_cf = db.cf_handle(REVERSE).expect("opened column family");
+    let mut output = PartOutput {
+        operations: Vec::with_capacity(deltas.len() * 3),
+        file_counts: BTreeMap::new(),
+        applied: 0,
+        obsolete: 0,
+        pk_lookup: Duration::ZERO,
+        reverse_lookup: Duration::ZERO,
+        mutation_build: Duration::ZERO,
+    };
+    let pk_lookup_started = Instant::now();
+    let current = db.batched_multi_get_cf(&pk_cf, keys.iter(), keys.is_sorted());
+    output.pk_lookup = pk_lookup_started.elapsed();
+    let reverse_lookup_started = Instant::now();
+    let mut owners = (!fresh).then(|| {
+        db.batched_multi_get_cf(&reverse_cf, targets.iter(), targets.is_sorted())
+            .into_iter()
+    });
+    output.reverse_lookup = reverse_lookup_started.elapsed();
+
+    let mutation_started = Instant::now();
+    let remap_options = ReadOptions::default();
+    let mut resolver = store.remaps_possible().then(|| {
+        crate::remap::Resolver::new(
+            db,
+            &store.0.remap_cache,
+            record.operation.table_id,
+            &remap_options,
+        )
+    });
+    let mut targets = targets.into_iter();
+    for ((mut delta, current), key) in deltas.into_iter().zip(current).zip(keys) {
+        let target = delta.replacement.as_ref().map(|_| {
+            let owner = owners.as_mut().map(|owners| {
+                owners
+                    .next()
+                    .expect("one reverse-owner result per replacement")
+            });
+            (owner, targets.next().expect("one target per replacement"))
+        });
+        let current = current?;
+        let current = current
+            .as_deref()
+            .map(decode_borrowed_row_location)
+            .transpose()?;
+        // A raw entry in a lazily retired file compares by its translated
+        // location; its reverse entry stays at the raw location.
+        let mut raw_reverse = None;
+        let translated = match (&mut resolver, &current) {
+            (Some(resolver), Some(raw)) => {
+                let owned = raw.to_owned_location();
+                let translated = resolver.resolve(&owned)?;
+                if translated.is_some() {
+                    raw_reverse = Some(reverse_key(&record.operation.table_id, &owned));
+                }
+                translated
+            }
+            _ => None,
+        };
+        let current = match &translated {
+            Some(location) => Some(BorrowedRowLocation::from_owned(location)),
+            None => current,
+        };
+        if !matches_expected(current.as_ref(), delta.expected.as_ref()) {
+            // Never overwrite an ingestion version from after the worker's
+            // read. Catalog validation is still mandatory before this point.
+            if record.operation.kind == OperationKind::Rewrite
+                && is_obsolete(current.as_ref(), delta.expected.as_ref())
+            {
+                output.obsolete += 1;
+                continue;
+            }
+            return Err(Error::IndexConflict {
+                table: record.operation.table_id,
+                key: delta.key,
+            });
+        }
+        if let Some(replacement) = &mut delta.replacement
+            && replacement.data_sequence_number == -1
+        {
+            replacement.data_sequence_number = record.sequence_number.ok_or_else(|| {
+                Error::InvalidState("committed sequence number is missing".into())
+            })?;
+        }
+        // Every owner lookup observes the committed index from before this
+        // outer batch. A delete in an earlier lookup chunk cannot free a
+        // physical row for a later chunk in the same atomic commit.
+        if let Some(raw) = raw_reverse {
+            output.operations.push(PartOperation::DeleteReverse(raw));
+        } else if let Some(old) = &delta.expected {
+            output
+                .operations
+                .push(PartOperation::DeleteReverse(reverse_key(
+                    &record.operation.table_id,
+                    old,
+                )));
+        }
+        match (&delta.replacement, target) {
+            (Some(new), Some((owner, target))) => {
+                let owner: Option<PrimaryKey> = owner
+                    .transpose()?
+                    .flatten()
+                    .map(|value| decode(&value))
+                    .transpose()?;
+                if owner.as_ref().is_some_and(|owner| owner != &delta.key) {
+                    return Err(Error::InvalidState(
+                        "two live keys claim the same physical row".into(),
+                    ));
+                }
+                output
+                    .operations
+                    .push(PartOperation::PutPk(key, bincode::serialize(new)?));
+                output.operations.push(PartOperation::PutReverse(
+                    target,
+                    bincode::serialize(&delta.key)?,
+                ));
+            }
+            (None, None) => output.operations.push(PartOperation::DeletePk(key)),
+            _ => unreachable!("one reverse-owner result per replacement"),
+        }
+        let old = delta.expected.as_ref().map(|row| &row.data_file_id);
+        let new = delta.replacement.as_ref().map(|row| &row.data_file_id);
+        if old != new {
+            for (file, change) in old
+                .into_iter()
+                .map(|file| (file, -1))
+                .chain(new.into_iter().map(|file| (file, 1)))
+            {
+                if let Some(count) = output.file_counts.get_mut(file) {
+                    *count = count.checked_add(change).ok_or_else(|| {
+                        Error::InvalidState(
+                            "file count delta exceeds the bounded lookup chunk".into(),
+                        )
+                    })?;
+                } else {
+                    output.file_counts.insert(file.clone(), change);
+                }
+            }
+        }
+        output.applied += 1;
+    }
+    output.mutation_build = mutation_started.elapsed();
+    Ok(output)
 }
 
 fn decode_borrowed_row_location(value: &[u8]) -> Result<BorrowedRowLocation<'_>> {
