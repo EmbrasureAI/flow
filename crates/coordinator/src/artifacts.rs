@@ -327,6 +327,12 @@ impl ArtifactTracker for MetadataRegistration {
             .map_err(iceberg_error)
         })
     }
+    fn commit_dependency(&self) -> Option<u64> {
+        match &self.backend {
+            RegistrationBackend::Live(store) => store.mirror_position(),
+            RegistrationBackend::Recovery(control) => control.mirror_position(),
+        }
+    }
 }
 
 pub(crate) struct WriterRegistration {

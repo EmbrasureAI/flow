@@ -160,6 +160,12 @@ impl ControlStore {
             .map_err(|_| Error::InvalidState("control mirror is already attached".into()))
     }
 
+    /// Replication position covering every control write completed so far,
+    /// if a mirror is attached.
+    pub fn mirror_position(&self) -> Option<u64> {
+        self.0.mirror.get().map(|mirror| mirror.position())
+    }
+
     /// Read a consistent copy of all authority records together with the
     /// mirror position it covers. Writers are blocked only while the RocksDB
     /// snapshot is taken, not while it is read.

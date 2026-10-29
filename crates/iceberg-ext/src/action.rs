@@ -11,6 +11,7 @@ use iceberg::table::Table;
 use iceberg::{Catalog, Result, TableCommit, TableRequirement, TableUpdate};
 use uuid::Uuid;
 
+use crate::artifacts::{depend_on, with_commit_dependency};
 use crate::validation::{CommitBase, find_operation_with_key, validate_inputs, validate_rewrite};
 use crate::{
     ArtifactSet, ArtifactTracker, ManifestCache, SnapshotView, conflict, content_file_id, invalid,
@@ -693,6 +694,23 @@ async fn publish(
     publication: Publication<'_>,
     catalog_update_elapsed: Option<&mut Option<Duration>>,
 ) -> Result<CommitResult> {
+    with_commit_dependency(publish_scoped(
+        catalog,
+        table,
+        view,
+        publication,
+        catalog_update_elapsed,
+    ))
+    .await
+}
+
+async fn publish_scoped(
+    catalog: &dyn Catalog,
+    table: &Table,
+    view: &SnapshotView,
+    publication: Publication<'_>,
+    catalog_update_elapsed: Option<&mut Option<Duration>>,
+) -> Result<CommitResult> {
     if publication.operation_id.is_empty() {
         return Err(invalid("operation ID must not be empty"));
     }
@@ -763,6 +781,11 @@ async fn publish(
                 .map(str::to_owned),
         );
         tracker.register(artifacts).await?;
+        // Everything the commit is built from was recorded before this
+        // registration, and nothing else is recorded before the commit.
+        if let Some(position) = tracker.commit_dependency() {
+            depend_on(position);
+        }
     }
     // Manifests are independent objects; write them concurrently, then the
     // list that names them. Each object store round trip delays visibility.

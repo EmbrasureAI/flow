@@ -580,9 +580,10 @@ impl Durability {
     }
 
     /// Wait until every change appended so far is durable and this process
-    /// still owns the state.
-    pub async fn barrier(&self) -> Result<()> {
-        self.0.shared.barrier().await
+    /// still owns the state. The wait is recorded under `effect`, the
+    /// external effect it guards.
+    pub async fn barrier(&self, effect: &'static str) -> Result<()> {
+        self.0.shared.barrier(effect).await
     }
 
     /// Position of the last appended change.
@@ -596,9 +597,10 @@ impl Durability {
         self.0.shared.covers(position)
     }
 
-    /// Wait until `position` is covered.
-    pub async fn wait_for(&self, position: u64) -> Result<()> {
-        self.0.shared.wait_for(position).await
+    /// Wait until `position` is covered, recording the wait under `effect`
+    /// if given.
+    pub async fn wait_for(&self, position: u64, effect: Option<&'static str>) -> Result<()> {
+        self.0.shared.wait_for(position, effect).await
     }
 
     pub fn status(&self) -> Status {

@@ -339,7 +339,7 @@ impl Shared {
     /// Wait for durability under a lease, without requiring the baseline
     /// checkpoint. Used while writing that checkpoint.
     pub(crate) async fn wait_durable(&self, target: u64) -> Result<()> {
-        self.wait_async(target, false).await
+        self.wait_async(target, false, None).await
     }
 
     /// Resolves once replication has stopped.
@@ -368,17 +368,23 @@ impl Shared {
         }
     }
 
-    pub(crate) async fn barrier(&self) -> Result<()> {
+    pub(crate) async fn barrier(&self, effect: &'static str) -> Result<()> {
         let target = self.position();
-        self.wait_for(target).await
+        self.wait_for(target, Some(effect)).await
     }
 
-    /// Wait until `target` and all earlier records are durable under a valid lease.
-    pub(crate) async fn wait_for(&self, target: u64) -> Result<()> {
-        self.wait_async(target, true).await
+    /// Wait until `target` and all earlier records are durable under a valid
+    /// lease. The wait is recorded under `effect`, if given.
+    pub(crate) async fn wait_for(&self, target: u64, effect: Option<&'static str>) -> Result<()> {
+        self.wait_async(target, true, effect).await
     }
 
-    async fn wait_async(&self, target: u64, baseline: bool) -> Result<()> {
+    async fn wait_async(
+        &self,
+        target: u64,
+        baseline: bool,
+        effect: Option<&'static str>,
+    ) -> Result<()> {
         let started = Instant::now();
         let mut warned = started;
         let mut changed = self.changed.subscribe();
@@ -392,8 +398,8 @@ impl Shared {
                     self.durable_under_lease(&state, target, now)?
                 };
                 if done {
-                    if baseline {
-                        metrics::histogram!("flow_durability_barrier_seconds")
+                    if let Some(effect) = effect {
+                        metrics::histogram!("flow_durability_barrier_seconds", "effect" => effect)
                             .record(started.elapsed().as_secs_f64());
                     }
                     return Ok(());
@@ -891,7 +897,7 @@ mod tests {
             shared.append(Item::Control(vec![index])).unwrap();
         }
         // Without a lease nothing is written and the barrier must not pass.
-        let early = tokio::time::timeout(Duration::from_millis(300), shared.barrier()).await;
+        let early = tokio::time::timeout(Duration::from_millis(300), shared.barrier("test")).await;
         assert!(early.is_err());
         assert!(
             store::list_numbered(&operator, format::LOG, None)
@@ -900,7 +906,7 @@ mod tests {
                 .is_empty()
         );
         let heartbeat = tokio::spawn(heartbeat_loop(shared.clone(), operator.clone()));
-        shared.barrier().await.unwrap();
+        shared.barrier("test").await.unwrap();
         assert!(shared.covers(10));
         let mut seen = Vec::new();
         for (_, key) in store::list_numbered(&operator, format::LOG, None)
@@ -925,7 +931,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(shared.barrier().await.is_err());
+        assert!(shared.barrier("test").await.is_err());
         assert!(shared.append(Item::Control(vec![1])).is_err());
         shared.close();
         writer.await.unwrap();

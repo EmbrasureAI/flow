@@ -1,6 +1,7 @@
 use futures::future::BoxFuture;
 use iceberg::Result;
 use serde::{Deserialize, Serialize};
+use std::{cell::Cell, future::Future};
 
 /// Compact names for a finite, immutable family of objects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +76,40 @@ impl ArtifactSet {
 /// JSON before superseding it. Unmanaged callers can omit tracking entirely.
 pub trait ArtifactTracker: std::fmt::Debug + Send + Sync {
     fn register(&self, artifacts: ArtifactSet) -> BoxFuture<'_, Result<()>>;
+    /// Called after a publication registers its artifacts and before it
+    /// writes them: the replication log position covering that registration
+    /// and everything recorded before it, which its catalog commit waits for.
+    /// `None` when registrations are not replicated.
+    fn commit_dependency(&self) -> Option<u64> {
+        None
+    }
+}
+
+tokio::task_local! {
+    static COMMIT_DEPENDENCY: Cell<Option<u64>>;
+}
+
+/// Run one publication so its catalog commit can name the replicated state it
+/// depends on. Outside such a scope there is no dependency.
+pub(crate) async fn with_commit_dependency<F: Future>(publication: F) -> F::Output {
+    COMMIT_DEPENDENCY.scope(Cell::new(None), publication).await
+}
+
+/// Record that the current publication's catalog commit depends on the
+/// replicated state through `position`.
+pub(crate) fn depend_on(position: u64) {
+    let _ = COMMIT_DEPENDENCY.try_with(|dependency| {
+        dependency.set(Some(dependency.get().map_or(position, |p| p.max(position))));
+    });
+}
+
+/// The replication position the catalog commit being made depends on, if a
+/// publication declared one. A fencing catalog may wait for just this
+/// position: the publication registered its artifacts after everything it
+/// was built from and records nothing more before committing. Without a
+/// declared dependency the commit must wait for all replicated state.
+pub fn commit_dependency() -> Option<u64> {
+    COMMIT_DEPENDENCY.try_with(Cell::get).ok().flatten()
 }
 
 // This is an optimization, not the retained-artifact protection set. Once its

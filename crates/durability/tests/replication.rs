@@ -220,11 +220,11 @@ async fn acknowledged_state_survives_losing_the_whole_state_directory() {
     }
     // Reclaim the first transactions: the restored journal must not need them.
     journal.reclaim(PgLsn(502)).unwrap();
-    durability.barrier().await.unwrap();
+    durability.barrier("test").await.unwrap();
     // Written after the barrier: may or may not survive, but never partially.
     commit(&mut journal, 21, b"after-barrier");
     let expected = transactions(&journal);
-    durability.barrier().await.unwrap();
+    durability.barrier("test").await.unwrap();
     // Crash without a release, then continue on another volume. The old
     // directory outlives the new owner's start: if its lock file were deleted,
     // the filesystem could hand its inode to the new lock file, which would
@@ -273,7 +273,7 @@ async fn a_repaired_tail_is_replicated_again_even_when_rewritten_longer() {
     // An orphan chunk makes the next open append an abort record.
     journal.append_chunk(2, b"orphan").unwrap();
     commit(&mut journal, 1, b"first");
-    durability.barrier().await.unwrap();
+    durability.barrier("test").await.unwrap();
     durability.stop();
     drop((control, index, journal));
     // A torn write shorter than that abort record. The next baseline copies
@@ -295,7 +295,7 @@ async fn a_repaired_tail_is_replicated_again_even_when_rewritten_longer() {
     assert!(journal.layout().repaired.is_some());
     commit(&mut journal, 3, b"third");
     let expected = transactions(&journal);
-    durability.barrier().await.unwrap();
+    durability.barrier("test").await.unwrap();
     durability.stop();
     drop((control, index, journal));
 
@@ -322,7 +322,7 @@ async fn a_replaced_owner_fails_its_barriers_and_cannot_append() {
     let (_control, index, mut journal) = attach(&old, old_dir.path()).await;
     commit(&mut journal, 1, b"before");
     index.put_source_transaction(b"k", b"1").unwrap();
-    old.barrier().await.unwrap();
+    old.barrier("test").await.unwrap();
 
     // A successor starts elsewhere while the old process keeps running.
     let new_dir = tempfile::tempdir().unwrap();
@@ -337,7 +337,7 @@ async fn a_replaced_owner_fails_its_barriers_and_cannot_append() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(old.failure().is_some(), "old owner was not fenced");
-    assert!(old.barrier().await.is_err());
+    assert!(old.barrier("test").await.is_err());
     assert!(index.put_source_transaction(b"k", b"2").is_err());
     let new = successor.await.unwrap();
     assert_eq!(new.mode(), Mode::Restored);
@@ -394,7 +394,7 @@ async fn clean_release_keeps_local_state_and_skips_the_lease_wait() {
         Some(b"v".to_vec())
     );
     commit(&mut journal, 6, b"more");
-    durability.barrier().await.unwrap();
+    durability.barrier("test").await.unwrap();
     drop((control, index, journal));
     durability.release().await.unwrap();
 
@@ -465,7 +465,7 @@ async fn a_crash_restart_on_the_same_volume_proves_the_old_owner_exited() {
     let (control, index, mut journal) = attach(&durability, state.path()).await;
     commit(&mut journal, 1, b"payload");
     index.put_source_transaction(b"k", b"v").unwrap();
-    durability.barrier().await.unwrap();
+    durability.barrier("test").await.unwrap();
     let expected = transactions(&journal);
     // Crash: no release record. The process lock is released with it.
     durability.stop();
@@ -727,7 +727,7 @@ async fn baseline_checkpoints_retry_transient_write_failures() {
     assert!(durability.status().stats.retries >= 6);
     commit(&mut journal, 2, b"after");
     let expected = transactions(&journal);
-    durability.barrier().await.unwrap();
+    durability.barrier("test").await.unwrap();
     drop((control, index, journal));
     durability.stop();
 

@@ -1125,6 +1125,12 @@ impl StateStore {
             .file_live_row_counts(files)
     }
 
+    /// Replication position covering every control write completed so far,
+    /// if the control store is mirrored.
+    pub fn mirror_position(&self) -> Option<u64> {
+        self.0.control.as_ref()?.mirror_position()
+    }
+
     /// Source-wide transaction ledger payloads. One key per transaction, never
     /// raw transaction rows. The caller owns the payload schema.
     pub fn put_source_transaction(&self, key: &[u8], value: &[u8]) -> Result<()> {
