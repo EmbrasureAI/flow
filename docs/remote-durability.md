@@ -22,6 +22,7 @@ uri = "s3://bucket/flow/orders-primary-v1"
 # max_batch_bytes = 8388608
 # max_inflight_writes = 4
 # max_writes_per_second = 20     # 0 removes the request budget
+# batch_interval_ms = 250
 # queue_memory_bytes = 67108864
 # checkpoint_interval_secs = 30
 # checkpoint_batches = 1000
@@ -51,13 +52,17 @@ earlier changes are durable and this process still holds its lease:
 
 | Effect | Where the barrier is |
 | --- | --- |
-| Iceberg catalog changes (commits, table and namespace creation, schema evolution, expiration) | Fenced catalog wrapper around every mutation |
+| Iceberg catalog changes (commits, table and namespace creation, schema evolution, expiration) | Fenced catalog wrapper around every mutation; a publication's commit waits only for changes up to its artifact registration |
 | Object deletions (garbage collection and any FileIO delete) | Storage observer, before the request |
 | PostgreSQL acknowledgement | Capture sends only progress whose state is replicated; later progress waits without blocking capture |
 | Replication slot creation during `init` | Before `CREATE_REPLICATION_SLOT`, after its intent is recorded |
 
-A barrier therefore costs about one object write when it must wait. In steady
-state the record it depends on is usually already durable.
+A barrier therefore costs about one object write when it must wait. A
+publication registers its artifacts after recording everything it was built
+from and records nothing more before committing, so its commit waits only for
+changes up to that registration. Those replicate while its manifests are
+written, and journal bytes captured meanwhile do not delay the commit. Other
+barriers wait for every earlier change.
 
 If object storage is unavailable, local capture continues within its journal
 quota and queue budget, but nothing is acknowledged, published or deleted:
@@ -185,13 +190,22 @@ hard-linked SST files carry over between checkpoints and, through
 
 ## Cost and tuning
 
-Each log write is one conditional PUT. Up to `max_inflight_writes` start at
-once; beyond `max_writes_per_second` records wait and form larger batches, which
-bounds request cost at the price of latency. At low rates each change is its own
-batch. Lease renewal is one HEAD per quarter lease. Checkpoints add a control
-snapshot, new journal parts of at most 8 MiB and a manifest per interval;
-retention deletes in batches. Journal bytes are written twice, once in the log
-and once as checkpoint parts.
+Each log write is one conditional PUT. A batch is written as soon as an external
+effect waits for one of its records, once `max_batch_bytes` are queued, or once
+its oldest record has waited `batch_interval_ms`. Up to `max_inflight_writes`
+start at once, and `max_writes_per_second` paces the batches nothing waits for.
+A busy source therefore writes about four batches a second plus about one per
+catalog commit, and nothing on the publication path waits for the interval: a
+publication asks for its registration to be written when it registers. Source
+acknowledgements do not shorten the interval; they are released up to
+`batch_interval_ms` later. With `batch_interval_ms = 0` everything is written
+whenever the request budget allows, as in earlier versions, except that external
+effects never wait for the budget. Garbage collection deletes each wait for a
+barrier, so a large collection pass can briefly write more than
+`max_writes_per_second`. Lease renewal is one HEAD per quarter lease.
+Checkpoints add a control snapshot, new journal parts of at most 8 MiB and a
+manifest per interval; retention deletes in batches. Journal bytes are written
+twice, once in the log and once as checkpoint parts.
 
 ## Observability
 
@@ -205,7 +219,7 @@ deleted objects.
 | `flow_durability_pending_records` | Appended records not yet durable |
 | `flow_durability_put_seconds{kind}` | Object writes for `log` batches, `control` snapshots, journal `part`s and `checkpoint` manifests |
 | `flow_durability_batch_bytes`, `flow_durability_batch_records` | Size of each log batch |
-| `flow_durability_barrier_seconds` | Time external effects waited for replication |
+| `flow_durability_barrier_seconds{effect}` | Time external effects waited for replication: `catalog_commit` (publication commits), `catalog` (other catalog changes), `delete`, `replication_slot`, and `acknowledgement` (from computing source progress to releasing it) |
 | `flow_durability_retries_total{kind}` | Retried object writes, by the same kinds |
 | `flow_durability_checkpoint_seconds` | Checkpoint duration |
 | `flow_durability_control_snapshot_bytes` | Latest control snapshot size |

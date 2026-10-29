@@ -433,6 +433,7 @@ mod tests {
             max_batch_bytes: 8 << 20,
             max_inflight: 4,
             writes_per_second: 0.0,
+            batch_interval: Duration::ZERO,
             queue_memory_bytes: 1 << 20,
             lease: Duration::from_secs(10),
             request_timeout: Duration::from_secs(1),

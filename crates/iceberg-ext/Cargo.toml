@@ -14,11 +14,11 @@ futures.workspace = true
 uuid.workspace = true
 serde.workspace = true
 moka = { version = "0.12", features = ["future"] }
+tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 async-trait.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

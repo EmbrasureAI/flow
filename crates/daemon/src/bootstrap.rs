@@ -522,7 +522,7 @@ pub(crate) async fn resume(
         } else {
             // The persisted creation intent must survive losing this disk, or
             // a restored owner would refuse the slot it cannot recognise.
-            crate::durability::barrier().await?;
+            crate::durability::barrier("replication_slot").await?;
             let snapshot =
                 export_snapshot(&replication, &mut keeper_sql, &config.source.slot).await?;
             let cut = snapshot.consistent_lsn;

@@ -21,7 +21,7 @@ pub use action::{
 };
 pub use artifacts::{
     ArtifactSet, ArtifactTracker, IndexProgress, NumberedArtifacts, RetainedIndex,
-    retained_artifacts,
+    commit_dependency, retained_artifacts,
 };
 pub use manifests::{ManifestRewritePolicy, RewriteManifestsAction};
 pub use plan::{ArtifactPlan, read_artifact_plan, write_artifact_plan};

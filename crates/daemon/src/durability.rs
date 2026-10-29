@@ -19,6 +19,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::Path,
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 static ACTIVE: OnceLock<Durability> = OnceLock::new();
@@ -93,10 +94,11 @@ pub(crate) fn write_authority_file(state_dir: &Path, name: &str, data: &[u8]) ->
     }
 }
 
-/// Wait until local state is durable before an external effect.
-pub(crate) async fn barrier() -> Result<()> {
+/// Wait until local state is durable before an external effect, recorded
+/// under `effect`.
+pub(crate) async fn barrier(effect: &'static str) -> Result<()> {
     match active() {
-        Some(durability) => durability.barrier().await,
+        Some(durability) => durability.barrier(effect).await,
         None => Ok(()),
     }
 }
@@ -221,7 +223,7 @@ pub(crate) fn status() -> Option<flow_durability::Status> {
 /// the replicated log covers the state they were computed from.
 pub(crate) struct AckGate {
     durability: Option<Durability>,
-    pending: VecDeque<(u64, Acknowledgement)>,
+    pending: VecDeque<(u64, Instant, Acknowledgement)>,
 }
 
 impl Default for AckGate {
@@ -250,7 +252,7 @@ impl AckGate {
             // A later position subsumes the newest entry.
             self.pending.pop_back();
         }
-        self.pending.push_back((position, progress));
+        self.pending.push_back((position, Instant::now(), progress));
         self.ready()
     }
 
@@ -261,9 +263,12 @@ impl AckGate {
         while self
             .pending
             .front()
-            .is_some_and(|(position, _)| durability.covers(*position))
+            .is_some_and(|(position, _, _)| durability.covers(*position))
         {
-            latest = self.pending.pop_front().map(|(_, progress)| progress);
+            let (_, admitted, progress) = self.pending.pop_front().expect("front exists");
+            metrics::histogram!("flow_durability_barrier_seconds", "effect" => "acknowledgement")
+                .record(admitted.elapsed().as_secs_f64());
+            latest = Some(progress);
         }
         latest
     }
@@ -273,10 +278,11 @@ impl AckGate {
     /// gate in other `select!` branches.
     pub(crate) fn ready_signal(&self) -> impl std::future::Future<Output = Result<()>> + use<> {
         let durability = self.durability.clone();
-        let target = self.pending.front().map(|(position, _)| *position);
+        let target = self.pending.front().map(|(position, _, _)| *position);
         async move {
             match (durability, target) {
-                (Some(durability), Some(position)) => durability.wait_for(position).await,
+                // `ready` records the delay from admission instead.
+                (Some(durability), Some(position)) => durability.wait_for(position, None).await,
                 _ => std::future::pending().await,
             }
         }
@@ -313,7 +319,21 @@ impl std::fmt::Debug for FencedCatalog {
 
 impl FencedCatalog {
     async fn guard(&self) -> iceberg::Result<()> {
-        barrier_error(self.durability.barrier().await, "a catalog change")
+        barrier_error(self.durability.barrier("catalog").await, "a catalog change")
+    }
+
+    /// A publication's commit waits only for the replicated state it was
+    /// built from, so capture continuing meanwhile does not delay it.
+    async fn commit_guard(&self) -> iceberg::Result<()> {
+        match flow_iceberg_ext::commit_dependency() {
+            Some(position) => barrier_error(
+                self.durability
+                    .wait_for(position, Some("catalog_commit"))
+                    .await,
+                "a catalog change",
+            ),
+            None => self.guard().await,
+        }
     }
 }
 
@@ -398,14 +418,14 @@ impl Catalog for FencedCatalog {
         self.inner.register_table(table, metadata_location).await
     }
     async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
-        self.guard().await?;
+        self.commit_guard().await?;
         self.inner.update_table(commit).await
     }
 }
 
 /// Barrier for storage deletions, mapped to the storage error type.
 pub(crate) async fn storage_guard() -> iceberg::Result<()> {
-    barrier_error(barrier().await, "deleting objects")
+    barrier_error(barrier("delete").await, "deleting objects")
 }
 
 #[cfg(test)]

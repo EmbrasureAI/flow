@@ -1,9 +1,16 @@
-use flow_iceberg_ext::{ArtifactSet, ArtifactTracker, RewriteFilesAction, RowDeltaAction};
+use async_trait::async_trait;
+use flow_iceberg_ext::{
+    ArtifactSet, ArtifactTracker, RewriteFilesAction, RowDeltaAction, commit_dependency,
+};
 use flow_materializer::{DataWriter, DeleteWriter, WriterConfig};
 use flow_model::{OperationId, PgLsn, Value};
 use flow_testkit::{catalog, scan, schema, table};
 use futures::future::BoxFuture;
 use iceberg::io::FileIO;
+use iceberg::memory::MemoryCatalog;
+use iceberg::table::Table;
+use iceberg::{Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent};
+use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -168,4 +175,138 @@ async fn registration_failure_prevents_data_delete_and_catalog_metadata_uploads(
         .table;
     gate.verify_outputs(true).await;
     assert_eq!(scan(&rewritten, &schema).await.unwrap(), rows[1..]);
+}
+
+/// Registers nothing and reports a fixed replication position.
+#[derive(Debug)]
+struct Replicated(u64);
+impl ArtifactTracker for Replicated {
+    fn register(&self, _: ArtifactSet) -> BoxFuture<'_, iceberg::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn commit_dependency(&self) -> Option<u64> {
+        Some(self.0)
+    }
+}
+
+/// Records the replication dependency each catalog commit observes.
+#[derive(Debug)]
+struct DependencyProbe {
+    inner: MemoryCatalog,
+    seen: Mutex<Vec<Option<u64>>>,
+}
+#[async_trait]
+impl Catalog for DependencyProbe {
+    async fn list_namespaces(
+        &self,
+        p: Option<&NamespaceIdent>,
+    ) -> iceberg::Result<Vec<NamespaceIdent>> {
+        self.inner.list_namespaces(p).await
+    }
+    async fn create_namespace(
+        &self,
+        n: &NamespaceIdent,
+        p: HashMap<String, String>,
+    ) -> iceberg::Result<Namespace> {
+        self.inner.create_namespace(n, p).await
+    }
+    async fn get_namespace(&self, n: &NamespaceIdent) -> iceberg::Result<Namespace> {
+        self.inner.get_namespace(n).await
+    }
+    async fn namespace_exists(&self, n: &NamespaceIdent) -> iceberg::Result<bool> {
+        self.inner.namespace_exists(n).await
+    }
+    async fn update_namespace(
+        &self,
+        n: &NamespaceIdent,
+        p: HashMap<String, String>,
+    ) -> iceberg::Result<()> {
+        self.inner.update_namespace(n, p).await
+    }
+    async fn drop_namespace(&self, n: &NamespaceIdent) -> iceberg::Result<()> {
+        self.inner.drop_namespace(n).await
+    }
+    async fn list_tables(&self, n: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
+        self.inner.list_tables(n).await
+    }
+    async fn create_table(&self, n: &NamespaceIdent, c: TableCreation) -> iceberg::Result<Table> {
+        self.inner.create_table(n, c).await
+    }
+    async fn load_table(&self, t: &TableIdent) -> iceberg::Result<Table> {
+        self.inner.load_table(t).await
+    }
+    async fn drop_table(&self, t: &TableIdent) -> iceberg::Result<()> {
+        self.inner.drop_table(t).await
+    }
+    async fn purge_table(&self, t: &TableIdent) -> iceberg::Result<()> {
+        self.inner.purge_table(t).await
+    }
+    async fn table_exists(&self, t: &TableIdent) -> iceberg::Result<bool> {
+        self.inner.table_exists(t).await
+    }
+    async fn rename_table(&self, s: &TableIdent, d: &TableIdent) -> iceberg::Result<()> {
+        self.inner.rename_table(s, d).await
+    }
+    async fn register_table(&self, t: &TableIdent, m: String) -> iceberg::Result<Table> {
+        self.inner.register_table(t, m).await
+    }
+    async fn update_table(&self, c: TableCommit) -> iceberg::Result<Table> {
+        self.seen.lock().unwrap().push(commit_dependency());
+        self.inner.update_table(c).await
+    }
+}
+
+#[tokio::test]
+async fn publication_commits_depend_only_on_what_their_tracker_replicated() {
+    let temp = TempDir::new().unwrap();
+    let probe = DependencyProbe {
+        inner: catalog(&temp.path().join("warehouse")).await,
+        seen: Mutex::new(Vec::new()),
+    };
+    let schema = schema(1);
+    let table = table(&probe.inner, &schema).await;
+    let write = |name: &'static str, rows: Vec<Vec<Value>>| {
+        let table = table.clone();
+        let schema = schema.clone();
+        async move {
+            let mut writer = DataWriter::new(
+                table.file_io().clone(),
+                table.metadata().location(),
+                &OperationId(name.into()),
+                schema,
+                0,
+                WriterConfig::default(),
+            )
+            .unwrap();
+            writer.write(&rows, PgLsn(10)).await.unwrap();
+            writer.close().await.unwrap()
+        }
+    };
+    let first = write("untracked", vec![vec![Value::Int64(1), Value::Null]]).await;
+    let second = write("tracked", vec![vec![Value::Int64(2), Value::Null]]).await;
+    let replacement = write("rewrite", vec![vec![Value::Int64(1), Value::Null]]).await;
+    // Without a replicating tracker the commit has no narrower dependency.
+    let untracked = RowDeltaAction::new(&table, "untracked")
+        .add_data_files(first.clone())
+        .commit(&probe, &table)
+        .await
+        .unwrap()
+        .table;
+    let tracked = RowDeltaAction::new(&untracked, "tracked")
+        .add_data_files(second)
+        .with_artifact_tracker(Some(Arc::new(Replicated(7))))
+        .commit(&probe, &untracked)
+        .await
+        .unwrap()
+        .table;
+    RewriteFilesAction::new(&tracked, "rewrite")
+        .remove_data_files([first[0].file_path().to_owned()])
+        .add_data_files(replacement)
+        .with_artifact_tracker(Some(Arc::new(Replicated(9))))
+        .commit(&probe, &tracked)
+        .await
+        .unwrap();
+    assert_eq!(*probe.seen.lock().unwrap(), [None, Some(7), Some(9)]);
+    // The dependency is scoped to its publication.
+    assert_eq!(commit_dependency(), None);
 }

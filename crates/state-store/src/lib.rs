@@ -1125,6 +1125,11 @@ impl StateStore {
             .file_live_row_counts(files)
     }
 
+    /// See [`ControlStore::mirror_now`].
+    pub fn mirror_now(&self) -> Option<u64> {
+        self.0.control.as_ref()?.mirror_now()
+    }
+
     /// Source-wide transaction ledger payloads. One key per transaction, never
     /// raw transaction rows. The caller owns the payload schema.
     pub fn put_source_transaction(&self, key: &[u8], value: &[u8]) -> Result<()> {

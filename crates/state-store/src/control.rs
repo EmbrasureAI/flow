@@ -35,6 +35,9 @@ pub trait ControlMirror: Send + Sync {
     /// Replication position that covers every batch passed so far. Called
     /// under the control lock while taking a snapshot.
     fn position(&self) -> u64;
+    /// Replicate everything through `position` without waiting to batch more:
+    /// an external effect is about to wait for it.
+    fn expedite(&self, _position: u64) {}
 }
 
 /// Rebuilds a control store from a replicated snapshot and later batches.
@@ -158,6 +161,16 @@ impl ControlStore {
             .mirror
             .set(mirror)
             .map_err(|_| Error::InvalidState("control mirror is already attached".into()))
+    }
+
+    /// Have the mirror replicate every control write completed so far without
+    /// waiting to batch more, returning the position that covers them, if a
+    /// mirror is attached.
+    pub fn mirror_now(&self) -> Option<u64> {
+        let mirror = self.0.mirror.get()?;
+        let position = mirror.position();
+        mirror.expedite(position);
+        Some(position)
     }
 
     /// Read a consistent copy of all authority records together with the

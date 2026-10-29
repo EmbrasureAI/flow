@@ -2,7 +2,10 @@
 //!
 //! Callers append records synchronously and in their local commit order; the
 //! append only queues work. One task groups queued records into immutable log
-//! batches and keeps several conditional creates in flight. The durable
+//! batches and keeps several conditional creates in flight. A batch is written
+//! as soon as an external effect waits for a queued record, once a full batch
+//! is queued, or once its oldest record has waited `batch_interval`; the
+//! request budget paces only the last two. The durable
 //! frontier advances only over a contiguous prefix of completed batches, so
 //! recovery always observes a prefix of local history.
 //!
@@ -36,6 +39,9 @@ pub(crate) struct Tuning {
     pub max_batch_bytes: u64,
     pub max_inflight: usize,
     pub writes_per_second: f64,
+    /// Longest a queued record waits for more to share its batch, unless an
+    /// external effect waits for it first.
+    pub batch_interval: Duration,
     pub queue_memory_bytes: u64,
     pub lease: Duration,
     /// Longest a single object request may take.
@@ -127,6 +133,12 @@ pub(crate) struct State {
     pub durable: u64,
     queue: VecDeque<(u64, Item)>,
     memory: u64,
+    /// Encoded size of the queued records.
+    queued_bytes: u64,
+    /// When the oldest queued record was queued.
+    queued_since: Option<Instant>,
+    /// The highest ordinal an external effect is waiting for.
+    urgent: Option<u64>,
     pub failure: Option<Arc<str>>,
     pub lease_until: Option<Instant>,
     /// Set once a checkpoint covering all local state from before this owner is durable.
@@ -176,6 +188,9 @@ impl Shared {
                 durable: next_ordinal,
                 queue: VecDeque::new(),
                 memory: 0,
+                queued_bytes: 0,
+                queued_since: None,
+                urgent: None,
                 failure: None,
                 lease_until: None,
                 baseline: false,
@@ -265,6 +280,8 @@ impl Shared {
         state.next_ordinal += 1;
         apply_to_model(&mut state, &item, ordinal);
         state.memory += memory;
+        state.queued_bytes += item.encoded_bytes();
+        state.queued_since.get_or_insert_with(Instant::now);
         state.queue.push_back((ordinal, item));
         let pending = state.next_ordinal - state.durable;
         drop(state);
@@ -276,6 +293,18 @@ impl Shared {
     /// The last appended ordinal, or the predecessor of the first if none.
     pub(crate) fn position(&self) -> u64 {
         self.lock().next_ordinal - 1
+    }
+
+    /// Write `target` and everything before it without waiting for more
+    /// records to share their batch.
+    pub(crate) fn expedite(&self, target: u64) {
+        let mut state = self.lock();
+        if state.durable > target || state.urgent.is_some_and(|urgent| urgent >= target) {
+            return;
+        }
+        state.urgent = Some(target);
+        drop(state);
+        self.wake_writer.notify_one();
     }
 
     fn satisfied(&self, state: &State, target: u64, now: Instant) -> Result<bool> {
@@ -337,9 +366,11 @@ impl Shared {
     }
 
     /// Wait for durability under a lease, without requiring the baseline
-    /// checkpoint. Used while writing that checkpoint.
+    /// checkpoint, writing the records without further batching. Used by
+    /// checkpoints, flushes and the release record.
     pub(crate) async fn wait_durable(&self, target: u64) -> Result<()> {
-        self.wait_async(target, false).await
+        self.expedite(target);
+        self.wait_async(target, false, None).await
     }
 
     /// Resolves once replication has stopped.
@@ -368,20 +399,30 @@ impl Shared {
         }
     }
 
-    pub(crate) async fn barrier(&self) -> Result<()> {
+    pub(crate) async fn barrier(&self, effect: &'static str) -> Result<()> {
         let target = self.position();
-        self.wait_for(target).await
+        self.wait_for(target, Some(effect)).await
     }
 
-    /// Wait until `target` and all earlier records are durable under a valid lease.
-    pub(crate) async fn wait_for(&self, target: u64) -> Result<()> {
-        self.wait_async(target, true).await
+    /// Wait until `target` and all earlier records are durable under a valid
+    /// lease. With an `effect`, an external effect waits: the records are
+    /// written without further batching and the wait is recorded under it.
+    pub(crate) async fn wait_for(&self, target: u64, effect: Option<&'static str>) -> Result<()> {
+        self.wait_async(target, true, effect).await
     }
 
-    async fn wait_async(&self, target: u64, baseline: bool) -> Result<()> {
+    async fn wait_async(
+        &self,
+        target: u64,
+        baseline: bool,
+        effect: Option<&'static str>,
+    ) -> Result<()> {
         let started = Instant::now();
         let mut warned = started;
         let mut changed = self.changed.subscribe();
+        if effect.is_some() {
+            self.expedite(target);
+        }
         loop {
             {
                 let state = self.lock();
@@ -392,8 +433,8 @@ impl Shared {
                     self.durable_under_lease(&state, target, now)?
                 };
                 if done {
-                    if baseline {
-                        metrics::histogram!("flow_durability_barrier_seconds")
+                    if let Some(effect) = effect {
+                        metrics::histogram!("flow_durability_barrier_seconds", "effect" => effect)
                             .record(started.elapsed().as_secs_f64());
                     }
                     return Ok(());
@@ -477,6 +518,7 @@ fn merge_extent(state: &mut State, item: &Item) -> Option<u64> {
     }
     *queued_len += len;
     let ordinal = *ordinal;
+    state.queued_bytes += len;
     apply_to_model(state, item, ordinal);
     Some(ordinal)
 }
@@ -549,6 +591,7 @@ fn take(shared: &Shared) -> Option<Taken> {
         bytes += size;
         let (_, item) = state.queue.pop_front().expect("front exists");
         state.memory -= item.memory();
+        state.queued_bytes -= size;
         let path = match &item {
             Item::Extent {
                 journal, segment, ..
@@ -560,6 +603,11 @@ fn take(shared: &Shared) -> Option<Taken> {
             _ => None,
         };
         items.push((item, path));
+    }
+    // Records left behind keep the age of the oldest taken one, which is no
+    // younger than theirs.
+    if state.queue.is_empty() {
+        state.queued_since = None;
     }
     drop(state);
     shared.space.notify_all();
@@ -727,6 +775,12 @@ impl Budget {
             .min(self.capacity);
         self.refreshed = now;
     }
+    /// Admit a write an external effect waits for now. It still counts, so
+    /// later batched writes absorb it.
+    fn force(&mut self) {
+        self.refresh();
+        self.tokens = (self.tokens - 1.0).max(-self.capacity);
+    }
     /// Time until a write may start; zero consumes a token.
     fn acquire(&mut self) -> Duration {
         self.refresh();
@@ -739,6 +793,30 @@ impl Budget {
     }
 }
 
+/// When the queued records should be written: now for a waiting external
+/// effect or on closing, paced for a full batch or one whose oldest record
+/// has waited `batch_interval`, otherwise after the remaining interval.
+enum Due {
+    Now,
+    Paced,
+    After(Duration),
+}
+
+fn due(shared: &Shared, state: &State) -> Option<Due> {
+    let (front, _) = state.queue.front()?;
+    if state.closing || state.urgent.is_some_and(|urgent| urgent >= *front) {
+        return Some(Due::Now);
+    }
+    let waited = state
+        .queued_since
+        .map_or(Duration::MAX, |since| since.elapsed());
+    if state.queued_bytes >= shared.tuning.max_batch_bytes || waited >= shared.tuning.batch_interval
+    {
+        return Some(Due::Paced);
+    }
+    Some(Due::After(shared.tuning.batch_interval - waited))
+}
+
 /// Group queued records into batches and keep a bounded number in flight.
 pub(crate) async fn write_loop(shared: Arc<Shared>, operator: Operator) {
     let mut inflight = FuturesUnordered::new();
@@ -746,23 +824,28 @@ pub(crate) async fn write_loop(shared: Arc<Shared>, operator: Operator) {
     let mut order: VecDeque<(u64, u64, bool)> = VecDeque::new();
     let mut budget = Budget::new(&shared.tuning);
     loop {
-        let (queued, closing, failed) = {
+        let (due, closing, failed) = {
             let state = shared.lock();
-            (
-                !state.queue.is_empty(),
-                state.closing,
-                state.failure.is_some(),
-            )
+            (due(&shared, &state), state.closing, state.failure.is_some())
         };
         if failed {
             return;
         }
-        if closing && !queued && inflight.is_empty() {
+        if closing && due.is_none() && inflight.is_empty() {
             return;
         }
         let mut delay = None;
-        if queued && inflight.len() < shared.tuning.max_inflight {
-            let wait = budget.acquire();
+        if let Some(due) = due
+            && inflight.len() < shared.tuning.max_inflight
+        {
+            let wait = match due {
+                Due::Now => {
+                    budget.force();
+                    Duration::ZERO
+                }
+                Due::Paced => budget.acquire(),
+                Due::After(remaining) => remaining.max(Duration::from_millis(1)),
+            };
             if wait.is_zero() {
                 let taken = take(&shared).expect("queue is not empty");
                 let seq = {
@@ -872,6 +955,7 @@ mod tests {
             max_batch_bytes: 1 << 20,
             max_inflight: 4,
             writes_per_second: 0.0,
+            batch_interval: Duration::ZERO,
             queue_memory_bytes: 1 << 20,
             lease: Duration::from_secs(10),
             request_timeout: Duration::from_secs(4),
@@ -891,7 +975,7 @@ mod tests {
             shared.append(Item::Control(vec![index])).unwrap();
         }
         // Without a lease nothing is written and the barrier must not pass.
-        let early = tokio::time::timeout(Duration::from_millis(300), shared.barrier()).await;
+        let early = tokio::time::timeout(Duration::from_millis(300), shared.barrier("test")).await;
         assert!(early.is_err());
         assert!(
             store::list_numbered(&operator, format::LOG, None)
@@ -900,7 +984,7 @@ mod tests {
                 .is_empty()
         );
         let heartbeat = tokio::spawn(heartbeat_loop(shared.clone(), operator.clone()));
-        shared.barrier().await.unwrap();
+        shared.barrier("test").await.unwrap();
         assert!(shared.covers(10));
         let mut seen = Vec::new();
         for (_, key) in store::list_numbered(&operator, format::LOG, None)
@@ -925,8 +1009,101 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(shared.barrier().await.is_err());
+        assert!(shared.barrier("test").await.is_err());
         assert!(shared.append(Item::Control(vec![1])).is_err());
+        shared.close();
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn records_wait_for_company_unless_an_external_effect_waits() {
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let tuning = Tuning {
+            batch_interval: Duration::from_secs(3600),
+            ..tuning()
+        };
+        let shared = Arc::new(Shared::new(tuning, 1, 0, 1));
+        shared.set_baseline();
+        shared.renewed(Instant::now() + Duration::from_secs(10));
+        let writer = tokio::spawn(write_loop(shared.clone(), operator.clone()));
+        let batches = || async {
+            store::list_numbered(&operator, format::LOG, None)
+                .await
+                .unwrap()
+                .len()
+        };
+        for index in 0..3u8 {
+            shared.append(Item::Control(vec![index])).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(batches().await, 0);
+        // A waiting effect writes them at once, together.
+        tokio::time::timeout(Duration::from_secs(5), shared.barrier("test"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batches().await, 1);
+        // So does a full batch.
+        shared
+            .append(Item::Control(vec![
+                0;
+                shared.tuning.max_batch_bytes as usize
+            ]))
+            .unwrap();
+        let full = shared.position();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !shared.covers(full) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // A wait without an effect, such as for a source acknowledgement,
+        // leaves the record for later company.
+        shared.append(Item::Control(vec![9])).unwrap();
+        let quiet = tokio::time::timeout(
+            Duration::from_millis(200),
+            shared.wait_for(shared.position(), None),
+        )
+        .await;
+        assert!(quiet.is_err());
+        assert_eq!(batches().await, 2);
+        // Closing writes what remains.
+        shared.close();
+        writer.await.unwrap();
+        assert_eq!(batches().await, 3);
+    }
+
+    #[tokio::test]
+    async fn records_nothing_waits_for_are_written_after_the_interval() {
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let tuning = Tuning {
+            batch_interval: Duration::from_millis(100),
+            ..tuning()
+        };
+        let shared = Arc::new(Shared::new(tuning, 1, 0, 1));
+        shared.set_baseline();
+        shared.renewed(Instant::now() + Duration::from_secs(10));
+        let writer = tokio::spawn(write_loop(shared.clone(), operator.clone()));
+        for round in 0..3u8 {
+            shared.append(Item::Control(vec![round])).unwrap();
+            let target = shared.position();
+            tokio::time::timeout(Duration::from_secs(5), shared.wait_for(target, None))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            store::list_numbered(&operator, format::LOG, None)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
         shared.close();
         writer.await.unwrap();
     }

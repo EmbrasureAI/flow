@@ -32,6 +32,11 @@ From earlier development builds of `main`:
   `[compaction] lazy_index_remap = false` or `delete_debt = "current"` for the
   earlier behavior. Small-file compaction also starts earlier
   (`l0_soft_files` and `stable_small_soft_files` default to 6 instead of 24).
+- Remote durability writes log batches by size and age
+  (`[durability] batch_interval_ms`, 250 ms) and at once when an external
+  effect waits, instead of whenever `max_writes_per_second` allows; `0`
+  restores the earlier writes. Source acknowledgements are released up to the
+  interval later. `flow_durability_barrier_seconds` gains an `effect` label.
 
 ### Added
 
@@ -232,6 +237,15 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- With remote durability, a publication's catalog commit waits only for the
+  replicated state it was built from, up to its artifact registration, instead
+  of the newest log record, and log batches are written by size and age or as
+  soon as an external effect waits. On real S3 at 60,000 mutations/s,
+  replication had cost 3.8% CDC service time, 3.6% drain and 63% p95
+  commit-to-catalog latency, about 80 ms per commit; afterwards CDC service
+  time and drain were unchanged within run-to-run noise at 30,000 and 60,000
+  mutations/s, and log PUTs fell by about three quarters to about 4.5 a second
+  ([report](docs/benchmarks/remote-durability.md#throughput-on-real-s3)).
 - The row index names data files by per-table ordinal instead of path in
   primary-key values, reverse keys and staged deltas (index format 4), so
   lookups, staging, apply and RocksDB compaction no longer scale with path
@@ -332,6 +346,10 @@ From earlier development builds of `main`:
 
 **Remote durability metrics**
 
+- `flow_durability_barrier_seconds` has an `effect` label (`catalog_commit`,
+  `catalog`, `delete`, `replication_slot`, `acknowledgement`);
+  acknowledgement samples measure from computing source progress to releasing
+  it.
 - `flow_durability_put_seconds` gains `kind="checkpoint"`, and
   `flow_durability_retries_total` also counts control snapshot, journal part and
   checkpoint writes; filter by `kind` for log-batch retries only.
