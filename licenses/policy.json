@@ -89,7 +89,7 @@
       }
     },
     "libz-sys": {
-      "version": "1.1.29",
+      "version": "1.1.31",
       "links": "z",
       "review": "Retain the separate zlib license texts for bundled zlib and zlib-ng; the Rust wrapper choice does not replace them. System-library linkage retains the system package terms.",
       "files": {
