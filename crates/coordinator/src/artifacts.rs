@@ -329,8 +329,8 @@ impl ArtifactTracker for MetadataRegistration {
     }
     fn commit_dependency(&self) -> Option<u64> {
         match &self.backend {
-            RegistrationBackend::Live(store) => store.mirror_position(),
-            RegistrationBackend::Recovery(control) => control.mirror_position(),
+            RegistrationBackend::Live(store) => store.mirror_now(),
+            RegistrationBackend::Recovery(control) => control.mirror_now(),
         }
     }
 }

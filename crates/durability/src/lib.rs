@@ -58,10 +58,15 @@ pub struct Config {
     /// Log batches written concurrently.
     #[serde(default = "defaults::max_inflight_writes")]
     pub max_inflight_writes: usize,
-    /// Average log writes per second; excess records form larger batches.
-    /// Zero removes the limit.
+    /// Average log writes per second for batches nothing waits for; excess
+    /// records form larger batches. Zero removes the limit.
     #[serde(default = "defaults::max_writes_per_second")]
     pub max_writes_per_second: f64,
+    /// Longest a record waits for more to share its log batch, unless an
+    /// external effect waits for it first. Zero writes whenever the request
+    /// budget allows.
+    #[serde(default = "defaults::batch_interval_ms")]
+    pub batch_interval_ms: u64,
     /// Memory for queued records before appends block. Journal extents count
     /// only their descriptors; their bytes are read when batched.
     #[serde(default = "defaults::queue_memory_bytes")]
@@ -93,6 +98,9 @@ mod defaults {
     pub(super) fn max_writes_per_second() -> f64 {
         20.0
     }
+    pub(super) fn batch_interval_ms() -> u64 {
+        250
+    }
     pub(super) fn queue_memory_bytes() -> u64 {
         64 << 20
     }
@@ -122,6 +130,7 @@ impl Config {
             max_batch_bytes: defaults::max_batch_bytes(),
             max_inflight_writes: defaults::max_inflight_writes(),
             max_writes_per_second: defaults::max_writes_per_second(),
+            batch_interval_ms: defaults::batch_interval_ms(),
             queue_memory_bytes: defaults::queue_memory_bytes(),
             checkpoint_interval_secs: defaults::checkpoint_interval_secs(),
             checkpoint_batches: defaults::checkpoint_batches(),
@@ -143,6 +152,10 @@ impl Config {
         ensure!(
             self.max_writes_per_second >= 0.0 && self.max_writes_per_second.is_finite(),
             "durability.max_writes_per_second must be zero or positive"
+        );
+        ensure!(
+            self.batch_interval_ms <= 2_000,
+            "durability.batch_interval_ms must be at most 2000"
         );
         ensure!(
             self.queue_memory_bytes >= 1 << 20,
@@ -168,6 +181,7 @@ impl Config {
             max_batch_bytes: self.max_batch_bytes,
             max_inflight: self.max_inflight_writes,
             writes_per_second: self.max_writes_per_second,
+            batch_interval: Duration::from_millis(self.batch_interval_ms),
             queue_memory_bytes: self.queue_memory_bytes,
             lease: Duration::from_secs(self.lease_secs),
             request_timeout: Duration::from_secs(self.request_timeout_secs),
@@ -865,6 +879,9 @@ impl ControlMirror for ControlAdapter {
     }
     fn position(&self) -> u64 {
         self.0.position()
+    }
+    fn expedite(&self, position: u64) {
+        self.0.expedite(position);
     }
 }
 

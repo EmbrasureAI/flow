@@ -79,7 +79,8 @@ pub trait ArtifactTracker: std::fmt::Debug + Send + Sync {
     /// Called after a publication registers its artifacts and before it
     /// writes them: the replication log position covering that registration
     /// and everything recorded before it, which its catalog commit waits for.
-    /// `None` when registrations are not replicated.
+    /// A replicating tracker should start replicating it now. `None` when
+    /// registrations are not replicated.
     fn commit_dependency(&self) -> Option<u64> {
         None
     }

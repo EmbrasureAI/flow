@@ -22,6 +22,7 @@ uri = "s3://bucket/flow/orders-primary-v1"
 # max_batch_bytes = 8388608
 # max_inflight_writes = 4
 # max_writes_per_second = 20     # 0 removes the request budget
+# batch_interval_ms = 250
 # queue_memory_bytes = 67108864
 # checkpoint_interval_secs = 30
 # checkpoint_batches = 1000
@@ -189,13 +190,22 @@ hard-linked SST files carry over between checkpoints and, through
 
 ## Cost and tuning
 
-Each log write is one conditional PUT. Up to `max_inflight_writes` start at
-once; beyond `max_writes_per_second` records wait and form larger batches, which
-bounds request cost at the price of latency. At low rates each change is its own
-batch. Lease renewal is one HEAD per quarter lease. Checkpoints add a control
-snapshot, new journal parts of at most 8 MiB and a manifest per interval;
-retention deletes in batches. Journal bytes are written twice, once in the log
-and once as checkpoint parts.
+Each log write is one conditional PUT. A batch is written as soon as an external
+effect waits for one of its records, once `max_batch_bytes` are queued, or once
+its oldest record has waited `batch_interval_ms`. Up to `max_inflight_writes`
+start at once, and `max_writes_per_second` paces the batches nothing waits for.
+A busy source therefore writes about four batches a second plus about one per
+catalog commit, and nothing on the publication path waits for the interval: a
+publication asks for its registration to be written when it registers. Source
+acknowledgements do not shorten the interval; they are released up to
+`batch_interval_ms` later. With `batch_interval_ms = 0` everything is written
+whenever the request budget allows, as in earlier versions, except that external
+effects never wait for the budget. Garbage collection deletes each wait for a
+barrier, so a large collection pass can briefly write more than
+`max_writes_per_second`. Lease renewal is one HEAD per quarter lease.
+Checkpoints add a control snapshot, new journal parts of at most 8 MiB and a
+manifest per interval; retention deletes in batches. Journal bytes are written
+twice, once in the log and once as checkpoint parts.
 
 ## Observability
 

@@ -1125,10 +1125,9 @@ impl StateStore {
             .file_live_row_counts(files)
     }
 
-    /// Replication position covering every control write completed so far,
-    /// if the control store is mirrored.
-    pub fn mirror_position(&self) -> Option<u64> {
-        self.0.control.as_ref()?.mirror_position()
+    /// See [`ControlStore::mirror_now`].
+    pub fn mirror_now(&self) -> Option<u64> {
+        self.0.control.as_ref()?.mirror_now()
     }
 
     /// Source-wide transaction ledger payloads. One key per transaction, never
