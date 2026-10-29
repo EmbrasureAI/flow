@@ -75,3 +75,10 @@ strip = false
 
 [profile.dev]
 debug = 1
+
+# Dependencies (Arrow, Parquet, zstd, RocksDB) dominate test and service-suite run
+# time at opt-level 0. Optimizing them roughly halves `cargo test` execution and cuts
+# the daemon-driven service suites by about 40%, for a slower cold dependency build.
+# Workspace crates stay unoptimized so incremental rebuilds are unaffected.
+[profile.dev.package."*"]
+opt-level = 2

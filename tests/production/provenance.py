@@ -46,6 +46,11 @@ def repository_identity(root=ROOT):
         path = root / os.fsdecode(encoded)
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
+        if path.is_dir() and not path.is_symlink():
+            # Git lists an untracked nested repository (such as a worktree) as
+            # a directory entry; record its presence rather than its contents.
+            digest.update(b"directory\0")
+            continue
         if path.is_symlink():
             target = os.fsencode(os.readlink(path))
             digest.update(b"symlink\0")

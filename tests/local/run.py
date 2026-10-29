@@ -83,11 +83,14 @@ class Run:
             "'enable_http_metadata_cache', 'enable_external_file_cache') ORDER BY name"
         ).fetchall())
         self.duck.execute("SET timezone = 'UTC'")
+        # Temporary credentials (real S3) also need their session token.
+        token = os.environ.get("AWS_SESSION_TOKEN")
         self.duck.execute(
-            "CREATE SECRET local_s3 (TYPE s3, KEY_ID {}, SECRET {}, REGION {}, "
+            "CREATE SECRET local_s3 (TYPE s3, KEY_ID {}, SECRET {}, {}REGION {}, "
             "ENDPOINT {}, URL_STYLE 'path', USE_SSL {})".format(
                 literal(os.environ["AWS_ACCESS_KEY_ID"]),
                 literal(os.environ["AWS_SECRET_ACCESS_KEY"]),
+                f"SESSION_TOKEN {literal(token)}, " if token else "",
                 literal(os.environ.get("AWS_REGION", "us-east-1")),
                 literal(endpoint.netloc), str(endpoint.scheme == "https").lower(),
             )

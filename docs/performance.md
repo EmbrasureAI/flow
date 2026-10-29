@@ -96,6 +96,15 @@ epoch rose from 111,000–116,000 to 158,000–159,000 mutations/s, and path len
 no longer affects apply or collapse time. These are local stage timings, not
 publication latency or service throughput.
 
+## Journal sync
+
+The [journal sync measurement](benchmarks/journal-sync.md) drained a backlog
+of one million single-row transactions through the capture thread. The journal
+sync took 13–17% of the time on local NVMe and limited catch-up to about 87,000
+transactions/s with 1 ms of added sync latency. A background sync would not
+shorten acknowledgement, so the sync stays on the capture thread for now; a
+larger commit group is the cheaper first step.
+
 ## Reproducibility
 
 The [benchmark report](benchmarks/v3-deletion-vectors.md) gives the environment,

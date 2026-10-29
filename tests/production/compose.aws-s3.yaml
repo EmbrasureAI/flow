@@ -1,0 +1,14 @@
+# Real Amazon S3 instead of MinIO for the catalog's warehouse. fixture.sh adds
+# this file when FLOW_PRODUCTION_WAREHOUSE (s3://bucket/prefix/) is set; pass the
+# same URL and `--s3-endpoint https://s3.<region>.amazonaws.com` to benchmark.py.
+# Credentials come from the caller's environment and are fixed when the
+# container starts: rerun `fixture.sh up` with fresh ones before they expire.
+services:
+  rest:
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set AWS credentials for real S3}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS credentials for real S3}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      CATALOG_WAREHOUSE: ${FLOW_PRODUCTION_WAREHOUSE}
+      CATALOG_S3_ENDPOINT: https://s3.${AWS_REGION:-us-east-1}.amazonaws.com
