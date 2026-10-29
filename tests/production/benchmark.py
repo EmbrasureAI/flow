@@ -157,6 +157,15 @@ warehouse = {json.dumps(self.args.warehouse)}
 "s3.region" = {json.dumps(os.environ.get('AWS_REGION', 'us-east-1'))}
 "s3.path-style-access" = "true"
 '''
+        if self.args.durability_uri:
+            # A fresh prefix per run: a prefix is bound to one source incarnation.
+            text += f'''[durability]
+uri = {json.dumps(self.args.durability_uri.rstrip('/') + '/' + self.name)}
+region = {json.dumps(os.environ.get('AWS_REGION', 'us-east-1'))}
+'''
+            if not urlparse(self.args.s3_endpoint).hostname.endswith(".amazonaws.com"):
+                text += f'''endpoint = {json.dumps(self.args.s3_endpoint)}
+'''
         text += f'''[compaction]
 data_rewrite_scope = {json.dumps({'current': 'all', 'l0-only': 'l0-only', 'delete-only': 'disabled', 'disabled': 'disabled'}[self.args.maintenance_mode])}
 '''
@@ -215,6 +224,10 @@ columns = [
 '''
         text = override_config(text, "compaction", self.args.compaction)
         text = override_config(text, "limits", self.args.limit)
+        if self.args.durability:
+            if not self.args.durability_uri:
+                raise ValueError("--durability requires --durability-uri")
+            text = override_config(text, "durability", self.args.durability)
         self.config = self.directory / "flow.toml"
         self.config.write_text(text)
         # Timing events are required evidence, independent of the caller's logging preference.
@@ -803,7 +816,7 @@ columns = [
 
     def resource_summary(self):
         """Sampled resource bounds and process counters, not billing estimates."""
-        gauges = ("flow_table_", "flow_source_retained_wal_bytes", "flow_journal_bytes")
+        gauges = ("flow_table_", "flow_source_retained_wal_bytes", "flow_journal_bytes", "flow_durability_")
         peaks = {}
         samples, peak_rss = 0, 0
         for sample in self.store.samples("resource"):
@@ -1171,6 +1184,10 @@ def main():
                         help="override a [limits] key with a TOML value; repeatable")
     parser.add_argument("--compaction", action="append", default=[], metavar="KEY=VALUE",
                         help="override a [compaction] key with a TOML value; repeatable")
+    parser.add_argument("--durability-uri", metavar="URI",
+                        help="enable remote durability under URI/<run name>, e.g. s3://bucket/prefix")
+    parser.add_argument("--durability", action="append", default=[], metavar="KEY=VALUE",
+                        help="override a [durability] key with a TOML value; repeatable")
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--setup-timeout", type=float, default=600,

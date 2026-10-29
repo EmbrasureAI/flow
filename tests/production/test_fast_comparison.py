@@ -35,6 +35,11 @@ class OverrideConfigTest(unittest.TestCase):
         self.assertEqual(parsed["compaction"], {"data_rewrite_scope": "all", "delete_files_soft": 16})
         self.assertEqual(parsed["tables"], [{"target_table": "events_0"}])
 
+    def test_overrides_the_durability_section(self):
+        text = override_config(GENERATED.replace("[compaction]", '[durability]\nuri = "s3://b/p"\n[compaction]'),
+                               "durability", ["max_writes_per_second = 0.0"])
+        self.assertEqual(tomllib.loads(text)["durability"], {"uri": "s3://b/p", "max_writes_per_second": 0.0})
+
     def test_rejects_an_assignment_without_a_value(self):
         with self.assertRaisesRegex(ValueError, "--limit expects KEY=VALUE"):
             override_config(GENERATED, "limits", ["batch_rows"])
