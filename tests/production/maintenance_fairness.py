@@ -135,9 +135,17 @@ class FairnessRun(ConcurrentRun):
         materialized = admitted["watermarks"]["materialized_lsn"]
         assert materialized < self.barrier, "build started only after the source backlog drained"
         assert admitted["pending_transactions"] > 0, "build admission did not overlap queued work"
-        pressure = [value for key, value in self.metrics().items()
+        # Table gauges reach metrics.prom on a one-second export cadence, which
+        # can trail an early admission. Wait for the built table's series.
+        orders_id = self.pg.execute("SELECT 'orders'::regclass::oid").fetchone()[0]
+        orders_pressure = f'flow_table_publication_pressure{{table_id="{orders_id}"}}'
+        def exported():
+            metrics = self.metrics()
+            return metrics if orders_pressure in metrics else None
+        metrics = self.until("orders publication pressure was not exported", exported, timeout=5)
+        pressure = [value for key, value in metrics.items()
                     if key.startswith("flow_table_publication_pressure{")]
-        assert pressure and max(pressure) < 2, "hard debt, not fairness, admitted the build"
+        assert max(pressure) < 2, "hard debt, not fairness, admitted the build"
         def progressed():
             status = self.status()
             return status if status["watermarks"]["materialized_lsn"] > materialized else None
