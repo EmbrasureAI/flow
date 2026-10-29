@@ -153,6 +153,8 @@ impl TableMaintenance {
             let index = index.clone();
             let insertion = insertion.clone();
             move || -> Result<(u64, u64)> {
+                // Reverse scans below must see rows moved by lazy remaps.
+                index.materialize_remaps(&table_id)?;
                 let batch_rows = index.batch_rows();
                 // 1. Remove entries whose rows are no longer live at the head.
                 let mut removed_rows = 0u64;

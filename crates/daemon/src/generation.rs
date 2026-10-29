@@ -594,7 +594,7 @@ fn index_maintenance(
         store.clone(),
         catalog.clone(),
         config.compaction.clone(),
-        crate::services::writer_config(config),
+        crate::services::compacted_writer_config(config),
     )?
     .with_read_limits(config.parquet_read.clone())
 }

@@ -11,6 +11,10 @@ rust-version.workspace = true
 [features]
 apply-profile = []
 sst-profile = []
+# Link RocksDB's jemalloc, which replaces malloc for the whole process on
+# GNU/Linux as `flow-daemon/jemalloc` does, so benchmarks measure the
+# production allocator.
+jemalloc = ["rocksdb/jemalloc"]
 
 [dependencies]
 flow-model.workspace = true

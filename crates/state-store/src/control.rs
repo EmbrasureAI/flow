@@ -75,6 +75,9 @@ const ACTIVE: &[u8] = b"active-generation";
 const INITIALIZING: &[u8] = b"initializing-generation";
 const REVISION: &[u8] = b"control-revision";
 const CHECKPOINT: u8 = 4;
+/// A checkpoint registered under the locks whose files are not yet synced.
+/// It protects its tables' snapshots but is never restored or replicated.
+const PENDING_CHECKPOINT: u8 = 5;
 const VERSION: &[u8] = b"control-format-version";
 const CONTROL_MAX_OPEN_FILES: i32 = 256;
 
@@ -626,24 +629,55 @@ impl ControlStore {
         // Flush memtables before taking the locks, so the flush inside the
         // checkpoint covers only writes since and durable transitions wait less.
         index.flush_memtables()?;
-        let _index_guard = index.lock()?;
-        let _guard = self.lock()?;
-        index.ensure_writable()?;
-        self.validate_index_path(index.0.db.path())?;
-        let revision = self.validate_index(&index.0.db)?;
-        index.0.db.flush_wal(true)?;
-        rocksdb::checkpoint::Checkpoint::new(&index.0.db)?.create_checkpoint(path.as_ref())?;
-        sync_directory_tree(path.as_ref())?;
-        let record = CheckpointRecord {
-            path: fs::canonicalize(path.as_ref())?,
-            revision,
-            tables: self.table_states()?,
-            pending_operations: self.pending_operations()?,
+        let record = {
+            let _index_guard = index.lock()?;
+            let _guard = self.lock()?;
+            index.ensure_writable()?;
+            self.validate_index_path(index.0.db.path())?;
+            let revision = self.validate_index(&index.0.db)?;
+            index.0.db.flush_wal(true)?;
+            rocksdb::checkpoint::Checkpoint::new(&index.0.db)?.create_checkpoint(path.as_ref())?;
+            let record = CheckpointRecord {
+                path: fs::canonicalize(path.as_ref())?,
+                revision,
+                tables: self.table_states()?,
+                pending_operations: self.pending_operations()?,
+            };
+            // The record must match the index at this instant, and snapshot
+            // retention must protect its tables from now on. Syncing every
+            // file can take long, so only a pending registration is written
+            // under the locks.
+            let mut batch = WriteBatch::default();
+            batch.put(
+                checkpoint_key_with(PENDING_CHECKPOINT, &record.path),
+                bincode::serialize(&record)?,
+            );
+            self.write_control(batch, &durable_write())?;
+            record
         };
+        sync_directory_tree(&record.path)?;
+        let _guard = self.lock()?;
         let mut batch = WriteBatch::default();
+        batch.delete(checkpoint_key_with(PENDING_CHECKPOINT, &record.path));
         batch.put(checkpoint_key(&record.path), bincode::serialize(&record)?);
         self.write_control(batch, &durable_write())?;
         Ok(record)
+    }
+
+    /// Drop registrations of checkpoints that never finished syncing, as after
+    /// a crash. Only the serialized checkpoint task may call this, before it
+    /// creates a checkpoint. Returns how many were removed.
+    pub fn forget_pending_checkpoints(&self) -> Result<usize> {
+        let _guard = self.lock()?;
+        let mut batch = WriteBatch::default();
+        for entry in self.scan(vec![PENDING_CHECKPOINT]) {
+            batch.delete(entry?.0);
+        }
+        let removed = batch.len();
+        if removed > 0 {
+            self.write_control(batch, &durable_write())?;
+        }
+        Ok(removed)
     }
 
     /// Restore a registered checkpoint into a new offline directory. Callers
@@ -697,10 +731,21 @@ impl ControlStore {
         Ok(relocated)
     }
 
+    /// Durable checkpoints, which may be restored, replicated or retired.
     pub fn checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
         self.scan(vec![CHECKPOINT])
             .map(|entry| entry.and_then(|(_, value)| decode(&value)))
             .collect()
+    }
+
+    /// Every checkpoint whose recorded snapshots must be retained: the durable
+    /// ones and those still syncing.
+    pub fn checkpoint_protections(&self) -> Result<Vec<CheckpointRecord>> {
+        let mut records = self.checkpoints()?;
+        for entry in self.scan(vec![PENDING_CHECKPOINT]) {
+            records.push(decode(&entry?.1)?);
+        }
+        Ok(records)
     }
 
     pub fn forget_checkpoint(&self, record: &CheckpointRecord) -> Result<()> {
@@ -775,7 +820,10 @@ fn next_revision(revision: u64) -> Result<u64> {
         .ok_or_else(|| Error::InvalidState("control revision exhausted".into()))
 }
 fn checkpoint_key(path: &Path) -> Vec<u8> {
-    let mut key = vec![CHECKPOINT];
+    checkpoint_key_with(CHECKPOINT, path)
+}
+fn checkpoint_key_with(prefix: u8, path: &Path) -> Vec<u8> {
+    let mut key = vec![prefix];
     key.extend_from_slice(path.as_os_str().as_encoded_bytes());
     key
 }
@@ -807,7 +855,7 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_directory_tree(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_directory_tree(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -844,6 +892,49 @@ mod tests {
     fn restore_image(image: &tempfile::TempDir, path: &Path) {
         fs::remove_dir_all(path).unwrap();
         copy_directory_tree(image.path(), path).unwrap();
+    }
+
+    #[test]
+    fn pending_checkpoints_protect_snapshots_but_are_never_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlStore::open(root.path().join("control")).unwrap();
+        let index = control
+            .initialize_index(root.path().join("index"), StateStoreOptions::default())
+            .unwrap();
+        let durable = control
+            .checkpoint(&index, root.path().join("durable"))
+            .unwrap();
+        // A finished checkpoint leaves only its durable registration.
+        assert_eq!(
+            control.checkpoints().unwrap(),
+            std::slice::from_ref(&durable)
+        );
+        assert_eq!(
+            control.checkpoint_protections().unwrap(),
+            std::slice::from_ref(&durable)
+        );
+        assert_eq!(control.forget_pending_checkpoints().unwrap(), 0);
+        // What a crash while syncing leaves behind.
+        let unfinished = CheckpointRecord {
+            path: root.path().join("unfinished"),
+            ..durable.clone()
+        };
+        let mut batch = WriteBatch::default();
+        batch.put(
+            checkpoint_key_with(PENDING_CHECKPOINT, &unfinished.path),
+            bincode::serialize(&unfinished).unwrap(),
+        );
+        control.write_control(batch, &durable_write()).unwrap();
+        assert_eq!(
+            control.checkpoints().unwrap(),
+            std::slice::from_ref(&durable)
+        );
+        assert_eq!(
+            control.checkpoint_protections().unwrap(),
+            [durable.clone(), unfinished]
+        );
+        assert_eq!(control.forget_pending_checkpoints().unwrap(), 1);
+        assert_eq!(control.checkpoint_protections().unwrap(), [durable]);
     }
 
     #[test]

@@ -27,9 +27,13 @@ const CONCURRENCY: usize = 8;
 /// Files are hashed and uploaded in pieces of this size, never read whole.
 const CHUNK: usize = 8 << 20;
 
+/// Saved beside the local checkpoints, so a restart does not hash every SST
+/// file again. Derived state: a missing or unreadable file only means hashing.
+const HASHES_FILE: &str = "replicated-hashes.json";
+
 /// Identifies an immutable file's contents without reading it. Successive
 /// checkpoints hard-link the same SST files, so their hashes carry over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct FileKey {
     device: u64,
     inode: u64,
@@ -58,9 +62,40 @@ impl FileKey {
     }
 }
 
-/// Hashes of the SST files in the last uploaded checkpoint.
+/// Hashes of the SST files in the last uploaded checkpoint, loaded from the
+/// checkpoints directory on first use.
 #[derive(Default)]
-pub(crate) struct Hashes(Mutex<HashMap<FileKey, String>>);
+pub(crate) struct Hashes(Mutex<Option<HashMap<FileKey, String>>>);
+
+impl Hashes {
+    fn known(&self, checkpoints: &Path) -> HashMap<FileKey, String> {
+        let mut known = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        known
+            .get_or_insert_with(|| {
+                fs::read(checkpoints.join(HASHES_FILE))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Vec<(FileKey, String)>>(&bytes).ok())
+                    .map(|entries| entries.into_iter().collect())
+                    .unwrap_or_default()
+            })
+            .clone()
+    }
+
+    fn remember(&self, checkpoints: &Path, hashes: HashMap<FileKey, String>) {
+        // Renamed into place, so a crash leaves the old file or the new one.
+        let saved = (|| -> Result<()> {
+            let entries: Vec<_> = hashes.iter().collect();
+            let temporary = checkpoints.join(format!("{HASHES_FILE}.tmp"));
+            fs::write(&temporary, serde_json::to_vec(&entries)?)?;
+            fs::rename(&temporary, checkpoints.join(HASHES_FILE))?;
+            Ok(())
+        })();
+        if let Err(error) = saved {
+            tracing::warn!(error = %format!("{error:#}"), "could not save replicated index checkpoint hashes");
+        }
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(hashes);
+    }
+}
 
 fn hash_file(path: &Path) -> Result<(String, u64)> {
     let mut hasher = blake3::Hasher::new();
@@ -161,8 +196,10 @@ pub(crate) async fn upload(
         .into_iter()
         .collect();
     let existing = Arc::new(existing);
-    let known = hashes.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let known = Arc::new(known);
+    let checkpoints = directory
+        .parent()
+        .context("index checkpoint directory has no parent")?;
+    let known = Arc::new(hashes.known(checkpoints));
     let results: Vec<(File, u64, Option<FileKey>)> = futures::stream::iter(paths)
         .map(|path| {
             let operator = operator.clone();
@@ -208,10 +245,13 @@ pub(crate) async fn upload(
         .buffered(CONCURRENCY)
         .try_collect()
         .await?;
-    *hashes.0.lock().unwrap_or_else(|e| e.into_inner()) = results
-        .iter()
-        .filter_map(|(file, _, key)| Some(((*key)?, file.blake3.clone())))
-        .collect();
+    hashes.remember(
+        checkpoints,
+        results
+            .iter()
+            .filter_map(|(file, _, key)| Some(((*key)?, file.blake3.clone())))
+            .collect(),
+    );
     let uploaded = results.iter().map(|(_, bytes, _)| bytes).sum();
     let total = results.iter().map(|(file, _, _)| file.size).sum();
     let manifest = Manifest {
@@ -334,4 +374,28 @@ pub(crate) async fn download(operator: &Operator, name: &str, directory: &Path) 
         "downloaded a replicated row-index checkpoint"
     );
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hashes_survive_a_restart_and_a_damaged_file_only_means_hashing() {
+        let checkpoints = tempfile::tempdir().unwrap();
+        let sst = checkpoints.path().join("000001.sst");
+        fs::write(&sst, b"rows").unwrap();
+        let key = FileKey::of(&fs::metadata(&sst).unwrap()).unwrap();
+        let hashes = Hashes::default();
+        assert!(hashes.known(checkpoints.path()).is_empty());
+        hashes.remember(
+            checkpoints.path(),
+            HashMap::from([(key, "hash".to_owned())]),
+        );
+        // A new process loads what the last upload saved.
+        let restarted = Hashes::default();
+        assert_eq!(restarted.known(checkpoints.path())[&key], "hash");
+        fs::write(checkpoints.path().join(HASHES_FILE), b"{torn").unwrap();
+        assert!(Hashes::default().known(checkpoints.path()).is_empty());
+    }
 }

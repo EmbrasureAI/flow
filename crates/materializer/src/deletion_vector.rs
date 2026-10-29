@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, ensure};
 use flow_iceberg_ext::ArtifactSet;
-use flow_model::{OperationId, RowLocation};
+use flow_model::OperationId;
 use iceberg::{
     compression::CompressionCodec,
     io::FileIO,
@@ -10,7 +10,7 @@ use iceberg::{
     spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Struct},
 };
 
-use crate::{WriterConfig, writer::ParquetDeleteWriter};
+use crate::{DeletePosition, WriterConfig, writer::ParquetDeleteWriter};
 
 /// Writes sorted, unique positions in the table's format. V3 keeps one vector
 /// per target, even when batches or requested file rotations split that target.
@@ -91,7 +91,7 @@ impl DeleteWriter {
         Ok(Self { inner })
     }
 
-    pub async fn write(&mut self, positions: &[RowLocation]) -> Result<()> {
+    pub async fn write(&mut self, positions: &[impl DeletePosition]) -> Result<()> {
         match &mut self.inner {
             Writer::Parquet(writer) => writer.write(positions).await,
             Writer::Puffin(writer) => writer.write(positions, None).await,
@@ -102,7 +102,7 @@ impl DeleteWriter {
     /// new positions. Merged positions may repeat or precede new ones.
     pub async fn write_with_priors(
         &mut self,
-        positions: &[RowLocation],
+        positions: &[impl DeletePosition],
         priors: &mut HashMap<String, DeleteVector>,
     ) -> Result<()> {
         match &mut self.inner {
@@ -121,6 +121,19 @@ impl DeleteWriter {
     pub async fn finish_file(&mut self) -> Result<()> {
         match &mut self.inner {
             Writer::Parquet(writer) => writer.finish_file().await,
+            Writer::Puffin(writer) => {
+                writer.rotate = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Close the current position-delete file at a target boundary, letting
+    /// its upload overlap the next targets' files. V3 already writes one
+    /// vector per target and rotates like [`Self::finish_file`].
+    pub async fn finish_target(&mut self) -> Result<()> {
+        match &mut self.inner {
+            Writer::Parquet(writer) => writer.finish_file_concurrently().await,
             Writer::Puffin(writer) => {
                 writer.rotate = true;
                 Ok(())
@@ -164,7 +177,7 @@ impl VectorWriter {
 
     async fn write(
         &mut self,
-        positions: &[RowLocation],
+        positions: &[impl DeletePosition],
         mut priors: Option<&mut HashMap<String, DeleteVector>>,
     ) -> Result<()> {
         let limit = self
@@ -178,29 +191,26 @@ impl VectorWriter {
             let mut check_each = chunk.len().saturating_mul(32)
                 > limit.saturating_sub(self.positions.serialized_size());
             for (index, position) in chunk.iter().enumerate() {
-                let target = &position.data_file_id.0;
+                let target = position.data_file();
+                let row_position = position.row_position();
                 ensure!(
-                    position.spec_id == self.spec_id
-                        && position.partition.is_empty()
-                        && position.row_position <= i64::MAX as u64,
+                    position.in_spec(self.spec_id) && row_position <= i64::MAX as u64,
                     "invalid deletion-vector position"
                 );
-                if let Some(previous) = &self.target {
+                if let Some(previous) = self.target.as_deref() {
                     ensure!(
                         target > previous
                             || (target == previous
-                                && self
-                                    .last_position
-                                    .is_none_or(|last| position.row_position > last)),
+                                && self.last_position.is_none_or(|last| row_position > last)),
                         "delete positions must be sorted and unique"
                     );
                 }
-                if self.target.as_ref() != Some(target) {
+                if self.target.as_deref() != Some(target) {
                     self.finish_target().await?;
                     if self.rotate || self.offset >= self.config.target_file_bytes as u64 {
                         self.finish_object().await?;
                     }
-                    self.target = Some(target.clone());
+                    self.target = Some(target.to_owned());
                     self.last_position = None;
                     if let Some(prior) = priors.as_deref_mut().and_then(|p| p.remove(target)) {
                         self.positions = prior;
@@ -208,8 +218,8 @@ impl VectorWriter {
                             > limit.saturating_sub(self.positions.serialized_size());
                     }
                 }
-                self.positions.insert(position.row_position);
-                self.last_position = Some(position.row_position);
+                self.positions.insert(row_position);
+                self.last_position = Some(row_position);
                 ensure!(
                     !check_each || self.positions.serialized_size() <= limit,
                     "deletion vector exceeds writer memory budget"
@@ -263,12 +273,13 @@ impl VectorWriter {
                     })
                     .await?;
             }
-            ensure!(
-                !self.file_io.exists(&path).await?,
-                "refusing to overwrite prepared delete artifact"
-            );
             self.current = Some(
-                PuffinWriter::new(&self.file_io.new_output(&path)?, HashMap::new(), false).await?,
+                PuffinWriter::new(
+                    &self.file_io.new_output(&path)?.if_absent(),
+                    HashMap::new(),
+                    false,
+                )
+                .await?,
             );
         }
         let blob = Blob::builder()

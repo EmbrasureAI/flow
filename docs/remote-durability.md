@@ -180,7 +180,8 @@ reclamation is replicated in order, so restored journals keep exactly the
 retained segments. A segment whose bytes are not durable yet is
 kept locally until a later reclamation instead of blocking the journal. Index
 checkpoint files are hashed and uploaded in 8 MiB pieces, and hashes of
-hard-linked SST files carry over between checkpoints.
+hard-linked SST files carry over between checkpoints and, through
+`checkpoints/replicated-hashes.json` (derived state), across restarts.
 
 ## Cost and tuning
 
@@ -188,9 +189,9 @@ Each log write is one conditional PUT. Up to `max_inflight_writes` start at
 once; beyond `max_writes_per_second` records wait and form larger batches, which
 bounds request cost at the price of latency. At low rates each change is its own
 batch. Lease renewal is one HEAD per quarter lease. Checkpoints add a control
-snapshot, new journal parts and a manifest per interval; retention deletes in
-batches. Journal bytes are written twice, once in the log and once as
-checkpoint parts.
+snapshot, new journal parts of at most 8 MiB and a manifest per interval;
+retention deletes in batches. Journal bytes are written twice, once in the log
+and once as checkpoint parts.
 
 ## Observability
 
@@ -222,11 +223,12 @@ and checkpoint; `index_checkpoint_replicated`, `index_checkpoint_downloaded` and
 - One process owns a prefix. Fencing relies on bounded clock rates and on
   object requests finishing within `request_timeout_secs`.
 - Each log batch, control snapshot and journal part is written with a single
-  request that must finish within `request_timeout_secs`. A batch can reach
-  `max_batch_bytes` and a part a whole journal segment (64 MiB), so the default
-  4 seconds needs about 16 MiB/s of upload bandwidth for the largest parts.
-  Slower links retry with warnings that name the object size; raise
-  `request_timeout_secs` together with `lease_secs`, or lower `max_batch_bytes`.
+  request that must finish within `request_timeout_secs`. Journal parts are at
+  most 8 MiB and a batch can reach `max_batch_bytes` (8 MiB by default), so the
+  default 4 seconds needs about 2 MiB/s of upload bandwidth per request; a
+  larger `max_batch_bytes` raises that proportionally. Slower links retry with
+  warnings that name the object size; raise `request_timeout_secs` together
+  with `lease_secs`, or lower `max_batch_bytes`.
 - Downloading the index checkpoint scales with index size, and catch-up with
   the files changed since that checkpoint. Without a usable replica, the full
   rebuild scales with table size.

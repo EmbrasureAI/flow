@@ -1,5 +1,7 @@
 use flow_compactor::{
-    DataRewriteScope, DeleteDependency, Error, FileCandidate, Level, Policy, PublicationPressure,
+    DataRewriteScope, Debt, DeleteDebt, DeleteDependency, DeleteLayout, Error, FileCandidate,
+    Level, MergeBudget, PlanReason, Policy, PublicationPressure, TargetDeleteFile, TargetDeletes,
+    TargetRanges,
 };
 use flow_model::FileId;
 use std::collections::BTreeSet;
@@ -12,6 +14,7 @@ fn file(id: usize, bytes: u64) -> FileCandidate {
         row_count: 100,
         deleted_rows: 0,
         delete_file_count: 0,
+        target_delete_files: 0,
         age_ms: 12_000 - id as u64,
         spec_id: 0,
         partition: vec![],
@@ -315,7 +318,28 @@ fn forced_delete_rewrite_keeps_companions_within_the_size_tier() {
     over_limit.level = Level::L1;
     let mut large = file(3, 128 << 20);
     large.level = Level::L1;
-    let policy = Policy::default();
+    // With consolidation, the default, an L1 seed admits only companions that
+    // are themselves past the deleted fraction.
+    let plan = Policy::default()
+        .plan(
+            1,
+            0,
+            &[
+                small.clone(),
+                at_limit.clone(),
+                over_limit.clone(),
+                large.clone(),
+            ],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.input_files, BTreeSet::from([small.id.clone()]));
+    // The current policy fills the group with companions within the size tier.
+    let policy = Policy {
+        delete_debt: DeleteDebt::Current,
+        ..Policy::default()
+    };
     let plan = policy
         .plan(
             1,
@@ -364,7 +388,13 @@ fn soft_aging_closes_old_singletons_and_new_files_wait() {
 
 #[test]
 fn fragmented_external_output_is_bounded_without_rewriting_idle_singletons() {
-    let policy = Policy::default();
+    // Soft limits above the nine files left after one consolidation isolate the
+    // bounded group from ordinary soft small-file compaction.
+    let policy = Policy {
+        l0_soft_files: 24,
+        stable_small_soft_files: 24,
+        ..Policy::default()
+    };
     let mut files = (0..40)
         .map(|id| {
             let mut candidate = file(id, 128 + id as u64 * 64);
@@ -559,4 +589,714 @@ fn hard_l0_relief_precedes_dense_stable_rewrites() {
     assert_eq!(plan.output_level, Level::L1);
     files.reverse();
     assert_eq!(policy.plan(4, 1, &files, &[]).unwrap().unwrap(), plan);
+}
+
+/// The profiled shape: a mostly-live L2 base, sixteen epochs of position
+/// deletes against it, and small hot L0 files of which one is dense.
+fn hot_base_with_delete_fanout() -> (Vec<FileCandidate>, Vec<DeleteDependency>) {
+    let mut base = file(0, 600 << 20);
+    base.level = Level::L2;
+    base.row_count = 1_000_000;
+    base.deleted_rows = 90_000;
+    base.age_ms = 60_000;
+    let mut files = vec![base];
+    for id in 1..=4 {
+        let mut l0 = file(id, 1 << 20);
+        l0.age_ms = 2_000;
+        l0.deleted_rows = if id == 1 { 50 } else { 5 };
+        files.push(l0);
+    }
+    let deletes = (0..16)
+        .map(|epoch| {
+            let mut targets = BTreeSet::from([files[0].id.clone()]);
+            if epoch % 4 == 0 {
+                targets.insert(files[1 + epoch / 4].id.clone());
+            }
+            DeleteDependency {
+                id: FileId(format!("epoch-delete-{epoch}")),
+                size_bytes: 100 << 10,
+                row_count: 10_000,
+                targets,
+            }
+        })
+        .collect::<Vec<_>>();
+    for delete in &deletes {
+        for file in files
+            .iter_mut()
+            .filter(|file| delete.targets.contains(&file.id))
+        {
+            file.delete_file_count += 1;
+        }
+    }
+    (files, deletes)
+}
+
+#[test]
+fn delete_file_count_debt_selects_consolidation_not_a_base_rewrite() {
+    let (files, deletes) = hot_base_with_delete_fanout();
+    let base = files[0].id.clone();
+    let current = Policy {
+        delete_debt: DeleteDebt::Current,
+        ..Policy::default()
+    };
+    let consolidate = Policy::default();
+    assert_eq!(consolidate.delete_debt, DeleteDebt::Consolidate);
+    for policy in [&current, &consolidate] {
+        let debt = policy
+            .debt_with_shared_deletes(&files, deletes.len())
+            .unwrap();
+        assert_eq!(debt.pressure, PublicationPressure::Pause);
+        assert_eq!(debt.max_delete_files, 16);
+        assert_eq!(debt.dense_delete_files, 1);
+        assert_eq!(
+            policy.delete_file_pressure(&debt),
+            PublicationPressure::Pause
+        );
+        assert_eq!(policy.layout_pressure(&debt), PublicationPressure::Healthy);
+        assert_eq!(policy.pressure_reasons(&debt), ["delete_file_count"]);
+        // Shared-file pressure is unchanged from the per-file debt.
+        assert_eq!(
+            policy.debt_with_shared_deletes(&files, 0).unwrap(),
+            Debt {
+                shared_delete_files: 0,
+                ..policy.debt(&files).unwrap()
+            }
+        );
+    }
+    let debt = consolidate.debt_with_shared_deletes(&files, 16).unwrap();
+    assert!(consolidate.consolidates_delete_debt(&debt));
+    assert!(!current.consolidates_delete_debt(&debt));
+    // The current policy pays delete-file count by rewriting the whole base.
+    let plan = current.plan(1, 0, &files, &deletes).unwrap().unwrap();
+    assert_eq!(plan.input_files, BTreeSet::from([base.clone()]));
+    assert_eq!(plan.reason, PlanReason::DeleteFileCount);
+    assert_eq!(plan.output_level, Level::L2);
+    // Consolidation pays it instead; data work only reclaims the dense L0
+    // file under the existing L0 grouping, and never moves the base.
+    let plan = consolidate.plan(1, 0, &files, &deletes).unwrap().unwrap();
+    assert!(!plan.input_files.contains(&base));
+    assert!(plan.input_files.contains(&files[1].id));
+    assert_eq!(plan.reason, PlanReason::DeletedRows);
+    assert_eq!(plan.output_level, Level::L1);
+    // Without a dense file, soft delete-file count alone selects no stable
+    // data rewrite; soft pressure still groups L0 files as before.
+    let mut sparse = files.clone();
+    sparse[1].deleted_rows = 5;
+    for file in &mut sparse {
+        file.delete_file_count = file.delete_file_count.min(8);
+    }
+    let debt = consolidate.debt_with_shared_deletes(&sparse, 8).unwrap();
+    assert_eq!(debt.pressure, PublicationPressure::Delay);
+    assert!(consolidate.consolidates_delete_debt(&debt));
+    let soft_deletes = deletes
+        .iter()
+        .take(8)
+        .cloned()
+        .map(|mut delete| {
+            delete.targets.retain(|target| *target == base);
+            delete
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        current
+            .plan(1, 0, &sparse, &soft_deletes)
+            .unwrap()
+            .unwrap()
+            .input_files,
+        BTreeSet::from([base.clone()])
+    );
+    let plan = consolidate
+        .plan(1, 0, &sparse, &soft_deletes)
+        .unwrap()
+        .unwrap();
+    assert!(!plan.input_files.contains(&base));
+    assert_eq!(plan.reason, PlanReason::L0Debt);
+    // After consolidation the base carries one shared delete file: the debt
+    // is healthy again instead of re-entering hard pressure.
+    let mut consolidated = sparse;
+    for file in &mut consolidated {
+        file.delete_file_count = 1;
+    }
+    let debt = consolidate
+        .debt_with_shared_deletes(&consolidated, 1)
+        .unwrap();
+    assert_eq!(debt.pressure, PublicationPressure::Healthy);
+    assert!(!consolidate.consolidates_delete_debt(&debt));
+    assert!(consolidate.pressure_reasons(&debt).is_empty());
+}
+
+#[test]
+fn consolidated_delete_debt_rewrites_only_files_past_the_deleted_fraction() {
+    let consolidate = Policy::default();
+    let mut files = Vec::new();
+    for (id, level, deleted) in [
+        (0, Level::L2, 350_000),
+        (1, Level::L2, 10_000),
+        (2, Level::L1, 400_000),
+        (3, Level::L1, 1_000),
+    ] {
+        let mut stable = file(id, 300 << 20);
+        stable.level = level;
+        stable.row_count = 1_000_000;
+        stable.deleted_rows = deleted;
+        stable.delete_file_count = 12;
+        stable.age_ms = 60_000;
+        files.push(stable);
+    }
+    // The current policy groups each dense file with a mostly-live neighbour
+    // selected only for its delete-file count.
+    let current = Policy {
+        delete_debt: DeleteDebt::Current,
+        ..Policy::default()
+    };
+    let plan = current.plan(1, 0, &files, &[]).unwrap().unwrap();
+    assert_eq!(
+        plan.input_files,
+        BTreeSet::from([files[2].id.clone(), files[3].id.clone()])
+    );
+    let rest = [files[0].clone(), files[1].clone(), files[3].clone()];
+    let plan = current.plan(1, 0, &rest, &[]).unwrap().unwrap();
+    assert_eq!(
+        plan.input_files,
+        BTreeSet::from([files[0].id.clone(), files[1].id.clone()])
+    );
+    // Consolidation leaves the mostly-live files in place.
+    let plan = consolidate.plan(1, 0, &files, &[]).unwrap().unwrap();
+    assert_eq!(plan.input_files, BTreeSet::from([files[2].id.clone()]));
+    assert_eq!(plan.reason, PlanReason::DeletedRows);
+    let plan = consolidate.plan(1, 0, &rest, &[]).unwrap().unwrap();
+
+    assert_eq!(plan.input_files, BTreeSet::from([files[0].id.clone()]));
+    assert_eq!(plan.output_level, Level::L2);
+    assert_eq!(plan.reason, PlanReason::DeletedRows);
+    // Mostly-live files are left to consolidation below the hard limit.
+    assert!(
+        consolidate
+            .plan(1, 0, &[files[1].clone(), files[3].clone()], &[])
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn consolidated_delete_debt_falls_back_to_count_driven_rewrite_at_the_hard_limit() {
+    let consolidate = Policy::default();
+    let mut base = file(0, 600 << 20);
+    base.level = Level::L2;
+    base.row_count = 1_000_000;
+    base.deleted_rows = 10_000;
+    base.age_ms = 60_000;
+    base.delete_file_count = 16;
+    // When consolidation cannot reduce the count, the data planner keeps its
+    // count-driven progress guarantee.
+    let plan = consolidate
+        .plan(1, 0, std::slice::from_ref(&base), &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.input_files, BTreeSet::from([base.id.clone()]));
+    assert_eq!(plan.reason, PlanReason::DeleteFileCount);
+    base.delete_file_count = 15;
+    assert!(consolidate.plan(1, 0, &[base], &[]).unwrap().is_none());
+}
+
+#[test]
+fn format_v3_tables_pay_delete_file_count_with_a_data_rewrite() {
+    use iceberg::spec::FormatVersion;
+    let policy = Policy::default();
+    let mut base = file(0, 600 << 20);
+    base.level = Level::L2;
+    base.row_count = 1_000_000;
+    base.deleted_rows = 10_000;
+    base.age_ms = 60_000;
+    base.delete_file_count = policy.delete_files_soft;
+    let debt = policy.debt(std::slice::from_ref(&base)).unwrap();
+    assert_eq!(debt.pressure, PublicationPressure::Delay);
+    for version in [FormatVersion::V1, FormatVersion::V2] {
+        let v2 = policy.for_format_version(version);
+        assert!(matches!(v2, std::borrow::Cow::Borrowed(_)));
+        assert!(v2.consolidates_delete_debt(&debt));
+        assert!(
+            v2.plan(1, 0, std::slice::from_ref(&base), &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+    // A data file keeps at most one deletion vector, so consolidation cannot
+    // lower this count; v3 rewrites the mostly-live base as before.
+    let v3 = policy.for_format_version(FormatVersion::V3);
+    assert_eq!(v3.delete_debt, DeleteDebt::Current);
+    assert_eq!(
+        format!("{:?}", *v3),
+        format!(
+            "{:?}",
+            Policy {
+                delete_debt: DeleteDebt::Current,
+                ..Policy::default()
+            }
+        )
+    );
+    assert!(!v3.consolidates_delete_debt(&debt));
+    let plan = v3
+        .plan(1, 0, std::slice::from_ref(&base), &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.input_files, BTreeSet::from([base.id.clone()]));
+    assert_eq!(plan.reason, PlanReason::DeleteFileCount);
+}
+
+fn per_target() -> Policy {
+    Policy {
+        delete_layout: DeleteLayout::PerTarget,
+        ..Policy::default()
+    }
+}
+
+fn target(name: &str, rows: &[u64], new_rows: u64, other_files: usize) -> TargetDeletes {
+    TargetDeletes {
+        target: FileId(name.into()),
+        files: rows
+            .iter()
+            .enumerate()
+            .map(|(index, rows)| TargetDeleteFile {
+                id: FileId(format!("{name}-delete-{index}")),
+                rows: *rows,
+                bytes: *rows * 8,
+            })
+            .collect(),
+        new_rows,
+        other_files,
+        full_size: true,
+    }
+}
+
+const UNLIMITED: MergeBudget = MergeBudget {
+    files: usize::MAX,
+    bytes: u64::MAX,
+    rows: u64::MAX,
+};
+
+fn ids(name: &str, indices: &[usize]) -> BTreeSet<FileId> {
+    indices
+        .iter()
+        .map(|index| FileId(format!("{name}-delete-{index}")))
+        .collect()
+}
+
+#[test]
+fn per_target_merges_stay_within_new_rows_and_skip_large_tiers() {
+    let policy = per_target();
+    assert_eq!(policy.target_delete_files(), 4);
+    // A 600k accumulated file and a 100k tier stay put; only the small files
+    // whose rows total at most the 10k new rows join the new output.
+    let base = target("base", &[600_000, 100_000, 5_000, 3_000], 10_000, 0);
+    assert_eq!(
+        policy.select_target_merges(&[base], UNLIMITED),
+        ids("base", &[2, 3])
+    );
+    // A large file is merged once new deletes reach its size.
+    let base = target("base", &[100_000, 1_000], 100_000, 0);
+    assert_eq!(
+        policy.select_target_merges(&[base], UNLIMITED),
+        ids("base", &[1])
+    );
+    let base = target("base", &[90_000, 1_000], 100_000, 0);
+    assert_eq!(
+        policy.select_target_merges(&[base], UNLIMITED),
+        ids("base", &[0, 1])
+    );
+}
+
+#[test]
+fn per_target_merges_keep_each_target_within_its_file_cap() {
+    let policy = per_target();
+    // Five tiers plus the new output exceed four files: the two smallest
+    // tiers merge, never the largest.
+    let base = target(
+        "base",
+        &[600_000, 200_000, 100_000, 50_000, 20_000],
+        1_000,
+        0,
+    );
+    assert_eq!(
+        policy.select_target_merges(&[base], UNLIMITED),
+        ids("base", &[3, 4])
+    );
+    // Shared files left in place count against the cap too.
+    let hot = target("hot", &[6_000, 5_000], 0, 3);
+    assert_eq!(
+        policy.select_target_merges(&[hot], UNLIMITED),
+        ids("hot", &[0, 1])
+    );
+    // Without new rows, files under the cap are left alone, and one file is
+    // never rewritten on its own.
+    assert!(
+        policy
+            .select_target_merges(&[target("idle", &[5_000, 6_000], 0, 0)], UNLIMITED)
+            .is_empty()
+    );
+    assert!(
+        policy
+            .select_target_merges(&[target("lone", &[5_000], 0, 9)], UNLIMITED)
+            .is_empty()
+    );
+}
+
+#[test]
+fn per_target_merges_respect_the_remaining_budget_most_files_first() {
+    let policy = per_target();
+    let crowded = target("crowded", &[10, 20, 30, 40, 50, 60], 0, 0);
+    let quiet = target("quiet", &[1, 2], 5, 0);
+    // The crowded target needs three merges to reach the cap and is served
+    // first; the quiet one gets what is left.
+    let budget = MergeBudget {
+        files: 4,
+        bytes: u64::MAX,
+        rows: u64::MAX,
+    };
+    let mut expected = ids("crowded", &[0, 1, 2]);
+    expected.extend(ids("quiet", &[0]));
+    assert_eq!(
+        policy.select_target_merges(&[quiet.clone(), crowded.clone()], budget),
+        expected
+    );
+    // A row budget ends a target's selection at the first file that does not
+    // fit; a lone admitted file without new rows is dropped.
+    let budget = MergeBudget {
+        files: usize::MAX,
+        bytes: u64::MAX,
+        rows: 15,
+    };
+    assert_eq!(
+        policy.select_target_merges(&[crowded, quiet], budget),
+        ids("quiet", &[0, 1])
+    );
+}
+
+#[test]
+fn per_target_layout_charges_only_shared_dependencies_table_wide() {
+    let shared = Policy {
+        min_file_age_ms: 0,
+        ..Policy::default()
+    };
+    let per_target = Policy {
+        min_file_age_ms: 0,
+        ..per_target()
+    };
+    let mut files = (0..4).map(|id| file(id, 1 << 20)).collect::<Vec<_>>();
+    for file in &mut files {
+        file.level = Level::L2;
+        file.size_bytes = 512 << 20;
+        file.delete_file_count = 5;
+    }
+    // Twenty single-target files across four stable data files: the shared
+    // layout charges them table-wide and falls back to a count-driven plan at
+    // the hard limit. Per target they are each file's own debt, under soft.
+    let deletes = (0..20)
+        .map(|index| DeleteDependency {
+            id: FileId(format!("delete-{index}")),
+            targets: BTreeSet::from([files[index % 4].id.clone()]),
+            size_bytes: 100,
+            row_count: 1,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        Policy {
+            delete_files_soft: 5,
+            ..shared.clone()
+        }
+        .plan(1, 0, &files, &deletes)
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        Policy {
+            delete_files_soft: 5,
+            ..per_target.clone()
+        }
+        .plan(1, 0, &files, &deletes)
+        .unwrap()
+        .is_none()
+    );
+    // Plans carry the layout to the worker's residual writer.
+    let l0 = (0..24).map(|id| file(id, 1 << 20)).collect::<Vec<_>>();
+    assert!(
+        per_target
+            .plan(1, 0, &l0, &[])
+            .unwrap()
+            .unwrap()
+            .per_target_deletes
+    );
+    assert!(
+        !shared
+            .plan(1, 0, &l0, &[])
+            .unwrap()
+            .unwrap()
+            .per_target_deletes
+    );
+    // Format v3 keeps one vector per data file and uses the shared layout.
+    let v3 = per_target.for_format_version(iceberg::spec::FormatVersion::V3);
+    assert_eq!(v3.delete_layout, DeleteLayout::Shared);
+    let v2 = per_target.for_format_version(iceberg::spec::FormatVersion::V2);
+    assert_eq!(v2.delete_layout, DeleteLayout::PerTarget);
+}
+
+#[test]
+fn per_target_budget_merges_the_cheapest_full_size_files_down_to_half() {
+    let policy = Policy {
+        target_delete_files_max: 8,
+        ..per_target()
+    };
+    // Eight files on two full-size targets, each within its cap of four,
+    // reach the budget of eight: the cheapest merges run until four remain,
+    // and the accumulated files are never read. A small target's files are
+    // left for its data rewrite.
+    let a = target("a", &[1_000, 10, 20, 30], 0, 0);
+    let b = target("b", &[500, 5, 6, 7], 0, 0);
+    let small = TargetDeletes {
+        full_size: false,
+        ..target("small", &[1, 2, 3, 4], 0, 0)
+    };
+    // Files too large to merge two in one consolidation neither count nor
+    // merge.
+    let settled = target("settled", &[600_000, 700_000], 0, 0);
+    assert!(policy.settled_target_delete(500_001, 0));
+    assert!(policy.settled_target_delete(1, (16 << 20) + 1));
+    assert!(!policy.settled_target_delete(500_000, 16 << 20));
+    let mut expected = ids("a", &[1, 2, 3]);
+    expected.extend(ids("b", &[1, 2, 3]));
+    assert_eq!(
+        policy.select_target_merges(
+            &[a.clone(), b.clone(), small.clone(), settled.clone()],
+            UNLIMITED
+        ),
+        expected
+    );
+    assert!(
+        Policy {
+            target_delete_files_max: 1,
+            ..policy.clone()
+        }
+        .select_target_merges(&[settled], UNLIMITED)
+        .is_empty()
+    );
+    // Below the budget nothing more is merged.
+    assert!(
+        Policy {
+            target_delete_files_max: 9,
+            ..policy.clone()
+        }
+        .select_target_merges(&[a.clone(), b.clone(), small], UNLIMITED)
+        .is_empty()
+    );
+    // A target with new rows has an output already, so each of its files
+    // merged removes one. The merge budget still bounds the reads.
+    let budget = MergeBudget {
+        files: 3,
+        bytes: u64::MAX,
+        rows: u64::MAX,
+    };
+    let hot = target("hot", &[3, 200], 1, 0);
+    let mut expected = ids("b", &[1, 2]);
+    expected.extend(ids("hot", &[0]));
+    assert_eq!(policy.select_target_merges(&[a, b, hot], budget), expected);
+}
+
+#[test]
+fn per_target_budget_is_soft_delete_file_debt_only_with_extra_full_size_files() {
+    let policy = Policy {
+        target_delete_files_max: 8,
+        ..per_target()
+    };
+    let mut files = (0..8).map(|id| file(id, 1 << 20)).collect::<Vec<_>>();
+    for file in &mut files {
+        file.level = Level::L2;
+        file.size_bytes = policy.l1_target_bytes;
+        file.target_delete_files = 1;
+        file.delete_file_count = 1;
+    }
+    // One file per full-size data file cannot be merged further.
+    let debt = policy.debt(&files).unwrap();
+    assert_eq!(debt.target_delete_files, 8);
+    assert_eq!(debt.excess_target_delete_files, 0);
+    assert!(!policy.over_target_budget(&debt));
+    assert_eq!(debt.pressure, PublicationPressure::Healthy);
+    files[0].target_delete_files = 2;
+    files[0].delete_file_count = 2;
+    let debt = policy.debt(&files).unwrap();
+    assert!(policy.over_target_budget(&debt));
+    assert_eq!(debt.pressure, PublicationPressure::Delay);
+    assert_eq!(
+        policy.delete_file_pressure(&debt),
+        PublicationPressure::Delay
+    );
+    assert!(policy.consolidates_delete_debt(&debt));
+    assert_eq!(policy.pressure_reasons(&debt), ["delete_file_count"]);
+    // Files on small data files and the shared layout do not count.
+    let mut small = files.clone();
+    small[0].size_bytes = policy.l1_target_bytes - 1;
+    assert!(!policy.over_target_budget(&policy.debt(&small).unwrap()));
+    let shared = Policy {
+        delete_layout: DeleteLayout::Shared,
+        ..policy.clone()
+    };
+    let debt = shared.debt(&files).unwrap();
+    assert_eq!(debt.target_delete_files, 0);
+    assert_eq!(debt.pressure, PublicationPressure::Healthy);
+}
+
+#[test]
+fn per_target_rewrites_small_files_carrying_single_target_deletes() {
+    let policy = Policy {
+        min_file_age_ms: 0,
+        small_file_target_deletes: 6,
+        ..per_target()
+    };
+    // A full-size base, two small L1 files and a small L2 file carry
+    // single-target delete files; another small file and an L0 file carry
+    // none.
+    let mut files = (0..6).map(|id| file(id, 1 << 20)).collect::<Vec<_>>();
+    files[0].level = Level::L2;
+    files[0].size_bytes = policy.l1_target_bytes;
+    files[0].target_delete_files = 4;
+    for (file, (level, count)) in files[1..5].iter_mut().zip([
+        (Level::L1, 3),
+        (Level::L1, 2),
+        (Level::L2, 1),
+        (Level::L1, 0),
+    ]) {
+        file.level = level;
+        file.target_delete_files = count;
+        file.delete_file_count = count;
+    }
+    files[3].size_bytes = 8 << 20;
+    files[5].age_ms = 0;
+    let deletes = files
+        .iter()
+        .flat_map(|file| {
+            (0..file.target_delete_files).map(|index| DeleteDependency {
+                id: FileId(format!("{}-delete-{index}", file.id.0)),
+                targets: BTreeSet::from([file.id.clone()]),
+                size_bytes: 100,
+                row_count: 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    let debt = policy.debt(&files).unwrap();
+    assert_eq!(debt.small_target_delete_files, 6);
+    assert!(policy.small_target_debt(&debt));
+    assert_eq!(debt.pressure, PublicationPressure::Delay);
+    assert_eq!(policy.pressure_reasons(&debt), ["target_deletes"]);
+    // A data rewrite pays this debt, not a consolidation.
+    assert!(!policy.consolidates_delete_debt(&debt));
+    let plan = policy.plan(1, 0, &files, &deletes).unwrap().unwrap();
+    assert_eq!(plan.reason, PlanReason::TargetDeletes);
+    assert_eq!(
+        plan.input_files,
+        BTreeSet::from([
+            files[1].id.clone(),
+            files[2].id.clone(),
+            files[3].id.clone()
+        ])
+    );
+    assert_eq!(plan.delete_files.len(), 6);
+    assert_eq!(plan.output_level, Level::L2);
+    // One carrier is rewritten alone.
+    let mut single = files.clone();
+    single[1].target_delete_files = 6;
+    single[2].target_delete_files = 0;
+    single[3].target_delete_files = 0;
+    let plan = policy.plan(1, 0, &single, &[]).unwrap().unwrap();
+    assert_eq!(plan.reason, PlanReason::TargetDeletes);
+    assert_eq!(plan.input_files, BTreeSet::from([files[1].id.clone()]));
+    // Below the limit, or with the shared layout, small files wait.
+    let below = Policy {
+        small_file_target_deletes: 7,
+        ..policy.clone()
+    };
+    assert!(!below.small_target_debt(&below.debt(&files).unwrap()));
+    assert!(below.plan(1, 0, &files, &deletes).unwrap().is_none());
+    let shared = Policy {
+        delete_layout: DeleteLayout::Shared,
+        ..policy.clone()
+    };
+    assert_eq!(shared.debt(&files).unwrap().small_target_delete_files, 0);
+    assert!(shared.plan(1, 0, &files, &deletes).unwrap().is_none());
+}
+
+#[test]
+fn per_target_pools_l0_and_small_targets_between_full_size_files() {
+    let policy = Policy {
+        min_file_age_ms: 0,
+        ..per_target()
+    };
+    let full = |name: &str| FileCandidate {
+        id: FileId(name.into()),
+        level: Level::L2,
+        size_bytes: policy.target_delete_min_file_bytes,
+        ..file(0, 1)
+    };
+    let small = |name: &str, level| FileCandidate {
+        id: FileId(name.into()),
+        level,
+        size_bytes: policy.target_delete_min_file_bytes - 1,
+        ..file(0, 1)
+    };
+    let files = vec![
+        small("a", Level::L0),
+        small("b", Level::L1),
+        full("c"),
+        small("d", Level::L2),
+        small("e", Level::L0),
+        full("selected"),
+    ];
+    let ranges = policy.target_ranges(&files, &BTreeSet::from([FileId("selected".into())]));
+    assert_eq!(
+        ranges.pooled,
+        ["a", "b", "d", "e"].map(|id| FileId(id.into())).into()
+    );
+    assert_eq!(ranges.breaks, BTreeSet::from([FileId("c".into())]));
+    let id = |name: &str| FileId(name.into());
+    // L0 and small files share a range until a full-size file lies between.
+    assert!(ranges.continues(&id("a"), &id("b")));
+    assert!(!ranges.continues(&id("b"), &id("d")));
+    assert!(ranges.continues(&id("d"), &id("e")));
+    // A full-size file always gets its own file.
+    assert!(!ranges.continues(&id("b"), &id("c")));
+    assert!(!ranges.continues(&id("c"), &id("d")));
+    // A rewrite's small output joins the pool, a full-size one splits it.
+    let mut with_outputs = ranges.clone();
+    with_outputs.add(id("a1"), 1);
+    with_outputs.add(id("a2"), policy.target_delete_min_file_bytes);
+    assert!(with_outputs.continues(&id("a"), &id("a1")));
+    assert!(!with_outputs.continues(&id("a1"), &id("b")));
+    // Past MAX_BREAKS full-size files, ranges may span them.
+    let mut crowded = TargetRanges {
+        full_size_bytes: 10,
+        ..TargetRanges::default()
+    };
+    crowded.add(id("a"), 1);
+    crowded.add(id("z"), 1);
+    for index in 0..TargetRanges::MAX_BREAKS {
+        crowded.add(FileId(format!("m{index}")), 10);
+    }
+    assert!(!crowded.continues(&id("a"), &id("z")));
+    crowded.add(id("n"), 10);
+    assert!(crowded.continues(&id("a"), &id("z")));
+    // Data rewrites carry the ranges to the residual writer; the shared
+    // layout needs none.
+    let l0 = (0..24).map(|id| file(id, 1 << 20)).collect::<Vec<_>>();
+    let plan = policy.plan(1, 0, &l0, &[]).unwrap().unwrap();
+    assert!(plan.target_ranges.breaks.is_empty());
+    assert_eq!(
+        plan.target_ranges.full_size_bytes,
+        policy.target_delete_min_file_bytes
+    );
+    let shared = Policy {
+        delete_layout: DeleteLayout::Shared,
+        ..policy.clone()
+    };
+    assert_eq!(
+        shared.plan(1, 0, &l0, &[]).unwrap().unwrap().target_ranges,
+        TargetRanges::default()
+    );
 }

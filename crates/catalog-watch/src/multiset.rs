@@ -23,6 +23,8 @@ pub fn match_append_only_rows<'a>(
     if before_scan == after_scan {
         return Err(Error::Invalid("multiset scratch scans must be distinct"));
     }
+    // Reverse scans of removed files must include rows moved by lazy remaps.
+    store.materialize_remaps(&table)?;
     let mut batch = Vec::with_capacity(scratch.batch_rows());
     for file in removed_files {
         for row in store.file_rows(&table, file) {

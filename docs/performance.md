@@ -1,7 +1,6 @@
 # Performance
 
-The service has passing local correctness and recovery checks, but has not met
-its full performance targets. The current targets are 50,000 mixed mutations/s,
+The current targets are 50,000 mixed mutations/s,
 PostgreSQL-commit-to-Iceberg-publication latency below 1 second at p95 and
 2 seconds at p99, and read time at most 1.25 times a compacted equivalent.
 No 24-hour endurance qualification has completed.
@@ -78,6 +77,24 @@ a further 30–32% on two vCPUs and 14–24% on one, with 14–24% less CPU per
 compaction, for up to about 90 MiB more peak memory per running build. These
 are worker timings on local disk, not publication latency or service
 throughput; the numbers above were not rerun.
+
+Those worker benchmarks linked the system allocator. Built with jemalloc, as
+the daemon is, the same worker benchmark ran 9–17% faster on two vCPUs in
+paired runs on a noisy host, with 8–16% less CPU
+([report](benchmarks/jemalloc-and-reconcile.md)). The same report times
+reconciliation of an external rewrite at about 46,000 rows/s on two vCPUs,
+mostly in unbatched row-index lookups and apply; larger scratch memtables gave
+no consistent gain there and were not adopted.
+
+## Row index
+
+Index format 4 names data files by per-table ordinal instead of path in
+primary-key values, reverse keys and staged deltas
+([report](benchmarks/index-file-ordinals.md)). In the PostgreSQL-free ingest
+microbenchmark on a 16-vCPU host, one busy table with 113,000 mutations per
+epoch rose from 111,000–116,000 to 158,000–159,000 mutations/s, and path length
+no longer affects apply or collapse time. These are local stage timings, not
+publication latency or service throughput.
 
 ## Reproducibility
 

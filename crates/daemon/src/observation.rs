@@ -448,6 +448,14 @@ pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
         ),
         ("flow_table_max_delete_files", debt.max_delete_files as f64),
         (
+            "flow_table_target_delete_files",
+            debt.target_delete_files as f64,
+        ),
+        (
+            "flow_table_small_target_delete_files",
+            debt.small_target_delete_files as f64,
+        ),
+        (
             "flow_table_delete_files",
             inventory.delete_file_count as f64,
         ),
@@ -467,6 +475,13 @@ pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
     ] {
         metrics::gauge!(name, "table_id" => table.clone()).set(value);
     }
+}
+
+/// Lazy index remaps that forward reads of the table may translate through.
+pub(crate) fn table_remaps(table: TableId, stats: &flow_state_store::RemapStats) {
+    let table = table.0.to_string();
+    metrics::gauge!("flow_index_remap_files", "table_id" => table.clone()).set(stats.files as f64);
+    metrics::gauge!("flow_index_remap_max_depth", "table_id" => table).set(stats.max_depth as f64);
 }
 
 #[cfg(test)]

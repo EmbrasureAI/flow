@@ -7,15 +7,22 @@
 mod apply;
 mod buffer;
 mod control;
+mod files;
 mod reader;
+mod remap;
 mod spool;
 #[cfg(all(test, feature = "sst-profile"))]
 #[path = "../tests/profiles/sst_staging.rs"]
 mod sst_staging_profile;
-pub use buffer::{BufferResult, CollapseBuffer, MemoryRows};
+pub use buffer::{Bound, BufferResult, CollapseBuffer, MemoryRows};
 pub use control::{CheckpointRecord, ControlMirror, ControlRestore, ControlStore, GenerationState};
 pub use reader::{IndexSnapshot, RowIndex};
-pub use spool::{Change, CollapsedMutation};
+pub use remap::{
+    FileRemap, LazyRemap, RemapCleanup, RemapLimits, RemapRun, RemapStats, RemapTarget,
+};
+pub use spool::{Change, CollapsedMutation, PositionDeleteCursor, StagedPosition};
+
+use files::{StoredDelta, StoredLocation};
 
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId};
 use rocksdb::{
@@ -25,7 +32,7 @@ use rocksdb::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
     path::Path,
     sync::{
@@ -44,7 +51,10 @@ const DELTAS: &str = "index_deltas";
 const TABLES: &str = "table_state";
 const SPOOL: &str = "transaction_mutations";
 const SOURCE: &str = "source_transactions";
-const STATE_COLUMN_FAMILIES: [&str; 8] = [
+// Lazy rewrite remaps, keyed like FILE_COUNTS by retired file. Every index
+// has this family, so binaries that predate it refuse to open the index.
+const REMAPS: &str = "file_remaps";
+const STATE_COLUMN_FAMILIES: [&str; 10] = [
     PK,
     REVERSE,
     FILE_COUNTS,
@@ -53,9 +63,13 @@ const STATE_COLUMN_FAMILIES: [&str; 8] = [
     TABLES,
     SPOOL,
     SOURCE,
+    REMAPS,
+    files::FILES,
 ];
-// Version 3 adds exact per-file counts; older indexes require reconstruction.
-const FORMAT_VERSION: u8 = 3;
+// Version 3 added exact per-file counts. Version 4 names data files by
+// ordinal in row values, reverse keys and staged deltas. Older indexes
+// require reconstruction.
+const FORMAT_VERSION: u8 = 4;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -109,10 +123,17 @@ pub struct StateStoreOptions {
     /// Maximum prepared deltas decoded and looked up together while building an
     /// atomic apply batch.
     pub apply_lookup_rows: usize,
+    /// Threads that look up and check one lookup chunk's rows. The batch is
+    /// still written once, in row order, under the store lock.
+    pub apply_threads: usize,
     /// RocksDB table-file descriptor cache. Files beyond it are reopened on
     /// demand, so a large index cannot exhaust the process descriptor limit.
     /// `-1` keeps every table file open.
     pub max_open_files: i32,
+    /// Skip the write-ahead log and fsyncs. Only for scratch stores that are
+    /// deleted rather than reopened after a crash; they cannot have a control
+    /// store. A clean close still flushes, so reopening in-process is safe.
+    pub ephemeral: bool,
 }
 impl Default for StateStoreOptions {
     fn default() -> Self {
@@ -121,18 +142,22 @@ impl Default for StateStoreOptions {
             write_buffer_bytes: 16 << 20,
             apply_batch_rows: 1024,
             apply_lookup_rows: 1024,
+            apply_threads: std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
             max_open_files: 4096,
+            ephemeral: false,
         }
     }
 }
 impl StateStoreOptions {
-    /// A short-lived store that one build writes once and then reads, such as
-    /// compaction scratch. Larger memtables flush a quarter as often, so
-    /// RocksDB rewrites the staged mappings far fewer times before the build
-    /// ends. Each running build may hold up to two such memtables.
+    /// A short-lived store that one build writes once, reads and then
+    /// discards, such as compaction scratch, which startup deletes after a
+    /// crash. Larger memtables flush a quarter as often, so RocksDB rewrites
+    /// the staged mappings far fewer times before the build ends. Each running
+    /// build may hold up to two such memtables.
     pub fn scratch() -> Self {
         Self {
             write_buffer_bytes: 64 << 20,
+            ephemeral: true,
             ..Self::default()
         }
     }
@@ -281,9 +306,16 @@ struct Inner {
     writer: Mutex<()>,
     batch_rows: usize,
     lookup_rows: usize,
+    apply_threads: usize,
     control: Option<ControlStore>,
     revision: AtomicU64,
     failed: AtomicBool,
+    ephemeral: bool,
+    /// Set once any lazy remap is committed; until then readers skip remaps.
+    remaps: AtomicBool,
+    remap_cache: remap::RemapCache,
+    /// Every data-file ordinal this index can name.
+    files: files::FileOrdinals,
 }
 #[derive(Clone)]
 pub struct StateStore(Arc<Inner>);
@@ -311,12 +343,18 @@ impl StateStore {
     ) -> Result<Self> {
         if config.apply_batch_rows == 0
             || config.apply_lookup_rows == 0
+            || config.apply_threads == 0
             || config.write_buffer_bytes == 0
             || config.block_cache_bytes == 0
             || (config.max_open_files != -1 && config.max_open_files <= 0)
         {
             return Err(Error::InvalidState(
                 "state store budgets must be positive".into(),
+            ));
+        }
+        if config.ephemeral && control.is_some() {
+            return Err(Error::InvalidState(
+                "a controlled index cannot skip its write-ahead log".into(),
             ));
         }
         if let Some(authority) = &control {
@@ -350,13 +388,24 @@ impl StateStore {
             cf.set_write_buffer_size(config.write_buffer_bytes);
             cf.set_max_write_buffer_number(2);
             cf.set_compression_type(DBCompressionType::Lz4);
+            // L0 and L1 hold recent, short-lived data that compaction rewrites
+            // soon; compressing it costs flush and compaction CPU for little disk.
+            cf.set_compression_per_level(&[
+                DBCompressionType::None,
+                DBCompressionType::None,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+                DBCompressionType::Lz4,
+            ]);
             ColumnFamilyDescriptor::new(name, cf)
         });
         let db = DB::open_cf_descriptors(&options, path, columns)?;
         match db.get(b"format-version")? {
-            Some(version) if version == [1] || version == [2] => {
+            Some(version) if version == [1] || version == [2] || version == [3] => {
                 if !authority_import {
-                    return Err(Error::RecoveryRequired("row fingerprint encoding or per-file live-row counts changed; rebuild the index from durable authority".into()));
+                    return Err(Error::RecoveryRequired("row fingerprint encoding, per-file live-row counts or data-file ordinals changed; rebuild the index from durable authority".into()));
                 }
             }
             Some(version) if version != [FORMAT_VERSION] => {
@@ -376,18 +425,25 @@ impl StateStore {
         } else {
             0
         };
+        let files = files::FileOrdinals::load(&db)?;
         // Legacy adoption must preserve readable control records even when
         // the old row/delta encoding needs rebuilding after authority import.
-        validate_operation_records(&db, !authority_import)?;
+        validate_operation_records(&db, &files, !authority_import)?;
+        let remaps = remap::any_remaps(&db)?;
         Ok(Self(Arc::new(Inner {
             db,
             cache,
             writer: Mutex::new(()),
             batch_rows: config.apply_batch_rows,
             lookup_rows: config.apply_lookup_rows,
+            apply_threads: config.apply_threads,
             control,
             revision: AtomicU64::new(revision),
             failed: AtomicBool::new(false),
+            ephemeral: config.ephemeral,
+            remaps: AtomicBool::new(remaps),
+            remap_cache: remap::RemapCache::default(),
+            files,
         })))
     }
 
@@ -439,7 +495,10 @@ impl StateStore {
     }
 
     pub fn lookup(&self, table: &TableId, key: &PrimaryKey) -> Result<Option<RowLocation>> {
-        self.get(PK, &pk_key(table, key))
+        Ok(self
+            .lookup_many(table, std::slice::from_ref(key))?
+            .pop()
+            .flatten())
     }
 
     pub fn index_is_empty(&self, table: &TableId) -> Result<bool> {
@@ -459,11 +518,52 @@ impl StateStore {
         &'a self,
         id: &OperationId,
     ) -> Result<impl Iterator<Item = Result<IndexDelta>> + 'a> {
-        let record = self.require_operation(id)?;
+        // The record, its deltas and their ordinals are read in one view, so
+        // a concurrent retirement cannot release an ordinal mid-stream.
+        let snapshot = self.0.db.snapshot();
+        let view = || {
+            let mut options = ReadOptions::default();
+            options.set_snapshot(&snapshot);
+            options
+        };
+        let operations = self
+            .0
+            .db
+            .cf_handle(OPERATIONS)
+            .expect("opened column family");
+        let record = self
+            .0
+            .db
+            .get_pinned_cf_opt(&operations, id.0.as_bytes(), &view())?
+            .map(|value| decode_operation_record(id.0.as_bytes(), &value))
+            .transpose()?
+            .ok_or_else(|| Error::InvalidState("unknown operation".into()))?;
         if record.phase == OperationPhase::Building {
             return Err(Error::InvalidState("delta is not sealed".into()));
         }
-        Ok(sealed_deltas(&self.0.db, &record))
+        let mut paths = files::PathReader::owned(&self.0.files, &self.0.db, view());
+        let table = record.operation.table_id;
+        let rows = sealed_deltas(&self.0.db, &record, view(), move |value| {
+            let stored = files::decode_delta(value)?;
+            let mut location = |stored: Option<StoredLocation<'_>>| {
+                stored
+                    .map(|stored| {
+                        paths
+                            .location(table, &stored)?
+                            .ok_or_else(files::unknown_file)
+                    })
+                    .transpose()
+            };
+            Ok(IndexDelta {
+                key: PrimaryKey(stored.key.into_owned()),
+                expected: location(stored.expected)?,
+                replacement: location(stored.replacement)?,
+            })
+        });
+        Ok(SnapshotIter {
+            rows,
+            _snapshot: snapshot,
+        })
     }
 
     pub fn table_state(&self, table: &TableId) -> Result<TableState> {
@@ -669,9 +769,20 @@ impl StateStore {
         let mut location_prefix = operation_prefix(id);
         location_prefix.push(2);
         location_prefix.extend_from_slice(&record.operation.table_id.0.to_be_bytes());
+        // While every batch sorts after the previous one, only each batch's
+        // largest key and location are kept: the next ordered batch compares
+        // against nothing else. The first unordered batch backfills full
+        // markers from the staged deltas, and the operation stays dense.
+        let mut dense_flag = operation_prefix(id);
+        dense_flag.push(DENSE_MARKERS_MARKER);
+        let mut dense = self.0.db.get_pinned_cf(&cf, &dense_flag)?.is_some();
         let mut ordinal = delta_key(id, 0);
         let ordinal_offset = ordinal.len() - size_of::<u64>();
         let mut encoded = Vec::new();
+        let mut memo = files::OrdinalMemo::default();
+        // Ordinals pinned by this call; a failed write ends the call.
+        let mut pinned = BTreeSet::new();
+        let table = record.operation.table_id;
         let mut deltas = deltas.into_iter().fuse();
         loop {
             let build_started = Instant::now();
@@ -689,22 +800,20 @@ impl StateStore {
                         "duplicate primary key in prepared delta".into(),
                     ));
                 }
-                if let Some(location) = &delta.replacement {
-                    let mut target = Vec::with_capacity(
-                        location_prefix.len()
-                            + 2 * size_of::<u64>()
-                            + location.data_file_id.0.len(),
-                    );
-                    target.extend_from_slice(&location_prefix);
-                    append_component(&mut target, location.data_file_id.0.as_bytes());
-                    target.extend_from_slice(&location.row_position.to_be_bytes());
+                let stored = self.store_delta(&mut batch, &mut memo, table, &delta)?;
+                for location in stored.expected.iter().chain(&stored.replacement) {
+                    if pinned.insert(location.file) {
+                        batch.put_cf(&cf, file_pin_key(id, location.file), []);
+                    }
+                }
+                if let Some(location) = &stored.replacement {
+                    let target = location_marker(&location_prefix, location);
                     if !batch_locations.insert(target) {
                         return Err(Error::InvalidState("duplicate output row location".into()));
                     }
                 }
                 ordinal[ordinal_offset..].copy_from_slice(&record.delta_count.to_be_bytes());
-                encoded.clear();
-                bincode::serialize_into(&mut encoded, &delta)?;
+                files::encode_delta(&mut encoded, &stored)?;
                 batch.put_cf(&cf, &ordinal, &encoded);
                 record.delta_count = record.delta_count.checked_add(1).ok_or_else(|| {
                     Error::RecoveryRequired(
@@ -714,11 +823,6 @@ impl StateStore {
             }
             if record.delta_count == start {
                 return Ok(());
-            }
-            // The sets retain marker bytes for both validation and the write;
-            // WriteBatch copies them, so staging needs no per-marker clone.
-            for marker in batch_keys.iter().chain(&batch_locations) {
-                batch.put_cf(&cf, marker, []);
             }
             self.put(&mut batch, OPERATIONS, id.0.as_bytes(), &record)?;
             let build = build_started.elapsed();
@@ -733,6 +837,22 @@ impl StateStore {
                 &location_prefix,
                 batch_locations.first().map(Vec::as_slice),
             )?;
+            if (check_keys || check_locations) && !dense {
+                self.backfill_delta_markers(&cf, &record, start, &unique_prefix, &location_prefix)?;
+                batch.put_cf(&cf, &dense_flag, []);
+                dense = true;
+            }
+            // The sets retain marker bytes for both validation and the write;
+            // WriteBatch copies them, so staging needs no per-marker clone.
+            if dense {
+                for marker in batch_keys.iter().chain(&batch_locations) {
+                    batch.put_cf(&cf, marker, []);
+                }
+            } else {
+                for marker in batch_keys.last().into_iter().chain(batch_locations.last()) {
+                    batch.put_cf(&cf, marker, []);
+                }
+            }
             if check_keys || check_locations {
                 // PK marker 1 sorts before location marker 2. Only families
                 // whose fresh range was not proven need the full sorted lookup.
@@ -770,6 +890,66 @@ impl StateStore {
                 .record(write_started.elapsed().as_secs_f64());
             result?;
         }
+    }
+
+    /// The compact form of a delta, allocating ordinals for its files in
+    /// `batch`. Expected files get one too: a translated current location may
+    /// lie in a lazy-rewrite output that has no row of its own yet.
+    fn store_delta<'d>(
+        &self,
+        batch: &mut StateBatch,
+        memo: &mut files::OrdinalMemo,
+        table: TableId,
+        delta: &'d IndexDelta,
+    ) -> Result<StoredDelta<'d>> {
+        let mut store = |location: &'d Option<RowLocation>| {
+            location
+                .as_ref()
+                .map(|location| {
+                    let file = self.file_ordinal(batch, memo, table, &location.data_file_id)?;
+                    Ok::<_, Error>(StoredLocation::new(file, location))
+                })
+                .transpose()
+        };
+        Ok(StoredDelta {
+            key: std::borrow::Cow::Borrowed(&delta.key.0),
+            expected: store(&delta.expected)?,
+            replacement: store(&delta.replacement)?,
+        })
+    }
+
+    /// Write a marker for every delta staged before `end`. Rewriting a marker
+    /// that already exists is harmless, so this needs no record of which do.
+    fn backfill_delta_markers(
+        &self,
+        cf: &impl rocksdb::AsColumnFamilyRef,
+        record: &OperationRecord,
+        end: u64,
+        unique_prefix: &[u8],
+        location_prefix: &[u8],
+    ) -> Result<()> {
+        let mut staged = record.clone();
+        staged.delta_count = end;
+        let mut batch = StateBatch::default();
+        let mut pending = 0;
+        for delta in sealed_deltas(&self.0.db, &staged, ReadOptions::default(), |value| {
+            Ok(files::decode_delta(value)?.into_owned())
+        }) {
+            let delta = delta?;
+            let mut unique = Vec::with_capacity(unique_prefix.len() + delta.key.len());
+            unique.extend_from_slice(unique_prefix);
+            unique.extend_from_slice(&delta.key);
+            batch.put_cf(cf, unique, []);
+            if let Some(location) = &delta.replacement {
+                batch.put_cf(cf, location_marker(location_prefix, location), []);
+            }
+            pending += 1;
+            if pending == self.0.batch_rows {
+                self.write_staged(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+        }
+        self.write_staged(batch)
     }
 
     // Callers hold the row writer lock and separately validate batch uniqueness.
@@ -1121,7 +1301,7 @@ impl StateStore {
                     "cannot forget an incomplete or fenced operation".into(),
                 ));
             }
-            kinds.push(record.operation.kind);
+            kinds.push((record.operation.table_id, record.operation.kind));
         }
         let mut batch = StateBatch::default();
         let operations = self
@@ -1129,7 +1309,27 @@ impl StateStore {
             .db
             .cf_handle(OPERATIONS)
             .expect("opened column family");
-        for (id, kind) in ids.iter().zip(kinds) {
+        // Sweep the retired operations' tables. Staged deltas of the
+        // remaining operations may name only the ordinals they pin.
+        let mut pinned: BTreeMap<TableId, BTreeSet<u64>> = kinds
+            .iter()
+            .map(|(table, _)| (*table, BTreeSet::new()))
+            .collect();
+        for entry in self.scan(OPERATIONS, Vec::new()) {
+            let (key, value) = entry?;
+            if ids.iter().any(|id| id.0.as_bytes() == &*key) {
+                continue;
+            }
+            let record = decode_operation_record(&key, &value)?;
+            let Some(ordinals) = pinned.get_mut(&record.operation.table_id) else {
+                continue;
+            };
+            ordinals.extend(operation_pins(&self.0.db, &record.operation.id)?);
+        }
+        for (table, pinned) in &pinned {
+            self.sweep_released_files(&mut batch, *table, pinned)?;
+        }
+        for (id, (_, kind)) in ids.iter().zip(kinds) {
             self.delete_prefix(&mut batch, DELTAS, &operation_prefix(id));
             if kind == OperationKind::Ingest {
                 self.delete_prefix(&mut batch, SPOOL, &operation_prefix(id));
@@ -1222,7 +1422,7 @@ impl StateStore {
                 entry?;
             }
         }
-        validate_operation_records(&self.0.db, true)
+        validate_operation_records(&self.0.db, &self.0.files, true)
     }
 
     fn require_operation(&self, id: &OperationId) -> Result<OperationRecord> {
@@ -1260,26 +1460,49 @@ impl StateStore {
         self.write_observed(batch).map(|_| ())
     }
     fn write_observed(&self, mut batch: StateBatch) -> Result<WriteObservation> {
-        if let Some(control) = &self.0.control {
+        let files = std::mem::take(&mut batch.files);
+        let result = if let Some(control) = &self.0.control {
             control.commit_index(self, &mut batch)
         } else {
             let observation = WriteObservation::capture(&batch.index);
-            self.0.db.write_opt(batch.index, &durable_write())?;
-            Ok(observation)
-        }
+            self.0
+                .db
+                .write_opt(batch.index, &self.durable_write())
+                .map(|()| observation)
+                .map_err(Error::from)
+        };
+        self.settle_file_changes(files, result.is_ok());
+        result
     }
     /// Derived state uses the WAL without forcing a disk flush per chunk.
     /// The next revision-bearing write syncs the index WAL, including this
     /// prefix, before any control revision names it. Staged batches after the
     /// last such write may be lost and are replayed or discarded under their
-    /// durable publication fence. Never disable the WAL here.
+    /// durable publication fence. Never disable the WAL here, except for an
+    /// ephemeral scratch store, which is deleted instead of recovered.
     fn write_staged(&self, batch: StateBatch) -> Result<()> {
         self.write_staged_observed(batch).map(|_| ())
     }
     fn write_staged_observed(&self, batch: StateBatch) -> Result<WriteObservation> {
         let observation = WriteObservation::capture(&batch.index);
-        self.0.db.write_opt(batch.index, &WriteOptions::default())?;
+        let result = self.0.db.write_opt(batch.index, &self.staged_write());
+        self.settle_file_changes(batch.files, result.is_ok());
+        result?;
         Ok(observation)
+    }
+
+    fn durable_write(&self) -> WriteOptions {
+        if self.0.ephemeral {
+            self.staged_write()
+        } else {
+            durable_write()
+        }
+    }
+
+    fn staged_write(&self) -> WriteOptions {
+        let mut options = WriteOptions::default();
+        options.disable_wal(self.0.ephemeral);
+        options
     }
 
     fn scan(&self, cf: &str, prefix: Vec<u8>) -> impl Iterator<Item = Result<RawEntry>> + '_ {
@@ -1333,7 +1556,11 @@ impl StateStore {
     }
 }
 
-fn validate_operation_records(db: &DB, validate_deltas: bool) -> Result<()> {
+fn validate_operation_records(
+    db: &DB,
+    files: &files::FileOrdinals,
+    validate_deltas: bool,
+) -> Result<()> {
     let family = db.cf_handle(OPERATIONS).expect("opened column family");
     let mut options = ReadOptions::default();
     options.fill_cache(false);
@@ -1347,7 +1574,24 @@ fn validate_operation_records(db: &DB, validate_deltas: bool) -> Result<()> {
                 OperationPhase::Prepared | OperationPhase::Committed
             )
         {
-            for delta in sealed_deltas(db, &record) {
+            // Every staged ordinal must resolve and be pinned by this
+            // operation, or a sweep could release it; the cache holds the
+            // whole dictionary at open.
+            let table = record.operation.table_id;
+            let pinned = operation_pins(db, &record.operation.id)?;
+            let resolves = |location: &Option<StoredLocation<'_>>| {
+                location.as_ref().is_none_or(|location| {
+                    files.path(table, location.file).is_some() && pinned.contains(&location.file)
+                })
+            };
+            for delta in sealed_deltas(db, &record, ReadOptions::default(), |value| {
+                let delta = files::decode_delta(value)?;
+                if resolves(&delta.expected) && resolves(&delta.replacement) {
+                    Ok(())
+                } else {
+                    Err(files::unknown_file())
+                }
+            }) {
                 delta?;
             }
         }
@@ -1356,17 +1600,18 @@ fn validate_operation_records(db: &DB, validate_deltas: bool) -> Result<()> {
 }
 
 // Share exact, bounded coverage checks between publication reads and startup.
-fn sealed_deltas<'a>(
+fn sealed_deltas<'a, T, F: FnMut(&[u8]) -> Result<T> + 'a>(
     db: &'a DB,
     record: &OperationRecord,
-) -> impl Iterator<Item = Result<IndexDelta>> + 'a + use<'a> {
+    mut options: ReadOptions,
+    mut decode: F,
+) -> impl Iterator<Item = Result<T>> + 'a + use<'a, T, F> {
     let mut prefix = operation_prefix(&record.operation.id);
     prefix.push(0);
     let mut expected = delta_key(&record.operation.id, 0);
     let count = record.delta_count;
     let may_be_pruned = record.phase == OperationPhase::Applied;
     let cf = db.cf_handle(DELTAS).expect("opened column family");
-    let mut options = ReadOptions::default();
     options.fill_cache(false);
     options.set_verify_checksums(true);
     if let Some(end) = prefix_end(&prefix) {
@@ -1435,6 +1680,8 @@ fn decode_operation_record(key: &[u8], value: &[u8]) -> Result<OperationRecord> 
 struct StateBatch {
     index: WriteBatch,
     control: WriteBatch,
+    /// Data-file ordinals this batch allocates or releases.
+    files: files::FileChanges,
 }
 impl Deref for StateBatch {
     type Target = WriteBatch;
@@ -1462,22 +1709,79 @@ fn decode_file_count(bytes: &[u8]) -> Result<u64> {
     })?))
 }
 fn pk_key(table: &TableId, key: &PrimaryKey) -> Vec<u8> {
-    let mut result = Vec::with_capacity(size_of::<u32>() + key.0.len());
+    pk_key_bytes(table, &key.0)
+}
+fn pk_key_bytes(table: &TableId, key: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(size_of::<u32>() + key.len());
     result.extend_from_slice(&table.0.to_be_bytes());
-    result.extend_from_slice(&key.0);
+    result.extend_from_slice(key);
     result
 }
+/// Per-file live-row counts and lazy remaps are keyed by table and path.
+/// Reverse entries use [`files::reverse_key`] instead.
 fn file_prefix(table: &TableId, file: &FileId) -> Vec<u8> {
-    // Reverse keys append a row position to this prefix.
     let mut result = Vec::with_capacity(size_of::<u32>() + 2 * size_of::<u64>() + file.0.len());
     result.extend_from_slice(&table.0.to_be_bytes());
     append_component(&mut result, file.0.as_bytes());
     result
 }
-fn reverse_key(table: &TableId, location: &RowLocation) -> Vec<u8> {
-    let mut result = file_prefix(table, &location.data_file_id);
-    result.extend_from_slice(&location.row_position.to_be_bytes());
-    result
+fn location_marker(prefix: &[u8], location: &StoredLocation<'_>) -> Vec<u8> {
+    let mut target = Vec::with_capacity(prefix.len() + 2 * size_of::<u64>());
+    target.extend_from_slice(prefix);
+    target.extend_from_slice(&location.file.to_be_bytes());
+    target.extend_from_slice(&location.row_position.to_be_bytes());
+    target
+}
+// Bytes after `operation_prefix` that separate an operation's staged records.
+// They share one key space in DELTAS, so every kind needs its own byte.
+// 0 = deltas, 1 = key markers, 2 = location markers, 3 = dense-marker flag.
+const DENSE_MARKERS_MARKER: u8 = 3;
+/// Staged lazy remap records of a rewrite.
+pub(crate) const REMAP_MARKER: u8 = 4;
+/// Staged output live-row counts of a lazy remap.
+pub(crate) const OUTPUT_COUNT_MARKER: u8 = 5;
+/// Data-file ordinals the operation's staged deltas name; see `files`.
+const FILE_PIN_MARKER: u8 = 6;
+fn file_pin_key(id: &OperationId, ordinal: u64) -> Vec<u8> {
+    let mut key = operation_prefix(id);
+    key.push(FILE_PIN_MARKER);
+    key.extend_from_slice(&ordinal.to_be_bytes());
+    key
+}
+/// The ordinals `id` pins, read from the current database.
+fn operation_pins(db: &DB, id: &OperationId) -> Result<BTreeSet<u64>> {
+    let mut prefix = operation_prefix(id);
+    prefix.push(FILE_PIN_MARKER);
+    let cf = db.cf_handle(DELTAS).expect("opened column family");
+    let mut pins = BTreeSet::new();
+    for entry in db.iterator_cf(
+        &cf,
+        IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+    ) {
+        let (key, _) = entry?;
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        let ordinal = <[u8; 8]>::try_from(&key[prefix.len()..])
+            .map(u64::from_be_bytes)
+            .map_err(|_| Error::RecoveryRequired("malformed file pin".into()))?;
+        pins.insert(ordinal);
+    }
+    Ok(pins)
+}
+
+/// An iterator that owns the RocksDB snapshot of its `ReadOptions`. Those
+/// hold the snapshot's native handle rather than a borrow, so `rows` is
+/// declared first and dropped before the snapshot is released.
+pub(crate) struct SnapshotIter<'a, I> {
+    pub(crate) rows: I,
+    pub(crate) _snapshot: rocksdb::Snapshot<'a>,
+}
+impl<I: Iterator> Iterator for SnapshotIter<'_, I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<I::Item> {
+        self.rows.next()
+    }
 }
 fn operation_prefix(id: &OperationId) -> Vec<u8> {
     // Delta keys append a marker and ordinal to this prefix.

@@ -364,7 +364,7 @@ fn control_crash_child() {
 
 #[test]
 fn old_index_formats_import_authority_but_require_rebuilt_live_counts() {
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("legacy");
         let store = StateStore::open(&path, options()).unwrap();

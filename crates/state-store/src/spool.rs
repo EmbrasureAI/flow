@@ -1,8 +1,9 @@
 use crate::StateBatch as WriteBatch;
-use crate::{Error, PK, Result, SPOOL, StateStore, append_component, decode, pk_key};
+use crate::{Error, PK, Result, SPOOL, StateStore, append_component, decode, pk_key, prefix_end};
 use flow_model::{
     PrimaryKey, Row, RowLocation, TableId, carry_forward_unchanged, row_has_unchanged,
 };
+use rocksdb::ReadOptions;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -196,16 +197,35 @@ impl StateStore {
             .into_iter();
         let bind_started = Instant::now();
         let mut batch = WriteBatch::default();
+        let remap_options = ReadOptions::default();
+        let mut resolvers = std::collections::HashMap::new();
+        // Under the row lock the ordinal cache is exact.
+        let mut paths = self.path_reader(None);
         for ((key, (table_id, primary_key, pending)), existing) in pending.into_iter().zip(existing)
         {
             let (original, present) = match existing {
                 Some(existing) => existing,
                 None => {
-                    let original: Option<RowLocation> = originals
+                    let mut original: Option<RowLocation> = originals
                         .next()
                         .expect("one index result per missing spool key")?
-                        .map(|value| decode(&value))
+                        .map(|value| paths.pk_value(table_id, &value))
                         .transpose()?;
+                    if let Some(location) = &mut original
+                        && self.remaps_possible()
+                    {
+                        resolvers
+                            .entry(table_id)
+                            .or_insert_with(|| {
+                                crate::remap::Resolver::new(
+                                    &self.0.db,
+                                    &self.0.remap_cache,
+                                    table_id,
+                                    &remap_options,
+                                )
+                            })
+                            .resolve_in_place(location)?;
+                    }
                     let present = original.is_some();
                     (original, present)
                 }
@@ -234,6 +254,63 @@ impl StateStore {
                 .record(end.duration_since(start).as_secs_f64());
         }
         result
+    }
+
+    /// Bind already-folded rows of one table, in canonical key order, and write
+    /// them to an empty spool. Validation and suppression match `collapse_changes`.
+    pub(crate) fn spill_folded(
+        &self,
+        transaction: &str,
+        table: &TableId,
+        rows: Vec<(PrimaryKey, PendingRow)>,
+    ) -> Result<()> {
+        let _guard = self.lock()?;
+        if self
+            .get::<bool>(SPOOL, &transaction_prefix(transaction))?
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidState("transaction spool is sealed".into()));
+        }
+        let pk_cf = self.0.db.cf_handle(PK).expect("opened column family");
+        let keys: Vec<_> = rows.iter().map(|(key, _)| pk_key(table, key)).collect();
+        let originals = self.0.db.batched_multi_get_cf(&pk_cf, keys.iter(), true);
+        let mut batch = WriteBatch::default();
+        let remap_options = ReadOptions::default();
+        let mut resolver = self.remaps_possible().then(|| {
+            crate::remap::Resolver::new(&self.0.db, &self.0.remap_cache, *table, &remap_options)
+        });
+        let mut paths = self.path_reader(None);
+        for ((key, pending), original) in rows.into_iter().zip(originals) {
+            let mut original: Option<RowLocation> = original?
+                .map(|value| paths.pk_value(*table, &value))
+                .transpose()?;
+            if let (Some(location), Some(resolver)) = (&mut original, &mut resolver) {
+                resolver.resolve_in_place(location)?;
+            }
+            let present = original.is_some();
+            pending.validate_initial(present)?;
+            let encoded = mutation_key(transaction, table, &key);
+            self.put(
+                &mut batch,
+                SPOOL,
+                encoded,
+                &pending.into_mutation(*table, key, original),
+            )?;
+        }
+        self.write_staged(batch)
+    }
+
+    pub(crate) fn ensure_spool_empty(&self, transaction: &str, table: &TableId) -> Result<()> {
+        if self
+            .scan(SPOOL, table_prefix(transaction, table))
+            .next()
+            .is_some()
+        {
+            return Err(Error::InvalidState(
+                "a collapse fold can only spill into an empty transaction spool".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Seal only after the complete source transaction and terminal commit record
@@ -312,6 +389,30 @@ impl StateStore {
             })
     }
 
+    /// [`Self::position_deletes`] as a cursor that borrows each record from
+    /// the store instead of decoding an owned [`RowLocation`].
+    pub fn position_delete_cursor(
+        &self,
+        transaction: &str,
+        table: &TableId,
+    ) -> PositionDeleteCursor<'_> {
+        let prefix = delete_prefix(transaction, table);
+        let mut options = ReadOptions::default();
+        options.fill_cache(false);
+        options.set_iterate_upper_bound(
+            prefix_end(&prefix).expect("length-prefixed internal key always has an upper bound"),
+        );
+        let mut records = self.0.db.raw_iterator_cf_opt(
+            &self.0.db.cf_handle(SPOOL).expect("opened column family"),
+            options,
+        );
+        records.seek(&prefix);
+        PositionDeleteCursor {
+            records,
+            prefix: prefix.len(),
+        }
+    }
+
     pub fn file_position_deletes<'a>(
         &'a self,
         transaction: &str,
@@ -375,9 +476,96 @@ impl StateStore {
     /// Used after abort, or after every table has durably published a transaction.
     pub fn discard_transaction(&self, transaction: &str) -> Result<()> {
         let _guard = self.lock()?;
+        // Every collapse discards first, and its spool is almost always empty.
+        // Deleting nothing needs neither a range tombstone nor a durable write.
+        if self
+            .scan(SPOOL, transaction_prefix(transaction))
+            .next()
+            .is_none()
+        {
+            return Ok(());
+        }
         let mut batch = WriteBatch::default();
         self.delete_prefix(&mut batch, SPOOL, &transaction_prefix(transaction));
         self.write(batch)
+    }
+}
+
+/// Forward cursor over one staged position-delete set, in path and then
+/// position order. It can skip the rest of a target file with one seek.
+pub struct PositionDeleteCursor<'a> {
+    records: rocksdb::DBRawIteratorWithThreadMode<'a, rocksdb::DB>,
+    prefix: usize,
+}
+
+impl PositionDeleteCursor<'_> {
+    /// The current target's encoded key part and the row position, or `None`
+    /// after the last record. Encoded targets compare as their paths do, and
+    /// equal only for the same path.
+    pub fn current(&self) -> Result<Option<(&[u8], u64)>> {
+        let Some(key) = self.records.key() else {
+            self.records.status()?;
+            return Ok(None);
+        };
+        let Some((target, position)) = key
+            .len()
+            .checked_sub(size_of::<u64>())
+            .filter(|split| *split >= self.prefix + 2 && key[split - 2..*split] == [0, 0])
+            .map(|split| key.split_at(split))
+        else {
+            return Err(Error::InvalidState("malformed staged delete key".into()));
+        };
+        Ok(Some((
+            &target[self.prefix..],
+            u64::from_be_bytes(position.try_into().expect("eight position bytes")),
+        )))
+    }
+
+    /// The current record, borrowed from the store.
+    pub fn record(&self) -> Result<StagedPosition<'_>> {
+        let value = self
+            .records
+            .value()
+            .ok_or_else(|| Error::InvalidState("staged delete cursor is exhausted".into()))?;
+        Ok(bincode::deserialize(value)?)
+    }
+
+    pub fn advance(&mut self) {
+        self.records.next();
+    }
+
+    /// Move past the current target's remaining positions.
+    pub fn skip_target(&mut self) {
+        let Some(key) = self.records.key() else {
+            return;
+        };
+        // Each target ends with the terminator `0, 0`; `0, 1` follows every
+        // position of this target and precedes the next target.
+        let mut next = key[..key.len().saturating_sub(size_of::<u64>())].to_vec();
+        if let Some(last) = next.last_mut() {
+            *last = 1;
+        }
+        self.records.seek(next);
+    }
+}
+
+/// The leading fields of a staged [`RowLocation`], borrowed from its
+/// encoding: what a position-delete file records and its writer checks. The
+/// identity fields that follow are not decoded.
+#[derive(Debug, Deserialize)]
+pub struct StagedPosition<'a> {
+    data_file_id: &'a [u8],
+    pub row_position: u64,
+    pub data_sequence_number: i64,
+    pub spec_id: i32,
+    pub partition: &'a [u8],
+}
+
+impl StagedPosition<'_> {
+    /// The target data file's path.
+    pub fn path(&self) -> Result<&str> {
+        std::str::from_utf8(self.data_file_id)
+            .map_err(|_| Error::InvalidState("staged delete path is not UTF-8".into()))
     }
 }
 

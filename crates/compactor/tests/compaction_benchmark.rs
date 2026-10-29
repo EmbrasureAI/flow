@@ -287,6 +287,10 @@ async fn fixture(
         input_bytes,
         delete_input_bytes: delete_files.iter().map(delete_content_size).sum(),
         delete_input_rows: delete_rows,
+        lazy_index_remap: false,
+        per_target_deletes: false,
+        target_ranges: Default::default(),
+        reason: flow_compactor::PlanReason::L0Debt,
     };
     Fixture {
         _dir: dir,

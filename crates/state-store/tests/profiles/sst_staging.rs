@@ -186,14 +186,16 @@ fn stage_ordinal_wal(
     let mut ordinal = delta_key(id, record.delta_count);
     let ordinal_offset = ordinal.len() - size_of::<u64>();
     let mut encoded = Vec::new();
+    let mut memo = files::OrdinalMemo::default();
+    let mut pinned = BTreeSet::new();
     let mut deltas = deltas.into_iter().fuse();
     loop {
         let mut batch = StateBatch::default();
         let start = record.delta_count;
         for delta in deltas.by_ref().take(store.0.batch_rows) {
             ordinal[ordinal_offset..].copy_from_slice(&record.delta_count.to_be_bytes());
-            encoded.clear();
-            bincode::serialize_into(&mut encoded, &delta)?;
+            let stored = store_with_pins(store, &mut batch, &mut memo, &mut pinned, id, &delta)?;
+            files::encode_delta(&mut encoded, &stored)?;
             batch.put_cf(&cf, &ordinal, &encoded);
             record.delta_count = record
                 .delta_count
@@ -208,12 +210,39 @@ fn stage_ordinal_wal(
     }
 }
 
+/// The staged form of `delta`, with its ordinals allocated and pinned in
+/// `batch` as `stage_deltas` does.
+fn store_with_pins<'d>(
+    store: &StateStore,
+    batch: &mut StateBatch,
+    memo: &mut files::OrdinalMemo,
+    pinned: &mut BTreeSet<u64>,
+    id: &OperationId,
+    delta: &'d IndexDelta,
+) -> Result<files::StoredDelta<'d>> {
+    let cf = store.0.db.cf_handle(DELTAS).expect("opened column family");
+    let stored = store.store_delta(batch, memo, TABLE, delta)?;
+    for location in stored.expected.iter().chain(&stored.replacement) {
+        if pinned.insert(location.file) {
+            batch.put_cf(&cf, file_pin_key(id, location.file), []);
+        }
+    }
+    Ok(stored)
+}
+
+/// Ordinals are store-local, so the SST is built against `store`, whose
+/// dictionary receives the allocations and pins before the file is ingested.
 fn build_external_sst(
+    store: &StateStore,
     id: &OperationId,
     path: &Path,
     deltas: impl IntoIterator<Item = IndexDelta>,
 ) -> Result<ExternalArtifact> {
     let build_started = Instant::now();
+    let _guard = store.lock()?;
+    let mut batch = StateBatch::default();
+    let mut memo = files::OrdinalMemo::default();
+    let mut pinned = BTreeSet::new();
     let mut options = Options::default();
     options.set_compression_type(DBCompressionType::Lz4);
     let mut writer = SstFileWriter::create(&options);
@@ -224,8 +253,8 @@ fn build_external_sst(
     let mut count = 0_u64;
     for delta in deltas {
         ordinal[ordinal_offset..].copy_from_slice(&count.to_be_bytes());
-        encoded.clear();
-        bincode::serialize_into(&mut encoded, &delta)?;
+        let stored = store_with_pins(store, &mut batch, &mut memo, &mut pinned, id, &delta)?;
+        files::encode_delta(&mut encoded, &stored)?;
         writer.put(&ordinal, &encoded)?;
         count = count
             .checked_add(1)
@@ -233,6 +262,7 @@ fn build_external_sst(
     }
     assert_ne!(count, 0);
     writer.finish()?;
+    store.write_staged(batch)?;
     let bytes = std::fs::metadata(path)?.len();
     let build = build_started.elapsed();
     Ok(ExternalArtifact {
@@ -282,10 +312,10 @@ fn run_profile(root: &Path, strategy: Staging, rows: u64) -> Observation {
     let database = root.join(strategy.name());
     let rewrite = operation("rewrite", OperationKind::Rewrite, Some(SEED_SNAPSHOT));
     let sst = root.join("rewrite-deltas.sst");
-    let external = matches!(strategy, Staging::ExternalSst)
-        .then(|| build_external_sst(&rewrite.id, &sst, rewrite_deltas(rows)).unwrap());
-
     let store = open(&database);
+    let external = matches!(strategy, Staging::ExternalSst)
+        .then(|| build_external_sst(&store, &rewrite.id, &sst, rewrite_deltas(rows)).unwrap());
+
     let activation_started = Instant::now();
     store.begin_prepare(rewrite.clone()).unwrap();
     let payload_started = Instant::now();
@@ -522,7 +552,7 @@ fn external_sst_building_boundary_discards_ingested_ordinals_after_reopen() {
             .unwrap();
         let sst = root.path().join("crash-boundary.sst");
         let installed = rows.min(4096);
-        let external = build_external_sst(&id, &sst, rewrite_deltas(installed)).unwrap();
+        let external = build_external_sst(&store, &id, &sst, rewrite_deltas(installed)).unwrap();
         ingest_external_sst(&store, &id, &sst).unwrap();
         assert_eq!(external.count, installed);
         assert_eq!(store.operation(&id).unwrap().unwrap().delta_count, 0);

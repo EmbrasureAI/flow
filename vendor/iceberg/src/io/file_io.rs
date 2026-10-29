@@ -1,3 +1,4 @@
+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -331,12 +332,25 @@ pub struct OutputFile {
     storage: Arc<dyn Storage>,
     // Absolute path of file.
     path: String,
+    // Writes fail instead of replacing an existing file.
+    if_absent: bool,
 }
 
 impl OutputFile {
     /// Creates a new output file.
     pub fn new(storage: Arc<dyn Storage>, path: String) -> Self {
-        Self { storage, path }
+        Self {
+            storage,
+            path,
+            if_absent: false,
+        }
+    }
+
+    /// Makes [`Self::write`] and [`Self::writer`] fail instead of replacing an
+    /// existing file, through a conditional create where the storage has one.
+    pub fn if_absent(mut self) -> Self {
+        self.if_absent = true;
+        self
     }
 
     /// Relative path to root uri.
@@ -368,9 +382,12 @@ impl OutputFile {
     ///
     /// # Notes
     ///
-    /// Calling `write` will overwrite the file if it exists.
-    /// For continuous writing, use [`Self::writer`].
+    /// Calling `write` will overwrite the file if it exists, unless
+    /// [`Self::if_absent`] was set. For continuous writing, use [`Self::writer`].
     pub async fn write(&self, bs: Bytes) -> crate::Result<()> {
+        if self.if_absent {
+            return self.storage.write_if_absent(&self.path, bs).await;
+        }
         self.storage.write(&self.path, bs).await
     }
 
@@ -380,6 +397,9 @@ impl OutputFile {
     ///
     /// For one-time writing, use [`Self::write`] instead.
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
+        if self.if_absent {
+            return self.storage.writer_if_absent(&self.path).await;
+        }
         self.storage.writer(&self.path).await
     }
 }

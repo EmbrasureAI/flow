@@ -96,3 +96,13 @@ range/footer/blob/bitmap validation. Flow's delete staging uses this to avoid
 repeating HEAD for descriptors sharing a Puffin file. Changed files:
 `src/puffin/deletion_vector.rs` and `src/puffin/mod.rs`. See
 `docs/patches/iceberg-dv-observed-size.patch`.
+
+The conditional-create patch adds `Storage::write_if_absent` and
+`Storage::writer_if_absent`, and `OutputFile::if_absent`, which routes the
+file's `write` and `writer` to them. The default implementations check
+existence first, which races with a concurrent writer; storages with
+conditional creates override them so the write itself fails. Flow uses this for
+prepared artifacts, which must never replace an earlier attempt's file, in
+place of a separate existence check before each write. Changed files:
+`src/io/file_io.rs` and `src/io/storage/mod.rs`. See
+`docs/patches/iceberg-conditional-create.patch`.

@@ -26,6 +26,8 @@ fn compaction_policy() -> Policy {
         oldest_l0_hard_ms: 2,
         deleted_rows_percent: 100,
         min_file_age_ms: 0,
+        // These tests cover the per-row path; lazy_maintenance covers remaps.
+        lazy_index_remap: false,
         ..Default::default()
     }
 }
@@ -35,6 +37,19 @@ fn maintenance(f: &Fixture) -> TableMaintenance {
         f.index.clone(),
         f.catalog.clone(),
         compaction_policy(),
+        WriterConfig::default(),
+    )
+    .unwrap()
+}
+
+fn lazy_maintenance(f: &Fixture) -> TableMaintenance {
+    TableMaintenance::new(
+        f.index.clone(),
+        f.catalog.clone(),
+        Policy {
+            lazy_index_remap: true,
+            ..compaction_policy()
+        },
         WriterConfig::default(),
     )
     .unwrap()
@@ -83,11 +98,19 @@ fn expected() -> Vec<Row> {
 }
 
 async fn build_with_late_changes(f: &mut Fixture) -> (ReadyCompaction, Table, Table) {
+    let maintenance = maintenance(f);
+    build_with_late_changes_using(f, &maintenance).await
+}
+
+async fn build_with_late_changes_using(
+    f: &mut Fixture,
+    maintenance: &TableMaintenance,
+) -> (ReadyCompaction, Table, Table) {
     // Include an unchanged selected row, in addition to the four live rows of
     // the older L0 file that late CDC will replace or remove.
     cdc(f, 90, vec![(16, Change::Insert(row(16)))]).await;
     let base = f.head.clone();
-    let running = maintenance(f)
+    let running = maintenance
         .start_compaction(&base, &f.schema, f.scratch("build"))
         .await
         .unwrap()
@@ -199,6 +222,11 @@ async fn verify(f: &Fixture, base: &Table, late: &Table, committed: &Table, rebu
                 .unwrap()
                 .is_none()
         );
+    }
+    assert_index_exact(f, committed, &format!("verify-{}", uuid::Uuid::new_v4())).await;
+    if f.index.has_remaps(&f.schema.table_id).unwrap() {
+        // Reverse scans of retired files stay raw until materialization.
+        return;
     }
     let inventory = maintenance(f)
         .inventory(committed, f.schema.table_id)
@@ -724,9 +752,22 @@ async fn preparation_past_stall_budget_can_activate_without_rebuilding_unchanged
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_prepared_recovery_survives_lost_response_and_complete_index_loss() {
-    for lose_index in [false, true] {
+    // The catalog commits the rewrite but its response is lost. Restart
+    // recovery must resolve it, applying either per-row deltas or the staged
+    // lazy remap, or rebuild the whole index.
+    for (lazy, lose_index) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut f = Fixture::new().await;
-        let (ready, base, late) = build_with_late_changes(&mut f).await;
+        let maintenance = |f: &Fixture| {
+            if lazy {
+                lazy_maintenance(f)
+            } else {
+                maintenance(f)
+            }
+        };
+        let builder = maintenance(&f);
+        let (ready, base, late) = build_with_late_changes_using(&mut f, &builder).await;
+        // The restart below must be able to reopen the index.
+        drop(builder);
         f.catalog.lose_next_response_and_disconnect();
         assert!(
             maintenance(&f)
@@ -736,6 +777,11 @@ async fn concurrent_prepared_recovery_survives_lost_response_and_complete_index_
         );
         let pending = f.index.pending_operations().unwrap().remove(0);
         assert_eq!(pending.phase, OperationPhase::Prepared);
+        assert_eq!(
+            pending.delta_count == 0,
+            lazy,
+            "a lazy rewrite stages a remap instead of row deltas"
+        );
         assert_eq!(pending.operation.last_lsn, PgLsn(110));
         assert!(
             f.index
@@ -795,6 +841,7 @@ async fn concurrent_prepared_recovery_survives_lost_response_and_complete_index_
                 .recover(&committed, &pending.operation.id)
                 .await
                 .unwrap();
+            assert_eq!(f.index.has_remaps(&f.schema.table_id).unwrap(), lazy);
         }
         assert_eq!(
             f.catalog
@@ -807,6 +854,22 @@ async fn concurrent_prepared_recovery_survives_lost_response_and_complete_index_
             snapshot_count
         );
         verify(&f, &base, &late, &committed, lose_index).await;
+        // CDC after recovery updates and deletes rows the rewrite moved.
+        f.head = committed.clone();
+        cdc(
+            &mut f,
+            120,
+            vec![(16, Change::Update(updated(16))), (17, Change::Delete)],
+        )
+        .await;
+        let mut rows = expected();
+        rows.retain(|row| ![16, 17].contains(&id_of(row)));
+        rows.push(updated(16));
+        assert_eq!(
+            sorted(scan(&f.head, &f.schema).await.unwrap()),
+            sorted(rows)
+        );
+        assert_index_exact(&f, &f.head, &format!("after-recovery-{lazy}-{lose_index}")).await;
     }
 }
 
@@ -1225,4 +1288,375 @@ async fn external_input_rewrite_cancels_completed_build_without_resurrecting_row
         sorted(scan(&delete_base, &f.schema).await.unwrap()),
         sorted(expected)
     );
+}
+
+/// Every live Iceberg row is indexed at its exact physical location, and the
+/// index holds nothing else. Lookups translate lazy remaps; per-file live
+/// counts must equal the effective rows of each live file.
+async fn assert_index_exact(f: &Fixture, table: &Table, name: &str) {
+    let view = SnapshotView::current(table).await.unwrap();
+    let files = view
+        .live_files
+        .values()
+        .filter(|entry| entry.content_type() == DataContentType::Data)
+        .map(|entry| flow_model::FileId(entry.file_path().into()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let scratch = f.scratch(name);
+    let mut live = Vec::new();
+    flow_compactor::scan_live_files(
+        table,
+        &f.schema,
+        &view,
+        &files,
+        &scratch,
+        name,
+        2,
+        &flow_compactor::ReadLimits::default(),
+        async |batch| {
+            for (row, position) in batch.rows.iter().zip(&batch.positions) {
+                live.push((
+                    f.schema.encode_key(row).unwrap(),
+                    batch.file_id.clone(),
+                    *position,
+                ));
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let keys = live
+        .iter()
+        .map(|(key, _, _)| key.clone())
+        .collect::<Vec<_>>();
+    let located = f.index.lookup_many(&f.schema.table_id, &keys).unwrap();
+    for ((key, file, position), location) in live.iter().zip(located) {
+        let location = location.unwrap_or_else(|| panic!("{key:?} is not indexed"));
+        assert_eq!(
+            (&location.data_file_id, location.row_position),
+            (file, *position),
+            "{key:?} is indexed at a different row"
+        );
+        assert_eq!(
+            Some(location.data_sequence_number),
+            view.live_files[&file.0].sequence_number
+        );
+    }
+    let files = files.into_iter().collect::<Vec<_>>();
+    let counts = f
+        .index
+        .file_live_row_counts(
+            &f.schema.table_id,
+            table.metadata().current_snapshot_id(),
+            &files,
+        )
+        .unwrap();
+    for (file, count) in files.iter().zip(counts) {
+        assert_eq!(
+            count,
+            live.iter().filter(|(_, live, _)| live == file).count() as u64,
+            "live count of {}",
+            file.0
+        );
+    }
+}
+
+fn id_of(row: &Row) -> i64 {
+    match row[0] {
+        Value::Int64(id) => id,
+        _ => unreachable!(),
+    }
+}
+
+/// With `delete_layout = "per_target"`, a caught-up build writes its residuals
+/// for unselected full-size files and its masks for late deletes on its
+/// output as one single-target file per data file, and those for L0 files in
+/// pooled ranges that no full-size file sees. Rows and index stay exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_target_catch_up_writes_residuals_and_masks_per_data_file() {
+    let mut f = Fixture::new().await;
+    let per_target = TableMaintenance::new(
+        f.index.clone(),
+        f.catalog.clone(),
+        Policy {
+            lazy_index_remap: true,
+            delete_layout: flow_compactor::DeleteLayout::PerTarget,
+            // Every file outside L0 is full-size.
+            target_delete_min_file_bytes: 1,
+            ..compaction_policy()
+        },
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let (ready, base, late) = build_with_late_changes_using(&mut f, &per_target).await;
+    let prepared = per_target
+        .start_compaction_preparation(&late, &f.schema, ready)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    per_target
+        .activate_compaction(&late, &f.schema, prepared)
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(late.identifier()).await.unwrap();
+    assert_eq!(sorted(scan(&f.head, &f.schema).await.unwrap()), expected());
+    assert_index_exact(&f, &f.head, "per-target-audit").await;
+    let before = SnapshotView::current(&late).await.unwrap();
+    let after = SnapshotView::current(&f.head).await.unwrap();
+    let full_size = per_target
+        .inventory(&f.head, f.schema.table_id)
+        .await
+        .unwrap()
+        .files
+        .into_iter()
+        .filter(|file| file.level != flow_compactor::Level::L0)
+        .map(|file| after.live_files[&file.id.0].clone())
+        .collect::<Vec<_>>();
+    let mut targets = std::collections::BTreeSet::new();
+    for (id, entry) in &after.live_files {
+        if entry.content_type() == DataContentType::PositionDeletes
+            && !before.live_files.contains_key(id)
+        {
+            match after.single_target(entry) {
+                Some(target) => assert!(targets.insert(target.file_path().to_owned())),
+                None => assert!(
+                    full_size
+                        .iter()
+                        .all(|data| !flow_iceberg_ext::position_delete_may_apply(entry, data))
+                ),
+            }
+        }
+    }
+    assert!(!targets.is_empty(), "late deletes leave masks or residuals");
+    verify(&f, &base, &late, &f.head, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_remap_build_catches_up_and_later_cdc_targets_translated_rows() {
+    let mut f = Fixture::new().await;
+    let lazy = lazy_maintenance(&f);
+    let (ready, _base, late) = build_with_late_changes_using(&mut f, &lazy).await;
+    let prepared = lazy
+        .start_compaction_preparation(&late, &f.schema, ready)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(f.index.pending_operations().unwrap().is_empty());
+    lazy.activate_compaction(&late, &f.schema, prepared)
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(late.identifier()).await.unwrap();
+    let table_id = f.schema.table_id;
+    assert!(
+        f.index.has_remaps(&table_id).unwrap(),
+        "the rewrite committed a remap instead of row deltas"
+    );
+    assert_eq!(sorted(scan(&f.head, &f.schema).await.unwrap()), expected());
+    assert_index_exact(&f, &f.head, "lazy-audit-1").await;
+    let moved = f
+        .index
+        .lookup(&table_id, &f.schema.encode_key(&row(16)).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        moved.source_commit_lsn,
+        PgLsn(90),
+        "moved rows keep their LSN"
+    );
+
+    // CDC after the lazy rewrite updates and deletes moved and unmoved rows;
+    // its position deletes must target the translated locations.
+    cdc(
+        &mut f,
+        120,
+        vec![
+            (16, Change::Update(updated(16))),
+            (3, Change::Delete),
+            (18, Change::Insert(row(18))),
+        ],
+    )
+    .await;
+    let mut expected_rows = vec![
+        row(4),
+        row(5),
+        updated(10),
+        row(15),
+        updated(16),
+        row(17),
+        row(18),
+        updated(140),
+    ];
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "lazy-audit-2").await;
+
+    // A second lazy rewrite without late changes, then more CDC on its output.
+    let head = f.head.clone();
+    let running = lazy
+        .start_compaction(&head, &f.schema, f.scratch("lazy-build-2"))
+        .await
+        .unwrap()
+        .unwrap();
+    let ready = running.wait().await.unwrap();
+    lazy.finish_compaction(&head, &f.schema, ready)
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(head.identifier()).await.unwrap();
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "lazy-audit-3").await;
+    cdc(
+        &mut f,
+        130,
+        vec![
+            (17, Change::Delete),
+            (18, Change::Update(updated(18))),
+            (140, Change::Delete),
+        ],
+    )
+    .await;
+    expected_rows.retain(|row| ![17, 18, 140].contains(&id_of(row)));
+    expected_rows.push(updated(18));
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "lazy-audit-4").await;
+
+    // Materializing restores exact reverse scans for reconcile/catch-up paths.
+    f.index.materialize_remaps(&table_id).unwrap();
+    assert!(!f.index.has_remaps(&table_id).unwrap());
+    assert_index_exact(&f, &f.head, "lazy-audit-5").await;
+    let inventory = lazy.inventory(&f.head, table_id).await.unwrap();
+    let mut indexed = 0;
+    for file in &inventory.files {
+        let rows = f
+            .index
+            .file_rows(&table_id, &file.id)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len() as u64;
+        assert_eq!(file.deleted_rows, file.row_count - rows);
+        indexed += rows;
+    }
+    assert_eq!(indexed, expected_rows.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_lazy_compaction_commits_a_remap_instead_of_row_deltas() {
+    let mut f = Fixture::new().await;
+    let lazy = lazy_maintenance(&f);
+    let table_id = f.schema.table_id;
+    cdc(
+        &mut f,
+        90,
+        vec![(16, Change::Insert(row(16))), (17, Change::Insert(row(17)))],
+    )
+    .await;
+    let mut expected_rows = f.expected.clone();
+    expected_rows.extend([row(16), row(17)]);
+    let minor = f.locations[6].data_file_id.clone();
+    let raw_minor = f
+        .index
+        .file_rows(&table_id, &minor)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!raw_minor.is_empty());
+
+    // The strict path fences the table for the whole rewrite; with the flag on
+    // it publishes a remap, so no moved row is rewritten in the index.
+    let head = f.head.clone();
+    lazy.compact(&head, &f.schema, f.scratch("strict-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(head.identifier()).await.unwrap();
+    assert!(f.index.has_remaps(&table_id).unwrap());
+    assert!(
+        !SnapshotView::current(&f.head)
+            .await
+            .unwrap()
+            .live_files
+            .contains_key(&minor.0),
+        "the L0 input was rewritten"
+    );
+    assert_eq!(
+        f.index
+            .file_rows(&table_id, &minor)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        raw_minor,
+        "no per-row delta moved the retired input's entries"
+    );
+    assert!(f.index.pending_operations().unwrap().is_empty());
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "strict-audit-1").await;
+
+    // CDC updates and deletes moved rows; position deletes must target the
+    // translated locations in the strict output.
+    cdc(
+        &mut f,
+        100,
+        vec![
+            (10, Change::Update(updated(10))),
+            (13, Change::Delete),
+            (16, Change::Update(updated(16))),
+            (18, Change::Insert(row(18))),
+        ],
+    )
+    .await;
+    expected_rows.retain(|row| ![10, 13, 16].contains(&id_of(row)));
+    expected_rows.extend([updated(10), updated(16), row(18)]);
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "strict-audit-2").await;
+
+    // A second strict rewrite chains through the first remap.
+    let head = f.head.clone();
+    lazy.compact(&head, &f.schema, f.scratch("strict-2"))
+        .await
+        .unwrap()
+        .unwrap();
+    f.head = f.catalog.load_table(head.identifier()).await.unwrap();
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "strict-audit-3").await;
+    cdc(
+        &mut f,
+        110,
+        vec![
+            (14, Change::Delete),
+            (17, Change::Update(updated(17))),
+            (18, Change::Delete),
+        ],
+    )
+    .await;
+    expected_rows.retain(|row| ![14, 17, 18].contains(&id_of(row)));
+    expected_rows.push(updated(17));
+    assert_eq!(
+        sorted(scan(&f.head, &f.schema).await.unwrap()),
+        sorted(expected_rows.clone())
+    );
+    assert_index_exact(&f, &f.head, "strict-audit-4").await;
+    f.index.materialize_remaps(&table_id).unwrap();
+    assert!(!f.index.has_remaps(&table_id).unwrap());
+    assert_index_exact(&f, &f.head, "strict-audit-5").await;
 }

@@ -163,6 +163,24 @@ impl Storage for ObservedStorage {
             metrics: self.metrics.clone(),
         }))
     }
+    async fn write_if_absent(&self, path: &str, bytes: Bytes) -> Result<()> {
+        let length = bytes.len() as u64;
+        self.metrics
+            .write
+            .record(self.inner.write_if_absent(path, bytes), |_| length)
+            .await
+    }
+    async fn writer_if_absent(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        let inner = self
+            .metrics
+            .writer_open
+            .record(self.inner.writer_if_absent(path), |_| 0)
+            .await?;
+        Ok(Box::new(ObservedWriter {
+            inner,
+            metrics: self.metrics.clone(),
+        }))
+    }
     // Deletion decisions come from local state; with remote durability they
     // must be replicated first so a successor never sees a deleted object as live.
     async fn delete(&self, path: &str) -> Result<()> {
@@ -242,6 +260,40 @@ mod tests {
     use iceberg::io::FileIOBuilder;
     use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
     use metrics_exporter_prometheus::PrometheusBuilder;
+    #[tokio::test]
+    async fn create_only_writes_never_replace_a_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let io =
+            FileIOBuilder::new(observe(Arc::new(OpenDalResolvingStorageFactory::new()))).build();
+        let path = format!("file://{}", temp.path().join("artifact").display());
+        let read = || async { io.new_input(&path).unwrap().read().await.unwrap() };
+        let output = || io.new_output(&path).unwrap().if_absent();
+        output().write(Bytes::from_static(b"first")).await.unwrap();
+        assert!(output().write(Bytes::from_static(b"second")).await.is_err());
+        assert_eq!(read().await, b"first"[..]);
+        // A streamed writer may report the conflict when opening or closing,
+        // but must not truncate or replace the existing file either way.
+        if let Ok(mut writer) = output().writer().await {
+            let _ = writer.write(Bytes::from_static(b"second")).await;
+            assert!(writer.close().await.is_err());
+        }
+        assert_eq!(read().await, b"first"[..]);
+        let fresh = format!("file://{}", temp.path().join("fresh").display());
+        let mut writer = io
+            .new_output(&fresh)
+            .unwrap()
+            .if_absent()
+            .writer()
+            .await
+            .unwrap();
+        writer.write(Bytes::from_static(b"new")).await.unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(
+            io.new_input(&fresh).unwrap().read().await.unwrap(),
+            b"new"[..]
+        );
+    }
+
     #[tokio::test]
     async fn real_file_io_preserves_streams_errors_and_factory_serialization() {
         let recorder = PrometheusBuilder::new().build_recorder();

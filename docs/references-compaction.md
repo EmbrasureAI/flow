@@ -34,8 +34,10 @@ batch writes. RocksDB prevents opening the same database for writing twice.
 Complete SOURCE-ledger batches on a controlled store use the separate control
 commit mutex, which orders both database revisions and fences failures before
 unlocking. They do not wait for unrelated row/spool processing. Checkpoints hold
-row then control locks; readers use consistent index snapshots. Standalone stores
-retain the row lock for ledger writes.
+row then control locks only to create the checkpoint and register it as pending,
+which already protects its snapshots; they sync its files outside the locks and
+then register it as durable. Readers use consistent index snapshots. Standalone
+stores retain the row lock for ledger writes.
 
 Prepared deltas live as separate bounded records, not a single transaction-sized
 value. Applying a committed delta is resumable in bounded batches; the table stays

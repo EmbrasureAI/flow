@@ -611,3 +611,35 @@ async fn lineage_rewrite_accepts_binary_columns() -> anyhow::Result<()> {
     assert_eq!(recovered, rows);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_retry_never_overwrites_a_prepared_data_file() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let rows: Vec<Row> = vec![vec![Value::Int64(1), Value::Null, Value::Null]];
+    let writer = || {
+        DataWriter::new(
+            io(),
+            directory.path().to_str().unwrap(),
+            &OperationId("prepared".into()),
+            schema(),
+            0,
+            WriterConfig::default(),
+        )
+    };
+    let mut first = writer()?;
+    first.write(&rows, PgLsn(10)).await?;
+    let files = first.close().await?;
+    let prepared = std::fs::read(files[0].file_path())?;
+    // The same operation names the same artifact; it must not be replaced.
+    let mut retry = writer()?;
+    let error = match retry.write(&rows, PgLsn(10)).await {
+        Err(error) => error,
+        Ok(_) => retry.close().await.unwrap_err(),
+    };
+    assert!(
+        format!("{error:#}").contains("refusing to overwrite"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(files[0].file_path())?, prepared);
+    Ok(())
+}

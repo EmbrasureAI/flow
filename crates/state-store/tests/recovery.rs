@@ -1,6 +1,6 @@
 use flow_model::{FileId, OperationId, PgLsn, PrimaryKey, RowLocation, TableId, Value};
 use flow_state_store::{
-    BufferResult, Change, CollapseBuffer, IndexDelta, OperationKind, OperationPhase,
+    Bound, BufferResult, Change, CollapseBuffer, IndexDelta, OperationKind, OperationPhase,
     OperationRecord, PreparedOperation, StateStore, StateStoreOptions,
 };
 use tempfile::TempDir;
@@ -580,6 +580,33 @@ fn checkpoint_restores_both_index_directions_and_delete_removes_reverse_row() {
 }
 
 #[test]
+fn sparse_staging_markers_backfill_once_and_keep_rejecting_earlier_duplicates() {
+    let temp = TempDir::new().unwrap();
+    let store = open(temp.path());
+    let id = OperationId("sparse".into());
+    store.begin_prepare(operation("sparse", None, 10)).unwrap();
+    // Ordered calls keep only each batch's largest markers.
+    for key in [1u8, 3, 5] {
+        store
+            .stage_deltas(
+                &id,
+                [
+                    insert(key, "a", u64::from(key)),
+                    insert(key + 1, "a", u64::from(key) + 1),
+                ],
+            )
+            .unwrap();
+    }
+    // An unordered but unique key backfills every earlier marker.
+    store.stage_deltas(&id, [insert(0, "b", 0)]).unwrap();
+    store.stage_deltas(&id, [insert(9, "c", 9)]).unwrap();
+    // Neither an early key nor an early location may be staged again.
+    assert!(store.stage_deltas(&id, [insert(3, "d", 0)]).is_err());
+    assert!(store.stage_deltas(&id, [insert(10, "a", 2)]).is_err());
+    assert!(store.stage_deltas(&id, [insert(11, "e", 0)]).is_ok());
+}
+
+#[test]
 fn duplicate_keys_and_locations_are_rejected_within_and_between_staging_batches() {
     for staging in [
         "same-batch",
@@ -809,6 +836,93 @@ fn abort_noop_and_position_delete_sort_are_disk_backed() {
 }
 
 #[test]
+fn position_delete_cursor_matches_records_and_skips_whole_targets() {
+    let dir = TempDir::new().unwrap();
+    let store = open_with_apply_limits(dir.path(), 64, 64);
+    let table = TableId(7);
+    // Paths that extend another path, including with a NUL byte, sort after it.
+    let paths = ["a", "a\0", "a\0b", "aa", "b"];
+    let mut staged = Vec::new();
+    for (ordinal, path) in paths.iter().enumerate() {
+        for position in [0, 255, 256, u64::MAX >> 1] {
+            let mut row = location(path, position, ordinal as u64 + 1);
+            row.partition = vec![ordinal as u8; ordinal];
+            staged.push(row);
+        }
+    }
+    store
+        .put_position_deletes("delete", &table, staged.iter().cloned())
+        .unwrap();
+    // Another table and spool share the key space but not the cursor.
+    store
+        .put_position_deletes("delete", &TableId(8), [location("a", 1, 1)])
+        .unwrap();
+    store
+        .put_position_deletes("other", &table, [location("a", 1, 1)])
+        .unwrap();
+    let expected: Vec<_> = store
+        .position_deletes("delete", &table)
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(expected.len(), staged.len());
+
+    let mut cursor = store.position_delete_cursor("delete", &table);
+    let mut read = Vec::new();
+    let mut targets = Vec::<Vec<u8>>::new();
+    while let Some((target, position)) = cursor.current().unwrap() {
+        if targets.last().is_none_or(|last| last.as_slice() != target) {
+            assert!(targets.last().is_none_or(|last| last.as_slice() < target));
+            targets.push(target.to_vec());
+        }
+        let record = cursor.record().unwrap();
+        assert_eq!(record.row_position, position);
+        read.push((
+            record.path().unwrap().to_owned(),
+            record.row_position,
+            record.data_sequence_number,
+            record.spec_id,
+            record.partition.to_vec(),
+        ));
+        cursor.advance();
+    }
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|row| {
+            (
+                row.data_file_id.0,
+                row.row_position,
+                row.data_sequence_number,
+                row.spec_id,
+                row.partition,
+            )
+        })
+        .collect();
+    assert_eq!(read, expected);
+    assert_eq!(targets.len(), paths.len());
+
+    // Skipping a target lands on the first position of the next one.
+    let mut cursor = store.position_delete_cursor("delete", &table);
+    let mut firsts = Vec::new();
+    while cursor.current().unwrap().is_some() {
+        let record = cursor.record().unwrap();
+        firsts.push((record.path().unwrap().to_owned(), record.row_position));
+        cursor.skip_target();
+    }
+    assert_eq!(
+        firsts,
+        paths.map(|path| (path.to_owned(), 0)).to_vec(),
+        "one seek per target"
+    );
+    assert!(
+        store
+            .position_delete_cursor("missing", &table)
+            .current()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn abrupt_process_exit_preserves_synced_prepare_and_apply_cursor() {
     for phase in ["prepared", "committed", "applying", "applied"] {
         let temp = TempDir::new().unwrap();
@@ -908,7 +1022,7 @@ proptest::proptest! {
         }
         store.seal_transaction("random").unwrap();
         let disk: Vec<_> = store.collapsed("random", &TableId(7)).unwrap().collect::<Result<_, _>>().unwrap();
-        let BufferResult::Ready(memory) = store.bind_collapse_buffer(memory, &store.table_state(&TableId(7)).unwrap()).unwrap() else { panic!("small fold must fit") };
+        let Bound::Ready(memory) = store.bind_collapse_buffer(memory, &store.table_state(&TableId(7)).unwrap()).unwrap() else { panic!("small fold must fit") };
         assert_eq!(memory.collect::<Vec<_>>(), disk);
         let actual: std::collections::BTreeMap<_, _> = disk.into_iter().map(|entry| {
             assert!(entry.original.is_none());
@@ -971,7 +1085,7 @@ fn memory_collapse_keeps_key_move_tombstones_originals_and_full_state_fence() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let BufferResult::Ready(memory) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
+    let Bound::Ready(memory) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
         panic!("small fold must fit")
     };
     assert_eq!(memory.table_state(), &expected);
@@ -1030,7 +1144,7 @@ fn memory_collapse_keeps_key_move_tombstones_originals_and_full_state_fence() {
 }
 
 #[test]
-fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_disk() {
+fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_spills_to_disk() {
     let temp = TempDir::new().unwrap();
     let table = TableId(7);
     let store = open(temp.path());
@@ -1079,7 +1193,7 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
             memory.push(key, Change::Insert(row)).unwrap(),
             BufferResult::CapacityExceeded
         ));
-        // Ignoring overflow cannot turn the discarded prefix into valid input.
+        // Ignoring overflow cannot make an over-limit fold bindable in memory.
         assert!(matches!(
             memory
                 .push(PrimaryKey(vec![10]), Change::Insert(vec![]))
@@ -1088,7 +1202,7 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
         ));
         assert!(matches!(
             store.bind_collapse_buffer(memory, &expected).unwrap(),
-            BufferResult::CapacityExceeded
+            Bound::Overflow(_)
         ));
     }
 
@@ -1115,7 +1229,7 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
             ));
         }
     }
-    let BufferResult::Ready(rows) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
+    let Bound::Ready(rows) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
         panic!("replacement must release budget")
     };
     assert!(rows.peak_accounted_bytes() <= 16 << 10);
@@ -1134,10 +1248,16 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
         ));
     }
     // Batch one binds keys1/2; key3's path AND partition exceed the retained cap.
-    assert!(matches!(
-        store.bind_collapse_buffer(memory, &expected).unwrap(),
-        BufferResult::CapacityExceeded
-    ));
+    let Bound::Overflow(overflow) = store.bind_collapse_buffer(memory, &expected).unwrap() else {
+        panic!("key3's original must overflow the retained cap")
+    };
+    store.spill_collapse_buffer("spilled", overflow).unwrap();
+    store.seal_transaction("spilled").unwrap();
+    let spilled = store
+        .collapsed("spilled", &table)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(store.table_state(&table).unwrap(), expected);
     assert_eq!(
         store.lookup(&table, &PrimaryKey(vec![3])).unwrap(),
@@ -1168,6 +1288,8 @@ fn memory_collapse_accounts_owned_capacity_and_late_binding_overflow_replays_on_
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(replay.len(), 3);
+    // Spilling the fold is equivalent to replaying its changes on disk.
+    assert_eq!(spilled, replay);
     for entry in replay {
         assert_eq!(entry.original, store.lookup(&table, &entry.key).unwrap());
         assert_eq!(entry.row, Some(vec![Value::Int32(99)]));
@@ -1447,4 +1569,99 @@ fn applied_delta_stream_accepts_complete_payload_then_atomic_retirement() {
     store.validate_storage().unwrap();
     assert!(store.operation(&id).unwrap().is_none());
     assert!(store.prepared_deltas(&id).is_err());
+}
+
+#[test]
+fn parallel_apply_matches_serial_apply_and_rejects_late_conflicts_atomically() {
+    let key = |n: u16| PrimaryKey(n.to_be_bytes().to_vec());
+    // The location apply stored: commit sequence numbers replace the placeholder.
+    let stored = |file: &str, n: u16, lsn: u64, sequence: i64| RowLocation {
+        data_sequence_number: sequence,
+        ..location(file, u64::from(n), lsn)
+    };
+    let file = |n: u16| if n.is_multiple_of(2) { "a" } else { "b" };
+    let table = TableId(7);
+    let mut outcomes = Vec::new();
+    for threads in [1, 4] {
+        let temp = TempDir::new().unwrap();
+        let store = StateStore::open(
+            temp.path(),
+            StateStoreOptions {
+                apply_batch_rows: 1024,
+                apply_lookup_rows: 1024,
+                apply_threads: threads,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let initial = (0..3000).map(|n| IndexDelta {
+            key: key(n),
+            expected: None,
+            replacement: Some(location(file(n), u64::from(n), 10)),
+        });
+        store
+            .prepare(operation("initial", None, 10), initial)
+            .unwrap();
+        let id = OperationId("initial".into());
+        store.mark_committed(&id, 1, 1).unwrap();
+        store.apply_committed(&id).unwrap();
+
+        // Updates move rows to c, deletes drop them, rewrites keep their file
+        // and inserts add new keys.
+        let changes = (0..3500).map(|n| IndexDelta {
+            key: key(n),
+            expected: (n < 3000).then(|| stored(file(n), n, 10, 1)),
+            replacement: match n {
+                0..1500 | 3000.. => Some(location("c", u64::from(n), 20)),
+                1500..2000 => None,
+                _ => Some(location(file(n), u64::from(n), 10)),
+            },
+        });
+        store
+            .prepare(operation("changes", Some(1), 20), changes)
+            .unwrap();
+        let id = OperationId("changes".into());
+        store.mark_committed(&id, 2, 2).unwrap();
+        let applied = store.apply_committed(&id).unwrap();
+
+        let keys: Vec<_> = (0..3500).map(key).collect();
+        let rows = |name: &str| {
+            store
+                .file_rows(&table, &FileId(name.into()))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        outcomes.push((
+            applied.applied_rows,
+            store.lookup_many(&table, &keys).unwrap(),
+            [rows("a"), rows("b"), rows("c")],
+            file_counts(&store, 2, &["a", "b", "c"]),
+        ));
+
+        // A conflict deep in the last part leaves the whole batch unapplied.
+        let conflict = (2000..3000).map(|n| IndexDelta {
+            key: key(n),
+            expected: Some(stored(file(n), n, if n == 2990 { 11 } else { 10 }, 2)),
+            replacement: None,
+        });
+        store
+            .prepare(operation("conflict", Some(2), 30), conflict)
+            .unwrap();
+        let id = OperationId("conflict".into());
+        store.mark_committed(&id, 3, 3).unwrap();
+        let error = store.apply_committed_batch(&id).unwrap_err();
+        assert!(
+            matches!(error, flow_state_store::Error::IndexConflict { key: conflict, .. }
+            if conflict == key(2990))
+        );
+        assert_eq!(store.operation(&id).unwrap().unwrap().applied_count, 0);
+        assert_eq!(
+            store.lookup_many(&table, &keys).unwrap(),
+            outcomes.last().unwrap().1
+        );
+    }
+    let serial = &outcomes[0];
+    assert_eq!(serial.0, 3500);
+    assert_eq!(serial.3, [500, 500, 2000]);
+    assert_eq!(&outcomes[1], serial);
 }

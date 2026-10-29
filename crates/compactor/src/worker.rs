@@ -2,6 +2,7 @@ use crate::{
     CompactionPlan, ReadLimits,
     columnar::{RowEncoder, conform},
     parquet_scan::{Input, Prefetch, read_input_batches},
+    residual::{ResidualInput, ResidualMerge},
 };
 use anyhow::{Result, bail, ensure};
 use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
@@ -11,10 +12,12 @@ use flow_materializer::{
     DataWriter, DeleteWriter, WriterConfig, rows_from_batch, writer_arrow_schema,
 };
 use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value};
-use flow_state_store::{IndexDelta, OperationKind, PreparedOperation, RowIndex, StateStore};
+use flow_state_store::{
+    FileRemap, IndexDelta, LazyRemap, OperationKind, PreparedOperation, RowIndex, StateStore,
+};
 use iceberg::{io::FileIO, spec::DataFile, table::Table};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Artifacts and durable row mappings only. There is deliberately no catalog
@@ -24,14 +27,32 @@ pub struct WorkerOutput {
     pub data_files: Vec<DataFile>,
     pub delete_files: Vec<DataFile>,
     pub delete_sequence: Option<i64>,
+    /// Positions in `delete_files` that target unselected data files, as
+    /// opposed to masks on this rewrite's output.
+    pub residual_delete_rows: u64,
     pub operation_id: OperationId,
     pub scratch: StateStore,
     pub(crate) masked_inputs: Option<String>,
     pub(crate) table_id: TableId,
+    /// Per-input remaps of a lazy build, before catch-up.
+    pub(crate) lazy_files: Option<Vec<FileRemap>>,
+    /// The complete lazy remap, after catch-up derived exact output counts.
+    pub(crate) lazy: Option<LazyRemap>,
 }
 impl WorkerOutput {
     pub fn table_id(&self) -> TableId {
         self.table_id
+    }
+
+    /// Whether this build replaces per-row index deltas with a lazy remap.
+    pub fn is_lazy(&self) -> bool {
+        self.lazy_files.is_some() || self.lazy.is_some()
+    }
+
+    /// The lazy remap to stage instead of [`Self::index_deltas`]. Only a
+    /// caught-up build has one; publishing a lazy build without it is an error.
+    pub fn lazy_remap(&self) -> Option<&LazyRemap> {
+        self.lazy.as_ref()
     }
 
     pub fn index_deltas(
@@ -131,13 +152,44 @@ pub async fn compact(
     )
     .await?;
     let mut output = built.output;
+    if let Some(files) = output.lazy_files.take() {
+        // The table stays fenced from the build base through publication, so
+        // there is no late change to catch up: every output row is live.
+        output.lazy = Some(strict_lazy_remap(&output, files)?);
+    }
     if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
         retain_shared_legacy_deletes(&mut output, &built.base)?;
         return Ok(output);
     }
-    output.delete_files =
+    (output.delete_files, output.residual_delete_rows) =
         write_residuals(table, &schema, &output, &output.operation_id.0, config).await?;
     Ok(output)
+}
+
+/// The lazy remap of a strict build: the worker's per-input runs at the base,
+/// with every output row live. Apply still requires the retired inputs'
+/// indexed counts at the fenced head to equal the outputs' rows.
+fn strict_lazy_remap(output: &WorkerOutput, files: Vec<FileRemap>) -> Result<LazyRemap> {
+    ensure!(
+        files
+            .iter()
+            .all(|remap| output.plan.input_files.contains(&remap.source)),
+        "lazy remap names a file outside the plan"
+    );
+    let output_live_rows: Vec<_> = output
+        .data_files
+        .iter()
+        .map(|file| (FileId(file.file_path().to_owned()), file.record_count()))
+        .collect();
+    ensure!(
+        files.iter().map(FileRemap::survivors).sum::<u64>()
+            == output_live_rows.iter().map(|(_, rows)| rows).sum::<u64>(),
+        "lazy remap and output files disagree on the moved rows"
+    );
+    Ok(LazyRemap {
+        files,
+        output_live_rows,
+    })
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
@@ -223,6 +275,7 @@ pub async fn build_data(
         table_id = schema.table_id.0,
         build_snapshot_id = plan.base_snapshot_id,
         output_level = ?plan.output_level,
+        selection_reason = plan.reason.as_str(),
         input_data_files = plan.input_files.len(),
         input_data_rows,
         input_data_bytes = plan.input_bytes,
@@ -231,7 +284,7 @@ pub async fn build_data(
         input_delete_bytes = plan.delete_input_bytes,
         "compaction metadata admitted before file reads"
     );
-    let batch_rows = scratch.batch_rows().min(config.row_group_rows).max(1);
+    let batch_rows = scratch.batch_rows().min(config.batch_rows).max(1);
     scratch.begin_prepare(PreparedOperation {
         id: operation_id.clone(),
         table_id: schema.table_id,
@@ -295,6 +348,14 @@ pub async fn build_data(
     >;
     let mut reverse_rows: Option<ReverseRows<'_>> = None;
     let mut mapped_rows = 0u64;
+    // Keyless tables rely on exact reverse scans of every input file.
+    let mut lazy = (plan.lazy_index_remap && !schema.primary_key.is_empty())
+        .then(std::collections::BTreeMap::<FileId, FileRemap>::new);
+    let output_sequence = table
+        .metadata()
+        .current_snapshot()
+        .expect("validated base snapshot")
+        .sequence_number();
     let mut stager = Stager::spawn(scratch.clone(), operation_id.clone())?;
     scan_staged_live_columns(
         table,
@@ -370,6 +431,22 @@ pub async fn build_data(
                 )
                 .await?;
             check_cancelled(Some(cancelled))?;
+            if let Some(remaps) = &mut lazy {
+                // Survivors are written in input order, so each input file's
+                // rows form a few contiguous runs of the outputs.
+                ensure!(
+                    written.locations.len() == live.positions.len(),
+                    "writer returned a location per row"
+                );
+                let remap = remaps
+                    .entry(live.file_id.clone())
+                    .or_insert_with(|| FileRemap::new(live.file_id.clone()));
+                for (position, location) in live.positions.iter().zip(&written.locations) {
+                    remap.push(*position, location, output_sequence)?;
+                }
+                mapped_rows += rows as u64;
+                return Ok(());
+            }
             let deltas = keys.into_iter().zip(originals).zip(written.locations).map(
                 |((key, original), mut replacement)| {
                     replacement.data_sequence_number = table
@@ -428,10 +505,13 @@ pub async fn build_data(
             data_files,
             delete_files: Vec::new(),
             delete_sequence,
+            residual_delete_rows: 0,
             operation_id,
             scratch,
             masked_inputs: None,
             table_id: schema.table_id,
+            lazy_files: lazy.map(|files| files.into_values().collect()),
+            lazy: None,
         },
     })
 }
@@ -532,24 +612,25 @@ pub(crate) async fn write_residuals(
     output: &WorkerOutput,
     scan: &str,
     config: WriterConfig,
-) -> Result<Vec<DataFile>> {
-    let positions = output
-        .scratch
-        .position_deletes(scan, &schema.table_id)
-        .filter(|position| match position {
-            Ok(position) => !output.plan.input_files.contains(&position.data_file_id),
-            Err(_) => true,
-        });
+) -> Result<(Vec<DataFile>, u64)> {
+    let positions = ResidualMerge::new(vec![ResidualInput::new(
+        output
+            .scratch
+            .position_delete_cursor(scan, &schema.table_id),
+        |file| !output.plan.input_files.contains(file),
+    )]);
     write_residual_positions(table, output, positions, config).await
 }
 
 /// Consume a sorted, unique union without restaging its already ordered inputs.
+/// Also returns how many positions target unselected data files rather than
+/// this rewrite's output.
 pub(crate) async fn write_residual_positions(
     table: &Table,
     output: &WorkerOutput,
-    positions: impl Iterator<Item = flow_state_store::Result<RowLocation>>,
+    mut positions: ResidualMerge<'_>,
     mut config: WriterConfig,
-) -> Result<Vec<DataFile>> {
+) -> Result<(Vec<DataFile>, u64)> {
     // A shared residual must not grow into one globally charged dependency.
     // At most eight sorted ranges bound both file fanout and each read charge.
     // Input admission already bounds total rows; row-group memory limits remain
@@ -561,11 +642,7 @@ pub(crate) async fn write_residual_positions(
         .div_ceil(MAX_COHORTS)
         .max(config.row_group_rows as u64)
         .max(1);
-    let batch_rows = output
-        .scratch
-        .batch_rows()
-        .min(config.row_group_rows)
-        .max(1);
+    let batch_rows = output.scratch.batch_rows().min(config.batch_rows).max(1);
     config.target_file_bytes = usize::MAX;
     let mut writer = DeleteWriter::new_for_version(
         table.file_io().clone(),
@@ -575,29 +652,81 @@ pub(crate) async fn write_residual_positions(
         config,
         table.metadata().format_version(),
     )?;
+    // Per-target residuals rotate at each full-size target instead, so no
+    // full-size data file gains a shared dependency; positions on L0 and small
+    // files, this rewrite's small outputs included, share ranges. Format v3
+    // vectors are per target already.
+    let per_target = output.plan.per_target_deletes
+        && table.metadata().format_version() < iceberg::spec::FormatVersion::V3;
+    let mut ranges = output.plan.target_ranges.clone();
+    for file in &output.data_files {
+        ranges.add(
+            FileId(file.file_path().to_owned()),
+            file.file_size_in_bytes(),
+        );
+    }
+    let outputs = output
+        .data_files
+        .iter()
+        .map(DataFile::file_path)
+        .collect::<HashSet<_>>();
+    // Batch slots keep their allocations; the first `filled` are pending.
     let mut batch = Vec::with_capacity(batch_rows);
+    let mut filled = 0;
     let mut total_rows = 0u64;
     let mut current_rows = 0u64;
-    for position in positions {
-        let position = position?;
+    let mut residual_rows = 0u64;
+    let mut residual_target = false;
+    let mut target = None::<FileId>;
+    loop {
+        if filled == batch.len() {
+            batch.push(crate::residual::empty_location());
+        }
+        let Some(starts) = positions.next_into(&mut batch[filled])? else {
+            break;
+        };
+        let position = &batch[filled];
         total_rows += 1;
         ensure!(
             total_rows <= output.plan.delete_input_rows,
             "residual positions exceed admitted delete inputs"
         );
+        if starts {
+            residual_target = !outputs.contains(position.data_file_id.0.as_str());
+        }
+        residual_rows += u64::from(residual_target);
+        if per_target {
+            if starts {
+                if let Some(previous) = &target
+                    && !ranges.continues(previous, &position.data_file_id)
+                {
+                    writer.write(&batch[..filled]).await?;
+                    batch.swap(0, filled);
+                    filled = 0;
+                    writer.finish_target().await?;
+                }
+                target = Some(batch[filled].data_file_id.clone());
+            }
+            filled += 1;
+            if filled == batch_rows {
+                writer.write(&batch[..filled]).await?;
+                filled = 0;
+            }
+            continue;
+        }
         current_rows += 1;
-        batch.push(position);
-        if batch.len() == batch_rows || current_rows == cohort_rows {
-            writer.write(&batch).await?;
-            batch.clear();
+        filled += 1;
+        if filled == batch_rows || current_rows == cohort_rows {
+            writer.write(&batch[..filled]).await?;
+            filled = 0;
         }
         if current_rows == cohort_rows {
             writer.finish_file().await?;
             current_rows = 0;
         }
     }
-    writer.write(&batch).await?;
-    writer.close().await
+    writer.write(&batch[..filled]).await?;
+    Ok((writer.close().await?, residual_rows))
 }
 
 /// Physical ordinals refer to the input file, before filtering position deletes.
@@ -963,6 +1092,118 @@ async fn stage_delete_files_inner(
         batch_rows > 0 && batch_rows <= scratch.batch_rows(),
         "scan batch exceeds scratch budget"
     );
+    check_delete_scan(table, view, files)?;
+    // A reused scratch directory after failure must not retain old delete state.
+    scratch.discard_transaction(scan_id)?;
+    check_delete_inputs(view, delete_files)?;
+    let targets = DeleteTargets::new(view, files)?;
+    let spec_id = table.metadata().default_partition_spec_id();
+    load_deletes(
+        table.file_io(),
+        view,
+        &targets,
+        delete_files,
+        batch_rows,
+        limits,
+        read_limits,
+        cancelled,
+        |positions| {
+            let locations = positions
+                .iter()
+                .map(|&(rank, position)| {
+                    Ok(RowLocation {
+                        data_file_id: targets.ids[rank as usize].clone(),
+                        row_position: position,
+                        data_sequence_number: targets.entries[rank as usize]
+                            .sequence_number
+                            .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
+                        spec_id,
+                        partition: Vec::new(),
+                        source_commit_lsn: PgLsn(0),
+                        row_version: 0,
+                        row_fingerprint: [0; 16],
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(scratch.put_position_deletes(scan_id, &schema.table_id, locations)?)
+        },
+    )
+    .await
+}
+
+/// The effective positions of a set of delete files, sorted by data-file path
+/// and row position, without duplicates: the set [`stage_delete_files`] stages.
+pub struct DeletePositions {
+    targets: Vec<FileId>,
+    /// Indexes into `targets`, which is in path order, and row positions.
+    positions: Vec<(u32, u64)>,
+}
+
+impl DeletePositions {
+    pub fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    /// Each position's data file and row, in path and row order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&FileId, u64)> + '_ {
+        self.positions
+            .iter()
+            .map(|&(rank, position)| (&self.targets[rank as usize], position))
+    }
+}
+
+/// [`stage_delete_files`] without a scratch store: the same checks, limits and
+/// errors, returning the effective positions and the rows scanned. Positions
+/// are merged in memory at 16 bytes each, so `limits.max_rows` also bounds
+/// memory; inputs need not be sorted. A consolidation then writes them
+/// without a scratch-store round trip.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_delete_files(
+    table: &Table,
+    view: &SnapshotView,
+    files: &BTreeSet<FileId>,
+    delete_files: &BTreeSet<FileId>,
+    batch_rows: usize,
+    limits: DeleteReadLimits,
+    read_limits: &ReadLimits,
+) -> Result<(DeletePositions, u64)> {
+    ensure!(batch_rows > 0, "scan batch must be positive");
+    check_delete_scan(table, view, files)?;
+    check_delete_inputs(view, delete_files)?;
+    let targets = DeleteTargets::new(view, files)?;
+    let mut positions = Vec::new();
+    let rows = load_deletes(
+        table.file_io(),
+        view,
+        &targets,
+        delete_files,
+        batch_rows,
+        limits,
+        read_limits,
+        None,
+        |batch| {
+            positions.extend_from_slice(batch);
+            Ok(())
+        },
+    )
+    .await?;
+    // Each input is usually one sorted run, which the stable sort merges.
+    positions.sort();
+    positions.dedup();
+    Ok((
+        DeletePositions {
+            targets: files.iter().cloned().collect(),
+            positions,
+        },
+        rows,
+    ))
+}
+
+fn check_delete_scan(table: &Table, view: &SnapshotView, files: &BTreeSet<FileId>) -> Result<()> {
     ensure!(
         matches!(
             table.metadata().format_version(),
@@ -992,8 +1233,10 @@ async fn stage_delete_files_inner(
             .is_some_and(|entry| entry.content_type() == iceberg::spec::DataContentType::Data)),
         "delete scan requires live data-file identities"
     );
-    // A reused scratch directory after failure must not retain old delete state.
-    scratch.discard_transaction(scan_id)?;
+    Ok(())
+}
+
+fn check_delete_inputs(view: &SnapshotView, delete_files: &BTreeSet<FileId>) -> Result<()> {
     ensure!(
         delete_files
             .iter()
@@ -1002,37 +1245,52 @@ async fn stage_delete_files_inner(
             )),
         "delete scan requires live position-delete files"
     );
-    load_deletes(
-        table.file_io(),
-        view,
-        files,
-        delete_files,
-        table.metadata().default_partition_spec_id(),
-        scratch,
-        scan_id,
-        schema,
-        batch_rows,
-        limits,
-        read_limits,
-        cancelled,
-    )
-    .await
+    Ok(())
 }
 
+/// The live data files a delete scan keeps positions for. Their indexes
+/// follow path order, so `(index, position)` sorts like `(path, position)`.
+struct DeleteTargets<'a> {
+    ids: Vec<&'a FileId>,
+    entries: Vec<&'a iceberg::spec::ManifestEntry>,
+    indexes: HashMap<&'a str, u32>,
+}
+
+impl<'a> DeleteTargets<'a> {
+    /// `files` must be live data files.
+    fn new(view: &'a SnapshotView, files: &'a BTreeSet<FileId>) -> Result<Self> {
+        ensure!(
+            u32::try_from(files.len()).is_ok(),
+            "delete scan has too many data files"
+        );
+        Ok(Self {
+            ids: files.iter().collect(),
+            entries: files
+                .iter()
+                .map(|file| view.live_files[&file.0].as_ref())
+                .collect(),
+            indexes: files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| (file.0.as_str(), index as u32))
+                .collect(),
+        })
+    }
+}
+
+/// Read the effective positions of `delete_files` on `targets`, passing each
+/// bounded batch to `sink` as `(target index, row position)` in read order.
 #[allow(clippy::too_many_arguments)]
 async fn load_deletes(
     file_io: &FileIO,
     view: &SnapshotView,
-    input_files: &BTreeSet<FileId>,
+    targets: &DeleteTargets<'_>,
     delete_files: &BTreeSet<FileId>,
-    spec_id: i32,
-    scratch: &StateStore,
-    scan_id: &str,
-    schema: &TableSchema,
     batch_rows: usize,
     limits: DeleteReadLimits,
     read_limits: &ReadLimits,
     cancelled: Option<&AtomicBool>,
+    mut sink: impl FnMut(&[(u32, u64)]) -> Result<()>,
 ) -> Result<u64> {
     let vector_targets = view
         .live_files
@@ -1077,11 +1335,13 @@ async fn load_deletes(
                 .live_files
                 .get(&read.referenced_data_file)
                 .ok_or_else(|| anyhow::anyhow!("DV target is not live"))?;
-            let target = FileId(read.referenced_data_file.clone());
-            let applies = input_files.contains(&target)
-                && flow_iceberg_ext::position_delete_may_apply(delete_entry, data);
+            let target = targets
+                .indexes
+                .get(read.referenced_data_file.as_str())
+                .copied()
+                .filter(|_| flow_iceberg_ext::position_delete_may_apply(delete_entry, data));
             vectors.push(read);
-            vector_files.push((target, data, applies));
+            vector_files.push((target, data));
         } else {
             parquet_files.push((file, delete_entry));
         }
@@ -1091,6 +1351,7 @@ async fn load_deletes(
     // Vectors share Puffin objects. Each object's size and footer are read
     // once per scan; every descriptor is still validated against both.
     let mut rows = 0u64;
+    let mut accepted = Vec::with_capacity(batch_rows);
     let concurrency = read_limits.prefetch_files.max(1);
     flow_materializer::read_vectors(
         file_io,
@@ -1104,7 +1365,7 @@ async fn load_deletes(
         },
         |index, vector| {
             check_cancelled(cancelled)?;
-            let (target, data, applies) = &vector_files[index];
+            let (target, data) = &vector_files[index];
             rows = rows
                 .checked_add(vector.len())
                 .ok_or_else(|| anyhow::anyhow!("delete row count overflow"))?;
@@ -1115,37 +1376,28 @@ async fn load_deletes(
                     .is_none_or(|position| position < data.data_file.record_count()),
                 "delete position exceeds data row count"
             );
-            if !applies {
+            let Some(target) = *target else {
                 return Ok(());
-            }
-            let sequence = data
-                .sequence_number
+            };
+            data.sequence_number
                 .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?;
             let mut positions = vector.iter();
             loop {
-                let mut batch = positions.by_ref().take(batch_rows).peekable();
-                if batch.peek().is_none() {
+                accepted.clear();
+                accepted.extend(
+                    positions
+                        .by_ref()
+                        .take(batch_rows)
+                        .map(|position| (target, position)),
+                );
+                if accepted.is_empty() {
                     return Ok(());
                 }
-                scratch.put_position_deletes(
-                    scan_id,
-                    &schema.table_id,
-                    batch.map(|position| RowLocation {
-                        data_file_id: target.clone(),
-                        row_position: position,
-                        data_sequence_number: sequence,
-                        spec_id,
-                        partition: Vec::new(),
-                        source_commit_lsn: PgLsn(0),
-                        row_version: 0,
-                        row_fingerprint: [0; 16],
-                    }),
-                )?;
+                sink(&accepted)?;
             }
         },
     )
     .await?;
-    let input_paths: HashSet<&str> = input_files.iter().map(|file| file.0.as_str()).collect();
     let mut prefetch = Prefetch::new(
         file_io,
         parquet_files
@@ -1174,6 +1426,10 @@ async fn load_deletes(
         );
         let declared_rows = delete_entry.data_file.record_count();
         let mut file_rows = 0u64;
+        // Sorted inputs repeat each path for a run of positions; resolve the
+        // target and its applicability once per run, without allocating.
+        let mut run_path = String::new();
+        let mut run_target = None::<Option<u32>>;
         read_input_batches(
             file_io,
             delete_entry.file_path(),
@@ -1216,38 +1472,39 @@ async fn load_deletes(
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| anyhow::anyhow!("delete position must be long"))?;
-                let mut locations = Vec::new();
+                accepted.clear();
                 for idx in 0..batch.num_rows() {
                     ensure!(
                         !paths.is_null(idx) && !positions.is_null(idx) && positions.value(idx) >= 0,
                         "invalid null or negative position delete"
                     );
                     let path = paths.value(idx);
-                    if !input_paths.contains(path) || vector_targets.contains(path) {
-                        continue;
+                    if run_target.is_none() || run_path != path {
+                        run_path.clear();
+                        run_path.push_str(path);
+                        run_target = Some(targets.indexes.get(path).copied().filter(|&target| {
+                            !vector_targets.contains(path)
+                                && flow_iceberg_ext::position_delete_may_apply(
+                                    delete_entry,
+                                    targets.entries[target as usize],
+                                )
+                        }));
                     }
-                    let data = &view.live_files[path];
-                    if !flow_iceberg_ext::position_delete_may_apply(delete_entry, data) {
+                    let Some(Some(target)) = run_target else {
                         continue;
-                    }
+                    };
+                    let data = targets.entries[target as usize];
                     ensure!(
                         (positions.value(idx) as u64) < data.data_file.record_count(),
                         "delete position exceeds data row count"
                     );
-                    locations.push(RowLocation {
-                        data_file_id: FileId(path.to_owned()),
-                        row_position: positions.value(idx) as u64,
-                        data_sequence_number: data
-                            .sequence_number
-                            .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
-                        spec_id,
-                        partition: Vec::new(),
-                        source_commit_lsn: PgLsn(0),
-                        row_version: 0,
-                        row_fingerprint: [0; 16],
-                    });
+                    data.sequence_number
+                        .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?;
+                    accepted.push((target, positions.value(idx) as u64));
                 }
-                scratch.put_position_deletes(scan_id, &schema.table_id, locations)?;
+                if !accepted.is_empty() {
+                    sink(&accepted)?;
+                }
                 Ok(())
             },
         )

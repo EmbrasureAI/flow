@@ -190,6 +190,23 @@ impl PendingWork {
         Ok(transactions)
     }
 
+    /// The queued transactions the table's next epoch must begin with: the
+    /// prefix [`Self::take_epoch`] would admit now. Later arrivals only append.
+    pub(super) fn epoch_prefix(&self, table: TableId) -> impl Iterator<Item = &SourceTransaction> {
+        let mut budget = EpochBudget {
+            payload: 0,
+            memory: 0,
+            count: 0,
+            limit: self.epoch_limit,
+            closed: false,
+        };
+        self.tables
+            .get(&table)
+            .into_iter()
+            .flatten()
+            .take_while(move |transaction| budget.admit(table, transaction))
+    }
+
     pub(super) fn refill(
         &mut self,
         ledger: &SourceLedger,
