@@ -1,12 +1,13 @@
 //! Execute one table's publication or maintenance visit under scheduler ownership.
 
+use super::prefold::PrefoldTicket;
 use super::{BUILD_MAX_AGE, OPTIONAL_MAINTENANCE_DELAY, blocked::publication_error_code};
 use crate::config::Config;
 use anyhow::{Context, Result, bail, ensure};
 use flow_coordinator::{
     CollapseLimits, DeleteRepairCursor, Epoch, PreparedCompaction, ReadyCompaction, ReplanRequired,
     RunningCompaction, RunningCompactionPreparation, TableMaintenance, TablePublisher,
-    collapse_epoch,
+    collapse_epoch_prefolded,
 };
 use flow_ingress_journal::JournalReader;
 use flow_model::{OperationId, SourceId, SourceTransaction, TableId, TableSchema};
@@ -156,6 +157,14 @@ pub(super) struct WorkOptions {
     pub(super) build_active: bool,
     pub(super) build_admission: BuildAdmission,
     pub(super) actor_acquired_at: Instant,
+}
+
+/// The fold of a CDC epoch's leading transactions, and the callback that lets
+/// the runtime fold the next epoch once this one's rows are consumed.
+#[derive(Default)]
+pub(super) struct PrefoldLink {
+    pub(super) ticket: Option<PrefoldTicket>,
+    pub(super) rows_released: Option<Box<dyn FnOnce() + Send>>,
 }
 
 pub(super) struct StartedBuild {
@@ -368,6 +377,14 @@ enum PendingRecovery {
 }
 
 impl TableWork {
+    pub(super) fn collapse_limits(&self) -> CollapseLimits {
+        CollapseLimits {
+            batch_rows: self.config.limits.batch_rows,
+            batch_bytes: self.config.limits.batch_bytes,
+            memory_bytes: self.config.limits.collapse_memory_bytes,
+        }
+    }
+
     async fn start_build(
         &self,
         table: &Table,
@@ -509,6 +526,7 @@ impl TableWork {
         options: WorkOptions,
         mut candidate: Option<CompactionCandidate>,
         finalization_lane: Option<FinalizationLane>,
+        prefold: PrefoldLink,
     ) -> Result<TableCompletion> {
         let started = Instant::now();
         let mut repair_cursor = DeleteRepairCursor::default();
@@ -558,6 +576,7 @@ impl TableWork {
                     options,
                     &mut candidate,
                     &mut repair_cursor,
+                    prefold,
                 )
                 .await
         }
@@ -764,6 +783,7 @@ impl TableWork {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_once(
         self,
         table: Table,
@@ -772,6 +792,7 @@ impl TableWork {
         options: WorkOptions,
         candidate: &mut Option<CompactionCandidate>,
         repair_cursor: &mut DeleteRepairCursor,
+        prefold: PrefoldLink,
     ) -> Result<TableOutcome> {
         let id = schema.table_id;
         if options.build_admission == BuildAdmission::Probe {
@@ -977,13 +998,18 @@ impl TableWork {
         let transaction_count = transactions.len();
         let prepare_table = current.clone();
         let reader = self.reader.clone();
-        let collapse_limits = CollapseLimits {
-            batch_rows: self.config.limits.batch_rows,
-            batch_bytes: self.config.limits.batch_bytes,
-            memory_bytes: self.config.limits.collapse_memory_bytes,
+        let collapse_limits = self.collapse_limits();
+        let PrefoldLink {
+            ticket,
+            rows_released,
+        } = prefold;
+        let prefold = match ticket {
+            Some(ticket) => ticket.resolve().await,
+            None => None,
         };
+        let offered = prefold.as_ref().map_or(0, |prefold| prefold.transactions().len());
         let collapsed = tokio::task::spawn_blocking(move || {
-            collapse_epoch(
+            collapse_epoch_prefolded(
                 &store,
                 &reader,
                 &prepare_table,
@@ -991,9 +1017,15 @@ impl TableWork {
                 &prepare_epoch,
                 &transactions,
                 collapse_limits,
+                prefold,
             )
         })
         .await??;
+        if offered > 0 {
+            let used = collapsed.prefolded_transactions() > 0;
+            metrics::counter!("flow_collapse_prefolds_total", "table_id" => id.0.to_string(),
+                "result" => if used { "used" } else { "discarded" }).increment(1);
+        }
         let seconds = collapse_started.elapsed().as_secs_f64();
         metrics::histogram!("flow_table_local_phase_seconds", "table_id" => id.0.to_string(), "phase" => "collapse").record(seconds);
         tracing::debug!(target: "flow_events", event = "epoch_collapsed", operation_id = %epoch.id.0,
@@ -1002,8 +1034,17 @@ impl TableWork {
             collapse_memory_limit_bytes = collapse_limits.memory_bytes,
             collapse_memory_peak_bytes = collapsed.memory_peak_bytes(),
             collapse_memory_peak_known = collapsed.memory_peak_bytes().is_some(),
+            prefold_offered_transactions = offered,
+            prefolded_transactions = collapsed.prefolded_transactions(),
             "epoch mutations collapsed against the row index");
-        let snapshot = self.publisher.publish(&current, &schema, collapsed).await?;
+        let snapshot = self
+            .publisher
+            .publish_observed(&current, &schema, collapsed, || {
+                if let Some(release) = rows_released {
+                    release();
+                }
+            })
+            .await?;
         if !options.build_active
             && let Some(periodic) = self
                 .maintain_after_publication(&current, id, manifests)
@@ -1045,26 +1086,129 @@ impl TableWork {
         {
             return Ok(TableOutcome::ProbeComplete);
         }
-        let inventory = self.maintenance.inventory(&current, id).await?;
+        let mut current = current;
+        let mut inventory = self.maintenance.inventory(&current, id).await?;
         crate::observation::table_inventory(id, &inventory);
-        if inventory.debt.pressure != flow_compactor::PublicationPressure::Delay
-            || self.prefers_delete_rewrite(&inventory)
-        {
+        if inventory.debt.pressure != flow_compactor::PublicationPressure::Delay {
             return Ok(TableOutcome::ProbeComplete);
         }
+        if self.prefers_delete_rewrite(&inventory) {
+            // Soft delete-file count debt under a continuous CDC backlog would
+            // otherwise wait for hard pressure. The consolidation is bounded
+            // and changes no row locations, so this visit can pay it.
+            if self
+                .delete_policy(&inventory)
+                .consolidates_delete_debt(&inventory.debt)
+            {
+                self.choose_maintenance(id, &inventory, "delete_consolidation", "probe");
+                self.compact(&current, &schema, CompactionKind::Deletes)
+                    .await?;
+            }
+            if !self.rewrites_after_consolidation(&inventory) {
+                return Ok(TableOutcome::ProbeComplete);
+            }
+            // Per target, continuous CDC keeps consolidation due on nearly
+            // every visit, which would otherwise starve the data rewrites
+            // that retire small files and their delete files. The same probe
+            // also captures one when that debt remains.
+            current = self.catalog.load_table(current.identifier()).await?;
+            inventory = self.maintenance.inventory(&current, id).await?;
+            crate::observation::table_inventory(id, &inventory);
+            if inventory.debt.pressure != flow_compactor::PublicationPressure::Delay
+                || !self.has_rewrite_debt(&inventory)
+            {
+                return Ok(TableOutcome::ProbeComplete);
+            }
+        }
+        self.choose_maintenance(id, &inventory, "background_build", "probe");
         Ok(match self.start_build(&current, &schema).await? {
             Some(build) => TableOutcome::Build(Box::new(build)),
             None => TableOutcome::ProbeComplete,
         })
     }
 
+    /// The configured compaction policy as it applies to this table's format.
+    fn delete_policy(
+        &self,
+        inventory: &flow_coordinator::Inventory,
+    ) -> std::borrow::Cow<'_, flow_compactor::Policy> {
+        self.config
+            .compaction
+            .for_format_version(inventory.format_version)
+    }
+
     fn prefers_delete_rewrite(&self, inventory: &flow_coordinator::Inventory) -> bool {
-        inventory.delete_file_count >= self.config.compaction.delete_files_soft
-            && (self.config.compaction.data_rewrite_scope != flow_compactor::DataRewriteScope::All
-                || !inventory
-                    .files
-                    .iter()
-                    .any(|file| self.config.compaction.needs_delete_reclamation(file)))
+        let policy = self.delete_policy(inventory);
+        // Per-target files are charged to their own target's count, not
+        // table-wide, so only shared files make consolidation preferable here.
+        let table_wide = match policy.delete_layout {
+            flow_compactor::DeleteLayout::Shared => inventory.delete_file_count,
+            flow_compactor::DeleteLayout::PerTarget => inventory.debt.shared_delete_files,
+        };
+        policy.consolidates_delete_debt(&inventory.debt)
+            || table_wide >= policy.delete_files_soft
+                && (policy.data_rewrite_scope != flow_compactor::DataRewriteScope::All
+                    || !inventory
+                        .files
+                        .iter()
+                        .any(|file| policy.needs_delete_reclamation(file)))
+    }
+
+    /// Whether a maintenance visit continues with a data rewrite after its
+    /// consolidation: with [`flow_compactor::DeleteLayout::PerTarget`], when
+    /// data rewrites may run. The shared layout keeps one action per visit.
+    fn rewrites_after_consolidation(&self, inventory: &flow_coordinator::Inventory) -> bool {
+        let policy = self.delete_policy(inventory);
+        policy.delete_layout == flow_compactor::DeleteLayout::PerTarget
+            && policy.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
+    }
+
+    /// Whether any debt a data rewrite pays remains: L0 and small-file
+    /// limits, dense deletes, or single-target files on small files.
+    fn has_rewrite_debt(&self, inventory: &flow_coordinator::Inventory) -> bool {
+        let policy = self.delete_policy(inventory);
+        let debt = &inventory.debt;
+        policy.layout_pressure(debt) != flow_compactor::PublicationPressure::Healthy
+            || debt.dense_delete_files > 0
+            || policy.small_target_debt(debt)
+    }
+
+    /// Record which maintenance action a table visit chose and the debt that
+    /// drove it, so benchmark runs can attribute their stalls.
+    fn choose_maintenance(
+        &self,
+        id: TableId,
+        inventory: &flow_coordinator::Inventory,
+        action: &'static str,
+        path: &'static str,
+    ) {
+        let policy = self.delete_policy(inventory);
+        let debt = &inventory.debt;
+        let reasons = policy.pressure_reasons(debt);
+        // Consolidation pays delete-file count; other actions pay whatever
+        // limits set the current pressure.
+        let reason = if action == "delete_consolidation" {
+            "delete_file_count".to_owned()
+        } else if reasons.is_empty() {
+            "none".to_owned()
+        } else {
+            reasons.join("+")
+        };
+        tracing::debug!(target: "flow_events", event = "maintenance_action_chosen",
+            table_id = id.0, action, reason, path,
+            pressure = ?debt.pressure,
+            pressure_reasons = reasons.join("+"),
+            delete_debt = ?policy.delete_debt,
+            delete_layout = policy.delete_layout.as_str(),
+            delete_files = inventory.delete_file_count,
+            shared_delete_files = debt.shared_delete_files,
+            max_delete_files = debt.max_delete_files,
+            target_delete_files = debt.target_delete_files,
+            small_target_delete_files = debt.small_target_delete_files,
+            dense_delete_files = debt.dense_delete_files,
+            l0_files = debt.l0_files,
+            small_files = debt.small_files,
+            "chose table maintenance action");
     }
 
     /// CDC does only mandatory maintenance. Optional work runs in its own job,
@@ -1082,9 +1226,45 @@ impl TableWork {
         crate::observation::table_inventory(id, &inventory);
         let mut pressure = inventory.debt.pressure;
         if options.build_active && pressure == flow_compactor::PublicationPressure::Pause {
-            // Release the actor instead of retrying while a completed build
-            // waits to acquire that same actor for finalization.
-            return Ok(MaintenanceOutcome::Deferred);
+            // Hard pressure from delete-file count alone does not need to wait
+            // for the build: one bounded consolidation can clear it without
+            // moving rows. A build whose delete inputs it replaces is
+            // invalidated at catch-up and rescheduled.
+            if self.compaction
+                && self
+                    .delete_policy(&inventory)
+                    .consolidates_delete_debt(&inventory.debt)
+                && self.config.compaction.layout_pressure(&inventory.debt)
+                    != flow_compactor::PublicationPressure::Pause
+            {
+                self.choose_maintenance(id, &inventory, "delete_consolidation", "build_active");
+                match self
+                    .compact(&current, schema, CompactionKind::Deletes)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        current = self.catalog.load_table(current.identifier()).await?;
+                        inventory = self.maintenance.inventory(&current, id).await?;
+                        crate::observation::table_inventory(id, &inventory);
+                        pressure = inventory.debt.pressure;
+                    }
+                    Ok(None) => {}
+                    // The build remains the way out; recovery settles any
+                    // unfinished consolidation on the next visit.
+                    Err(error) if retry_table_work(&error) => {
+                        tracing::debug!(target: "flow_events",
+                            event = "delete_consolidation_deferred", table_id = id.0, %error,
+                            "consolidation beside a running build will be retried");
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if pressure == flow_compactor::PublicationPressure::Pause {
+                // Release the actor instead of retrying while a completed build
+                // waits to acquire that same actor for finalization.
+                self.choose_maintenance(id, &inventory, "defer_for_build", "build_active");
+                return Ok(MaintenanceOutcome::Deferred);
+            }
         }
         while self.compaction
             && (pressure == flow_compactor::PublicationPressure::Pause
@@ -1092,12 +1272,27 @@ impl TableWork {
         {
             let before = current.metadata().current_snapshot_id();
             let data_rewrite_scope = self.config.compaction.data_rewrite_scope;
-            let rewritten = if self.prefers_delete_rewrite(&inventory) {
+            let path = if optional { "idle" } else { "publication" };
+            let mut rewritten = if self.prefers_delete_rewrite(&inventory) {
+                self.choose_maintenance(id, &inventory, "delete_consolidation", path);
                 self.compact(&current, schema, CompactionKind::Deletes)
                     .await?
             } else {
                 None
             };
+            if rewritten.is_some() && self.rewrites_after_consolidation(&inventory) {
+                // As in the probe: a data rewrite follows in the same visit
+                // while the debt it pays remains.
+                current = self.catalog.load_table(current.identifier()).await?;
+                inventory = self.maintenance.inventory(&current, id).await?;
+                crate::observation::table_inventory(id, &inventory);
+                pressure = inventory.debt.pressure;
+                if pressure != flow_compactor::PublicationPressure::Healthy
+                    && self.has_rewrite_debt(&inventory)
+                {
+                    rewritten = None;
+                }
+            }
             if rewritten.is_none() {
                 let soft = pressure == flow_compactor::PublicationPressure::Delay;
                 if soft && options.build_admission == BuildAdmission::Wait {
@@ -1113,14 +1308,22 @@ impl TableWork {
                         inventory.manifest_count,
                     ));
                 }
+                let background = soft && options.build_admission == BuildAdmission::Start;
+                if data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled {
+                    self.choose_maintenance(
+                        id,
+                        &inventory,
+                        if background {
+                            "background_build"
+                        } else {
+                            "data_rewrite"
+                        },
+                        path,
+                    );
+                }
                 if data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
                     && let Some(build) = self
-                        .maintain_data(
-                            &current,
-                            schema,
-                            soft && options.build_admission == BuildAdmission::Start,
-                            repair_cursor,
-                        )
+                        .maintain_data(&current, schema, background, repair_cursor)
                         .await?
                 {
                     return Ok(MaintenanceOutcome::Build(build));
@@ -1292,7 +1495,48 @@ impl TableWork {
     async fn metadata_due(&self, table: &Table, id: TableId, manifests: usize) -> Result<bool> {
         Ok(self.manifests_due(id, manifests, MetadataScope::Full)?
             || self.garbage_due(id)?
+            || self.remaps_due(id)?
             || self.history_due(table, id, MetadataScope::Full).await?)
+    }
+
+    /// Whether the table's lazy index remaps exceed their limits, from sizes
+    /// the index caches until the next remap commit or cleanup.
+    fn remaps_due(&self, id: TableId) -> Result<bool> {
+        let stats = self.store.remap_stats(&id)?;
+        crate::observation::table_remaps(id, &stats);
+        Ok(stats.exceeds(&self.config.compaction.remap_limits()))
+    }
+
+    /// One bounded remap cleanup pass on the table actor. Dropping remaps
+    /// nothing needs is free; materializing rows is limited to
+    /// `remap_cleanup_rows` in row-lock batches and needs no table fence.
+    /// Returns whether another pass is due.
+    async fn clean_remaps(&self, id: TableId) -> Result<bool> {
+        let store = self.store.clone();
+        let limits = self.config.compaction.remap_limits();
+        let started = Instant::now();
+        let cleanup =
+            tokio::task::spawn_blocking(move || store.clean_remaps(&id, &limits)).await??;
+        crate::observation::table_remaps(id, &cleanup.stats);
+        if cleanup.dropped_files > 0 || cleanup.rewritten_rows > 0 {
+            let table = id.0.to_string();
+            metrics::counter!("flow_index_remaps_dropped_total", "table_id" => table.clone())
+                .increment(cleanup.dropped_files);
+            metrics::counter!("flow_index_remap_rows_materialized_total", "table_id" => table)
+                .increment(cleanup.rewritten_rows);
+            tracing::info!(
+                event = "index_remaps_cleaned",
+                table_id = id.0,
+                dropped_files = cleanup.dropped_files,
+                rewritten_rows = cleanup.rewritten_rows,
+                remap_files = cleanup.stats.files,
+                remap_max_depth = cleanup.stats.max_depth,
+                continuation = cleanup.continuation,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "lazy index remaps cleaned"
+            );
+        }
+        Ok(cleanup.continuation)
     }
 
     /// Record the outcome of one metadata maintenance task. A table-scoped
@@ -1357,8 +1601,9 @@ impl TableWork {
     }
 
     /// Run on the table actor independently of soft data debt. Garbage collection
-    /// visits one bounded page, then yields before its continuation is admitted.
-    /// Returns the head, whether garbage collection continues, and the head's
+    /// visits one bounded page, and a full visit one bounded remap cleanup pass,
+    /// then yields before its continuation is admitted. Returns the head,
+    /// whether garbage collection or remap cleanup continues, and the head's
     /// manifest count.
     async fn maintain_metadata(
         &self,
@@ -1456,7 +1701,9 @@ impl TableWork {
                     .record(started.elapsed().as_secs_f64());
             }
         }
-        Ok((current, garbage_pending, manifests))
+        // Remaps are local index state; their cleanup needs no catalog.
+        let remaps_pending = scope == MetadataScope::Full && self.clean_remaps(id).await?;
+        Ok((current, garbage_pending || remaps_pending, manifests))
     }
 }
 
@@ -1770,6 +2017,7 @@ mod publication_retry_tests {
                 },
                 None,
                 None,
+                PrefoldLink::default(),
             )
             .await
             .unwrap();
@@ -1795,6 +2043,9 @@ mod publication_retry_tests {
         settle_unfinished_operation(Target::Replaced).await;
     }
 }
+
+#[cfg(test)]
+mod per_target_tests;
 
 #[cfg(test)]
 mod metadata_maintenance_tests {
@@ -2139,7 +2390,14 @@ mod metadata_maintenance_tests {
         let completion = f
             .work
             .clone()
-            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .run(
+                f.schema.clone(),
+                vec![transaction],
+                options(),
+                None,
+                None,
+                PrefoldLink::default(),
+            )
             .await
             .unwrap();
         let TableOutcome::Complete {
@@ -2174,7 +2432,14 @@ mod metadata_maintenance_tests {
         let transaction = journal_insert(&mut f, 101, 1010);
         f.work
             .clone()
-            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .run(
+                f.schema.clone(),
+                vec![transaction],
+                options(),
+                None,
+                None,
+                PrefoldLink::default(),
+            )
             .await
             .unwrap();
         assert_eq!(load(&f).await.metadata().snapshots().len(), 4);
@@ -2195,7 +2460,14 @@ mod metadata_maintenance_tests {
         let completion = f
             .work
             .clone()
-            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .run(
+                f.schema.clone(),
+                vec![transaction],
+                options(),
+                None,
+                None,
+                PrefoldLink::default(),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -2254,7 +2526,14 @@ mod metadata_maintenance_tests {
         let completion = f
             .work
             .clone()
-            .run(f.schema.clone(), vec![transaction], options(), None, None)
+            .run(
+                f.schema.clone(),
+                vec![transaction],
+                options(),
+                None,
+                None,
+                PrefoldLink::default(),
+            )
             .await
             .unwrap();
         // Publishing on the pre-recovery head would first reconcile the index
@@ -2579,5 +2858,107 @@ mod metadata_maintenance_tests {
             .unwrap_err();
         assert_eq!(publication_error_code(&error), Some("maintenance_pressure"));
         assert!(retry_table_work(&error));
+    }
+
+    /// Remaps over their limits make a periodic visit due; each visit runs
+    /// one bounded cleanup pass and continues until the remaps are gone.
+    #[tokio::test]
+    async fn periodic_visits_materialize_remaps_in_bounded_passes() {
+        let mut f = fixture(|_| {}, 4).await;
+        let id = f.schema.table_id;
+        let keys: Vec<_> = (1..=4)
+            .map(|n| {
+                f.schema
+                    .encode_key(&vec![Value::Int64(n), Value::String("kept".into())])
+                    .unwrap()
+            })
+            .collect();
+        // A strict lazy rewrite of the four one-row seed files.
+        let policy = flow_compactor::Policy {
+            l0_soft_files: 2,
+            stable_small_soft_files: 2,
+            min_file_age_ms: 0,
+            lazy_index_remap: true,
+            ..Default::default()
+        };
+        let scratch = StateStore::open(
+            f._root.path().join("compaction-scratch"),
+            StateStoreOptions::default(),
+        )
+        .unwrap();
+        TableMaintenance::new(
+            f.work.store.clone(),
+            f.work.catalog.clone(),
+            policy,
+            crate::services::writer_config(&f.work.config),
+        )
+        .unwrap()
+        .compact(&f.head, &f.schema, scratch)
+        .await
+        .unwrap()
+        .unwrap();
+        f.head = load(&f).await;
+        assert!(f.work.store.has_remaps(&id).unwrap());
+        let locations = f.work.store.lookup_many(&id, &keys).unwrap();
+        assert!(locations.iter().all(Option::is_some));
+
+        // Within the default limits nothing is due.
+        f.work
+            .garbage_checked
+            .lock()
+            .unwrap()
+            .insert(id, Instant::now());
+        assert!(!f.work.remaps_due(id).unwrap());
+        let mut config = (*f.work.config).clone();
+        config.compaction.remap_max_files = 0;
+        config.compaction.remap_cleanup_rows = 1;
+        f.work.config = Arc::new(config);
+        assert!(f.work.remaps_due(id).unwrap());
+        assert!(f.work.metadata_due(&f.head, id, 1).await.unwrap());
+
+        let mut visits = 0;
+        loop {
+            visits += 1;
+            let completion = f
+                .work
+                .clone()
+                .run(
+                    f.schema.clone(),
+                    vec![],
+                    WorkOptions {
+                        periodic_maintenance: true,
+                        ..options()
+                    },
+                    None,
+                    None,
+                    PrefoldLink::default(),
+                )
+                .await
+                .unwrap();
+            let TableOutcome::PeriodicComplete { next_due } = completion.outcome else {
+                panic!("expected a periodic visit");
+            };
+            if next_due.is_none() {
+                break;
+            }
+            assert!(visits < 10, "cleanup must make progress");
+        }
+        // One row per visit; the last visit also drops the drained remaps.
+        assert_eq!(visits, 4);
+        assert!(!f.work.store.has_remaps(&id).unwrap());
+        assert!(!f.work.remaps_due(id).unwrap());
+        assert_eq!(f.work.store.lookup_many(&id, &keys).unwrap(), locations);
+        for location in locations.into_iter().flatten() {
+            assert_eq!(
+                f.work
+                    .store
+                    .file_rows(&id, &location.data_file_id)
+                    .filter_map(|row| row.ok())
+                    .filter(|(position, _)| *position == location.row_position)
+                    .count(),
+                1,
+                "reverse entries are exact after materialization"
+            );
+        }
     }
 }

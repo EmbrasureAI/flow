@@ -132,10 +132,14 @@ No separate export task is created.
 | `flow_state_apply_batch_seconds` | State-store aggregate lock wait, preparation, commit and lock hold, plus decode, PK lookup, reverse lookup, mutation-build and file-count components; fixed operation-kind and controlled/standalone labels |
 | `flow_state_apply_batch_size` | Apply cursor rows, serialized index `WriteBatch` bytes, submitted update-record count and reverse-owner reads; fixed measurement, operation-kind and controlled/standalone labels |
 | `flow_state_stage_batch_seconds` | Delta-batch construction, duplicate lookup and staged write; fixed operation-kind and controlled/standalone labels |
+| `flow_collapse_prefolds_total{table_id,result}` | Folds of a table's next epoch offered to its collapse, `used` or `discarded`; see [collapse retention](#collapse-retention) |
+| `flow_collapse_prefold_seconds{table_id}` | Duration of each fold or extension of a table's next epoch |
 | `flow_state_collapse_batch_seconds` | Disk-collapse batch setup, fold, prior spool reads, index lookup, binding and staged write; fixed phase and controlled/standalone labels |
-| `flow_table_l0_files`, `flow_table_l0_bytes`, `flow_table_oldest_l0_seconds`, `flow_table_small_files`, `flow_table_*delete_files`, `flow_table_reclaimable_bytes`, `flow_table_manifest*`, `flow_table_publication_pressure` | L0 count, bytes and oldest-file age, small files, total delete files and per-file fanout, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
+| `flow_table_l0_files`, `flow_table_l0_bytes`, `flow_table_oldest_l0_seconds`, `flow_table_small_files`, `flow_table_*delete_files`, `flow_table_reclaimable_bytes`, `flow_table_manifest*`, `flow_table_publication_pressure` | L0 count, bytes and oldest-file age, small files, total delete files and per-file fanout, single-target delete files on full-size (`target_delete_files`) and small (`small_target_delete_files`) data files with `delete_layout = "per_target"`, reclaimable bytes, manifest count/entries, and pressure (`0` healthy, `1` delay, `2` pause) |
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
+| `flow_index_remap_files`, `flow_index_remap_max_depth` | Retired data files whose lazy index remap is still kept, and the longest translation chain in hops; periodic maintenance keeps them within `remap_max_files` and `remap_max_depth` |
+| `flow_index_remaps_dropped_total`, `flow_index_remap_rows_materialized_total` | Remaps dropped by cleanup, and index entries it rewrote to their translated location |
 | `flow_compaction_finalization_actor_lane_hold_seconds` | Completed data-build finalization from actual table-lane reservation through cleanup and lane release |
 | `flow_compaction_preparation_handoff_actor_lane_hold_seconds` | Actor time used to validate and hand a completed build to detached preparation; separate from finalization |
 | `flow_compaction_publication_stall_seconds` | Same-table publication gate from preparation handoff through activation, invalidation or preparation deadline expiry |
@@ -263,7 +267,12 @@ does not dilute finalization samples. Candidate invalidation events include stag
 bounded reason and the complete error chain.
 `delete_rewrite_completed` similarly
 records admitted rows, scanned rows and produced file/row/byte totals with its
-operation and catalog snapshot. These file sizes exclude metadata artifacts and
+operation and catalog snapshot. Its `delete_layout`, `shared_input_files`,
+`target_input_files`, `largest_rewritten_rows`, `output_targets` and
+`largest_output_rows` show whether a consolidation re-read accumulated
+single-target files. `compaction_completed` and `compaction_catch_up_completed`
+report `residual_delete_rows`, the output delete positions for unselected data
+files rather than masks on the rewrite's output. These file sizes exclude metadata artifacts and
 SDK traffic; process-wide storage counters remain a separate observation. `ingest_prepared`, `epoch_collapsed` and `epoch_completed`
 carry operation IDs in logs for correlation; operation IDs are never metric
 labels. ACK feedback timing ends when the coordinator sends feedback, before
@@ -490,6 +499,17 @@ dropped; `collapse_memory_peak_known` distinguishes that from zero. The outer
 collapse duration covers every mode. StateStore's six batch-phase histograms
 cover only disk collapse and must not be treated as a complete decomposition of
 buffered epochs.
+
+With `limits.collapse_prefold` (on by default), once a busy table's epoch has
+sealed its preparation and released its collapsed rows, the transactions its
+next epoch must begin with are folded from the journal while the current epoch
+commits and applies. The fold holds no index state and stays within the same
+collapse budget; a fold that would exceed it is dropped rather than spilled.
+The next collapse uses it only if that epoch begins with exactly the folded
+transactions under the same source, schema and budget, and still binds it
+against the index with every check of a cold collapse. `epoch_collapsed`
+reports `prefold_offered_transactions` and `prefolded_transactions`, and
+`flow_collapse_prefolds_total{result="used"|"discarded"}` counts offered folds.
 
 ## Parquet admission
 

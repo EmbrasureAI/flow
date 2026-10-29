@@ -270,12 +270,15 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, schema.table_id).await?;
-        let Some(plan) = self.policy.plan(
-            snapshot,
-            table.metadata().current_schema_id(),
-            &inventory.files,
-            &inventory.deletes,
-        )?
+        let Some(plan) = self
+            .policy
+            .for_format_version(table.metadata().format_version())
+            .plan(
+                snapshot,
+                table.metadata().current_schema_id(),
+                &inventory.files,
+                &inventory.deletes,
+            )?
         else {
             return Ok(None);
         };
@@ -285,6 +288,7 @@ impl TableMaintenance {
             Level::L2 => "l2",
         };
         let operation = OperationId(format!("flow-{level}-rewrite-{}", uuid::Uuid::new_v4()));
+        let selection_reason = plan.reason.as_str();
         let base = CommitBase::new(&table);
         let ownership = BuildRegistration::begin(
             self.store.clone(),
@@ -328,7 +332,7 @@ impl TableMaintenance {
         match ready.await {
             Ok(indexed) => {
                 tracing::info!(event = "compaction_build_started", operation_id = %ownership.operation_id().0,
-                    base_snapshot_id = snapshot, materialized_lsn = %indexed.materialized_lsn,
+                    base_snapshot_id = snapshot, materialized_lsn = %indexed.materialized_lsn, selection_reason,
                     "captured speculative compaction index snapshot");
                 Ok(Some(RunningCompaction {
                     worker,

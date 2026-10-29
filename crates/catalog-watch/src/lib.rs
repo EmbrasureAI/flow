@@ -187,6 +187,8 @@ pub fn reconcile_rewrite(
     }
     let artifacts = operation.artifacts.clone();
     let payload = operation.payload.clone();
+    // Reverse scans of removed files must include rows moved by lazy remaps.
+    store.materialize_remaps(&table_id)?;
     store.begin_prepare(operation)?;
     let mut expected_rows = 0u64;
     for file in removed_files {

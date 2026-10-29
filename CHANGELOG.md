@@ -13,6 +13,26 @@ No release has been tagged yet; the first will be `0.1.0`.
 
 This will be the initial public release, `0.1.0`.
 
+### Upgrade
+
+From earlier development builds of `main`:
+
+- The row index moves to format 4, which names data files by ordinal. The
+  first start rebuilds it from the control store and Iceberg, skipping
+  row-index checkpoints of the older format; the journal, control store,
+  source slot and Iceberg tables are kept. Allow for the rebuild's time and its
+  copy of the index (see [disk sizing](docs/operations.md#index-verification-and-rebuild-space)).
+- Earlier builds refuse to open the new index, which also has new
+  `file_remaps` and `file_ordinals` column families (RocksDB reports
+  `Column families not opened`), without changing it. To downgrade, restore
+  the `state_dir` copied before the upgrade, or delete the row index so the
+  earlier build rebuilds it from Iceberg.
+- Data rewrites of keyed tables commit lazy index remaps, and delete-file count
+  debt is paid by delete-only consolidation, by default. Set
+  `[compaction] lazy_index_remap = false` or `delete_debt = "current"` for the
+  earlier behavior. Small-file compaction also starts earlier
+  (`l0_soft_files` and `stable_small_soft_files` default to 6 instead of 24).
+
 ### Added
 
 **Capture and publication**
@@ -76,6 +96,55 @@ This will be the initial public release, `0.1.0`.
 - `embrasure-flow metadata-import` adopts existing catalog metadata JSON into
   grace-delayed collection.
 - Maintenance failures back off per table instead of stopping the daemon.
+- Data rewrites of keyed tables, background and strict, commit one index
+  remap per input file instead of rewriting every moved row's index entries,
+  and reads translate through the remaps (`[compaction] lazy_index_remap`,
+  default `true`; `false` restores per-row deltas). In service benchmarks the
+  table's compaction stall fell by 70–96%, and commit-to-catalog p95 at 30,000
+  mutations/s fell from 3.2 s to 1.2 s for the default mixed workload and from
+  41.7 s to 5.8 s for Zipf-skewed updates. Periodic maintenance drops remaps
+  nothing needs, and while a table keeps more than `remap_max_files` (512)
+  remaps or a chain longer than `remap_max_depth` (8) hops, materializes the
+  longest chain, at most `remap_cleanup_rows` (32,768) entries per visit,
+  without the table fence. `flow_index_remap_files`,
+  `flow_index_remap_max_depth`, `flow_index_remaps_dropped_total` and
+  `flow_index_remap_rows_materialized_total` report it. See
+  [local compaction](docs/local-compaction.md#lazy-index-remap).
+- Delete-file count debt, soft and hard, is paid by the bounded delete-only
+  consolidation instead of a data rewrite of a mostly-live base, and
+  delete-driven data rewrites select only files past `deleted_rows_percent`
+  (`[compaction] delete_debt`, default `"consolidate"`; `"current"` restores
+  count-driven data rewrites). With 2M rows and Zipf-skewed updates at 30,000
+  mutations/s, commit-to-catalog p95 fell from 6.8 s to 2.0 s and reads stayed
+  within 1.25× of a compacted copy; the default mixed workload was neutral.
+  Format v3 tables keep `"current"`: a data file has at most one deletion
+  vector, so consolidation cannot lower its count. A
+  `maintenance_action_chosen` debug event and a `selection_reason` field on
+  build and rewrite events record why each action ran.
+- Opt-in `[compaction] delete_layout = "per_target"` (default `"shared"`;
+  format v3 tables always use `"shared"`) makes v2 delete-only consolidation
+  and data-rewrite residuals write one position-delete file per target data
+  file. Consolidation merges a target's files by size tier, so it reads about
+  the new deletes instead of every accumulated one, and data rewrites of inputs
+  with only single-target deletes write no residual. On the default mixed
+  workload at 30,000 mutations/s for five minutes, commit-to-catalog p95 fell
+  from 7.6 s to 2.5 s and compaction stall by two thirds. CDC epochs still
+  write one shared delete file each. `delete_rewrite_completed`,
+  `compaction_completed` and `compaction_catch_up_completed` report the
+  layout, input kinds and residual rows.
+- With `delete_layout = "per_target"`, the delete files readers open stay
+  bounded under skew. Only full-size data files (outside L0, at least
+  `[compaction] target_delete_min_file_bytes`, 128 MiB) keep one delete file
+  each; positions on L0 and smaller files share range files. Once single-target
+  files on full-size files reach `target_delete_files_max` (16) while one has
+  more than one, consolidation merges the smallest until at most half remain,
+  and smaller data files carrying single-target files are rewritten at
+  `small_file_target_deletes` (8). A build probe or idle visit that
+  consolidates also starts a background data rewrite while rewrite debt
+  remains, so continuous CDC no longer starves builds. In a daemon test of
+  Zipf CDC the mean delete-file count fell from 85 to 13 and the peak from 150
+  to 23. New `flow_table_target_delete_files` and
+  `flow_table_small_target_delete_files` gauges report both counts.
 
 **Commands and configuration**
 
@@ -158,6 +227,27 @@ This will be the initial public release, `0.1.0`.
 
 **Performance**
 
+- The row index names data files by per-table ordinal instead of path in
+  primary-key values, reverse keys and staged deltas (index format 4), so
+  lookups, staging, apply and RocksDB compaction no longer scale with path
+  length. In the ingest microbenchmark one table rose from about 113,000 to
+  158,000 mutations/s with default paths and from 83,000 to 157,000 with
+  paths 155 characters longer
+  ([report](docs/benchmarks/index-file-ordinals.md)).
+- Index apply looks up and checks each chunk's rows on up to
+  `min(available_parallelism, 8)` threads, and collapse binds folded keys
+  against the index on up to four threads, decoding locations without
+  allocating their paths. In the service benchmark CDC service time per
+  mutation fell 6–8% from parallel apply and collapse time 52–58% from
+  parallel bind.
+- Data-rewrite residuals stream staged delete positions without decoding each
+  record; the residual merge took about half as long in a local benchmark.
+- `[compaction] l0_soft_files` and `stable_small_soft_files` default to 6
+  instead of 24, so background compaction starts earlier; the hard limits stay
+  at 32, so publication pauses at the same debt. Merge-on-read scan cost tracks
+  file count, and at 30,000 mutations/s the median read slowdown against a
+  compacted copy fell from 2.7× to 1.6× and commit-to-catalog p95 by 43%, for
+  about 8% more CDC work per mutation.
 - Capture keeps small PostgreSQL source transactions in a bounded memory buffer
   (256 KiB each, 32 MiB in total, so capture may use up to about 32 MiB more
   memory) instead of creating a spool directory and file per transaction.
@@ -167,6 +257,12 @@ This will be the initial public release, `0.1.0`.
 - UPDATE/DELETE keys are encoded without copying the table schema, and CDC and
   initial COPY rows no longer revalidate the relation's types row by row.
 - The four concurrent initial COPY workers run on separate runtime threads.
+- A busy table's next epoch is folded from the journal while the current
+  epoch commits and applies, so its collapse only binds the fold against the
+  index. The fold stays within `limits.collapse_memory_bytes`, is used only if
+  the epoch begins with exactly the folded transactions, and is checked like a
+  cold collapse. `limits.collapse_prefold = false` turns it off;
+  `flow_collapse_prefolds_total` counts used and discarded folds.
 - Periodic row-index checkpoints flush memtables before taking the index
   locks, and collapse folds source chunks outside the row lock, shortening
   stalls of concurrent publication.
@@ -186,6 +282,13 @@ This will be the initial public release, `0.1.0`.
   fetch vectors concurrently within the `[parquet_read]` prefetch bounds. Small
   objects go from four requests per vector to about one per object, with
   unchanged validation.
+- Delete-only consolidation merges its inputs' positions in memory (16 bytes
+  each, within its one-million-position budget) and writes them from borrowed
+  paths, instead of round-tripping every position through the scratch store.
+  Merging eight files of about 800,000 positions with 120-byte paths fell from
+  948 ms to 123 ms (shared layout) and from 1,251 ms to 154 ms (`per_target`)
+  in a local release benchmark, with byte-identical outputs. Delete scans for
+  data rewrites and catch-up resolve each run of positions on one path once.
 - Data builds reuse manifests already loaded for planning, and v3 delete
   consolidation no longer reads inputs or uploads a Puffin object for a rewrite
   that cannot reduce the object count.

@@ -71,6 +71,9 @@ pub struct Inventory {
     pub manifest_count: usize,
     pub manifest_entries: usize,
     pub delete_file_count: usize,
+    /// The table's format version, which selects the delete-debt policy. See
+    /// [`flow_compactor::Policy::for_format_version`].
+    pub format_version: iceberg::spec::FormatVersion,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -360,6 +363,7 @@ impl TableMaintenance {
                 row_count: file.record_count(),
                 deleted_rows: 0,
                 delete_file_count: deletes.len(),
+                target_delete_files: 0,
                 age_ms,
                 spec_id: table.metadata().default_partition_spec_id(),
                 partition: Vec::new(),
@@ -384,6 +388,22 @@ impl TableMaintenance {
                 anyhow::anyhow!("indexed live rows exceed physical rows in {}", file.id.0)
             })?;
         }
+        let positions = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.id.clone(), index))
+            .collect::<HashMap<_, _>>();
+        for (path, targets) in &dependencies {
+            let file = &view.live_files[path].data_file;
+            if let (1, Some(target)) = (targets.len(), targets.first())
+                && !self.policy.settled_target_delete(
+                    file.record_count(),
+                    flow_iceberg_ext::delete_content_size(file),
+                )
+            {
+                files[positions[target]].target_delete_files += 1;
+            }
+        }
         let deletes = dependencies
             .into_iter()
             .map(|(path, targets)| DeleteDependency {
@@ -402,25 +422,25 @@ impl TableMaintenance {
             .map(|entry| entry.file_path())
             .collect::<BTreeSet<_>>()
             .len();
+        let policy = self
+            .policy
+            .for_format_version(table.metadata().format_version());
+        let per_target = policy.delete_layout == flow_compactor::DeleteLayout::PerTarget;
         let legacy_delete_count = view
             .live_files
             .values()
             .filter(|entry| {
                 entry.content_type() == DataContentType::PositionDeletes
                     && entry.file_format() != iceberg::spec::DataFileFormat::Puffin
+                    && !(per_target && view.single_target(entry).is_some())
             })
             .count();
-        let mut debt = self.policy.debt(&files)?;
         // Legacy shared/dangling files add planning work across targets. A DV
         // is scoped to one file; sparse vectors on healthy files are not global
-        // debt. Per-file density still schedules reclamation.
-        if legacy_delete_count >= self.policy.delete_files_hard {
-            debt.pressure = flow_compactor::PublicationPressure::Pause;
-        } else if legacy_delete_count >= self.policy.delete_files_soft {
-            debt.pressure = debt
-                .pressure
-                .max(flow_compactor::PublicationPressure::Delay);
-        }
+        // debt. Per-file density still schedules reclamation. With the
+        // per-target layout, a file whose every position targets one live data
+        // file is charged to that file's count alone, like a vector.
+        let debt = policy.debt_with_shared_deletes(&files, legacy_delete_count)?;
         Ok(Inventory {
             files,
             deletes,
@@ -428,6 +448,7 @@ impl TableMaintenance {
             manifest_count: view.manifest_count(),
             manifest_entries: view.manifest_entries(),
             delete_file_count,
+            format_version: table.metadata().format_version(),
         })
     }
 
@@ -459,12 +480,15 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, table_id).await?;
-        let Some(plan) = self.policy.plan(
-            snapshot,
-            table.metadata().current_schema_id(),
-            &inventory.files,
-            &inventory.deletes,
-        )?
+        let Some(plan) = self
+            .policy
+            .for_format_version(table.metadata().format_version())
+            .plan(
+                snapshot,
+                table.metadata().current_schema_id(),
+                &inventory.files,
+                &inventory.deletes,
+            )?
         else {
             return Ok(None);
         };
@@ -634,6 +658,8 @@ impl TableMaintenance {
             payload: serde_json::to_vec(&recovery)?,
         };
         let id = operation.id.clone();
+        let selection_reason = output.plan.reason;
+        let residual_delete_rows = output.residual_delete_rows;
         // Physical output includes rows masked during catch-up. It is not the
         // number of surviving mappings or the catalog's logical row count.
         let output_data_files = output.data_files.len();
@@ -664,7 +690,12 @@ impl TableMaintenance {
         };
         let store = self.store.clone();
         blocking(move || {
-            if !context.deltas_staged {
+            if let Some(remap) = output.lazy_remap() {
+                // O(files) lazy remap instead of one delta per moved row.
+                store.stage_remap(&operation.id, remap)?;
+            } else if output.is_lazy() {
+                anyhow::bail!("a lazy compaction build must be caught up before publication");
+            } else if !context.deltas_staged {
                 store.stage_deltas_fallible(&operation.id, output.index_deltas()?)?;
             }
             store.seal_prepare_with_record(
@@ -709,6 +740,7 @@ impl TableMaintenance {
             table_id = table_id.0,
             operation_id = %id.0,
             candidate_kind = "data_rewrite",
+            selection_reason = selection_reason.as_str(),
             snapshot_id = snapshot,
             output_level = level,
             output_data_files,
@@ -716,6 +748,7 @@ impl TableMaintenance {
             output_data_bytes,
             output_delete_files,
             output_delete_rows,
+            residual_delete_rows,
             output_delete_bytes,
             worker_ms = context.worker_ms,
             prepare_ms,

@@ -6,6 +6,7 @@ use flow_iceberg_ext::{ArtifactSet, ArtifactTracker};
 use flow_model::{
     ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableSchema, Value, fingerprint,
 };
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use iceberg::{
     arrow::schema_to_arrow_schema,
     io::FileIO,
@@ -159,11 +160,44 @@ fn batch_row_bytes(schema: &TableSchema, batch: &RecordBatch) -> Result<Vec<usiz
     Ok(bytes)
 }
 
-fn delete_bytes(position: &RowLocation) -> Result<usize> {
+/// One position for a delete writer: an owned [`RowLocation`], or a borrowed
+/// `(data file path, row position)` pair already in the writer's spec, which
+/// avoids an owned path per position.
+pub trait DeletePosition {
+    fn data_file(&self) -> &str;
+    fn row_position(&self) -> u64;
+    /// Whether the position is in the writer's unpartitioned spec `spec_id`.
+    fn in_spec(&self, spec_id: i32) -> bool;
+}
+
+impl DeletePosition for RowLocation {
+    fn data_file(&self) -> &str {
+        &self.data_file_id.0
+    }
+    fn row_position(&self) -> u64 {
+        self.row_position
+    }
+    fn in_spec(&self, spec_id: i32) -> bool {
+        self.spec_id == spec_id && self.partition.is_empty()
+    }
+}
+
+impl DeletePosition for (&str, u64) {
+    fn data_file(&self) -> &str {
+        self.0
+    }
+    fn row_position(&self) -> u64 {
+        self.1
+    }
+    fn in_spec(&self, _: i32) -> bool {
+        true
+    }
+}
+
+fn delete_bytes(position: &impl DeletePosition) -> Result<usize> {
     // String offsets, Int64 position, and a validity byte for each column.
     position
-        .data_file_id
-        .0
+        .data_file()
         .len()
         .checked_add(18)
         .context("delete row logical payload size overflow")
@@ -508,7 +542,8 @@ impl DataWriter {
 }
 
 /// Streaming position-delete writer. Input must be sorted globally by path and position.
-/// The caller uses the disk-backed sort in the state store, even for large transactions.
+/// Callers sort with the state store's disk-backed spool or, within a bounded
+/// position budget, in memory.
 pub(crate) struct ParquetDeleteWriter {
     file_io: FileIO,
     builder: ParquetWriterBuilder,
@@ -522,7 +557,14 @@ pub(crate) struct ParquetDeleteWriter {
     last: Option<(String, u64)>,
     file_paths: Option<(String, String)>,
     spec_id: i32,
+    /// Files closing concurrently; see [`Self::finish_file_concurrently`].
+    closing: FuturesUnordered<BoxFuture<'static, Result<Vec<DataFile>>>>,
+    closed_concurrently: bool,
 }
+
+/// Small per-target files cost one object upload each. Overlap that many.
+const MAX_CONCURRENT_CLOSES: usize = 8;
+
 impl ParquetDeleteWriter {
     pub fn new(
         file_io: FileIO,
@@ -570,9 +612,11 @@ impl ParquetDeleteWriter {
             last: None,
             file_paths: None,
             spec_id,
+            closing: FuturesUnordered::new(),
+            closed_concurrently: false,
         })
     }
-    pub async fn write(&mut self, positions: &[RowLocation]) -> Result<()> {
+    pub async fn write(&mut self, positions: &[impl DeletePosition]) -> Result<()> {
         if positions.is_empty() {
             return Ok(());
         }
@@ -582,21 +626,21 @@ impl ParquetDeleteWriter {
             .map(|(path, position)| (path.as_str(), *position));
         for p in positions {
             ensure!(
-                p.spec_id == self.spec_id && p.partition.is_empty(),
+                p.in_spec(self.spec_id),
                 "position deletes require matching unpartitioned spec"
             );
             ensure!(
-                p.row_position <= i64::MAX as u64,
+                p.row_position() <= i64::MAX as u64,
                 "position overflows Iceberg long"
             );
             self.config.admit_row(delete_bytes(p)?)?;
             if let Some((path, pos)) = last {
                 ensure!(
-                    (path, pos) < (p.data_file_id.0.as_str(), p.row_position),
+                    (path, pos) < (p.data_file(), p.row_position()),
                     "delete positions must be sorted and unique"
                 );
             }
-            last = Some((p.data_file_id.0.as_str(), p.row_position));
+            last = Some((p.data_file(), p.row_position()));
         }
         let mut remaining = positions;
         while !remaining.is_empty() {
@@ -605,11 +649,11 @@ impl ParquetDeleteWriter {
             remaining = &remaining[count..];
         }
         let last = positions.last().expect("nonempty positions");
-        self.last = Some((last.data_file_id.0.clone(), last.row_position));
+        self.last = Some((last.data_file().to_owned(), last.row_position()));
         Ok(())
     }
 
-    async fn write_batch(&mut self, positions: &[RowLocation], bytes: usize) -> Result<()> {
+    async fn write_batch(&mut self, positions: &[impl DeletePosition], bytes: usize) -> Result<()> {
         if self
             .current
             .as_ref()
@@ -644,25 +688,26 @@ impl ParquetDeleteWriter {
                 Arc::new(
                     positions
                         .iter()
-                        .map(|p| Some(p.data_file_id.0.as_str()))
+                        .map(|p| Some(p.data_file()))
                         .collect::<StringArray>(),
                 ),
                 Arc::new(
                     positions
                         .iter()
-                        .map(|p| Some(p.row_position as i64))
+                        .map(|p| Some(p.row_position() as i64))
                         .collect::<Int64Array>(),
                 ),
             ],
         )?;
         writer.write(&batch).await?;
         self.row_group.written(positions.len(), bytes, &self.config);
-        let first = &positions.first().expect("nonempty batch").data_file_id.0;
-        let last = &positions.last().expect("nonempty batch").data_file_id.0;
+        let first = positions.first().expect("nonempty batch").data_file();
+        let last = positions.last().expect("nonempty batch").data_file();
         if let Some((_, upper)) = &mut self.file_paths {
-            upper.clone_from(last);
+            upper.clear();
+            upper.push_str(last);
         } else {
-            self.file_paths = Some((first.clone(), last.clone()));
+            self.file_paths = Some((first.to_owned(), last.to_owned()));
         }
         Ok(())
     }
@@ -671,12 +716,40 @@ impl ParquetDeleteWriter {
     /// Calling this without an open file is a no-op. Global path/position ordering
     /// and uniqueness remain enforced across rotations; artifact names are never reused.
     pub async fn finish_file(&mut self) -> Result<()> {
-        if let Some(writer) = self.current.take() {
-            let (first, last) = self.file_paths.take().context("delete file has no rows")?;
+        if let Some(close) = self.take_file()? {
+            self.files.extend(close.await?);
+        }
+        Ok(())
+    }
+
+    /// [`Self::finish_file`], but the closed file's upload overlaps later
+    /// writes, up to [`MAX_CONCURRENT_CLOSES`] at once. `close` waits for all
+    /// of them; dropping the writer cancels unfinished uploads.
+    pub async fn finish_file_concurrently(&mut self) -> Result<()> {
+        if let Some(close) = self.take_file()? {
+            self.closing.push(close);
+            self.closed_concurrently = true;
+            while self.closing.len() >= MAX_CONCURRENT_CLOSES {
+                let files = self.closing.next().await.expect("pending close")?;
+                self.files.extend(files);
+            }
+        }
+        Ok(())
+    }
+
+    fn take_file(&mut self) -> Result<Option<BoxFuture<'static, Result<Vec<DataFile>>>>> {
+        self.row_group = RowGroupBudget::default();
+        let Some(writer) = self.current.take() else {
+            return Ok(None);
+        };
+        let (first, last) = self.file_paths.take().context("delete file has no rows")?;
+        let spec_id = self.spec_id;
+        Ok(Some(Box::pin(async move {
+            let mut files = Vec::new();
             for mut file in writer.close().await? {
                 file.content(DataContentType::PositionDeletes)
                     .partition(Struct::empty())
-                    .partition_spec_id(self.spec_id);
+                    .partition_spec_id(spec_id);
                 // Parquet's string statistics can be omitted or truncated. These
                 // exact bounds let readers exclude unrelated delete-file ranges.
                 let metadata = file.build()?;
@@ -685,14 +758,22 @@ impl ParquetDeleteWriter {
                 lower.insert(RESERVED_FIELD_ID_DELETE_FILE_PATH, Datum::string(&first));
                 upper.insert(RESERVED_FIELD_ID_DELETE_FILE_PATH, Datum::string(&last));
                 file.lower_bounds(lower).upper_bounds(upper);
-                self.files.push(file.build()?);
+                files.push(file.build()?);
             }
-        }
-        self.row_group = RowGroupBudget::default();
-        Ok(())
+            Ok(files)
+        })))
     }
+
     pub async fn close(mut self) -> Result<Vec<DataFile>> {
         self.finish_file().await?;
+        while let Some(files) = self.closing.next().await {
+            self.files.extend(files?);
+        }
+        if self.closed_concurrently {
+            // Uploads finish in any order; artifact names follow write order.
+            self.files
+                .sort_by(|left, right| left.file_path().cmp(right.file_path()));
+        }
         Ok(self.files)
     }
 }

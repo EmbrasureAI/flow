@@ -210,6 +210,10 @@ async fn parquet_compaction_applies_position_deletes_and_stock_reader_sees_ident
             .map(|file| file.file_size_in_bytes())
             .sum(),
         delete_input_rows: delete_files.iter().map(|file| file.record_count()).sum(),
+        lazy_index_remap: false,
+        per_target_deletes: false,
+        target_ranges: Default::default(),
+        reason: flow_compactor::PlanReason::L0Debt,
     };
     let keyless_scratch = StateStore::open(
         temp.path().join("keyless-scratch"),

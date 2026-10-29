@@ -28,8 +28,8 @@ pub use maintenance::{
     discard_abandoned_builds,
 };
 pub use publication::{
-    CollapseLimits, CollapsedEpoch, Epoch, ReplanRequired, TablePublisher, collapse_epoch,
-    resolve_catalog_operation,
+    CollapseLimits, CollapsedEpoch, Epoch, Prefold, ReplanRequired, TablePublisher, collapse_epoch,
+    collapse_epoch_prefolded, resolve_catalog_operation,
 };
 pub use scheduler::{Priority, Scheduler, SourceHealth, WalPressure};
 pub use schema::{

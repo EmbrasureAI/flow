@@ -162,6 +162,9 @@ pub struct Limits {
     pub batch_bytes: usize,
     /// Additional retained collapse state per table worker; zero uses disk only.
     pub collapse_memory_bytes: usize,
+    /// Fold a busy table's next epoch from the journal while its current
+    /// epoch commits and applies, within the same collapse budget.
+    pub collapse_prefold: bool,
     pub parquet_row_group_bytes: usize,
     /// Rows per Parquet row group in compacted files and the initial copy,
     /// which readers scan most. Publication files keep 8192 rows, so CDC
@@ -214,6 +217,7 @@ impl Default for Limits {
             batch_rows: 1024,
             batch_bytes: 8 << 20,
             collapse_memory_bytes: 128 << 20,
+            collapse_prefold: true,
             parquet_row_group_bytes: 32 << 20,
             parquet_row_group_rows: 122_880,
             pending_transactions: 256,
@@ -562,12 +566,63 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(keys.len(), 21);
+        assert_eq!(keys.len(), 30);
         let documented: Config =
             toml::from_str(&format!("{example}\n[compaction]\n{}\n", keys.join("\n"))).unwrap();
         assert_eq!(
             format!("{:?}", documented.compaction),
             format!("{:?}", flow_compactor::Policy::default())
+        );
+    }
+
+    #[test]
+    fn delete_debt_defaults_to_consolidate_and_accepts_current() {
+        let example = include_str!("../../../examples/flow.toml");
+        assert_eq!(
+            valid_config().compaction.delete_debt,
+            flow_compactor::DeleteDebt::Consolidate
+        );
+        for (value, expected) in [
+            ("current", flow_compactor::DeleteDebt::Current),
+            ("consolidate", flow_compactor::DeleteDebt::Consolidate),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "{example}\n[compaction]\ndelete_debt = \"{value}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.compaction.delete_debt, expected);
+        }
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "{example}\n[compaction]\ndelete_debt = \"rewrite\"\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delete_layout_defaults_to_shared_and_accepts_per_target() {
+        let example = include_str!("../../../examples/flow.toml");
+        assert_eq!(
+            valid_config().compaction.delete_layout,
+            flow_compactor::DeleteLayout::Shared
+        );
+        for (value, expected) in [
+            ("shared", flow_compactor::DeleteLayout::Shared),
+            ("per_target", flow_compactor::DeleteLayout::PerTarget),
+            ("per-target", flow_compactor::DeleteLayout::PerTarget),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "{example}\n[compaction]\ndelete_layout = \"{value}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.compaction.delete_layout, expected);
+        }
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "{example}\n[compaction]\ndelete_layout = \"vector\"\n"
+            ))
+            .is_err()
         );
     }
 

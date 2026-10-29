@@ -6,7 +6,9 @@
 mod collapse;
 mod deletes;
 use collapse::CollapsedRows;
-pub use collapse::{CollapseLimits, CollapsedEpoch, Epoch, collapse_epoch};
+pub use collapse::{
+    CollapseLimits, CollapsedEpoch, Epoch, Prefold, collapse_epoch, collapse_epoch_prefolded,
+};
 use deletes::EpochDeletes;
 
 use crate::artifacts::{MetadataRegistration, WriterRegistration};
@@ -410,6 +412,19 @@ impl TablePublisher {
         schema: &TableSchema,
         collapsed: CollapsedEpoch,
     ) -> Result<Option<i64>> {
+        self.publish_observed(table, schema, collapsed, || {}).await
+    }
+
+    /// [`Self::publish`], calling `rows_released` once the epoch's collapsed
+    /// rows are consumed and its preparation is sealed, before the catalog
+    /// commit. The collapse budget is then free for the table's next epoch.
+    pub async fn publish_observed(
+        &self,
+        table: &Table,
+        schema: &TableSchema,
+        collapsed: CollapsedEpoch,
+        rows_released: impl FnOnce(),
+    ) -> Result<Option<i64>> {
         let CollapsedEpoch {
             epoch,
             schema: captured_schema,
@@ -741,6 +756,7 @@ impl TablePublisher {
             other_prepare_ms = other_prepare.as_secs_f64() * 1000.0,
             "ingest artifacts and index deltas prepared"
         );
+        rows_released();
         let fresh = FreshPublication {
             head: table.clone(),
             files: ArtifactPlan {

@@ -212,6 +212,10 @@ async fn stale_checkpoint_catches_up_to_exactly_a_full_rebuild() {
     assert_eq!(state.snapshot_id, f.head.metadata().current_snapshot_id());
     assert!(restored.pending_operations().unwrap().is_empty());
     assert_eq!(contents(&f, &restored), contents(&f, &rebuilt));
+    // The live index's compaction committed a lazy remap; reverse scans of its
+    // outputs are exact only after materialization.
+    assert!(f.index.has_remaps(&f.schema.table_id).unwrap());
+    f.index.materialize_remaps(&f.schema.table_id).unwrap();
     assert_eq!(contents(&f, &restored), contents(&f, &f.index));
     for id in [4, 13] {
         assert!(

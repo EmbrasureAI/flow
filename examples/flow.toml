@@ -27,6 +27,9 @@ batch_rows = 1024
 batch_bytes = 8388608
 # Additional per-worker collapse retention; 0 forces the disk path.
 collapse_memory_bytes = 134217728
+# Fold a busy table's next epoch while the current one commits and applies,
+# within the same collapse budget.
+collapse_prefold = true
 parquet_row_group_bytes = 33554432
 # Rows per row group in compacted files and the initial copy; publication
 # files keep 8192.
@@ -84,20 +87,39 @@ prefetch_file_bytes = 4194304
 # "all", "l0-only", or "disabled"; delete-file compaction runs in every scope.
 # data_rewrite_scope = "all"
 # Uncompacted ingest output (L0): file count, total bytes and oldest file age.
-# l0_soft_files = 24
+# l0_soft_files = 6
 # l0_hard_files = 32
 # l0_soft_bytes = 134217728
 # l0_hard_bytes = 268435456
 # oldest_l0_soft_ms = 10000
 # oldest_l0_hard_ms = 30000
 # Files outside L0 smaller than l1_target_bytes, such as external rewrite output.
-# stable_small_soft_files = 24
+# stable_small_soft_files = 6
 # stable_small_hard_files = 32
 # Delete files that apply to any single data file.
 # delete_files_soft = 8
 # delete_files_hard = 16
 # Rewrite a data file once this share of its rows is deleted.
 # deleted_rows_percent = 30
+# Pay delete-file count debt with a delete-only consolidation before any data
+# rewrite; "current" restores the previous count-driven data rewrites. Format
+# v3 tables always use "current".
+# delete_debt = "consolidate"
+# "per_target" makes delete consolidation and data-rewrite residuals write one
+# position-delete file per full-size target data file, merging a target's
+# files by size tier, and pooled ranges for L0 and smaller files, instead of
+# shared files. Format v3 tables always use "shared".
+# delete_layout = "shared"
+# With "per_target", data files outside L0 of at least this size keep one
+# delete file each; deletes on smaller and L0 files share range files.
+# target_delete_min_file_bytes = 134217728
+# With "per_target", once full-size data files keep this many single-target
+# delete files table-wide and one keeps more than one, consolidation merges
+# the smallest until at most half as many remain.
+# target_delete_files_max = 16
+# With "per_target", rewrite smaller data files outside L0 once this many
+# single-target delete files apply to them table-wide.
+# small_file_target_deletes = 8
 # Bounds of one rewrite group and its applicable delete inputs.
 # min_group_files = 2
 # max_group_files = 32
@@ -110,6 +132,15 @@ prefetch_file_bytes = 4194304
 # l2_target_bytes = 536870912
 # Files younger than this are not rewritten unless publication is paused.
 # min_file_age_ms = 1000
+# Data rewrites of keyed tables record one remap per input file instead of
+# rewriting each moved row's index entry. See docs/local-compaction.md.
+# lazy_index_remap = true
+# Periodic maintenance materializes remaps while more retired files keep one,
+# or a lookup may translate through more hops, rewriting at most
+# remap_cleanup_rows index entries per visit.
+# remap_max_files = 512
+# remap_max_depth = 8
+# remap_cleanup_rows = 32768
 
 # Optional: replicate the journal and control state to object storage, so a
 # worker and its whole state volume can be replaced without losing changes
