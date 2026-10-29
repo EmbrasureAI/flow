@@ -19,6 +19,21 @@ pub(crate) struct BlockedTable {
     pub(crate) retry_at_ms: u64,
     pub(crate) attempts: u32,
     pub(crate) pending_operation: Option<OperationId>,
+    /// When an `external_mutation` stops retrying and holding source WAL.
+    /// Rolling back the foreign snapshot before then clears the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resync_after_ms: Option<u64>,
+    /// Durable once its changes may have settled without publication, so a
+    /// wall-clock correction cannot reopen the block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) resync_required: bool,
+}
+
+impl BlockedTable {
+    /// Only a resync clears this block, so its changes settle without publication.
+    pub(crate) fn requires_resync(&self) -> bool {
+        self.resync_required || requires_resync(&self.error_code)
+    }
 }
 
 pub(crate) struct BlockedTables {
@@ -26,11 +41,18 @@ pub(crate) struct BlockedTables {
     prefix: Vec<u8>,
     records: BTreeMap<TableId, BlockedTable>,
     deadlines: BTreeMap<TableId, Instant>,
+    external_grace: Duration,
 }
 
 impl BlockedTables {
     pub(crate) fn load(store: &StateStore, source: &SourceId) -> Result<Self> {
         Self::load_at(store, source, now_ms()?, Instant::now())
+    }
+
+    /// How long an `external_mutation` retries before only a resync recovers it.
+    pub(crate) fn with_external_grace(mut self, grace: Duration) -> Self {
+        self.external_grace = grace;
+        self
     }
 
     fn load_at(store: &StateStore, source: &SourceId, wall_ms: u64, now: Instant) -> Result<Self> {
@@ -51,7 +73,7 @@ impl BlockedTables {
             let delay = Duration::from_millis(record.retry_at_ms.saturating_sub(wall_ms))
                 .min(MAX_RETRY_DELAY);
             record.retry_at_ms = wall_ms.saturating_add(delay.as_millis() as u64);
-            if !requires_resync(&record.error_code) {
+            if !record.requires_resync() {
                 deadlines.insert(record.table_id, now + delay);
             }
             records.insert(record.table_id, record);
@@ -61,6 +83,9 @@ impl BlockedTables {
             prefix,
             records,
             deadlines,
+            external_grace: Duration::from_secs(
+                crate::config::DEFAULT_EXTERNAL_MUTATION_GRACE_SECS,
+            ),
         })
     }
 
@@ -76,14 +101,29 @@ impl BlockedTables {
         );
         let wall_ms = now_ms()?;
         let previous = self.records.get(&id);
-        // Only a resync clears a publication block. A transient failure while
-        // settling its unfinished operation keeps the code and retries.
+        // Only a resync clears a block that requires one, and it keeps its
+        // first cause. A transient failure while settling its unfinished
+        // operation keeps the code and retries. A publication block supersedes
+        // another cause: changes may be missing, not merely unpublishable. An
+        // external mutation keeps its grace deadline across transient retries.
         let incoming = error_code;
-        let error_code = if previous.is_some_and(|record| record.error_code == PUBLICATION_CHANGED)
-        {
-            PUBLICATION_CHANGED
-        } else {
-            error_code
+        let (error_code, resync_after_ms, resync_required) = match previous {
+            Some(record)
+                if (record.requires_resync() && incoming != PUBLICATION_CHANGED)
+                    || (record.error_code == EXTERNAL_MUTATION && !requires_resync(incoming)) =>
+            {
+                (
+                    record.error_code.as_str(),
+                    record.resync_after_ms,
+                    record.resync_required,
+                )
+            }
+            _ => (
+                incoming,
+                (incoming == EXTERNAL_MUTATION)
+                    .then(|| wall_ms.saturating_add(self.external_grace.as_millis() as u64)),
+                false,
+            ),
         };
         let attempts = previous.map_or(1, |record| record.attempts.saturating_add(1));
         let delay = crate::retry::delay(attempts - 1).min(MAX_RETRY_DELAY);
@@ -95,11 +135,13 @@ impl BlockedTables {
             retry_at_ms: wall_ms.saturating_add(delay.as_millis() as u64),
             attempts,
             pending_operation,
+            resync_after_ms,
+            resync_required,
         };
         self.store
             .put_source_transaction(&record_key(&self.prefix, id), &serde_json::to_vec(&record)?)?;
         // Never alter scheduler-visible state before its durable write succeeds.
-        if requires_resync(incoming) {
+        if requires_resync(incoming) || (incoming == EXTERNAL_MUTATION && record.resync_required) {
             self.deadlines.remove(&id);
         } else {
             self.deadlines.insert(id, Instant::now() + delay);
@@ -108,13 +150,13 @@ impl BlockedTables {
         Ok(())
     }
 
-    /// A completed publication cannot clear a publication block: the table's
-    /// changes may have been skipped, so only a resync replaces it.
+    /// A completed publication cannot clear a block that requires a resync:
+    /// the table's changes are dropped, so only a resync replaces it.
     pub(crate) fn clear(&mut self, id: TableId) -> Result<()> {
         if self
             .records
             .get(&id)
-            .is_none_or(|record| record.error_code == PUBLICATION_CHANGED)
+            .is_none_or(BlockedTable::requires_resync)
         {
             return Ok(());
         }
@@ -123,6 +165,35 @@ impl BlockedTables {
         self.records.remove(&id);
         self.deadlines.remove(&id);
         Ok(())
+    }
+
+    /// External mutations whose grace has passed now require a resync. The
+    /// durable flag is written before the caller may settle their changes.
+    pub(crate) fn expire_external_grace(&mut self) -> Result<Vec<TableId>> {
+        self.expire_external_grace_at(now_ms()?)
+    }
+
+    fn expire_external_grace_at(&mut self, wall_ms: u64) -> Result<Vec<TableId>> {
+        let expired: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| {
+                !record.resync_required
+                    && record.resync_after_ms.is_some_and(|after| after <= wall_ms)
+            })
+            .map(|record| record.table_id)
+            .collect();
+        for id in &expired {
+            let mut record = self.records[id].clone();
+            record.resync_required = true;
+            self.store.put_source_transaction(
+                &record_key(&self.prefix, *id),
+                &serde_json::to_vec(&record)?,
+            )?;
+            self.deadlines.remove(id);
+            self.records.insert(*id, record);
+        }
+        Ok(expired)
     }
 
     pub(crate) fn get(&self, id: TableId) -> Option<&BlockedTable> {
@@ -183,9 +254,14 @@ fn now_ms() -> Result<u64> {
 }
 
 pub(crate) const PUBLICATION_CHANGED: &str = "publication_changed";
+/// Another writer changed target rows; it requires a resync once its grace passes.
+pub(crate) const EXTERNAL_MUTATION: &str = "external_mutation";
 
-/// Capture latched these tables; retrying publication cannot clear them.
-fn requires_resync(code: &str) -> bool {
+/// Capture latched these tables; only a resync clears them. Their tables never
+/// publish again, so their changes are settled without publication instead of
+/// holding the source acknowledgement: a resync starts from a new slot and
+/// cannot use that WAL.
+pub(crate) fn requires_resync(code: &str) -> bool {
     matches!(code, "source_schema_incompatible" | "publication_changed")
 }
 
@@ -194,6 +270,7 @@ fn valid_error_code(code: &str) -> bool {
         code,
         "source_schema_incompatible"
             | "publication_changed"
+            | "external_mutation"
             | "publication_replan"
             | "maintenance_pressure"
             | "catalog_unavailable"
@@ -215,6 +292,9 @@ fn valid_error_code(code: &str) -> bool {
 pub(crate) fn publication_error_code(error: &anyhow::Error) -> Option<&'static str> {
     if error.is::<flow_model::SourceTableBlocked>() {
         return Some("source_schema_incompatible");
+    }
+    if error.is::<flow_coordinator::ExternalMutation>() {
+        return Some(EXTERNAL_MUTATION);
     }
     let replanning = error
         .downcast_ref::<flow_coordinator::ReplanRequired>()
@@ -370,6 +450,8 @@ mod tests {
             retry_at_ms: u64::MAX,
             attempts: 1,
             pending_operation: None,
+            resync_after_ms: None,
+            resync_required: false,
         };
         let key = record_key(&prefix(&source), record.table_id);
         store
@@ -462,29 +544,100 @@ mod tests {
             publication_error_code(&flow_compactor::Error::InvalidInventory("corrupt").into()),
             None
         );
+        let external = anyhow::Error::from(flow_coordinator::ExternalMutation {
+            snapshot_id: 7,
+            detail: "added or removed rows",
+        })
+        .context("reconcile table");
+        assert_eq!(publication_error_code(&external), Some("external_mutation"));
     }
 
     #[test]
-    fn publication_changed_is_permanent_and_survives_reload() {
+    fn resync_blocks_survive_transient_failures_and_successful_runs() {
         let root = tempfile::tempdir().unwrap();
-        let control = ControlStore::open(root.path().join("control")).unwrap();
-        let store = control
-            .initialize_index(root.path().join("index"), StateStoreOptions::default())
-            .unwrap();
-        let source = SourceId("publication".into());
+        let store =
+            StateStore::open(root.path().join("index"), StateStoreOptions::default()).unwrap();
+        let source = SourceId("resync".into());
         let mut blocked = BlockedTables::load(&store, &source).unwrap();
+        for (id, code) in [
+            (TableId(1), "source_schema_incompatible"),
+            (TableId(2), "publication_changed"),
+        ] {
+            assert!(requires_resync(code));
+            blocked.record(id, code, None).unwrap();
+            assert_eq!(blocked.deadline_for(id), None, "no retry clears {code}");
+            // Settling an unfinished operation can fail transiently.
+            blocked.record(id, "catalog_unavailable", None).unwrap();
+            assert_eq!(blocked.get(id).unwrap().error_code, code);
+            blocked.clear(id).unwrap();
+            assert_eq!(blocked.get(id).unwrap().error_code, code);
+        }
+        // A publication block supersedes another resync cause, never the reverse.
         blocked
-            .record(TableId(12), "publication_changed", None)
+            .record(TableId(1), "publication_changed", None)
             .unwrap();
-        assert_eq!(
-            blocked.deadline_for(TableId(12)),
-            None,
-            "no retry clears it"
-        );
+        blocked
+            .record(TableId(2), "source_schema_incompatible", None)
+            .unwrap();
         let reloaded = BlockedTables::load(&store, &source).unwrap();
-        let record = reloaded.get(TableId(12)).unwrap();
-        assert_eq!(record.error_code, "publication_changed");
-        assert_eq!(reloaded.deadline_for(TableId(12)), None);
-        assert!(reloaded.get(TableId(11)).is_none());
+        let codes: Vec<_> = reloaded
+            .records()
+            .map(|record| record.error_code.as_str())
+            .collect();
+        assert_eq!(codes, ["publication_changed", "publication_changed"]);
+        assert!(reloaded.due(Instant::now() + MAX_RETRY_DELAY).is_empty());
+        assert!(!requires_resync("catalog_unavailable"));
+    }
+
+    #[test]
+    fn external_mutation_retries_until_its_grace_passes_then_requires_resync() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            StateStore::open(root.path().join("index"), StateStoreOptions::default()).unwrap();
+        let source = SourceId("external".into());
+        let grace = Duration::from_secs(60);
+        let mut blocked = BlockedTables::load(&store, &source)
+            .unwrap()
+            .with_external_grace(grace);
+        let (rolled_back, kept) = (TableId(1), TableId(2));
+        for id in [rolled_back, kept] {
+            blocked.record(id, EXTERNAL_MUTATION, None).unwrap();
+            let record = blocked.get(id).unwrap();
+            assert!(!record.requires_resync() && blocked.deadline_for(id).is_some());
+        }
+        // A transient failure while retrying keeps the cause and its deadline.
+        let after = blocked.get(kept).unwrap().resync_after_ms.unwrap();
+        assert_eq!(after, blocked.get(kept).unwrap().blocked_at_ms + 60_000);
+        blocked.record(kept, "catalog_unavailable", None).unwrap();
+        assert_eq!(blocked.get(kept).unwrap().error_code, EXTERNAL_MUTATION);
+        assert_eq!(blocked.get(kept).unwrap().resync_after_ms, Some(after));
+
+        // Rolling back the foreign snapshot lets publication succeed and clear it.
+        blocked.clear(rolled_back).unwrap();
+        assert!(blocked.get(rolled_back).is_none());
+        assert!(
+            blocked
+                .expire_external_grace_at(after - 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(blocked.expire_external_grace_at(after).unwrap(), [kept]);
+        assert_eq!(blocked.deadline_for(kept), None);
+        blocked.clear(kept).unwrap();
+        blocked.record(kept, EXTERNAL_MUTATION, None).unwrap();
+        assert_eq!(blocked.deadline_for(kept), None);
+
+        // Permanent across reload and wall-clock corrections.
+        let mut reloaded = BlockedTables::load_at(&store, &source, 0, Instant::now()).unwrap();
+        assert!(reloaded.get(kept).unwrap().requires_resync());
+        assert_eq!(reloaded.deadline_for(kept), None);
+        assert!(reloaded.expire_external_grace_at(0).unwrap().is_empty());
+        assert_eq!(
+            publication_error_code(&anyhow::Error::from(flow_coordinator::ExternalMutation {
+                snapshot_id: 7,
+                detail: "added or removed rows",
+            })),
+            Some(EXTERNAL_MUTATION)
+        );
     }
 }

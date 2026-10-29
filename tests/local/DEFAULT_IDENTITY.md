@@ -26,9 +26,10 @@ in configured key order. Non-key NULL placeholders never become replacement
 row values. Updates without an old tuple derive the unchanged key from the new
 row. A changed key uses the existing old-key delete/new-row insert application.
 FULL fills an unchanged-TOAST marker from its complete old tuple; DEFAULT
-carries it forward as described above. A marker with no prior image fails. Invalid events cannot produce a successful capture
-commit. The materialized checkpoint and source acknowledgement remain behind
-quarantined/unapplied changes; the ingress journal may safely retain later WAL.
+carries it forward as described above. A marker with no prior image fails.
+Invalid events cannot produce a successful capture commit. An unsupported
+change blocks its table until a resync: the target stays unchanged, and the
+source acknowledgement passes the table's dropped changes.
 
 ## Engine-only run
 

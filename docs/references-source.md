@@ -278,8 +278,8 @@ failure only quarantines that transaction's changes of the table in the
 spool, beside the spool position of the first one. Other transactions keep
 publishing the table meanwhile. At the transaction's commit, a decision that
 survived every savepoint rollback latches the durable table block before the
-journal terminal, so all of that transaction's changes of the table commit
-quarantined. A rollback removes the decision with the changes it quarantined:
+journal terminal, so all of that transaction's changes of the table are
+dropped. A rollback removes the decision with the changes it quarantined:
 a subtransaction abort truncates both at the subtransaction's first spooled
 change, and a transaction abort discards both. Outside streaming, PostgreSQL
 has already committed the transaction and the block is immediate. Incompatible

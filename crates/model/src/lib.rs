@@ -470,7 +470,7 @@ pub enum QuarantineFormat {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("source table requires schema repair or full resync")]
+#[error("source table requires a full resync")]
 pub struct SourceTableBlocked;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

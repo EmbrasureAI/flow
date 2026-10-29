@@ -17,6 +17,13 @@ from table_isolation import IsolationRun
 
 
 class SchemaRun(IsolationRun):
+    def check_released(self, barrier):
+        # A schema block requires a resync: its changes are dropped, so the
+        # source ACK passes them while the blocked target stays unchanged.
+        confirmed = self.wait_acknowledged(barrier)
+        assert self.blocked()["error_code"] == "source_schema_incompatible"
+        return {"confirmed_flush_lsn": confirmed, "barrier": barrier}
+
     def configure(self):
         super().configure()
         if self.args.explicit:
@@ -69,22 +76,22 @@ class SchemaRun(IsolationRun):
         self.wait_blocked()
         assert self.blocked()["error_code"] == "source_schema_incompatible"
         self.healthy(barrier)
-        self.check_ack(barrier)
+        self.check_released(barrier)
         assert self.rows("orders") == previous
         self.pg.execute("BEGIN")
         self.pg.execute("UPDATE orders SET renamed_payload='rolled-back-evidence' WHERE id=2")
         self.pg.execute("ROLLBACK")
         for i in range(12):
             barrier = self.transaction([f"UPDATE accounts SET amount={i} WHERE id=1",
-                                        f"UPDATE orders SET renamed_payload='retained-{i}' WHERE id=1"])
+                                        f"UPDATE orders SET renamed_payload='dropped-{i}' WHERE id=1"])
         self.healthy(barrier)
-        self.check_ack(barrier)
+        self.check_released(barrier)
         self.stop(crash=True)
         self.start()
         barrier = self.transaction(["UPDATE accounts SET amount=123 WHERE id=1"])
         self.wait_blocked()
         self.healthy(barrier)
-        self.check_ack(barrier)
+        self.check_released(barrier)
         assert self.rows("orders") == previous
         for segment in (self.directory / "state" / "journal").glob("*.segment"):
             assert secret.encode() not in segment.read_bytes(), "excluded value entered the journal"
@@ -111,14 +118,14 @@ class SchemaRun(IsolationRun):
                                     "UPDATE accounts SET amount=42 WHERE id=1"])
         self.wait_blocked()
         self.healthy(barrier)
-        self.check_ack(barrier)
+        self.check_released(barrier)
         assert self.rows("orders") == previous
         self.stop(crash=True)
         self.start()
         self.wait_blocked()
         barrier = self.transaction(["UPDATE accounts SET amount=43 WHERE id=1"])
         self.healthy(barrier)
-        self.check_ack(barrier)
+        self.check_released(barrier)
         assert self.rows("orders") == previous
         logs = "\n".join(p.read_text() for p in self.directory.glob("*.log"))
         assert "source heap was rewritten; resynchronization is required" in logs

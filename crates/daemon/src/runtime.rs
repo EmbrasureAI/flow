@@ -7,7 +7,7 @@ mod prefold;
 mod table;
 
 use self::{
-    blocked::{BlockedTables, PUBLICATION_CHANGED},
+    blocked::{BlockedTable, BlockedTables, PUBLICATION_CHANGED},
     health::{HealthCheckResult, check_health, observe_health, record_publication_changed},
     pending::{EPOCH_MAX_BYTES, EPOCH_MUTATION_TRIGGER, PendingWork, schedule_transactions},
     prefold::Prefolds,
@@ -220,7 +220,7 @@ async fn run_service(
             )?;
             let validated = validate_publication(&sql, config, schemas, false).await;
             // Table-scoped violations block only those tables; the rest start.
-            // Latch them before schema refresh, which could otherwise quarantine.
+            // Latch them before schema refresh, which would report a schema cause.
             for violation in crate::lifecycle::record_publication_changed(config, validated)? {
                 registry.block_publication(violation.table, &violation.reason)?;
             }
@@ -377,16 +377,17 @@ async fn run_service(
     result
 }
 
-/// Capture drops a `publication_changed` table's changes; only a resync
-/// recovers it. Call only while no run owns the table: its outcome may still
-/// complete its transactions at a new snapshot, which must not race an earlier
-/// completion. Builds and preparations never complete transactions.
+/// A table whose block requires a resync never publishes again, so its
+/// transactions complete without publication. Call only while no run owns the
+/// table: its outcome may still complete its transactions at a new snapshot,
+/// which must not race an earlier completion. Builds and preparations never
+/// complete transactions.
 /// - An unfinished operation first needs a recovery-only attempt; its
 ///   transactions complete through the ordinary applied-operation path.
 /// - Otherwise one bounded page of transactions the table journaled before the
 ///   latch completes at its unchanged snapshot, so they stop holding the
 ///   acknowledgement frontier. Returns whether a page was completed.
-fn settle_dropped_table(
+fn settle_resync_table(
     ledger: &mut SourceLedger,
     store: &StateStore,
     blocked: &mut BlockedTables,
@@ -643,7 +644,10 @@ impl PublishRuntime {
         } = self;
         let config = &work.config;
         let store = &work.store;
-        let mut blocked = BlockedTables::load(store, &SourceId(config.source.id.clone()))?;
+        let mut blocked = BlockedTables::load(store, &SourceId(config.source.id.clone()))?
+            .with_external_grace(Duration::from_secs(
+                config.limits.external_mutation_grace_secs,
+            ));
         let mut excluded: HashSet<_> = blocked.ids().collect();
         let mut recovering: HashSet<TableId>;
         let mut retrying = HashSet::new();
@@ -832,7 +836,7 @@ impl PublishRuntime {
                 _ = tokio::task::yield_now(), if settling.iter().any(|id| !busy.contains(id)) => {
                     // One bounded page per loop iteration, like other completion work.
                     let id = *settling.iter().find(|id| !busy.contains(*id)).expect("settling table");
-                    if !settle_dropped_table(ledger, store, &mut blocked, id)? {
+                    if !settle_resync_table(ledger, store, &mut blocked, id)? {
                         settling.remove(&id);
                     }
                     ledger.drain_completed_prefix()?;
@@ -1279,7 +1283,7 @@ impl PublishRuntime {
                                 .find(|id| !busy.contains(id) && !recovering.contains(id))
                         };
                         if let Some(id) = retry
-                            && blocked.get(id).is_none_or(|record| record.error_code != PUBLICATION_CHANGED)
+                            && blocked.get(id).is_none_or(|record| !record.requires_resync())
                             && store.table_state(&id)?.pending_operation.is_none()
                             && ledger.pending_table_transactions_after(id, PgLsn(0)).next().transpose()?.is_some()
                         {
@@ -1442,6 +1446,10 @@ impl PublishRuntime {
                 }
                 _ = health.tick() => {
                     applied.invalidate();
+                    for id in blocked.expire_external_grace()? {
+                        tracing::warn!(event = "external_mutation_requires_resync", table_id = id.0,
+                            "external row changes were not rolled back; table changes settle until resync");
+                    }
                     for id in schemas.keys().copied() {
                         let cause = crate::schema::capture_block(store, &SourceId(config.source.id.clone()), id)?;
                         let recorded = blocked.get(id).map(|record| record.error_code.clone());
@@ -1457,7 +1465,7 @@ impl PublishRuntime {
                                 pending.defer(id, &mut scheduler);
                             }
                         }
-                        if blocked.get(id).is_some_and(|record| record.error_code == PUBLICATION_CHANGED) {
+                        if blocked.get(id).is_some_and(BlockedTable::requires_resync) {
                             let (build, preparation) = release_blocked_candidates(
                                 id, &mut ready_builds, &mut ready_preparations, &mut build_active,
                                 &mut activation_pending, &mut waiting_for_build, &mut retiring_builds);
@@ -2130,14 +2138,14 @@ mod startup_recovery_tests {
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(0));
 
         // The batch capacity is two: one tick settles one page.
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(20));
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(40));
         assert_eq!(ledger.pending_count(), 0);
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
     }
 
     /// A run admitted before the latch may still commit its transactions at a
@@ -2161,7 +2169,7 @@ mod startup_recovery_tests {
             blocked.get(dropped).unwrap().error_code,
             PUBLICATION_CHANGED
         );
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
 
@@ -2207,7 +2215,7 @@ mod startup_recovery_tests {
             })
             .unwrap();
         assert_eq!(blocked.deadline_for(dropped), None);
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         assert!(
             blocked.deadline_for(dropped).is_some(),
             "recovery-only attempt admitted"
@@ -2226,7 +2234,7 @@ mod startup_recovery_tests {
         store.discard_uncommitted(&id).unwrap();
         blocked.record(dropped, PUBLICATION_CHANGED, None).unwrap();
         assert_eq!(blocked.deadline_for(dropped), None);
-        settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
+        settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap();
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(10));
     }
@@ -2269,7 +2277,7 @@ mod startup_recovery_tests {
         assert!(retiring_builds.contains(&dropped) && ready_builds.is_empty());
 
         // Only a run owns the table's ledger share, so settling proceeds.
-        while settle_dropped_table(&mut ledger, &store, &mut blocked, dropped).unwrap() {}
+        while settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap() {}
         ledger.drain_completed_prefix().unwrap();
         assert_eq!(ledger.watermarks().materialized_lsn, PgLsn(20));
     }

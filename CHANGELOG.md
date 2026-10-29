@@ -42,7 +42,12 @@ From earlier development builds of `main`:
   journal, persistent row index, background compaction and reconciliation of
   external maintenance.
 - Independent per-table publication, so a failing table does not stop the
-  others.
+  others. A table blocked until resync (`source_schema_incompatible` or
+  `publication_changed`) has its changes settled without publication, so it
+  stops holding the source acknowledgement and WAL. Another writer's row changes
+  to a target block only that table (`external_mutation`); rolling them back
+  within `limits.external_mutation_grace_secs` resumes it, and afterwards it
+  requires a resync.
 - `REPLICA IDENTITY DEFAULT` for primary-key tables. Out-of-line (TOAST)
   values an update leaves unchanged are carried forward from the key's earlier
   row image in the epoch or its indexed Iceberg row, so variable-width tables no

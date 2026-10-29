@@ -35,10 +35,10 @@ pub(crate) struct SchemaRegistry {
     types: TypeRegistry,
     projections: BTreeMap<TableId, Vec<String>>,
     identities: BTreeMap<(String, String), TableId>,
-    blocked: BTreeSet<TableId>,
-    /// Blocked because the publication stopped covering them: capture drops
-    /// their changes instead of quarantining them.
-    dropped: BTreeSet<TableId>,
+    /// Durable blocks with their cause. Only a resync clears one, so capture
+    /// drops a blocked table's changes: retaining them would hold the source
+    /// acknowledgement and its WAL for a slot no resync can reuse.
+    blocked: BTreeMap<TableId, CaptureBlock>,
 }
 impl SchemaRegistry {
     pub(crate) fn new(store: StateStore, source: SourceId, bases: &[TableSchema]) -> Result<Self> {
@@ -51,8 +51,7 @@ impl SchemaRegistry {
             );
         }
         let mut identities = BTreeMap::new();
-        let mut blocked = BTreeSet::new();
-        let mut dropped = BTreeSet::new();
+        let mut blocked = BTreeMap::new();
         for id in initial.keys().copied() {
             if let Some(entry) = store
                 .source_transactions_after(&schema_prefix(&source, id), None)
@@ -62,21 +61,15 @@ impl SchemaRegistry {
                 let record = SchemaRecord::decode(&bytes)?;
                 identities.insert((record.relation.namespace, record.relation.name), id);
             }
-            match capture_block(&store, &source, id)? {
-                Some(CaptureBlock::PublicationChanged) => {
-                    blocked.insert(id);
-                    dropped.insert(id);
-                }
-                Some(CaptureBlock::SchemaIncompatible) => {
-                    blocked.insert(id);
-                }
-                None => {}
+            // A schema block may have quarantined journal entries from an
+            // earlier build; settlement releases them.
+            if let Some(cause) = capture_block(&store, &source, id)? {
+                blocked.insert(id, cause);
             }
         }
         Ok(Self {
             identities,
             blocked,
-            dropped,
             store,
             source,
             bases: initial,
@@ -232,28 +225,23 @@ impl SchemaRegistry {
     }
 
     pub(crate) fn is_blocked(&self, table: TableId) -> bool {
-        self.blocked.contains(&table)
+        self.blocked.contains_key(&table)
     }
 
-    pub(crate) fn is_dropped(&self, table: TableId) -> bool {
-        self.dropped.contains(&table)
+    /// Capture drops every blocked table's changes; see [`CaptureAssembler::drop_table`].
+    pub(crate) fn blocked(&self) -> impl Iterator<Item = TableId> + '_ {
+        self.blocked.keys().copied()
     }
 
-    /// Tables whose capture drops changes; see [`CaptureAssembler::drop_table`].
-    pub(crate) fn dropped(&self) -> impl Iterator<Item = TableId> + '_ {
-        self.dropped.iter().copied()
-    }
-
-    pub(crate) fn block_decoder(
+    /// Stop capturing a durably blocked table, including the rows its open
+    /// transactions already spooled.
+    pub(crate) fn drop_blocked(
         &self,
         table: TableId,
         assembler: &mut CaptureAssembler,
     ) -> Result<()> {
-        if assembler.is_blocked(table) {
-            return Ok(());
-        }
-        assembler.set_schema(self.latest(table)?.schema)?;
-        assembler.block_table(table)?;
+        ensure!(self.is_blocked(table), "dropping an unblocked table");
+        assembler.drop_table(table)?;
         Ok(())
     }
 
@@ -261,11 +249,12 @@ impl SchemaRegistry {
         self.block_with(table, CaptureBlock::SchemaIncompatible, reason)
     }
 
-    /// Quarantine one change and block its table. pgoutput streams changes of
+    /// Block a change's table and drop its changes. pgoutput streams changes of
     /// transactions that may still roll back, so a decision inside a streamed
-    /// transaction stays provisional: it blocks the table only when that
-    /// transaction commits with the change, see [`Self::commit_provisional`].
-    /// Other transactions keep publishing the table meanwhile.
+    /// transaction stays provisional: it quarantines the change and blocks the
+    /// table only when that transaction commits with it, see
+    /// [`Self::commit_provisional`]. Other transactions keep publishing the
+    /// table meanwhile.
     pub(crate) fn quarantine(
         &mut self,
         table: TableId,
@@ -279,9 +268,7 @@ impl SchemaRegistry {
             return Ok(());
         }
         self.block(table, reason)?;
-        self.block_decoder(table, assembler)?;
-        assembler.quarantine(event, relation)?;
-        Ok(())
+        self.drop_blocked(table, assembler)
     }
 
     /// A Relation capture cannot decode. Inside a streamed transaction it only
@@ -301,7 +288,7 @@ impl SchemaRegistry {
 
     /// Called at every Commit before schema validation and the assembler: make
     /// the committed transaction's surviving provisional blocks durable, so its
-    /// quarantined and earlier decoded changes of those tables commit quarantined.
+    /// quarantined and earlier decoded changes of those tables are dropped.
     pub(crate) fn commit_provisional(
         &mut self,
         xid: u32,
@@ -309,7 +296,7 @@ impl SchemaRegistry {
     ) -> Result<()> {
         for (table, reason) in assembler.provisional_blocks(xid) {
             self.block(table, &reason)?;
-            self.block_decoder(table, assembler)?;
+            self.drop_blocked(table, assembler)?;
         }
         Ok(())
     }
@@ -325,11 +312,10 @@ impl SchemaRegistry {
             "unconfigured capture block"
         );
         // The block is durable and only a resync clears it. It keeps its first
-        // cause, except that a publication block supersedes a schema block:
-        // both need a resync, and dropping stops its quarantined changes from
-        // holding the acknowledgement frontier.
-        if self.blocked.contains(&table)
-            && (cause != CaptureBlock::PublicationChanged || self.dropped.contains(&table))
+        // cause, except that a publication block supersedes a schema block in
+        // status: changes may already be missing, not merely undecodable.
+        if let Some(current) = self.blocked.get(&table)
+            && (cause != CaptureBlock::PublicationChanged || *current == cause)
         {
             return Ok(());
         }
@@ -337,10 +323,7 @@ impl SchemaRegistry {
         self.latest(table)?;
         self.store
             .put_source_transaction(&capture_block_key(&self.source, table), cause.value())?;
-        self.blocked.insert(table);
-        if cause == CaptureBlock::PublicationChanged {
-            self.dropped.insert(table);
-        }
+        self.blocked.insert(table, cause);
         self.candidates.retain(|(id, _), _| *id != table);
         self.dirty.remove(&table);
         tracing::warn!(
@@ -348,7 +331,7 @@ impl SchemaRegistry {
             table_id = table.0,
             error_code = cause.code(),
             reason,
-            "source table requires schema repair or full resync"
+            "source table requires a full resync; its changes are dropped"
         );
         Ok(())
     }
@@ -479,7 +462,7 @@ impl SchemaRegistry {
         let hints = assembler.schema_hints(xid)?;
         for hint in &hints {
             if self.is_blocked(hint.table_id) {
-                self.block_decoder(hint.table_id, assembler)?;
+                self.drop_blocked(hint.table_id, assembler)?;
             }
         }
         let needs_validation = hints.iter().any(|hint| {
@@ -494,7 +477,7 @@ impl SchemaRegistry {
         let mut publish = Vec::new();
         for version in versions {
             if self.is_blocked(version.table_id) {
-                self.block_decoder(version.table_id, assembler)?;
+                self.drop_blocked(version.table_id, assembler)?;
                 continue;
             }
             let validated: Result<()> = async {
@@ -564,7 +547,7 @@ impl SchemaRegistry {
                     return Err(error);
                 }
                 self.block(version.table_id, schema_block_reason(&error))?;
-                self.block_decoder(version.table_id, assembler)?;
+                self.drop_blocked(version.table_id, assembler)?;
                 publish.retain(|record| record.schema.table_id != version.table_id);
             }
         }
@@ -795,17 +778,15 @@ impl CaptureBlock {
     }
 }
 
-/// Latch a durable publication block as capture would, for runtime tests.
+/// Latch a durable capture block as capture would, for runtime tests.
 #[cfg(test)]
-pub(crate) fn latch_publication_block(
+pub(crate) fn latch_capture_block(
     store: &StateStore,
     source: &SourceId,
     table: TableId,
+    cause: CaptureBlock,
 ) -> Result<()> {
-    store.put_source_transaction(
-        &capture_block_key(source, table),
-        CaptureBlock::PublicationChanged.value(),
-    )?;
+    store.put_source_transaction(&capture_block_key(source, table), cause.value())?;
     Ok(())
 }
 
@@ -1208,7 +1189,7 @@ mod target_identity_tests {
         let relation = registry.saved_relation(table).unwrap();
         let unblocked = |registry: &SchemaRegistry, assembler: &CaptureAssembler| {
             !registry.is_blocked(table)
-                && !assembler.is_blocked(table)
+                && assembler.is_configured(table.0)
                 && capture_block(&store, &source, table).unwrap().is_none()
         };
 
@@ -1265,7 +1246,8 @@ mod target_identity_tests {
         push(&mut assembler, SourceEvent::StreamStop);
         assert!(unblocked(&registry, &assembler));
         registry.commit_provisional(43, &mut assembler).unwrap();
-        assert!(registry.is_blocked(table) && assembler.is_blocked(table));
+        // Capture drops the table, including the quarantined TRUNCATE.
+        assert!(registry.is_blocked(table) && !assembler.is_configured(table.0));
         assert_eq!(
             capture_block(&store, &source, table).unwrap(),
             Some(CaptureBlock::SchemaIncompatible)
@@ -1286,6 +1268,8 @@ mod target_identity_tests {
             .reject_relation(other, "type changed", &mut assembler)
             .unwrap();
         assert!(registry.is_blocked(other) && !assembler.is_undecodable(other));
+        registry.drop_blocked(other, &mut assembler).unwrap();
+        assert!(!assembler.is_configured(other.0));
         assert_eq!(
             capture_block(&store, &source, other).unwrap(),
             Some(CaptureBlock::SchemaIncompatible)
@@ -1377,22 +1361,25 @@ mod target_identity_tests {
         registry
             .block_publication(TableId(12), "missing: public.t12")
             .unwrap();
-        assert!(registry.is_dropped(TableId(12)) && !registry.is_blocked(TableId(11)));
-        // The first cause wins; a later schema block cannot turn drop into quarantine.
+        assert!(registry.is_blocked(TableId(12)) && !registry.is_blocked(TableId(11)));
+        // The first cause wins; a later schema block does not replace it.
         registry.block(TableId(12), "schema").unwrap();
         assert_eq!(
             capture_block(&store, &source, TableId(12)).unwrap(),
             Some(CaptureBlock::PublicationChanged)
         );
         registry.block(TableId(11), "schema").unwrap();
-        assert!(registry.is_blocked(TableId(11)) && !registry.is_dropped(TableId(11)));
-        // A publication change supersedes a schema block: both need a resync,
-        // and dropping stops quarantined changes holding acknowledgement.
+        // Every durable block drops its table's changes, whatever the cause.
+        assert_eq!(
+            registry.blocked().collect::<Vec<_>>(),
+            [TableId(11), TableId(12)]
+        );
+        // A publication change supersedes a schema block in status.
         let mut superseded = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
         superseded
             .block_publication(TableId(11), "missing: public.t11")
             .unwrap();
-        assert!(superseded.is_dropped(TableId(11)));
+        assert!(superseded.is_blocked(TableId(11)));
         assert_eq!(
             capture_block(&store, &source, TableId(11)).unwrap(),
             Some(CaptureBlock::PublicationChanged)
@@ -1407,9 +1394,11 @@ mod target_identity_tests {
 
         // Durable across restart, whatever the publication looks like then.
         let restarted = SchemaRegistry::new(store.clone(), source.clone(), &bases).unwrap();
-        assert!(restarted.is_dropped(TableId(12)));
-        assert!(restarted.is_blocked(TableId(11)) && !restarted.is_dropped(TableId(11)));
-        assert_eq!(restarted.dropped().collect::<Vec<_>>(), [TableId(12)]);
+        // A schema block latched by an earlier build also drops on restart.
+        assert_eq!(
+            restarted.blocked().collect::<Vec<_>>(),
+            [TableId(11), TableId(12)]
+        );
         assert_eq!(
             capture_block(&store, &source, TableId(11)).unwrap(),
             Some(CaptureBlock::SchemaIncompatible)

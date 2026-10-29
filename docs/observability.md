@@ -345,6 +345,14 @@ storage limits. Code `catalog_auth` means the catalog or its OAuth endpoint
 rejected Flow's credentials or permissions (after one token renewal when OAuth
 credentials are configured) and needs operator action; `catalog_unavailable`
 covers catalog outages and other unexpected responses.
+`source_schema_incompatible` and `publication_changed` clear only through a
+resync. `external_mutation` means another writer added or removed target rows:
+it retries, holding source WAL, until `resync_after_ms`; rolling back the
+foreign snapshot first clears it. Afterwards the record shows
+`resync_required: true` and it too needs a resync. Tables that require a resync
+have no retry deadline and stop updating, but they do not hold the source
+acknowledgement. A settled table has no unpublished changes, so
+`flow_table_lag_seconds` does not grow for it; alert on `flow_table_blocked`.
 
 ## Stall and lag signals
 
@@ -369,7 +377,7 @@ groups:
         for: 10m
         annotations:
           summary: "Table {{ $labels.table_id }} blocked ({{ $labels.code }})"
-          description: "Healthy tables continue, but source WAL and the journal grow until it is resolved. See status blocked_tables."
+          description: "Healthy tables continue. A retryable block retains source WAL and the journal until it is resolved; a block that requires a resync stops updating this table. See status blocked_tables."
       - alert: FlowTableLagging
         expr: flow_table_lag_seconds > 900
         for: 10m

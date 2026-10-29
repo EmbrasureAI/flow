@@ -211,8 +211,8 @@ class DefaultRun(Run):
         return self.compare('nullable-fixed-addition')
 
     def unsupported_change(self, identity=False):
-        # On a new run, fail one table after initial progress. Neither its target
-        # nor the source-wide materialized/slot checkpoint may cross this batch.
+        # On a new run, fail one table after initial progress. Its target must
+        # not change, but only a resync recovers it, so the slot passes this batch.
         before = self.rows('orders')
         if identity:
             self.pg.execute('ALTER TABLE orders REPLICA IDENTITY NOTHING')
@@ -221,18 +221,16 @@ class DefaultRun(Run):
             self.pg.execute("ALTER TABLE orders ADD COLUMN unsafe text NOT NULL DEFAULT 'backfilled'")
         barrier = self.transaction(['INSERT INTO orders (tenant,body,id) VALUES (33,77,999999)'])
         table_id = self.pg.execute("SELECT 'orders'::regclass::oid").fetchone()[0]
-        self.until('table did not quarantine', lambda: any(t['table_id'] == table_id
+        self.until('table was not blocked', lambda: any(t['table_id'] == table_id
             for t in json.loads((self.directory/'state'/'status.json').read_text()).get('blocked_tables', [])))
-        time.sleep(2)
+        confirmed = lsn(self.wait_acknowledged(barrier))
         assert self.rows('orders') == before
         metrics = self.metrics()
-        confirmed = lsn(self.pg.execute('SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s',(self.name,)).fetchone()[0])
-        assert confirmed < barrier and metrics['flow_materialized_lsn'] < barrier, (confirmed,barrier,metrics)
         self.stop(crash=True); self.start()
         time.sleep(2)
         assert self.rows('orders') == before
-        after_restart = lsn(self.pg.execute('SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s',(self.name,)).fetchone()[0])
-        assert after_restart < barrier
+        assert any(t['table_id'] == table_id
+            for t in json.loads((self.directory/'state'/'status.json').read_text()).get('blocked_tables', []))
         return {'failed_batch_lsn':barrier,'confirmed_lsn':confirmed,'metrics':metrics}
 
     def execute(self):

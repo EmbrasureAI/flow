@@ -85,7 +85,9 @@ derived counts preserves control authority and the permanent source slot.
 External data rewrites are accepted only after comparing every live key and its
 canonical fingerprint. A snapshot's `replace` operation label is a hint, not proof
 of logical equivalence. Unknown history, unverified schema changes, unexpected inserts,
-missing rows, and changed values pause publication.
+missing rows, and changed values pause publication: inserts and deletes outside
+`replace` block only that table, which requires a resync unless they are rolled
+back within `limits.external_mutation_grace_secs`; the rest stop the connection.
 
 Keyless append-only tables use a disk-backed multiset join ordered by canonical
 fingerprint and physical location. Equal rows are matched deterministically to
