@@ -720,6 +720,8 @@ pub(crate) async fn create(
             Ok(Created::New | Created::Same) => {
                 metrics::histogram!("flow_durability_put_seconds", "kind" => kind)
                     .record(started.elapsed().as_secs_f64());
+                metrics::counter!("flow_durability_put_bytes_total", "kind" => kind)
+                    .increment(bytes.len() as u64);
                 return Ok(());
             }
             Ok(Created::Different(_)) => {

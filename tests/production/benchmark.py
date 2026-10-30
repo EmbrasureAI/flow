@@ -166,6 +166,17 @@ region = {json.dumps(os.environ.get('AWS_REGION', 'us-east-1'))}
             if not urlparse(self.args.s3_endpoint).hostname.endswith(".amazonaws.com"):
                 text += f'''endpoint = {json.dumps(self.args.s3_endpoint)}
 '''
+        if self.args.state_medium == "memory":
+            if not self.args.durability_uri:
+                raise ValueError("--state-medium memory requires --durability-uri")
+            # A tmpfs directory behind the usual path, so reports and pruning
+            # find the state where they always do.
+            memory = Path("/dev/shm/flow-benchmark") / self.name
+            memory.mkdir(parents=True)
+            (self.directory / "state").symlink_to(memory)
+            text += '''[storage]
+medium = "memory"
+'''
         text += f'''[compaction]
 data_rewrite_scope = {json.dumps({'current': 'all', 'l0-only': 'l0-only', 'delete-only': 'disabled', 'disabled': 'disabled'}[self.args.maintenance_mode])}
 '''
@@ -1188,6 +1199,9 @@ def main():
                         help="enable remote durability under URI/<run name>, e.g. s3://bucket/prefix")
     parser.add_argument("--durability", action="append", default=[], metavar="KEY=VALUE",
                         help="override a [durability] key with a TOML value; repeatable")
+    parser.add_argument("--state-medium", choices=("disk", "memory"), default="disk",
+                        help="memory keeps state_dir in /dev/shm/flow-benchmark/<run> with "
+                             "[storage] medium = \"memory\"; requires --durability-uri")
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--setup-timeout", type=float, default=600,
