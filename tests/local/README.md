@@ -74,6 +74,12 @@ responses, and commits completed after the caller is killed. Ordinary table
 failures must preserve the daemon PID. Native manifest audits verify unique
 operation identities and exact reader results. Source connection/slot/identity failure remains global. Classified table schema/row errors and TRUNCATE are isolated.
 
+Restarts under catalog denial use a clean shutdown and require the intact-index
+marker. An arbitrary SIGKILL can interrupt the index/control revision transition
+and require an index rebuild, which needs every target's catalog metadata.
+The held-commit phase still kills the caller and verifies exactly-once recovery
+after the commit completes upstream.
+
 CI runs both cases on PostgreSQL 14 and 18 (`isolation` shard), together with
 [`default_identity.py`](DEFAULT_IDENTITY.md#engine-only-run).
 
