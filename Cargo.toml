@@ -54,7 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tempfile = "3"
 proptest = "1"
 crc32fast = "1"
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "1.1"
 
