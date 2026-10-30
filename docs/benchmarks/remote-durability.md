@@ -6,6 +6,10 @@ durability is opt-in.
 
 ## Summary
 
+- With `[durability]`, memory-backed state was faster than unreplicated state
+  on a dedicated gp3 volume: 2.6–6.0% less CDC service time and 17–35% lower
+  p95 latency at 30,000 and 60,000 mutations/s. See
+  [Memory-backed state](#memory-backed-state).
 - At 30,000 and 60,000 mutations/s on real S3, replication now costs no
   measurable CDC service time or drain, after two changes from October 29: a
   commit waits only for the state it was built from, and log batches are
@@ -240,6 +244,69 @@ run on both sides, and the 2.5 s p95 commit-to-catalog gate failed on both
 sides; the Zipf and 400 s runs missed 240–1,600 transactions per run. One
 local-only Zipf run's independent reader-baseline compactor did not finish
 within its 180 s timeout on real S3 after verification had passed.
+
+## Memory-backed state
+
+October 30, 2026. With `[durability]`, object storage is the authority, so
+`state_dir` can be on tmpfs ([memory-backed state](../operations.md#memory-backed-state)).
+These runs compare that with a disk volume on the same binary, as in the
+previous section, three runs per side, every row verified. The disk side used a
+dedicated 100 GiB gp3 volume (6,000 IOPS, 400 MiB/s), so only Flow's state was
+on it, as in production with a remote source; PostgreSQL and the catalog stayed
+on the host's root volume. `benchmark.py --state-medium memory` and
+`--state-root` place the state.
+
+Local-only on the dedicated volume against `[durability]` with memory-backed
+state, `profiling` builds:
+
+| Workload | CDC service | Drain | p95 commit-to-catalog | Apply | Peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| 30k mutations/s | −2.6% | +1.0% | −26% (2.26 to 1.67 s) | −35% | +5.7% |
+| 60k mutations/s | −4.3% | +1.4% | −35% (3.16 to 2.05 s) | −26% | +7.3% |
+| Zipf, 30k mutations/s | −6.0% | +0.1% | −17% (1.96 to 1.64 s) | −38% | +17% |
+
+- Replicated, memory-backed state was faster than unreplicated state on gp3.
+  The service time ranges did not overlap at 30k and 60k mutations/s (Zipf's
+  did). Most of the gain is in index apply and the index work in preparation:
+  RocksDB's synced writes cost far less on tmpfs. Faster epochs are smaller,
+  so latency fell most.
+- With `[durability]` on both sides, `bench-fast` builds, memory-backed state
+  against the dedicated volume lowered CDC service time 4.1% and 7.1% at 30k
+  and 60k mutations/s, raised drain 2.7% at 60k, and cut p95 18% and 56%.
+  With the state volume shared with PostgreSQL, the gain was 8–10% service
+  time and 57–62% p95 at 60k mutations/s.
+- With 10-row transactions at 30,000 mutations/s requested, the single-host
+  PostgreSQL source produced only about 10,000 (about two thirds of
+  transactions were missed on both sides), so drain could not change; apply
+  fell 51% and p95 23%.
+- Memory is the cost: the row index, journal and spool live in RAM (about
+  170 MiB at the end of these runs; size it as in
+  [memory-backed state](../operations.md#memory-backed-state)), and every
+  restart restores from object storage instead of reopening local state (see
+  [large table recovery](#large-table-recovery)).
+
+The two Zipf runs that failed their gate, one per side, failed only because the
+independent reader-baseline compactor did not finish within 180 s on real S3,
+after full verification had passed.
+
+### Journal bytes in checkpoint parts
+
+Each checkpoint, every 30 s, uploads as parts the journal bytes of segments
+still retained at that moment, which the log already holds. Measured with
+`flow_durability_put_bytes_total` across the runs above:
+
+| Workload | Runs | Log per run | Parts per run | Part bytes / log bytes | Part PUTs / all log and part PUTs |
+| --- | --- | --- | --- | --- | --- |
+| Mixed, 30k mutations/s | 9 | 611 MiB | 24–112 MiB | 4–18% (median 14%) | 1.1–4.1% |
+| Mixed, 60k mutations/s | 21 | 1,110–1,200 MiB | 91–260 MiB | 8–23% (median 14%) | 3.3–9.3% |
+| Zipf, 30k mutations/s | 3 | 507–528 MiB | 37–82 MiB | 7–16% (median 15%) | 1.9–5.1% |
+| 10-row transactions, about 10k mutations/s | 6 | 247–256 MiB | 62–121 MiB | 24–48% (median 47%) | 3.0–4.7% |
+
+At most 34 part PUTs per 75 s run, about 0.45 a second, is about 1.2 million a
+month, or $6 at S3 Standard PUT prices for a continuously busy source; S3 does
+not charge for uploaded bytes, and superseded parts are deleted. Having
+checkpoints name log batches instead would save that and 4–48% of upload bytes,
+but needs a format change and longer log retention, so it is not planned.
 
 ## Limits of this evidence
 

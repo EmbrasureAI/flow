@@ -204,8 +204,12 @@ effects never wait for the budget. Garbage collection deletes each wait for a
 barrier, so a large collection pass can briefly write more than
 `max_writes_per_second`. Lease renewal is one HEAD per quarter lease.
 Checkpoints add a control snapshot, new journal parts of at most 8 MiB and a
-manifest per interval; retention deletes in batches. Journal bytes are written
-twice, once in the log and once as checkpoint parts.
+manifest per interval; retention deletes in batches. Checkpoint parts upload
+again the journal bytes of segments still retained when the checkpoint is taken:
+in the
+[benchmarks](benchmarks/remote-durability.md#journal-bytes-in-checkpoint-parts),
+4–23% of the log's bytes and at most 9% of its requests, and up to 48% of the
+bytes with small transactions. `flow_durability_put_bytes_total` reports both.
 
 ## Observability
 
