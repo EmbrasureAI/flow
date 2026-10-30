@@ -166,6 +166,20 @@ region = {json.dumps(os.environ.get('AWS_REGION', 'us-east-1'))}
             if not urlparse(self.args.s3_endpoint).hostname.endswith(".amazonaws.com"):
                 text += f'''endpoint = {json.dumps(self.args.s3_endpoint)}
 '''
+        root = self.args.state_root
+        if self.args.state_medium == "memory":
+            if not self.args.durability_uri:
+                raise ValueError("--state-medium memory requires --durability-uri")
+            root = root or Path("/dev/shm/flow-benchmark")
+            text += '''[storage]
+medium = "memory"
+'''
+        if root is not None:
+            # Behind the usual path, so reports and pruning find the state
+            # where they always do.
+            state = root / self.name
+            state.mkdir(parents=True)
+            (self.directory / "state").symlink_to(state)
         text += f'''[compaction]
 data_rewrite_scope = {json.dumps({'current': 'all', 'l0-only': 'l0-only', 'delete-only': 'disabled', 'disabled': 'disabled'}[self.args.maintenance_mode])}
 '''
@@ -1188,6 +1202,12 @@ def main():
                         help="enable remote durability under URI/<run name>, e.g. s3://bucket/prefix")
     parser.add_argument("--durability", action="append", default=[], metavar="KEY=VALUE",
                         help="override a [durability] key with a TOML value; repeatable")
+    parser.add_argument("--state-medium", choices=("disk", "memory"), default="disk",
+                        help="memory keeps state_dir in tmpfs with [storage] medium = \"memory\"; "
+                             "requires --durability-uri")
+    parser.add_argument("--state-root", type=Path,
+                        help="keep state_dir in STATE_ROOT/<run>, such as a dedicated volume "
+                             "(default: the artifact directory, or /dev/shm/flow-benchmark for memory)")
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--setup-timeout", type=float, default=600,

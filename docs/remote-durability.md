@@ -204,8 +204,12 @@ effects never wait for the budget. Garbage collection deletes each wait for a
 barrier, so a large collection pass can briefly write more than
 `max_writes_per_second`. Lease renewal is one HEAD per quarter lease.
 Checkpoints add a control snapshot, new journal parts of at most 8 MiB and a
-manifest per interval; retention deletes in batches. Journal bytes are written
-twice, once in the log and once as checkpoint parts.
+manifest per interval; retention deletes in batches. Checkpoint parts upload
+again the journal bytes of segments still retained when the checkpoint is taken:
+in the
+[benchmarks](benchmarks/remote-durability.md#journal-bytes-in-checkpoint-parts),
+4–23% of the log's bytes and at most 9% of its requests, and up to 48% of the
+bytes with small transactions. `flow_durability_put_bytes_total` reports both.
 
 ## Observability
 
@@ -220,6 +224,7 @@ deleted objects.
 | `flow_durability_put_seconds{kind}` | Object writes for `log` batches, `control` snapshots, journal `part`s and `checkpoint` manifests |
 | `flow_durability_batch_bytes`, `flow_durability_batch_records` | Size of each log batch |
 | `flow_durability_barrier_seconds{effect}` | Time external effects waited for replication: `catalog_commit` (publication commits), `catalog` (other catalog changes), `delete`, `replication_slot`, and `acknowledgement` (from computing source progress to releasing it) |
+| `flow_durability_put_bytes_total{kind}` | Bytes written, by the same kinds; row-index checkpoints are counted separately |
 | `flow_durability_retries_total{kind}` | Retried object writes, by the same kinds |
 | `flow_durability_checkpoint_seconds` | Checkpoint duration |
 | `flow_durability_control_snapshot_bytes` | Latest control snapshot size |

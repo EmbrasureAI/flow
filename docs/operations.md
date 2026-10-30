@@ -266,9 +266,13 @@ medium = "memory"
 min_free_bytes = 536870912 # memory headroom below which capture pauses
 ```
 
-It is off by default and supported only on Linux. `init` and `run` refuse to
-start unless `[durability]` is configured and `state_dir` is on tmpfs or ramfs,
-and warn about a memory-backed `state_dir` still declared as `disk`.
+It is off by default and supported only on Linux. It is also faster: on EBS gp3
+at 30,000 to 60,000 mutations/s it cut CDC service time 2.6–6.0% and p95
+publication latency 17–35% against unreplicated state on a dedicated volume
+([benchmark](benchmarks/remote-durability.md#memory-backed-state)), at the cost
+of memory and a restore from object storage on every restart. `init` and `run`
+refuse to start unless `[durability]` is configured and `state_dir` is on tmpfs
+or ramfs, and warn about a memory-backed `state_dir` still declared as `disk`.
 
 Every byte of state is then memory, so free space is the smallest of the
 filesystem's own free space, the headroom under every cgroup v2 memory limit of

@@ -190,8 +190,11 @@ From earlier development builds of `main`:
 - Opt-in `storage.medium = "memory"` for a `state_dir` on tmpfs or ramfs
   (Linux, with `[durability]`): startup verifies the filesystem, and free space
   is also bounded by the memory left under the process's cgroup v2 limits, so
-  capture pauses before memory runs out. See
-  [memory-backed state](docs/operations.md#memory-backed-state).
+  capture pauses before memory runs out. On EBS gp3 at 30,000 to 60,000
+  mutations/s it lowered CDC service time 2.6–6.0% and p95 commit-to-catalog
+  latency 17–35% against unreplicated state on a dedicated volume. See
+  [memory-backed state](docs/operations.md#memory-backed-state) and the
+  [benchmark](docs/benchmarks/remote-durability.md#memory-backed-state).
 - Maintenance scans fetch small inputs whole, a bounded number ahead
   (`parquet_read.prefetch_files`, `parquet_read.prefetch_file_bytes`), and
   fresh publications reuse the catalog head and plan they already validated,
@@ -346,6 +349,8 @@ From earlier development builds of `main`:
 
 **Remote durability metrics**
 
+- `flow_durability_put_bytes_total{kind}` counts bytes written to object
+  storage per object kind.
 - `flow_durability_barrier_seconds` has an `effect` label (`catalog_commit`,
   `catalog`, `delete`, `replication_slot`, `acknowledgement`);
   acknowledgement samples measure from computing source progress to releasing
