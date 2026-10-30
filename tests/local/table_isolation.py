@@ -131,6 +131,17 @@ class IsolationRun(Run):
             (self.name,)).fetchone()[0]) >= barrier)
         return self.compare(label)
 
+    def stop_with_intact_index(self):
+        # Isolation on restart requires an intact index. SIGKILL can interrupt
+        # the two-store revision transition and legitimately require a rebuild,
+        # which needs every target's catalog metadata, including the denied one.
+        # The separate commit_after_crash phase exercises SIGKILL recovery.
+        old = self.process
+        self.stop()
+        assert old.returncode == 0, "blocked restart did not stop cleanly"
+        assert (self.directory / "state" / "index-clean-shutdown").is_file(), \
+            "blocked restart requires a clean, intact index"
+
     def rejection(self, status, restart=False):
         pid = self.process.pid
         before = self.table("orders")
@@ -153,7 +164,7 @@ class IsolationRun(Run):
             # Deny catalog loads as well. A persisted table failure must not
             # become a startup-wide failure when reopening the same operation.
             self.proxy.reject_table("orders", status)
-            self.stop(crash=True)
+            self.stop_with_intact_index()
             tail = self.burst("while-stopped")
             self.start()
             restarted_pid = self.process.pid
@@ -161,7 +172,7 @@ class IsolationRun(Run):
             assert restored["blocked_at_ms"] == blocked["blocked_at_ms"]
             assert restored["attempts"] >= blocked["attempts"]
             # A retry may prove a rejected operation did not commit and prepare
-            # a replacement before the crash. The unresolved operation must
+            # a replacement before the stop. The unresolved operation must
             # still be present; the ambiguous-commit phase checks exact identity.
             assert restored["pending_operation"]
             evidence["after_restart"] = {"blocked": restored, "healthy": self.healthy(tail),
@@ -194,7 +205,7 @@ class IsolationRun(Run):
         dropped = [event for event in self.proxy.events[offset:]
                    if event.get("fault") == "drop-after-successful-commit"]
         assert len(dropped) == 1 and dropped[0].get("operation_id")
-        self.stop(crash=True)
+        self.stop_with_intact_index()
         self.start()
         restored = self.wait_blocked()
         assert restored["pending_operation"] == blocked["pending_operation"]
