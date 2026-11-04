@@ -33,7 +33,7 @@ flow-durability = { path = "crates/durability" }
 arrow-array = "58"
 arrow-schema = "58"
 arrow-select = "58"
-parquet = { version = "58", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "async", "zstd", "snap"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "async", "zstd", "snap"] }
 iceberg = "=0.10.1"
 iceberg-catalog-rest = "=0.10.1"
 rocksdb = { version = "=0.24.0", default-features = false, features = ["lz4", "zstd", "multi-threaded-cf", "bindgen-runtime"] }
