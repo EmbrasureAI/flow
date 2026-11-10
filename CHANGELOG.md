@@ -361,6 +361,17 @@ From earlier development builds of `main`:
 
 ### Fixed
 
+- When initializing a snapshot failed after creating a permanent replication
+  slot, for example because the exported snapshot could not be imported, the
+  slot was left behind, retaining WAL and making the next attempt fail because
+  the slot already existed. The slot is now dropped, so a retry can create it
+  again. If the drop fails, a warning is logged and the original error is
+  returned. Temporary slots are still released with their session.
+- Bounded periodic cleanup (garbage collection, snapshot expiration and
+  manifest rewrites) can use a free worker lane beside a running CDC epoch.
+  It used to need a further idle lane whenever CDC work was queued, so two busy
+  tables finishing in turns could starve it indefinitely. Builds and other
+  speculative work still leave the last lane for queued CDC.
 - Reuse observed Puffin object sizes within a delete scan, avoiding repeated
   metadata requests for shared v3 deletion vectors while preserving validation.
 - PostgreSQL date and timestamp arrays accept finite values beyond Chrono's
