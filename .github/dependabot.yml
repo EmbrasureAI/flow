@@ -13,6 +13,13 @@ updates:
       # (see vendor/iceberg-storage-opendal/LOCAL_CHANGES.md).
       - dependency-name: opendal
       - dependency-name: iceberg-storage-opendal
+      # The vendored iceberg exchanges arrow types with Flow, so arrow and
+      # parquet majors must move together with an iceberg built on the same
+      # arrow. Patch and minor updates still arrive.
+      - dependency-name: "arrow-*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: parquet
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
