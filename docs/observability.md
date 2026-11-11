@@ -533,7 +533,10 @@ Row groups also end at a row count. Compacted files and the initial copy use
 groups; CDC publication files keep 8,192 rows, so an epoch never buffers a
 larger group. Compaction still reads and rewrites in batches of 8,192 rows, and
 position reads use each file's offset index to decode only the pages holding
-the selected rows.
+the selected rows. Every data and delete file also records page statistics,
+so it carries a column index: per-page bounds that let readers skip pages
+inside a row group. A rewrite reads its inputs in commit order (data sequence
+number, then path), so rows stay in arrival order.
 
 Compaction, external reconciliation, and index rebuild share `[parquet_read]`:
 

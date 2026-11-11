@@ -156,10 +156,10 @@ pub async fn catch_up(
             let mut positions = Vec::with_capacity(batch_rows);
             let mut mapping_lookup = Duration::ZERO;
             let mut mask_spool = Duration::ZERO;
-            let mut late = output
-                .scratch
-                .position_deletes(&late_scan, &schema.table_id)
-                .peekable();
+            // The worker scans inputs in commit order, not path order, so
+            // late deletes are read per input file as its mappings begin.
+            let mut late = None;
+            let mut finished = BTreeSet::<FileId>::new();
             let mut deltas = output
                 .scratch
                 .prepared_deltas(&output.operation_id)?
@@ -189,18 +189,37 @@ pub async fn catch_up(
                     let replacement = delta
                         .replacement
                         .ok_or_else(|| anyhow::anyhow!("worker mapping lacks replacement"))?;
-                    if let Some((file, position)) = &mut previous {
-                        ensure!(
-                            (&*file, *position) < physical(&old),
-                            "worker mappings are not in input order"
-                        );
-                        if *file != old.data_file_id {
-                            file.0.clone_from(&old.data_file_id.0);
+                    // Each input's mappings are one contiguous run in position order.
+                    match &mut previous {
+                        Some((file, position)) if *file == old.data_file_id => {
+                            ensure!(
+                                *position < old.row_position,
+                                "worker mappings are not in input order"
+                            );
+                            *position = old.row_position;
                         }
-                        *position = old.row_position;
-                    } else {
-                        previous = Some((old.data_file_id.clone(), old.row_position));
+                        _ => {
+                            if let Some((file, _)) = previous.take() {
+                                finished.insert(file);
+                            }
+                            ensure!(
+                                !finished.contains(&old.data_file_id),
+                                "worker mappings are not in input order"
+                            );
+                            late = Some(
+                                output
+                                    .scratch
+                                    .file_position_deletes(
+                                        &late_scan,
+                                        &schema.table_id,
+                                        &old.data_file_id,
+                                    )
+                                    .peekable(),
+                            );
+                            previous = Some((old.data_file_id.clone(), old.row_position));
+                        }
                     }
+                    let late = late.as_mut().expect("opened for this mapping's file");
                     let deleted = loop {
                         match late.peek() {
                             Some(Err(_)) => {
