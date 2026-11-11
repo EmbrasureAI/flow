@@ -36,20 +36,20 @@ jobs:
         run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
       - name: Build PostgreSQL regression tests
         run: |
-          cargo test --locked -p flow-pg-source --test snapshot_timeout --test schema_batch --test superset_publication --no-run --message-format=json > target/pg-test-build.jsonl
+          cargo test --locked -p flow-pg-source --test snapshot_timeout --test snapshot_slots --test schema_batch --test superset_publication --no-run --message-format=json > target/pg-test-build.jsonl
           cargo test --locked --features flow-daemon/jemalloc -p flow-daemon --bin embrasure-flow --no-run --message-format=json > target/daemon-test-build.jsonl
           python3 - <<'PYTEST'
           import json
           import shutil
           from pathlib import Path
           artifacts = [json.loads(line) for name in ("pg", "daemon") for line in Path(f"target/{name}-test-build.jsonl").read_text().splitlines()]
-          for name, output in (("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("superset_publication", "superset_publication_tests"), ("embrasure-flow", "daemon_tests")):
+          for name, output in (("snapshot_slots", "snapshot_slots_tests"), ("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("superset_publication", "superset_publication_tests"), ("embrasure-flow", "daemon_tests")):
               executable, = [item["executable"] for item in artifacts if item.get("executable") and item.get("profile", {}).get("test") and item.get("target", {}).get("name") == name]
               shutil.copy2(executable, f"target/debug/{output}")
           PYTEST
       - name: Package service binaries with executable permissions and checksums
         run: |
-          binaries=(target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/schema_batch_tests target/debug/superset_publication_tests target/debug/daemon_tests)
+          binaries=(target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/snapshot_slots_tests target/debug/schema_batch_tests target/debug/superset_publication_tests target/debug/daemon_tests)
           sha256sum "${binaries[@]}" > target/service-binaries.sha256
           tar -cf "$RUNNER_TEMP/service-binaries.tar" "${binaries[@]}" target/service-binaries.sha256
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -115,6 +115,8 @@ jobs:
             suite: crash-loop
           - postgres: '18.6'
             suite: periodic-single-worker
+          - postgres: '18.6'
+            suite: periodic-with-builds
           - postgres: '18.6'
             suite: readers
           - postgres: '18.6'
@@ -200,9 +202,11 @@ jobs:
       - name: Superset publication captures only configured tables
         if: matrix.suite == 'compatibility'
         run: target/debug/superset_publication_tests live_ --ignored
-      - name: Snapshot COPY survives inherited statement timeouts
+      - name: Snapshot timeouts and replication slot lifecycle
         if: matrix.suite == 'compatibility'
-        run: target/debug/snapshot_timeout_tests --ignored
+        run: |
+          target/debug/snapshot_timeout_tests --ignored
+          target/debug/snapshot_slots_tests --ignored
       - name: Crash recovery and concurrent compaction
         # Not version-sensitive (about 170 seconds): the lifecycle shards cover the oldest and newest majors, and
         # moving it out of the compatibility shards keeps those below the longest suite.
@@ -339,6 +343,15 @@ jobs:
           --two-hot-tables --table-workers 1
           --timeout 600 --drain-timeout 900
           --artifacts "$RUNNER_TEMP/service-periodic-single-worker"
+      - name: Periodic cleanup beside native compaction
+        if: matrix.suite == 'periodic-with-builds'
+        run: >-
+          uv run tests/production/periodic_maintenance.py
+          --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
+          --binary target/debug/embrasure-flow
+          --two-hot-tables
+          --timeout 600
+          --artifacts "$RUNNER_TEMP/service-periodic-with-builds"
       - name: Composite keys, index reconstruction and journal quota recovery
         if: matrix.suite == 'lifecycle'
         run: >-

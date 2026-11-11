@@ -627,6 +627,20 @@ impl MaintenanceAdmission {
         // Pools can reserve a separate lane before starting speculative work.
         !self.source_pressure && free_workers > usize::from(table_workers > 1 && cdc_waiting)
     }
+
+    fn periodic_allowed(
+        &self,
+        table_workers: usize,
+        free_workers: usize,
+        cdc_waiting: bool,
+        cdc_running: bool,
+    ) -> bool {
+        // Periodic work is bounded and yields to a CDC dispatch between visits.
+        // An already-running CDC actor keeps its lane; requiring an additional
+        // idle lane can starve GC forever when two hot actors finish in turns.
+        self.optional_allowed(table_workers, free_workers, cdc_waiting)
+            || (!self.source_pressure && free_workers > 0 && cdc_running)
+    }
 }
 
 impl PublishRuntime {
@@ -717,6 +731,7 @@ impl PublishRuntime {
         let mut periodic_due = maintenance_due.clone();
         let mut applied = AppliedOperations::new(schemas.len().max(1));
         let mut periodic_active = false;
+        let mut cdc_running = HashSet::new();
         let mut periodic_yield_to_cdc = false;
         let mut retry_yield_to_cdc = false;
         let mut maintenance_admission = MaintenanceAdmission::default();
@@ -747,15 +762,22 @@ impl PublishRuntime {
                 running.len() + builds.len() + preparations.len() + retirements.len(),
             );
             let available = free_workers > 0;
+            let cdc_waiting = pending.has_work()
+                || pending.has_runnable_unloaded(ledger, &excluded)
+                || ledger.watermarks().journal_durable_lsn < capture_goal;
+            let disk_available = !crate::disk::capture_paused_for_space(&config.state_dir);
             let optional_allowed = maintenance_admission.optional_allowed(
                 config.limits.table_workers,
                 free_workers,
-                pending.has_work()
-                    || pending.has_runnable_unloaded(ledger, &excluded)
-                    || ledger.watermarks().journal_durable_lsn < capture_goal,
-            ) && !crate::disk::capture_paused_for_space(&config.state_dir);
+                cdc_waiting,
+            ) && disk_available;
             let cdc_deadline = scheduler.next_deadline();
-            let periodic_allowed = optional_allowed
+            let periodic_allowed = maintenance_admission.periodic_allowed(
+                config.limits.table_workers,
+                free_workers,
+                cdc_waiting,
+                !cdc_running.is_empty(),
+            ) && disk_available
                 && !periodic_active
                 && !(periodic_yield_to_cdc
                     && cdc_deadline.is_some_and(|due| due <= Instant::now()));
@@ -873,6 +895,7 @@ impl PublishRuntime {
                     // The actor may have applied, recovered or retired operations.
                     applied.invalidate();
                     busy.remove(&id);
+                    cdc_running.remove(&id);
                     retrying.remove(&id);
                     if let Some(lane) = finalization_lane {
                         lane.record_release(id, Instant::now());
@@ -1223,13 +1246,16 @@ impl PublishRuntime {
                         let free_workers = config.limits.table_workers.saturating_sub(
                             running.len() + builds.len() + preparations.len() + retirements.len()
                         );
+                        let cdc_waiting = pending.has_work()
+                            || pending.has_runnable_unloaded(ledger, &excluded)
+                            || ledger.watermarks().journal_durable_lsn < capture_goal;
+                        let disk_available = !crate::disk::capture_paused_for_space(&config.state_dir);
                         let optional_allowed = maintenance_admission.optional_allowed(
-                            config.limits.table_workers,
-                            free_workers,
-                            pending.has_work()
-                                || pending.has_runnable_unloaded(ledger, &excluded)
-                                || ledger.watermarks().journal_durable_lsn < capture_goal,
-                        ) && !crate::disk::capture_paused_for_space(&config.state_dir);
+                            config.limits.table_workers, free_workers, cdc_waiting,
+                        ) && disk_available;
+                        let periodic_allowed = maintenance_admission.periodic_allowed(
+                            config.limits.table_workers, free_workers, cdc_waiting, !cdc_running.is_empty(),
+                        ) && disk_available;
                         let prepared = ready_preparations
                             .keys()
                             .find(|id| !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none())
@@ -1251,7 +1277,7 @@ impl PublishRuntime {
                         let cdc_ready = scheduler.next_deadline().is_some_and(|due| due <= now);
                         // One periodic visit at a time; ready CDC must receive a
                         // dispatch between visits even across different tables.
-                        let periodic = if optional_allowed && !(periodic_yield_to_cdc && cdc_ready) {
+                        let periodic = if periodic_allowed && !(periodic_yield_to_cdc && cdc_ready) {
                             next_periodic_visit(&periodic_due, periodic_active, now, |id| {
                                 !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
                                     && !build_active.contains(id) && !retiring_builds.contains(id)
@@ -1421,6 +1447,9 @@ impl PublishRuntime {
                             scheduler.stall(id, true);
                         }
                         busy.insert(id);
+                        if !transactions.is_empty() {
+                            cdc_running.insert(id);
+                        }
                         scheduler.stall(id, true);
                         let finalization_lane = candidate.as_ref().and_then(|candidate| {
                             candidate.activation_stall_started().map(|stall_started| FinalizationLane {
@@ -1580,6 +1609,24 @@ mod maintenance_admission_tests {
     }
 
     #[test]
+    fn periodic_work_can_use_a_free_lane_beside_running_cdc_without_admitting_builds() {
+        let mut admission = MaintenanceAdmission::default();
+        // Two hot tables need not finish at the same instant for bounded GC
+        // to run. The remaining CDC actor keeps making source progress.
+        assert!(admission.periodic_allowed(2, 1, true, true));
+        assert!(!admission.optional_allowed(2, 1, true));
+        // A build occupying the other lane is not CDC progress: preserve the
+        // last free slot for queued source work in that case.
+        assert!(!admission.periodic_allowed(2, 1, true, false));
+        assert!(!admission.periodic_allowed(2, 0, true, true));
+        assert!(admission.periodic_allowed(1, 1, true, false));
+        admission.observe(SourceHealthStatus::Warning);
+        assert!(!admission.periodic_allowed(2, 1, true, true));
+        admission.observe(SourceHealthStatus::Healthy);
+        assert!(admission.periodic_allowed(2, 1, true, true));
+    }
+
+    #[test]
     fn a_periodic_visit_that_only_recovers_keeps_later_periodic_visits_running() {
         let start = Instant::now();
         let (recovered, quiet) = (TableId(1), TableId(2));
@@ -1633,7 +1680,7 @@ mod maintenance_admission_tests {
     }
 
     #[test]
-    fn maintenance_cannot_take_the_last_lane_during_a_cdc_permit_gap() {
+    fn speculative_work_cannot_take_the_last_lane_during_a_cdc_permit_gap() {
         let admission = MaintenanceAdmission::default();
         let now = Instant::now();
         let mut scheduler = Scheduler::new(10_000, 32 << 20, 1, now).unwrap();
@@ -1656,8 +1703,8 @@ mod maintenance_admission_tests {
         );
         assert!(scheduler.next_deadline().unwrap() > now);
 
-        // One CDC actor is running. A periodic visit and a build may use two
-        // more lanes, but the next probe must leave room for the queued epoch.
+        // One CDC actor is running. Speculative work may use two more lanes,
+        // but the next probe must leave room for the queued epoch.
         let mut free_workers = 3;
         while admission.optional_allowed(4, free_workers, true) {
             free_workers -= 1;

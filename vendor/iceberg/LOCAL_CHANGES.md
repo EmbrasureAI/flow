@@ -66,6 +66,7 @@ patch -p1 < docs/patches/iceberg-v3.patch
 patch -p1 < docs/patches/iceberg-source-nullability.patch
 patch -p1 < docs/patches/iceberg-debug-redaction.patch
 patch -p1 < docs/patches/iceberg-dv-observed-size.patch
+patch -p1 < docs/patches/iceberg-scan-shared-entry.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is
@@ -96,6 +97,12 @@ range/footer/blob/bitmap validation. Flow's delete staging uses this to avoid
 repeating HEAD for descriptors sharing a Puffin file. Changed files:
 `src/puffin/deletion_vector.rs` and `src/puffin/mod.rs`. See
 `docs/patches/iceberg-dv-observed-size.patch`.
+
+The scan cleanup removes an obsolete TODO about an expensive manifest-entry
+clone and uses `Arc::clone` explicitly. Manifest entries are already shared
+through `ManifestEntryRef`, so this does not change behavior or improve
+performance. Changed file: `src/scan/context.rs`. See
+`docs/patches/iceberg-scan-shared-entry.patch`.
 
 The conditional-create patch adds `Storage::write_if_absent` and
 `Storage::writer_if_absent`, and `OutputFile::if_absent`, which routes the

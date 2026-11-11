@@ -106,12 +106,13 @@ class PeriodicRun(FairnessRun):
             expired = all(s["snapshot-id"] != self.expirable for s in metadata["snapshots"])
             reclaimed = expired and self.missing(self.expirable_manifest)
             json_reclaimed = self.missing(self.expirable_json)
-            saw_json_reclamation |= json_reclaimed
-            if (rewrite and not saw_rewrite) or (expired and not saw_expiration) or (reclaimed and not saw_reclamation):
+            if ((rewrite and not saw_rewrite) or (expired and not saw_expiration)
+                    or (reclaimed and not saw_reclamation) or (json_reclaimed and not saw_json_reclamation)):
                 observations.append({"seconds": round(time.monotonic() - started, 3),
                                      "orders_lsn": source_lsn, "status": status,
                                      "manifest_rewrite": rewrite, "snapshot_expired": expired,
                                      "manifest_list_deleted": reclaimed, "metadata_json_deleted": json_reclaimed})
+            saw_json_reclamation |= json_reclaimed
             saw_rewrite |= rewrite
             saw_expiration |= expired
             saw_reclamation |= reclaimed
