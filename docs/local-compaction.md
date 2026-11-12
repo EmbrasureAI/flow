@@ -132,11 +132,11 @@ and cleaned up.
   late deletes. Flow never leaves an index entry on a deleted row, so equal
   counts mean the same row set. Output live counts are record counts minus masks.
 - Activation stages the remap in the operation's delta namespace instead of
-  per-row deltas. The final apply batch stores one `file_remaps` record per
-  retired input, deletes the input counts, adds the output counts and checks
-  that both sums agree, atomically with the table transition. Ambiguous commit,
-  discard and restart recovery are unchanged; the staged remap is replayed or
-  dropped with its operation.
+  per-row deltas. The final apply batch stores one `file_remaps` header and its
+  `file_remap_chunks` per retired input, deletes the input counts, adds the
+  output counts and checks that both sums agree, atomically with the table
+  transition. Ambiguous commit, discard and restart recovery are unchanged; the
+  staged remap is replayed or dropped with its operation.
 - Primary-key and reverse entries keep their raw location. Every forward read
   (`lookup`, `lookup_many`, index snapshots, collapse binding and the apply
   compare-and-swap) translates a raw location in a retired file, following
@@ -153,6 +153,29 @@ and cleaned up.
   CDC deletes and updates write deletion vectors for the output files, merged
   with any catch-up mask already there, and never for a retired input.
 
+### Remap storage
+
+A remap is a list of runs, ordered by old position. Runs are encoded in
+chunks of up to 512, each varint-encoded relative to the previous run, with a
+restart point every 32 runs that records the decoder state. A run that follows
+the previous one in the same output costs about two bytes, and the restart
+points add about 0.7 bytes per run. A rewrite that keeps every input contiguous
+needs one chunk per input file. A rewrite that interleaves inputs, such as a
+merge of sorted files, records about one run per moved row, at about three
+bytes each instead of 28.
+
+The worker keeps its remaps encoded in memory as it pushes rows, and stages
+them that way. In the index, `file_remaps` holds a small header per retired
+file (its targets, row and run counts and each chunk's range) and
+`file_remap_chunks` holds the chunks, keyed by the header's key and the chunk's
+first old position. A forward read seeks the header, then reads only the chunk
+that covers the position, under the reader's own snapshot, and decodes at most
+32 runs from the nearest restart point without allocating. Encoded chunks are
+cached across reads up to 64 MiB (`flow_memory_index_remap_cache_bytes`, about
+20 million runs), and each lookup batch keeps the chunks it read. Records written by earlier
+releases, one `file_remaps` value per retired file, are still read, translated
+and cleaned up; they are not rewritten.
+
 ### Remap cleanup
 
 Each remap stays until no raw entry or other remap needs it, and every hop of a
@@ -163,7 +186,8 @@ in each full visit, without the table fence:
    translates into, which costs one seek per file. CDC that updates or deletes
    the moved rows makes most remaps free this way.
 2. While more than `remap_max_files` (default 512) retired files keep a remap,
-   or a chain is longer than `remap_max_depth` (default 8) hops, it
+   a chain is longer than `remap_max_depth` (default 8) hops, or the table's
+   remaps take more than `remap_max_bytes` (default 256 MiB), it
    materializes the retired file at the root of the longest chain: raw entries
    are rewritten to their translated location in row-lock batches of
    `limits.batch_rows`, like an apply, and the remap is dropped once the file is
@@ -176,18 +200,22 @@ next pass resumes. A remap's targets are always fresh outputs, so a remap never
 gains a referrer and a retired file never gains raw entries; dropping a root
 changes no other chain. Cold rows are therefore rewritten about once per
 `remap_max_depth + 1` rewrites of their data instead of once per rewrite.
-`flow_index_remap_files` and `flow_index_remap_max_depth` report the current
-size, and `index_remaps_cleaned` events the work done.
+`flow_index_remap_files`, `flow_index_remap_max_depth` and
+`flow_index_remap_bytes` report the current size, and `index_remaps_cleaned`
+events the work done. Dropping a remap deletes its header and every chunk.
 
 ### Downgrade
 
-Every row index this release opens has the `file_remaps` column family, even
-with `lazy_index_remap = false` and no remaps. A binary that predates the
-family lists only the older ones, and RocksDB refuses to open the index
-(`Column families not opened: file_remaps`) before anything is read or
-written, so an older binary fails at startup instead of misreading raw entries
-in retired files. Run this release or a newer one on that state directory; the
-flag does not make an index readable by older binaries.
+Every row index this release opens has the `file_remaps` and
+`file_remap_chunks` column families, even with `lazy_index_remap = false` and
+no remaps. A binary that predates either lists only the older ones, and RocksDB
+refuses to open the index (`Column families not opened: file_remap_chunks`)
+before anything is read or written. An older binary therefore fails at startup
+instead of misreading raw entries in retired files, or reading a chunked
+header as a single-value remap. Run this release or a newer one on that state
+directory; the flag does not make an index readable by older binaries.
+Upgrading needs no step: the new family is created at open, and existing remaps
+stay readable.
 
 ## Consolidation-first delete debt
 

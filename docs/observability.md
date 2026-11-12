@@ -140,7 +140,7 @@ No separate export task is created.
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
 | `flow_epoch_sort_total` | Epochs of sorted tables by `result`: `already_sorted`, `sorted` (reordered in memory), `unsortable` (a sort value was carried forward) and `disk` (collapsed on disk, written in key-encoding order) |
-| `flow_index_remap_files`, `flow_index_remap_max_depth` | Retired data files whose lazy index remap is still kept, and the longest translation chain in hops; periodic maintenance keeps them within `remap_max_files` and `remap_max_depth` |
+| `flow_index_remap_files`, `flow_index_remap_max_depth`, `flow_index_remap_bytes` | Retired data files whose lazy index remap is still kept, the longest translation chain in hops, and the bytes of their records and chunks; periodic maintenance keeps them within `remap_max_files`, `remap_max_depth` and `remap_max_bytes` |
 | `flow_index_remaps_dropped_total`, `flow_index_remap_rows_materialized_total` | Remaps dropped by cleanup, and index entries it rewrote to their translated location |
 | `flow_compaction_finalization_actor_lane_hold_seconds` | Completed data-build finalization from actual table-lane reservation through cleanup and lane release |
 | `flow_compaction_preparation_handoff_actor_lane_hold_seconds` | Actor time used to validate and hand a completed build to detached preparation; separate from finalization |

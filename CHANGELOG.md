@@ -37,6 +37,10 @@ From earlier development builds of `main`:
   effect waits, instead of whenever `max_writes_per_second` allows; `0`
   restores the earlier writes. Source acknowledgements are released up to the
   interval later. `flow_durability_barrier_seconds` gains an `effect` label.
+- The row index also gains a `file_remap_chunks` column family. Builds without
+  it refuse to open the index (`Column families not opened:
+  file_remap_chunks`) without changing it. Lazy remaps already committed stay
+  readable and are translated and cleaned up as before; no step is needed.
 
 ### Added
 
@@ -258,6 +262,20 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- Lazy index remaps are stored in chunks of up to 512 runs, varint-encoded with
+  a restart point every 32 runs, at about three bytes per run instead of 28,
+  with a small header per retired file. A forward read through a retired file
+  reads only the chunk covering its position and decodes at most 32 runs,
+  instead of fetching the file's whole remap on every lookup batch, and
+  remaps no longer accumulate in memory without bound: encoded chunks are
+  cached up to 64 MiB. For a 4M-row two-input interleaved remap, the shape a
+  merge of sorted files produces, the index stores 11 MB instead of 112 MB and
+  a random lookup costs 8.7 µs instead of 90 µs, against 6.7 µs with no remap.
+  On an update-heavy workload the rewrites' remaps took 3.3 bytes per run and
+  CDC service time was 5.5% lower; on the default mixed workload it was
+  unchanged. `[compaction] remap_max_bytes` (default 256 MiB) bounds a table's
+  remaps alongside the file and depth limits; `flow_index_remap_bytes` and
+  `flow_memory_index_remap_cache_bytes` report them.
 - With remote durability, a publication's catalog commit waits only for the
   replicated state it was built from, up to its artifact registration, instead
   of the newest log record, and log batches are written by size and age or as

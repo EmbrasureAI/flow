@@ -416,6 +416,10 @@ fn sample_memory_budgets(
                     "flow_memory_index_table_reader_bytes",
                     index.table_reader_bytes,
                 ),
+                (
+                    "flow_memory_index_remap_cache_bytes",
+                    index.remap_cache_bytes,
+                ),
             ] {
                 metrics::gauge!(name).set(value as f64);
             }
@@ -501,7 +505,9 @@ pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
 pub(crate) fn table_remaps(table: TableId, stats: &flow_state_store::RemapStats) {
     let table = table.0.to_string();
     metrics::gauge!("flow_index_remap_files", "table_id" => table.clone()).set(stats.files as f64);
-    metrics::gauge!("flow_index_remap_max_depth", "table_id" => table).set(stats.max_depth as f64);
+    metrics::gauge!("flow_index_remap_max_depth", "table_id" => table.clone())
+        .set(stats.max_depth as f64);
+    metrics::gauge!("flow_index_remap_bytes", "table_id" => table).set(stats.bytes as f64);
 }
 
 #[cfg(test)]

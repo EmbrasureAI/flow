@@ -269,6 +269,8 @@ pub struct Policy {
     pub remap_max_files: u64,
     /// ... or while a translation chain has more hops than this.
     pub remap_max_depth: u64,
+    /// ... or while the table's remap records and chunks take more bytes.
+    pub remap_max_bytes: u64,
     /// Index entries one periodic visit may rewrite while materializing.
     pub remap_cleanup_rows: u64,
 }
@@ -310,6 +312,7 @@ impl Default for Policy {
             target_delete_min_file_bytes: 128 << 20,
             remap_max_files: 512,
             remap_max_depth: 8,
+            remap_max_bytes: 256 << 20,
             remap_cleanup_rows: 32_768,
         }
     }
@@ -442,6 +445,7 @@ impl Policy {
         flow_state_store::RemapLimits {
             max_files: self.remap_max_files,
             max_depth: self.remap_max_depth,
+            max_bytes: self.remap_max_bytes,
             max_rows: self.remap_cleanup_rows,
         }
     }
