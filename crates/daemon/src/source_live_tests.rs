@@ -202,6 +202,10 @@ async fn live_busy_slot_waits_and_row_errors_block_only_their_table() {
     let root = tempfile::tempdir().unwrap();
     let mut config: Config = toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
     config.state_dir = root.path().join("state");
+    // Compaction is off here, so an L0 age limit would pause publication once a
+    // slow runner takes longer than it; these tests do not exercise that.
+    config.compaction.oldest_l0_soft_ms = 3_600_000;
+    config.compaction.oldest_l0_hard_ms = 7_200_000;
     config.source.id = name.clone();
     config.source.connection_env = "FLOW_POSTGRES_URL".into();
     config.source.slot = name.clone();
@@ -362,6 +366,10 @@ async fn carries_unchanged_toast_values_forward(switch_from_full: bool) {
     let root = tempfile::tempdir().unwrap();
     let mut config: Config = toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
     config.state_dir = root.path().join("state");
+    // Compaction is off here, so an L0 age limit would pause publication once a
+    // slow runner takes longer than it; these tests do not exercise that.
+    config.compaction.oldest_l0_soft_ms = 3_600_000;
+    config.compaction.oldest_l0_hard_ms = 7_200_000;
     config.source.id = name.clone();
     config.source.connection_env = "FLOW_POSTGRES_URL".into();
     config.source.slot = name.clone();
