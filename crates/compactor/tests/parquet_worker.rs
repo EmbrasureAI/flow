@@ -335,3 +335,359 @@ async fn parquet_compaction_applies_position_deletes_and_stock_reader_sees_ident
         0
     );
 }
+
+/// Commit one file of `ids` and index it, returning the refreshed table.
+async fn commit_rows(
+    catalog: &impl Catalog,
+    table: &iceberg::table::Table,
+    index: &StateStore,
+    schema: &TableSchema,
+    operation_id: &str,
+    ids: std::ops::Range<i64>,
+    lsn: u64,
+) -> (iceberg::table::Table, FileId) {
+    let rows: Vec<Row> = ids
+        .map(|id| vec![Value::Int64(id), Value::String(format!("row-{id}"))])
+        .collect();
+    let mut writer = DataWriter::new(
+        table.file_io().clone(),
+        table.metadata().location(),
+        &OperationId(operation_id.into()),
+        schema.clone(),
+        0,
+        WriterConfig::default(),
+    )
+    .unwrap();
+    let locations = writer.write(&rows, PgLsn(lsn)).await.unwrap().locations;
+    let files = writer.close().await.unwrap();
+    let file = FileId(files[0].file_path().into());
+    let committed = RowDeltaAction::new(table, operation_id)
+        .add_data_files(files)
+        .commit(catalog, table)
+        .await
+        .unwrap();
+    let base = table.metadata().current_snapshot_id();
+    index
+        .prepare(
+            operation(operation_id, OperationKind::Ingest, base, lsn),
+            rows.iter()
+                .zip(locations)
+                .map(|(row, location)| IndexDelta {
+                    key: schema.encode_key(row).unwrap(),
+                    expected: None,
+                    replacement: Some(location),
+                }),
+        )
+        .unwrap();
+    let id = OperationId(operation_id.into());
+    index
+        .mark_committed(&id, committed.snapshot_id, committed.sequence_number)
+        .unwrap();
+    index.apply_committed(&id).unwrap();
+    (committed.table, file)
+}
+
+/// A keyed table with three committed files whose path order is the reverse of
+/// their commit order, as with Flow's random artifact names.
+struct ReversedInputs {
+    _temp: TempDir,
+    root: std::path::PathBuf,
+    index: StateStore,
+    schema: TableSchema,
+    catalog: iceberg::memory::MemoryCatalog,
+    table: iceberg::table::Table,
+    /// Inputs in commit order; ids 0..4, 4..8 and 8..12.
+    files: [FileId; 3],
+}
+
+async fn reversed_inputs() -> ReversedInputs {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().to_owned();
+    let index = StateStore::open(root.join("index"), StateStoreOptions::default()).unwrap();
+    let schema = TableSchema {
+        table_id: TableId(1),
+        version: 0,
+        columns: vec![
+            Column {
+                field_id: 1,
+                name: "id".into(),
+                data_type: ColumnType::Int64,
+                nullable: false,
+            },
+            Column {
+                field_id: 2,
+                name: "value".into(),
+                data_type: ColumnType::String,
+                nullable: true,
+            },
+        ],
+        primary_key: vec![0],
+        append_only: false,
+    };
+    let catalog = MemoryCatalogBuilder::default()
+        .load(
+            "order-test",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://warehouse".into())]),
+        )
+        .await
+        .unwrap();
+    let namespace = NamespaceIdent::new("test".into());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .unwrap();
+    let table = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("data".into())
+                .schema(iceberg_schema(&schema).unwrap())
+                .format_version(FormatVersion::V2)
+                .build(),
+        )
+        .await
+        .unwrap();
+    let (table, first) = commit_rows(&catalog, &table, &index, &schema, "zz-first", 0..4, 10).await;
+    let (table, second) =
+        commit_rows(&catalog, &table, &index, &schema, "mm-second", 4..8, 20).await;
+    let (table, third) =
+        commit_rows(&catalog, &table, &index, &schema, "aa-third", 8..12, 30).await;
+    assert!(third < second && second < first);
+    ReversedInputs {
+        _temp: temp,
+        root,
+        index,
+        schema,
+        catalog,
+        table,
+        files: [first, second, third],
+    }
+}
+
+async fn plan_all(
+    table: &iceberg::table::Table,
+    files: &[FileId],
+    lazy_index_remap: bool,
+) -> CompactionPlan {
+    let view = SnapshotView::current(table).await.unwrap();
+    CompactionPlan {
+        base_snapshot_id: table.metadata().current_snapshot_id().unwrap(),
+        schema_id: 0,
+        input_bytes: files
+            .iter()
+            .map(|file| view.live_files[&file.0].data_file.file_size_in_bytes())
+            .sum(),
+        input_files: files.iter().cloned().collect(),
+        delete_files: BTreeSet::new(),
+        spec_id: 0,
+        partition: vec![],
+        output_level: Level::L1,
+        target_file_bytes: 128 << 20,
+        delete_input_bytes: 0,
+        delete_input_rows: 0,
+        lazy_index_remap,
+        per_target_deletes: false,
+        target_ranges: Default::default(),
+        reason: flow_compactor::PlanReason::L0Debt,
+    }
+}
+
+#[tokio::test]
+async fn compaction_keeps_commit_order_and_writes_page_indexes() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::file::serialized_reader::ReadOptionsBuilder;
+
+    let ReversedInputs {
+        root,
+        index,
+        schema,
+        table,
+        files,
+        _temp: _guard,
+        ..
+    } = reversed_inputs().await;
+    let plan = plan_all(&table, &files, true).await;
+    let scratch = StateStore::open(root.join("scratch"), StateStoreOptions::default()).unwrap();
+    let output = compact(
+        &table,
+        schema.clone(),
+        plan,
+        OperationId("compact".into()),
+        &index,
+        scratch,
+        WriterConfig::default(),
+        &flow_compactor::ReadLimits::default(),
+        &flow_iceberg_ext::ManifestCache::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.data_files.len(), 1);
+    let bytes = table
+        .file_io()
+        .new_input(output.data_files[0].file_path())
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for batch in ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+        .unwrap()
+        .build()
+        .unwrap()
+    {
+        let batch = batch.unwrap();
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        ids.extend(column.values().iter().copied());
+    }
+    assert_eq!(ids, (0..12).collect::<Vec<_>>(), "rows follow commit order");
+    let reader = SerializedFileReader::new_with_options(
+        bytes,
+        ReadOptionsBuilder::new().with_page_index().build(),
+    )
+    .unwrap();
+    let metadata = reader.metadata();
+    assert!(
+        metadata
+            .column_index()
+            .is_some_and(|groups| !groups.is_empty()),
+        "page statistics produce a column index"
+    );
+    assert!(metadata.offset_index().is_some());
+}
+
+/// The per-row path (keyless tables, or lazy remap off) joins the worker's
+/// mappings, which follow commit order, with late deletes stored in path order.
+/// Late deletes on the first and last committed inputs, whose path order is
+/// reversed, must both mask their rows at catch-up and at publication.
+#[tokio::test]
+async fn per_row_catch_up_masks_late_deletes_on_commit_ordered_inputs() {
+    let ReversedInputs {
+        root,
+        index,
+        schema,
+        catalog,
+        table: base,
+        files,
+        _temp: _guard,
+    } = reversed_inputs().await;
+    let plan = plan_all(&base, &files, false).await;
+    let built = flow_compactor::build_data(
+        &base,
+        schema.clone(),
+        plan,
+        OperationId("rewrite".into()),
+        &index,
+        StateStore::open(root.join("scratch"), StateStoreOptions::default()).unwrap(),
+        WriterConfig::default(),
+        &flow_compactor::ReadLimits::default(),
+        &flow_iceberg_ext::ManifestCache::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await
+    .unwrap();
+
+    // Delete id 1 (first commit, last by path) and id 9 (last commit, first by path).
+    let originals: Vec<_> = [1, 9]
+        .map(|id| {
+            let key = schema.encode_key_values(&[Value::Int64(id)]).unwrap();
+            let location = index.lookup(&schema.table_id, &key).unwrap().unwrap();
+            (key, location)
+        })
+        .into();
+    let mut locations: Vec<_> = originals
+        .iter()
+        .map(|(_, location)| location.clone())
+        .collect();
+    locations
+        .sort_by(|a, b| (&a.data_file_id, a.row_position).cmp(&(&b.data_file_id, b.row_position)));
+    let mut writer = DeleteWriter::new(
+        base.file_io().clone(),
+        base.metadata().location(),
+        &OperationId("late".into()),
+        0,
+        WriterConfig::default(),
+    )
+    .unwrap();
+    writer.write(&locations).await.unwrap();
+    let late = RowDeltaAction::new(&base, "late")
+        .add_delete_files(writer.close().await.unwrap())
+        .validate_data_files_exist(
+            locations
+                .iter()
+                .map(|location| location.data_file_id.0.clone()),
+        )
+        .commit(&catalog, &base)
+        .await
+        .unwrap();
+    index
+        .prepare(
+            operation(
+                "late",
+                OperationKind::Ingest,
+                base.metadata().current_snapshot_id(),
+                40,
+            ),
+            originals.into_iter().map(|(key, original)| IndexDelta {
+                key,
+                expected: Some(original),
+                replacement: None,
+            }),
+        )
+        .unwrap();
+    let late_id = OperationId("late".into());
+    index
+        .mark_committed(&late_id, late.snapshot_id, late.sequence_number)
+        .unwrap();
+    index.apply_committed(&late_id).unwrap();
+
+    let counts = files
+        .iter()
+        .cloned()
+        .zip(
+            index
+                .file_live_row_counts(&schema.table_id, Some(late.snapshot_id), &files)
+                .unwrap(),
+        )
+        .collect();
+    let mut staged = Vec::new();
+    let output = flow_compactor::catch_up(
+        &late.table,
+        &schema,
+        &flow_iceberg_ext::CommitBase::new(&base),
+        built,
+        &index,
+        &counts,
+        &flow_compactor::Policy::default(),
+        WriterConfig::default(),
+        &flow_compactor::ReadLimits::default(),
+        &flow_iceberg_ext::ManifestCache::default(),
+        |deltas| {
+            staged.extend(deltas);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let survivors: BTreeSet<_> = [0, 2, 3, 4, 5, 6, 7, 8, 10, 11]
+        .map(|id| schema.encode_key_values(&[Value::Int64(id)]).unwrap())
+        .into();
+    assert_eq!(
+        staged
+            .iter()
+            .map(|delta| delta.key.clone())
+            .collect::<BTreeSet<_>>(),
+        survivors,
+        "catch-up stages exactly the surviving rows"
+    );
+    let published = output
+        .index_deltas()
+        .unwrap()
+        .map(|delta| delta.unwrap().key)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(published, survivors, "publication omits masked rows");
+}

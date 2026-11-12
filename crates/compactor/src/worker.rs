@@ -59,11 +59,10 @@ impl WorkerOutput {
         &self,
     ) -> flow_state_store::Result<impl Iterator<Item = flow_state_store::Result<IndexDelta>> + '_>
     {
-        let mut masked = self.masked_inputs.as_ref().map(|scan| {
-            self.scratch
-                .position_deletes(scan, &self.table_id)
-                .peekable()
-        });
+        // Mappings follow the worker's commit-order scan, so the masked
+        // positions are read per input file as its mappings begin.
+        let mut masked = None;
+        let mut masked_file = None::<FileId>;
         let mut deltas = self.scratch.prepared_deltas(&self.operation_id)?;
         Ok(std::iter::from_fn(move || {
             loop {
@@ -71,7 +70,7 @@ impl WorkerOutput {
                     Ok(delta) => delta,
                     Err(error) => return Some(Err(error)),
                 };
-                let Some(masked) = &mut masked else {
+                let Some(scan) = &self.masked_inputs else {
                     return Some(Ok(delta));
                 };
                 let Some(expected) = delta.expected.as_ref() else {
@@ -79,6 +78,15 @@ impl WorkerOutput {
                         "worker mapping lacks original".into(),
                     )));
                 };
+                if masked_file.as_ref() != Some(&expected.data_file_id) {
+                    masked = Some(
+                        self.scratch
+                            .file_position_deletes(scan, &self.table_id, &expected.data_file_id)
+                            .peekable(),
+                    );
+                    masked_file = Some(expected.data_file_id.clone());
+                }
+                let masked = masked.as_mut().expect("opened for this mapping's file");
                 loop {
                     let Some(position) = masked.peek() else {
                         return Some(Ok(delta));
@@ -361,7 +369,7 @@ pub async fn build_data(
         table,
         &schema,
         &view,
-        &plan.input_files,
+        &commit_order(&view, &plan.input_files)?,
         &scratch,
         &operation_id.0,
         batch_rows,
@@ -816,7 +824,7 @@ async fn scan_staged_live_files(
         table,
         schema,
         view,
-        files,
+        &files.iter().collect::<Vec<_>>(),
         scratch,
         scan_id,
         batch_rows,
@@ -880,6 +888,28 @@ struct LiveColumns {
     lineage: Option<Vec<flow_materializer::RowLineage>>,
 }
 
+/// Data rewrite inputs in commit order: data sequence number, then path. Files
+/// written by one operation share a sequence and their paths number them in
+/// write order. Paths alone start with a random operation ID, so path order
+/// would interleave epochs at random and spread every output row group over
+/// the key and time ranges of all its inputs. Commit order keeps an
+/// append-mostly table's rows in arrival order through every rewrite. Scans
+/// that write no data, such as reconciliation and index rebuild, keep path order.
+fn commit_order<'a>(view: &SnapshotView, files: &'a BTreeSet<FileId>) -> Result<Vec<&'a FileId>> {
+    let mut ordered = files
+        .iter()
+        .map(|file| {
+            let entry = view
+                .live_files
+                .get(&file.0)
+                .ok_or_else(|| anyhow::anyhow!("scan input {} is not live", file.0))?;
+            Ok((entry.sequence_number, file))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort();
+    Ok(ordered.into_iter().map(|(_, file)| file).collect())
+}
+
 /// Data scan after delete staging. The caller owns the scratch namespace and
 /// must stage every applicable delete before entering this loop. Batches stay
 /// columnar: deleted rows are filtered out and the rest are not copied.
@@ -888,7 +918,7 @@ async fn scan_staged_live_columns(
     table: &Table,
     schema: &TableSchema,
     view: &SnapshotView,
-    files: &BTreeSet<FileId>,
+    files: &[&FileId],
     scratch: &StateStore,
     scan_id: &str,
     batch_rows: usize,
@@ -908,7 +938,7 @@ async fn scan_staged_live_columns(
         }),
         read_limits,
     );
-    for file in files {
+    for &file in files {
         check_cancelled(cancelled)?;
         let source = prefetch.next(&file.0).await?;
         let mut deletes = scratch.file_position_deletes(scan_id, &schema.table_id, file);

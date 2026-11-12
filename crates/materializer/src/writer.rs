@@ -70,10 +70,13 @@ impl WriterConfig {
             self.batch_limit() <= i32::MAX as usize,
             "writer batch limit exceeds Arrow's variable-width offset range"
         );
+        // Page statistics add the column index: per-page bounds that let
+        // readers skip pages inside a row group, not just whole row groups.
+        // Every file keeps the offset index, which position reads also use.
         Ok(WriterProperties::builder()
             .set_compression(self.compression)
             .set_max_row_group_row_count(Some(self.row_group_rows))
-            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .set_statistics_enabled(EnabledStatistics::Page)
             .build())
     }
 

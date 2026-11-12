@@ -120,7 +120,8 @@ and cleaned up.
 - A strict rewrite fences the table from its build base through publication,
   so it needs no catch-up: its remap is the worker's runs and every output row
   is live.
-- The worker writes each input file's survivors in input order, so it records
+- The worker reads inputs in commit order (data sequence number, then path)
+  and writes each input file's survivors in input order, so it records
   only runs `(old start, output file, new start, length)`. Runs break at
   positions deleted at the build base and at output-file rotation: the remap is
   O(files + deleted positions), not O(rows).

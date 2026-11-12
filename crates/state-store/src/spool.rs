@@ -418,7 +418,9 @@ impl StateStore {
         transaction: &str,
         table: &TableId,
         file: &flow_model::FileId,
-    ) -> impl Iterator<Item = Result<RowLocation>> + 'a {
+    ) -> impl Iterator<Item = Result<RowLocation>> + use<'a> {
+        // Only the store is borrowed: the prefix is owned, so callers may
+        // keep the cursor after the file identity they passed is dropped.
         let mut prefix = delete_prefix(transaction, table);
         for byte in file.0.bytes() {
             prefix.push(byte);

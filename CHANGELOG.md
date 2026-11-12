@@ -346,6 +346,17 @@ From earlier development builds of `main`:
   alongside it. CDC publication files keep 8,192 rows, compaction keeps
   8,192-row batches, and position reads use the offset index to skip pages.
   Set the limit to 8192 for the previous layout.
+- Data and delete files record page statistics, so each carries a Parquet
+  column index (per-page bounds) as well as the offset index. Readers that use
+  it, such as Trino, Spark and DataFusion, can skip pages inside a row group.
+- Compaction reads its inputs in commit order (data sequence number, then
+  path) instead of path order. Epoch file paths begin with a random operation
+  ID, so path order concatenated epochs at random and spread each output row
+  group over the whole key and time range. On a local append workload of 2.3M
+  rows, the compacted file is now in key order, and the rows a point lookup
+  decodes fell from 9.9% to 4.9% of the table with row-group statistics, or
+  0.9% with the page index. CDC service time on the default mixed workload was
+  unchanged.
 
 **Remote durability metrics**
 
