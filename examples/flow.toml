@@ -139,10 +139,11 @@ prefetch_file_bytes = 4194304
 # rewriting each moved row's index entry. See docs/local-compaction.md.
 # lazy_index_remap = true
 # Periodic maintenance materializes remaps while more retired files keep one,
-# or a lookup may translate through more hops, rewriting at most
-# remap_cleanup_rows index entries per visit.
+# a lookup may translate through more hops, or they take more bytes,
+# rewriting at most remap_cleanup_rows index entries per visit.
 # remap_max_files = 512
 # remap_max_depth = 8
+# remap_max_bytes = 268435456
 # remap_cleanup_rows = 32768
 
 # Optional: replicate the journal and control state to object storage, so a

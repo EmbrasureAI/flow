@@ -19,6 +19,7 @@ pub use control::{CheckpointRecord, ControlMirror, ControlRestore, ControlStore,
 pub use reader::{IndexSnapshot, RowIndex};
 pub use remap::{
     FileRemap, LazyRemap, RemapCleanup, RemapLimits, RemapRun, RemapStats, RemapTarget,
+    RemapTranslator,
 };
 pub use spool::{Change, CollapsedMutation, PositionDeleteCursor, StagedPosition};
 
@@ -54,7 +55,11 @@ const SOURCE: &str = "source_transactions";
 // Lazy rewrite remaps, keyed like FILE_COUNTS by retired file. Every index
 // has this family, so binaries that predate it refuse to open the index.
 const REMAPS: &str = "file_remaps";
-const STATE_COLUMN_FAMILIES: [&str; 10] = [
+// Chunks of chunked remaps, keyed by the REMAPS key and the chunk's first old
+// position. Every index has this family, so binaries that predate chunked
+// remaps refuse to open the index instead of misreading their records.
+const REMAP_CHUNKS: &str = "file_remap_chunks";
+const STATE_COLUMN_FAMILIES: [&str; 11] = [
     PK,
     REVERSE,
     FILE_COUNTS,
@@ -64,6 +69,7 @@ const STATE_COLUMN_FAMILIES: [&str; 10] = [
     SPOOL,
     SOURCE,
     REMAPS,
+    REMAP_CHUNKS,
     files::FILES,
 ];
 // Version 3 added exact per-file counts. Version 4 names data files by
@@ -298,6 +304,8 @@ pub struct IndexMemory {
     pub memtable_bytes: u64,
     /// Table-reader memory outside the block cache.
     pub table_reader_bytes: u64,
+    /// Decoded lazy-remap chunks kept for forward reads.
+    pub remap_cache_bytes: u64,
 }
 
 struct Inner {
@@ -466,6 +474,7 @@ impl StateStore {
             table_reader_bytes: db
                 .property_int_value("rocksdb.estimate-table-readers-mem")?
                 .unwrap_or(0),
+            remap_cache_bytes: self.0.remap_cache.chunk_bytes()? as u64,
         };
         for name in STATE_COLUMN_FAMILIES {
             let cf = db.cf_handle(name).expect("opened column family");

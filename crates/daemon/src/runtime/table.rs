@@ -1564,6 +1564,7 @@ impl TableWork {
                 rewritten_rows = cleanup.rewritten_rows,
                 remap_files = cleanup.stats.files,
                 remap_max_depth = cleanup.stats.max_depth,
+                remap_bytes = cleanup.stats.bytes,
                 continuation = cleanup.continuation,
                 elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
                 "lazy index remaps cleaned"

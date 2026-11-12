@@ -513,6 +513,12 @@ pub async fn build_data(
         output_data_files = data_files.len(),
         output_data_rows = data_files.iter().map(|file| file.record_count()).sum::<u64>(),
         output_data_bytes = data_files.iter().map(|file| file.file_size_in_bytes()).sum::<u64>(),
+        remap_runs = lazy
+            .as_ref()
+            .map_or(0, |files| files.values().map(FileRemap::runs).sum::<u64>()),
+        remap_bytes = lazy
+            .as_ref()
+            .map_or(0, |files| files.values().map(FileRemap::encoded_bytes).sum::<u64>()),
         sorted_output_files = data_files
             .iter()
             .filter(|file| file.sort_order_id().is_some_and(|id| i64::from(id) == sort.order_id()))

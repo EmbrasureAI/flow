@@ -393,24 +393,33 @@ fn lazy_catch_up(
             .all(|file| output.plan.input_files.contains(*file)),
         "lazy remap names a file outside the plan"
     );
+    // Late deletes arrive in (file, position) order, so one translator per
+    // input decodes each of its chunks once.
+    let mut translators: BTreeMap<&FileId, flow_state_store::RemapTranslator<'_>> = remaps
+        .iter()
+        .map(|(file, remap)| (*file, remap.translator()))
+        .collect();
     let mut late_by_input = BTreeMap::<&FileId, u64>::new();
     let mut masked_by_output = BTreeMap::<FileId, u64>::new();
     let mut positions = Vec::with_capacity(batch_rows);
     let mut masked_rows = 0u64;
     for position in output.scratch.position_deletes(late_scan, &output.table_id) {
         let position = position?;
-        let Some(remap) = remaps.get(&position.data_file_id) else {
+        let Some((&source, _)) = remaps.get_key_value(&position.data_file_id) else {
             continue;
         };
+        let translator = translators
+            .get_mut(source)
+            .expect("one translator per remap");
         // Positions already deleted at the base were never written.
-        let Some(replacement) = remap.translate(&position) else {
+        let Some(replacement) = translator.translate(&position)? else {
             continue;
         };
         ensure!(
             sequence.is_some_and(|sequence| sequence >= build_sequence),
             CatchUpRejected("late delete cannot mask output at its build sequence")
         );
-        *late_by_input.entry(&remap.source).or_default() += 1;
+        *late_by_input.entry(source).or_default() += 1;
         *masked_by_output
             .entry(replacement.data_file_id.clone())
             .or_default() += 1;
