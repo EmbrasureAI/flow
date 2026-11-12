@@ -314,17 +314,97 @@ impl CollapseBuffer {
     }
 }
 
-/// Bound, validated rows in canonical key order. No snapshot or DB borrow escapes.
+/// Bound, validated rows in canonical key order, unless reordered by
+/// [`MemoryRows::sort_rows`]. No snapshot or DB borrow escapes.
 #[derive(Debug)]
 pub struct MemoryRows {
     table: TableId,
     state: TableState,
-    rows: btree_map::IntoIter<PrimaryKey, Entry>,
+    rows: MemoryOrder,
     interned: Expanded,
     peak: usize,
 }
 
+#[derive(Debug)]
+enum MemoryOrder {
+    Key(btree_map::IntoIter<PrimaryKey, Entry>),
+    Sorted(std::vec::IntoIter<(PrimaryKey, Entry)>),
+}
+
+impl Iterator for MemoryOrder {
+    type Item = (PrimaryKey, Entry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Key(rows) => rows.next(),
+            Self::Sorted(rows) => rows.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Key(rows) => rows.size_hint(),
+            Self::Sorted(rows) => rows.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for MemoryOrder {}
+
+/// What [`MemoryRows::sort_rows`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOrder {
+    /// Row images were already in order; canonical key order is kept.
+    AlreadySorted,
+    /// Row images now follow the order; deletions come first.
+    Sorted,
+    /// A row image cannot be ordered yet; canonical key order is kept.
+    Unsortable,
+}
+
 impl MemoryRows {
+    /// Order the remaining row images by `compare`. Rows without an image
+    /// (deletions) carry no data and move to the front. The entries move
+    /// without expanding their interned originals, so the epoch's memory
+    /// stays within its collapse budget plus one vector of entries.
+    pub fn sort_rows(
+        &mut self,
+        sortable: impl Fn(&Row) -> bool,
+        mut compare: impl FnMut(&Row, &Row) -> std::cmp::Ordering,
+    ) -> RowOrder {
+        let mut rows: Vec<_> =
+            std::mem::replace(&mut self.rows, MemoryOrder::Sorted(Vec::new().into_iter()))
+                .collect();
+        fn image(entry: &(PrimaryKey, Entry)) -> Option<&Row> {
+            entry.1.0.row.as_ref()
+        }
+        let outcome = if rows.iter().filter_map(image).any(|row| !sortable(row)) {
+            RowOrder::Unsortable
+        } else {
+            let mut images = rows.iter().filter_map(image);
+            let sorted = images.next().is_none_or(|first| {
+                images
+                    .try_fold(first, |previous, row| {
+                        (compare(previous, row) != std::cmp::Ordering::Greater).then_some(row)
+                    })
+                    .is_some()
+            });
+            if sorted {
+                RowOrder::AlreadySorted
+            } else {
+                rows.sort_by(|left, right| match (image(left), image(right)) {
+                    (Some(left), Some(right)) => compare(left, right),
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                });
+                RowOrder::Sorted
+            }
+        };
+        self.rows = MemoryOrder::Sorted(rows.into_iter());
+        outcome
+    }
+
     pub fn table_state(&self) -> &TableState {
         &self.state
     }
@@ -448,7 +528,7 @@ impl StateStore {
         Ok(Bound::Ready(MemoryRows {
             table: buffer.table,
             state: snapshot.table_state().clone(),
-            rows: buffer.rows.into_iter(),
+            rows: MemoryOrder::Key(buffer.rows.into_iter()),
             interned: interned.finish(),
             peak: buffer.peak,
         }))

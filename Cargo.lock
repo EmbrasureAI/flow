@@ -1584,6 +1584,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-ord",
  "arrow-schema",
  "bytes",
  "flow-iceberg-ext",

@@ -169,6 +169,7 @@ async fn describe(
         primary_key: keys.into_iter().map(|(_, index)| index).collect(),
         append_only: preflight.primary_key_attributes.is_empty(),
         priority: Default::default(),
+        sort: None,
     };
     let mut notes = Vec::new();
     if configured.append_only {
@@ -284,6 +285,7 @@ mod tests {
             primary_key: vec![0],
             append_only: false,
             priority: Default::default(),
+            sort: None,
         };
         let block = render(&table, &["a note\nspanning lines".into()]).unwrap();
         assert!(block.contains("# a note spanning lines\n"));

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 // it in immutable service artifact names survives snapshot expiration and index
 // rebuilding. Unknown external output starts at L1; small size alone cannot
 // turn an already compacted idle file back into L0 indefinitely.
-pub(super) fn file_level(
+pub(crate) fn file_level(
     data_prefix: &str,
     path: &str,
     summary: Option<&HashMap<String, String>>,

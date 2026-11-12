@@ -22,7 +22,7 @@ use flow_pg_source::{
 };
 use flow_state_store::{ControlStore, OperationKind, OperationPhase, StateStore};
 use futures::{StreamExt, TryStreamExt};
-use iceberg::{Catalog, TableCreation, table::Table};
+use iceberg::{Catalog, table::Table};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -313,11 +313,7 @@ async fn prepare_source(
             let created = catalog
                 .create_table(
                     &id.namespace,
-                    TableCreation::builder()
-                        .name(id.name.clone())
-                        .format_version(configured.format_version)
-                        .schema(flow_materializer::iceberg_schema(&schema)?)
-                        .build(),
+                    crate::services::table_creation(configured, &schema, id.name.clone())?,
                 )
                 .await?;
             ensure!(
@@ -328,6 +324,9 @@ async fn prepare_source(
             );
         }
         let existing = catalog.load_table(&id).await?;
+        let existing =
+            crate::schema::ensure_table_sort_order(store, catalog, &existing, configured, &schema)
+                .await?;
         ensure!(
             existing.metadata().current_snapshot_id().is_none()
                 && *existing.metadata().current_schema().as_ref()
@@ -1088,6 +1087,7 @@ mod tests {
     use super::*;
     use flow_coordinator::{AckMode, JournalDurability};
     use flow_state_store::StateStoreOptions;
+    use iceberg::TableCreation;
 
     #[test]
     fn operator_messages_name_the_state_directory_and_spare_active_slots() {

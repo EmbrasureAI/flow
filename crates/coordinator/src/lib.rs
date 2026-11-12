@@ -12,6 +12,7 @@
 use anyhow::Result;
 
 mod artifacts;
+mod layout;
 mod ledger;
 mod maintenance;
 mod publication;
@@ -19,6 +20,7 @@ mod scheduler;
 mod schema;
 
 pub use artifacts::{import_catalog_metadata, register_catalog_metadata};
+pub use layout::{Overlap, SortLayout, sort_layout};
 pub use ledger::{AckMode, JournalDurability, SourceLedger, Watermarks};
 pub use maintenance::{
     BuildRegistration, CatchUpStats, DeleteRepairCursor, DeleteRewritePolicy, ExternalMutation,

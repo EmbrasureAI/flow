@@ -31,6 +31,7 @@ flow-compactor = { path = "crates/compactor" }
 flow-catalog-watch = { path = "crates/catalog-watch" }
 flow-durability = { path = "crates/durability" }
 arrow-array = "58"
+arrow-ord = "58"
 arrow-schema = "58"
 arrow-select = "58"
 parquet = { version = "58", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "async", "zstd", "snap"] }

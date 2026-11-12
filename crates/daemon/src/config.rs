@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use flow_coordinator::{AckMode, JournalDurability, Priority};
 use flow_ingress_journal::JournalConfig;
 use flow_model::{Column, TableId, TableSchema};
@@ -113,7 +113,41 @@ pub struct Table {
     pub append_only: bool,
     #[serde(default)]
     pub priority: Priority,
+    /// The target's Iceberg sort order. Absent: a table Flow creates is
+    /// sorted by its primary key and an existing table keeps its own order.
+    /// Set: Flow also replaces a differing order on an existing table.
+    #[serde(default)]
+    pub sort: Option<SortSetting>,
 }
+
+/// A configured sort order: `"primary_key"`, `"none"`, or a list of
+/// `"column [asc|desc] [nulls first|nulls last]"`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SortSetting {
+    PrimaryKey,
+    Unsorted,
+    Columns(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for SortSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Name(String),
+            Columns(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Name(name) if name == "primary_key" => Ok(Self::PrimaryKey),
+            Raw::Name(name) if name == "none" => Ok(Self::Unsorted),
+            Raw::Name(_) => Err(serde::de::Error::custom(
+                "sort must be \"primary_key\", \"none\" or a list of columns",
+            )),
+            Raw::Columns(columns) => Ok(Self::Columns(columns)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ColumnSelection {
@@ -127,6 +161,66 @@ fn default_format_version() -> iceberg::spec::FormatVersion {
 }
 
 impl Table {
+    /// The sort keys Flow declares on this target: the configured order, or
+    /// the primary key when none is configured. Keyless tables are unsorted.
+    pub fn sort_keys(&self) -> Result<Vec<flow_materializer::SortKey>> {
+        let primary_key = || flow_materializer::primary_key_sort(&self.schema(0));
+        match &self.sort {
+            None => Ok(primary_key()),
+            Some(SortSetting::PrimaryKey) => {
+                ensure!(
+                    !self.primary_key.is_empty(),
+                    "sort = \"primary_key\" requires a primary key"
+                );
+                Ok(primary_key())
+            }
+            Some(SortSetting::Unsorted) => Ok(Vec::new()),
+            Some(SortSetting::Columns(fields)) => {
+                ensure!(!fields.is_empty(), "sort lists no columns; use \"none\"");
+                let mut keys: Vec<flow_materializer::SortKey> = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let key = self.sort_field(field)?;
+                    ensure!(
+                        keys.iter().all(|existing| existing.column != key.column),
+                        "sort lists column {field:?} twice"
+                    );
+                    keys.push(key);
+                }
+                Ok(keys)
+            }
+        }
+    }
+
+    /// Parse `column [asc|desc] [nulls first|nulls last]`. As in Iceberg and
+    /// Spark, nulls default to first for ascending and last for descending.
+    fn sort_field(&self, field: &str) -> Result<flow_materializer::SortKey> {
+        let words: Vec<String> = field.split_whitespace().map(str::to_lowercase).collect();
+        let name = field.split_whitespace().next().unwrap_or_default();
+        let column = self
+            .columns
+            .iter()
+            .position(|column| column.name == name)
+            .with_context(|| format!("sort column {name:?} is not a configured column"))?;
+        let (descending, rest) = match words.get(1).map(String::as_str) {
+            Some("asc") => (false, &words[2..]),
+            Some("desc") => (true, &words[2..]),
+            _ => (false, &words[1..]),
+        };
+        let nulls_first = match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [] => !descending,
+            ["nulls", "first"] => true,
+            ["nulls", "last"] => false,
+            _ => {
+                bail!("sort field {field:?} must be \"column [asc|desc] [nulls first|nulls last]\"")
+            }
+        };
+        Ok(flow_materializer::SortKey {
+            column,
+            descending,
+            nulls_first,
+        })
+    }
+
     pub fn projection(&self) -> Option<Vec<String>> {
         (self.column_selection == ColumnSelection::Explicit).then(|| {
             self.columns
@@ -466,6 +560,9 @@ impl Config {
                 "duplicate target table"
             );
             table.schema(0).validate()?;
+            table
+                .sort_keys()
+                .with_context(|| format!("invalid sort for target table {}", table.target_table))?;
         }
         Ok(())
     }
@@ -629,6 +726,76 @@ mod tests {
                 "{example}\n[compaction]\ndelete_layout = \"vector\"\n"
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn sort_defaults_to_the_primary_key_and_parses_explicit_orders() {
+        use flow_materializer::SortKey;
+        let key = |column, descending, nulls_first| SortKey {
+            column,
+            descending,
+            nulls_first,
+        };
+        let with = |sort: Option<&str>| {
+            let mut config = valid_config();
+            config.tables[0].sort = sort.map(|sort| {
+                toml::from_str::<Wrapper>(&format!("sort = {sort}"))
+                    .unwrap()
+                    .sort
+            });
+            config
+        };
+        #[derive(Deserialize)]
+        struct Wrapper {
+            sort: SortSetting,
+        }
+        assert!(with(None).validate().is_ok());
+        assert!(with(Some(r#"["status", "id DESC"]"#)).validate().is_ok());
+        assert_eq!(
+            with(None).tables[0].sort_keys().unwrap(),
+            [key(0, false, true)]
+        );
+        assert_eq!(
+            with(Some("\"primary_key\"")).tables[0].sort_keys().unwrap(),
+            [key(0, false, true)]
+        );
+        assert!(
+            with(Some("\"none\"")).tables[0]
+                .sort_keys()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            with(Some(r#"["status", "id DESC"]"#)).tables[0]
+                .sort_keys()
+                .unwrap(),
+            [key(1, false, true), key(0, true, false)]
+        );
+        assert_eq!(
+            with(Some(r#"["status desc nulls first", "id asc nulls last"]"#)).tables[0]
+                .sort_keys()
+                .unwrap(),
+            [key(1, true, true), key(0, false, false)]
+        );
+        for invalid in [
+            r#"["missing"]"#,
+            r#"["id sideways"]"#,
+            r#"["id", "id desc"]"#,
+            r#"["id nulls"]"#,
+            "[]",
+        ] {
+            assert!(with(Some(invalid)).validate().is_err(), "{invalid}");
+        }
+        assert!(toml::from_str::<Wrapper>("sort = \"by_magic\"").is_err());
+        let mut keyless = with(Some("\"primary_key\""));
+        keyless.tables[0].primary_key.clear();
+        keyless.tables[0].append_only = true;
+        assert!(keyless.validate().is_err());
+        keyless.tables[0].sort = None;
+        assert!(
+            keyless.tables[0].sort_keys().unwrap().is_empty(),
+            "keyless tables are unsorted"
         );
     }
 

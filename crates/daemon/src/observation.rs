@@ -472,6 +472,26 @@ pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
             "flow_table_publication_pressure",
             debt.pressure as u8 as f64,
         ),
+        (
+            "flow_table_sort_order_id",
+            inventory.sort.sort_order_id as f64,
+        ),
+        (
+            "flow_table_sorted_rows_ratio",
+            inventory.sort.sorted_rows_ratio(),
+        ),
+        (
+            "flow_table_unsorted_bytes",
+            inventory.sort.unsorted_bytes as f64,
+        ),
+        (
+            "flow_table_sort_overlap_files",
+            inventory
+                .sort
+                .overlap
+                .as_ref()
+                .map_or(0.0, |overlap| overlap.mean_files),
+        ),
     ] {
         metrics::gauge!(name, "table_id" => table.clone()).set(value);
     }

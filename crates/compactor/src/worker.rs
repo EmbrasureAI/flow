@@ -9,7 +9,8 @@ use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow_select::filter::filter_record_batch;
 use flow_iceberg_ext::{ManifestCache, SnapshotView};
 use flow_materializer::{
-    DataWriter, DeleteWriter, WriterConfig, rows_from_batch, writer_arrow_schema,
+    DataWriter, DeleteWriter, SortMode, SortSpec, TableSort, WriterConfig, rows_from_batch,
+    writer_arrow_schema,
 };
 use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value};
 use flow_state_store::{
@@ -247,10 +248,6 @@ pub async fn build_data(
             .is_empty(),
         "only unpartitioned compaction is supported"
     );
-    ensure!(
-        table.metadata().default_sort_order().fields.is_empty(),
-        "sorted tables require a sort-preserving compaction worker"
-    );
     ensure!(!plan.input_files.is_empty(), "compaction requires inputs");
     check_cancelled(Some(cancelled))?;
     // Planning normally just loaded these manifests through the same cache.
@@ -269,6 +266,13 @@ pub async fn build_data(
         required_deletes == plan.delete_files,
         "plan must consume exactly every applicable delete file"
     );
+    // Rewrites keep each input contiguous, so the output is sorted when the
+    // inputs are sorted and their key ranges can be laid end to end.
+    let sort = TableSort::of_table(&schema, table.metadata());
+    let (scan_order, layout) = match key_order(&view, &plan.input_files, &schema, sort.spec())? {
+        Some(order) => (order, "key_order"),
+        None => (commit_order(&view, &plan.input_files)?, "commit_order"),
+    };
     let input_data_rows = plan.input_files.iter().try_fold(0u64, |rows, id| {
         let entry = view
             .live_files
@@ -290,6 +294,8 @@ pub async fn build_data(
         input_delete_files = plan.delete_files.len(),
         input_delete_rows = plan.delete_input_rows,
         input_delete_bytes = plan.delete_input_bytes,
+        layout,
+        sort_order_id = sort.order_id(),
         "compaction metadata admitted before file reads"
     );
     let batch_rows = scratch.batch_rows().min(config.batch_rows).max(1);
@@ -350,6 +356,9 @@ pub async fn build_data(
     if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
         writer = writer.with_row_lineage()?;
     }
+    if let Some(spec) = sort.spec() {
+        writer = writer.with_sort(spec, SortMode::Verify)?;
+    }
     let mut reverse_file = None;
     type ReverseRows<'a> = Box<
         dyn Iterator<Item = flow_state_store::Result<(u64, flow_model::PrimaryKey)>> + Send + 'a,
@@ -369,7 +378,7 @@ pub async fn build_data(
         table,
         &schema,
         &view,
-        &commit_order(&view, &plan.input_files)?,
+        &scan_order,
         &scratch,
         &operation_id.0,
         batch_rows,
@@ -504,6 +513,10 @@ pub async fn build_data(
         output_data_files = data_files.len(),
         output_data_rows = data_files.iter().map(|file| file.record_count()).sum::<u64>(),
         output_data_bytes = data_files.iter().map(|file| file.file_size_in_bytes()).sum::<u64>(),
+        sorted_output_files = data_files
+            .iter()
+            .filter(|file| file.sort_order_id().is_some_and(|id| i64::from(id) == sort.order_id()))
+            .count(),
         "compaction data and mappings built before catalog publication"
     );
     Ok(BuiltData {
@@ -908,6 +921,65 @@ fn commit_order<'a>(view: &SnapshotView, files: &'a BTreeSet<FileId>) -> Result<
         .collect::<Result<Vec<_>>>()?;
     ordered.sort();
     Ok(ordered.into_iter().map(|(_, file)| file).collect())
+}
+
+/// Inputs in key order, when every input is stamped with the current sort
+/// order and their leading-column ranges are disjoint, so concatenating them
+/// keeps the output sorted. The writer still verifies the result.
+fn key_order<'a>(
+    view: &SnapshotView,
+    files: &'a BTreeSet<FileId>,
+    schema: &TableSchema,
+    spec: Option<&SortSpec>,
+) -> Result<Option<Vec<&'a FileId>>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let Some(leading) = spec.keys.first() else {
+        return Ok(None);
+    };
+    let order_id = spec.iceberg_order_id()?;
+    let field = schema.columns[leading.column].field_id;
+    let mut ranges = Vec::with_capacity(files.len());
+    for file in files {
+        let entry = view
+            .live_files
+            .get(&file.0)
+            .ok_or_else(|| anyhow::anyhow!("scan input {} is not live", file.0))?;
+        let data = &entry.data_file;
+        let (Some(lower), Some(upper)) = (
+            data.lower_bounds().get(&field),
+            data.upper_bounds().get(&field),
+        ) else {
+            return Ok(None);
+        };
+        if data.sort_order_id() != Some(order_id)
+            || data
+                .null_value_counts()
+                .get(&field)
+                .is_some_and(|nulls| *nulls > 0)
+        {
+            return Ok(None);
+        }
+        ranges.push((lower.clone(), upper.clone(), file));
+    }
+    let ascending = !leading.descending;
+    ranges.sort_by(|left, right| {
+        let ordering = if ascending {
+            left.0.partial_cmp(&right.0)
+        } else {
+            right.1.partial_cmp(&left.1)
+        };
+        ordering.unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let disjoint = ranges.windows(2).all(|pair| {
+        if ascending {
+            pair[0].1 < pair[1].0
+        } else {
+            pair[0].0 > pair[1].1
+        }
+    });
+    Ok(disjoint.then(|| ranges.into_iter().map(|(_, _, file)| file).collect()))
 }
 
 /// Data scan after delete staging. The caller owns the scratch namespace and

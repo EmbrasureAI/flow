@@ -92,6 +92,17 @@ From earlier development builds of `main`:
 
 **Table maintenance**
 
+- Sorted layout: tables Flow creates declare their primary key as the Iceberg
+  sort order (keyless tables stay unsorted), and Flow writes any sort order
+  whose fields are identity transforms. Epochs collapsed in memory are written
+  in that order; other epochs, the initial copy and compaction output are
+  checked as they are written. Only files whose every row was in order carry
+  `sort_order_id`, and epochs sorted in memory also declare Parquet sorting
+  columns. Compaction concatenates sorted inputs with disjoint key ranges in
+  key order. `[[tables]] sort` (`"primary_key"`, `"none"` or a column list)
+  sets the order of new tables and replaces a differing order on existing
+  ones; without it an existing table keeps the order set from SQL. See
+  [Sorted layout](docs/sorted-layout.md).
 - Snapshot expiration is on by default (`limits.snapshot_expiration`). It keeps
   at least `limits.snapshot_retain_last` (128) snapshots of `main`, honors an
   explicit table `history.expire.max-snapshot-age-ms`, and caps Flow-managed
@@ -158,6 +169,13 @@ From earlier development builds of `main`:
 
 **Commands and configuration**
 
+- `embrasure-flow layout [--table namespace.table] [--json]` prints each
+  target's sort order, the share of rows in files marked with it, files by
+  level, key-range overlap and advice, from catalog metadata. Periodic
+  maintenance exports `flow_table_sort_order_id`,
+  `flow_table_sorted_rows_ratio`, `flow_table_unsorted_bytes` and
+  `flow_table_sort_overlap_files`; `flow_epoch_sort_total{result}` counts how
+  epochs of sorted tables were written.
 - `embrasure-flow discover` prints `[[tables]]` configuration for the
   publication's tables, named tables or a schema, using the same type mapping
   and validation as `init`.
@@ -357,6 +375,13 @@ From earlier development builds of `main`:
   decodes fell from 9.9% to 4.9% of the table with row-group statistics, or
   0.9% with the page index. CDC service time on the default mixed workload was
   unchanged.
+- An epoch reordered into a table's sort order stages its index changes
+  without the cross-batch duplicate-key check, which needs canonical key
+  order. Its keys come from one collapsed map and are unique by construction;
+  duplicates within a batch and duplicate output locations are still
+  rejected. On the default mixed workload, whose epochs all reorder, CDC
+  service time was 11% lower than without sorted layout; staged with the
+  check, reordering had cost 10%.
 
 **Remote durability metrics**
 
@@ -372,6 +397,10 @@ From earlier development builds of `main`:
 
 ### Fixed
 
+- A table whose sort order was set by another engine (`ALTER TABLE … WRITE
+  ORDERED BY`) no longer fails data compaction. The build returned an
+  unclassified error, which stopped the daemon each time compaction became
+  due.
 - When initializing a snapshot failed after creating a permanent replication
   slot, for example because the exported snapshot could not be imported, the
   slot was left behind, retaining WAL and making the next attempt fail because

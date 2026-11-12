@@ -19,12 +19,13 @@ use flow_iceberg_ext::{
     read_artifact_plan, write_artifact_plan,
 };
 use flow_materializer::{
-    DataWriter, DeleteWriter, WriterConfig, WrittenBatch, iceberg_schema, rows_from_batch,
+    DataWriter, DeleteWriter, SortMode, TableSort, WriterConfig, WrittenBatch, iceberg_schema,
+    rows_from_batch,
 };
 use flow_model::{OperationId, TableSchema, carry_forward_unchanged, row_has_unchanged};
 use flow_state_store::{
     CollapsedMutation, ControlStore, IndexDelta, MemoryRows, OperationKind, OperationPhase,
-    OperationRecord, PreparedOperation, StateStore,
+    OperationRecord, PreparedOperation, RowOrder, StateStore,
 };
 use iceberg::{Catalog, puffin::DeleteVector, spec::DataFile, table::Table};
 use serde::{Deserialize, Serialize};
@@ -467,13 +468,49 @@ impl TablePublisher {
         if indexed != captured_state {
             return Err(ReplanRequired.into());
         }
+        // A buffered epoch is written in the table's sort order. Its new rows
+        // get fresh index entries in any order, so sorting costs no index work.
+        // A disk-collapsed epoch streams in canonical key order; its file is
+        // stamped only if that order happens to be the sort order.
+        let sort = TableSort::of_table(schema, table.metadata());
+        let mut sort_mode = None;
+        // A reordered epoch's keys leave canonical order, which the staging
+        // duplicate check needs to stay cheap. They come from one collapsed
+        // map, so they are unique by construction.
+        let mut reordered = false;
         let mut batches = match rows {
-            CollapsedRows::Disk => CollapsedBatches::Disk(self.collapsed_batches(epoch)),
-            CollapsedRows::Memory(rows) => CollapsedBatches::Memory {
-                rows: Box::new(rows.peekable()),
-                max_rows: self.batch_rows,
-                max_bytes: self.batch_bytes,
-            },
+            CollapsedRows::Disk => {
+                if sort.spec().is_some() {
+                    sort_mode = Some(SortMode::Verify);
+                    metrics::counter!("flow_epoch_sort_total", "result" => "disk").increment(1);
+                }
+                CollapsedBatches::Disk(self.collapsed_batches(epoch))
+            }
+            CollapsedRows::Memory(mut rows) => {
+                if let Some(spec) = sort.spec() {
+                    let order = rows.sort_rows(
+                        |row| spec.sortable(row),
+                        |left, right| spec.compare_rows(left, right),
+                    );
+                    let result = match order {
+                        RowOrder::AlreadySorted => "already_sorted",
+                        RowOrder::Sorted => "sorted",
+                        RowOrder::Unsortable => "unsortable",
+                    };
+                    metrics::counter!("flow_epoch_sort_total", "result" => result).increment(1);
+                    reordered = order == RowOrder::Sorted;
+                    sort_mode = Some(if order == RowOrder::Unsortable {
+                        SortMode::Verify
+                    } else {
+                        SortMode::Sorted
+                    });
+                }
+                CollapsedBatches::Memory {
+                    rows: Box::new(rows.peekable()),
+                    max_rows: self.batch_rows,
+                    max_bytes: self.batch_bytes,
+                }
+            }
         };
         let Some(first) = batches.next().await? else {
             let store = self.store.clone();
@@ -516,14 +553,18 @@ impl TablePublisher {
         })
         .await?;
         let spec_id = table.metadata().default_partition_spec_id();
-        let mut data_writer = Some(DataWriter::new(
+        let mut data_writer = DataWriter::new(
             table.file_io().clone(),
             table.metadata().location(),
             &attempt,
             schema.clone(),
             spec_id,
             writer_config.clone(),
-        )?);
+        )?;
+        if let (Some(spec), Some(mode)) = (sort.spec(), sort_mode) {
+            data_writer = data_writer.with_sort(spec, mode)?;
+        }
+        let mut data_writer = Some(data_writer);
         let mut referenced = BTreeSet::new();
         // Deleted originals stay in memory, sorted at the end, unless they
         // outgrow the batch budget; the spool then stages them as before.
@@ -613,7 +654,11 @@ impl TablePublisher {
             let epoch = epoch.clone();
             let batch_rows = self.batch_rows;
             stage = Some(DataStage::spawn(move || {
-                store.stage_deltas(&epoch.id, deltas)?;
+                if reordered {
+                    store.stage_unique_deltas(&epoch.id, deltas)?;
+                } else {
+                    store.stage_deltas(&epoch.id, deltas)?;
+                }
                 if let Some(mut spill) = spill {
                     spill.spill(&store, &epoch.id.0, &epoch.table, batch_rows)?;
                 }
