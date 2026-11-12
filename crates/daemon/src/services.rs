@@ -187,6 +187,23 @@ pub(crate) fn target(namespace: &[String], name: &str) -> Result<TableIdent> {
     ))
 }
 
+/// How Flow creates a target: the configured schema and format, and the
+/// configured sort order, or the primary key when none is configured.
+pub(crate) fn table_creation(
+    configured: &crate::config::Table,
+    schema: &flow_model::TableSchema,
+    name: String,
+) -> Result<iceberg::TableCreation> {
+    let iceberg = flow_materializer::iceberg_schema(schema)?;
+    let order = flow_materializer::sort_order(&iceberg, schema, &configured.sort_keys()?)?;
+    Ok(iceberg::TableCreation::builder()
+        .name(name)
+        .format_version(configured.format_version)
+        .schema(iceberg)
+        .sort_order(order)
+        .build())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

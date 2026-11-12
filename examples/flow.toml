@@ -171,6 +171,11 @@ target_table = "orders"
 format_version = 2
 primary_key = [0]
 append_only = false
+# Iceberg sort order. Absent: a table Flow creates is sorted by its primary key
+# and an existing table keeps its own order, which SQL engines may change.
+# Set to "primary_key", "none", or columns such as ["status", "id desc"] to
+# also replace a differing order on an existing table at startup.
+# sort = "primary_key"
 columns = [
   { field_id = 1, name = "id", data_type = "Int64", nullable = false },
   { field_id = 2, name = "status", data_type = "String", nullable = true },

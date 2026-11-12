@@ -888,6 +888,75 @@ pub(crate) async fn ensure_table_schema(
     Ok(updated)
 }
 
+/// Apply an explicitly configured `sort` to an existing target whose default
+/// order differs. Without `sort`, the table's own order is left alone, so it
+/// can be managed from SQL. A lost response is resolved by reloading the table.
+pub(crate) async fn ensure_table_sort_order(
+    store: &StateStore,
+    catalog: &dyn Catalog,
+    table: &Table,
+    configured: &ConfiguredTable,
+    schema: &TableSchema,
+) -> Result<Table> {
+    if configured.sort.is_none() {
+        return Ok(table.clone());
+    }
+    let keys = configured.sort_keys()?;
+    let matches =
+        |table: &Table| match flow_materializer::TableSort::of_table(schema, table.metadata()) {
+            flow_materializer::TableSort::Unsorted => keys.is_empty(),
+            flow_materializer::TableSort::Supported(spec) => spec.keys == keys,
+            flow_materializer::TableSort::Unsupported { .. } => false,
+        };
+    if matches(table) {
+        return Ok(table.clone());
+    }
+    let previous = table.metadata().default_sort_order().order_id;
+    let transaction = Transaction::new(table);
+    let mut action = transaction.replace_sort_order();
+    for key in &keys {
+        let name = &schema.columns[key.column].name;
+        let nulls = if key.nulls_first {
+            iceberg::spec::NullOrder::First
+        } else {
+            iceberg::spec::NullOrder::Last
+        };
+        action = if key.descending {
+            action.desc(name, nulls)
+        } else {
+            action.asc(name, nulls)
+        };
+    }
+    flow_coordinator::register_catalog_metadata(store, table, schema.table_id).await?;
+    let updated = match action.apply(transaction)?.commit(catalog).await {
+        Ok(table) => table,
+        Err(error) => {
+            let refreshed = refresh_table(catalog, table).await?;
+            if !matches(&refreshed) {
+                return Err(error.into());
+            }
+            refreshed
+        }
+    };
+    ensure!(
+        updated.metadata().uuid() == table.metadata().uuid(),
+        "Iceberg target UUID changed during sort order update"
+    );
+    ensure!(
+        matches(&updated),
+        "catalog sort order differs from the configured sort"
+    );
+    tracing::info!(
+        event = "table_sort_order_set",
+        table_id = schema.table_id.0,
+        previous_sort_order_id = previous,
+        sort_order_id = updated.metadata().default_sort_order().order_id,
+        fields = keys.len(),
+        "configured sort order applied to the target"
+    );
+    Ok(updated)
+}
+
 fn verify_storage(record: &SchemaRecord, metadata: &flow_pg_source::TableMetadata) -> Result<()> {
     ensure!(
         record.storage_id == metadata.storage_id,
@@ -916,6 +985,80 @@ mod target_identity_tests {
         spec::FormatVersion,
     };
     use std::collections::HashMap;
+
+    /// Flow creates targets sorted by primary key, and an explicit `sort`
+    /// replaces a differing order once; an absent `sort` leaves it alone.
+    #[tokio::test]
+    async fn targets_are_created_sorted_and_explicit_sorts_are_reconciled() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            temp.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "sort",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://sort".into())]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("replicated".into());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let mut configured = config.tables[0].clone();
+        let schema = configured.schema(1);
+        let table = catalog
+            .create_table(
+                &namespace,
+                crate::services::table_creation(&configured, &schema, "orders".into()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let order =
+            |table: &Table| flow_materializer::TableSort::of_table(&schema, table.metadata());
+        let Some(spec) = order(&table).spec().cloned() else {
+            panic!("new target is not sorted");
+        };
+        assert_eq!(spec.keys, flow_materializer::primary_key_sort(&schema));
+
+        // Absent: the table's own order stands.
+        let unchanged = ensure_table_sort_order(&store, &catalog, &table, &configured, &schema)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.metadata_location(), table.metadata_location());
+
+        configured.sort = Some(crate::config::SortSetting::Columns(vec![
+            "status desc".into(),
+            "id".into(),
+        ]));
+        let replaced = ensure_table_sort_order(&store, &catalog, &table, &configured, &schema)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(&replaced).spec().unwrap().keys,
+            configured.sort_keys().unwrap()
+        );
+        assert_ne!(
+            replaced.metadata().default_sort_order().order_id,
+            spec.order_id
+        );
+        // Already matching: no new metadata.
+        let again = ensure_table_sort_order(&store, &catalog, &replaced, &configured, &schema)
+            .await
+            .unwrap();
+        assert_eq!(again.metadata_location(), replaced.metadata_location());
+
+        configured.sort = Some(crate::config::SortSetting::Unsorted);
+        let unsorted = ensure_table_sort_order(&store, &catalog, &again, &configured, &schema)
+            .await
+            .unwrap();
+        assert_eq!(order(&unsorted), flow_materializer::TableSort::Unsorted);
+    }
 
     #[test]
     fn only_classified_source_errors_are_table_scoped() {

@@ -16,7 +16,7 @@ use flow_state_store::{
 };
 use iceberg::{Catalog, table::Table};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -363,6 +363,10 @@ pub(super) struct TableWork {
     pub(super) garbage_checked: Arc<Mutex<BTreeMap<TableId, Instant>>>,
     pub(super) metadata_backoff: Arc<Mutex<MetadataBackoff>>,
     pub(super) compaction: bool,
+    /// Each table's index in `config.tables`.
+    pub(super) configured: Arc<BTreeMap<TableId, usize>>,
+    /// Tables whose configured sort order was applied in this process.
+    pub(super) sort_checked: Arc<Mutex<BTreeSet<TableId>>>,
 }
 
 /// What recovering a table's unfinished operation did.
@@ -858,6 +862,22 @@ impl TableWork {
             &schema,
         )
         .await?;
+        if !self.sort_reconciled(id)? {
+            if let Some(&index) = self.configured.get(&id) {
+                current = crate::schema::ensure_table_sort_order(
+                    &self.store,
+                    self.catalog.as_ref(),
+                    &current,
+                    &self.config.tables[index],
+                    &schema,
+                )
+                .await?;
+            }
+            self.sort_checked
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sort order check lock poisoned"))?
+                .insert(id);
+        }
         let indexed = self.store.table_state(&id)?;
         if indexed.snapshot_id != current.metadata().current_snapshot_id() {
             let path = self
@@ -1419,6 +1439,14 @@ impl TableWork {
         }
     }
 
+    fn sort_reconciled(&self, id: TableId) -> Result<bool> {
+        Ok(self
+            .sort_checked
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sort order check lock poisoned"))?
+            .contains(&id))
+    }
+
     fn backoff(&self) -> Result<std::sync::MutexGuard<'_, MetadataBackoff>> {
         self.metadata_backoff
             .lock()
@@ -1947,6 +1975,8 @@ mod publication_retry_tests {
             ),
             garbage_checked: Arc::default(),
             metadata_backoff: Arc::default(),
+            configured: Arc::new(BTreeMap::from([(id, 0)])),
+            sort_checked: Arc::default(),
             compaction: false,
         };
 
@@ -2306,6 +2336,8 @@ mod metadata_maintenance_tests {
             ),
             garbage_checked: Arc::default(),
             metadata_backoff: Arc::default(),
+            configured: Arc::new(BTreeMap::from([(id, 0)])),
+            sort_checked: Arc::default(),
             compaction: false,
         };
         Fixture {

@@ -1665,3 +1665,41 @@ fn parallel_apply_matches_serial_apply_and_rejects_late_conflicts_atomically() {
     assert_eq!(serial.3, [500, 500, 2000]);
     assert_eq!(&outcomes[1], serial);
 }
+
+/// An epoch reordered in memory stages keys out of key order. Its keys are
+/// attested unique, so they skip only the cross-call key check: in-call
+/// duplicates and duplicate locations are still rejected, and an operation
+/// cannot mix the two forms.
+#[test]
+fn attested_unique_keys_stage_out_of_order_and_keep_location_checks() {
+    let temp = TempDir::new().unwrap();
+    let store = open(temp.path());
+    let id = OperationId("sorted".into());
+    store.begin_prepare(operation("sorted", None, 10)).unwrap();
+    store
+        .stage_unique_deltas(&id, [insert(9, "a", 0), insert(8, "a", 1)])
+        .unwrap();
+    store
+        .stage_unique_deltas(&id, [insert(1, "a", 2), insert(2, "a", 3)])
+        .unwrap();
+    assert!(matches!(
+        store.stage_unique_deltas(&id, [insert(3, "a", 4), insert(3, "a", 5)]),
+        Err(flow_state_store::Error::InvalidState(reason)) if reason == "duplicate primary key in prepared delta"
+    ));
+    assert!(matches!(
+        store.stage_unique_deltas(&id, [insert(4, "a", 1)]),
+        Err(flow_state_store::Error::InvalidState(reason)) if reason == "duplicate output row location"
+    ));
+    assert!(store.stage_deltas(&id, [insert(5, "a", 6)]).is_err());
+    assert_eq!(store.operation(&id).unwrap().unwrap().delta_count, 4);
+
+    store.discard_uncommitted(&id).unwrap();
+    let mixed = OperationId("mixed".into());
+    store.begin_prepare(operation("mixed", None, 10)).unwrap();
+    store.stage_deltas(&mixed, [insert(1, "b", 0)]).unwrap();
+    assert!(
+        store
+            .stage_unique_deltas(&mixed, [insert(2, "b", 1)])
+            .is_err()
+    );
+}

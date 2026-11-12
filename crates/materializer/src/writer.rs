@@ -26,6 +26,7 @@ use std::{borrow::Borrow, sync::Arc};
 use crate::{
     arrow::{validated_columns, writer_arrow_schema},
     iceberg_schema,
+    sort::{SortSpec, SortVerifier},
 };
 
 #[derive(Debug, Clone)]
@@ -58,6 +59,13 @@ impl Default for WriterConfig {
 }
 impl WriterConfig {
     fn properties(&self) -> Result<WriterProperties> {
+        self.properties_sorted(None)
+    }
+
+    fn properties_sorted(
+        &self,
+        sorting: Option<Vec<parquet::file::metadata::SortingColumn>>,
+    ) -> Result<WriterProperties> {
         ensure!(
             self.target_file_bytes > 0
                 && self.row_group_rows > 0
@@ -77,6 +85,7 @@ impl WriterConfig {
             .set_compression(self.compression)
             .set_max_row_group_row_count(Some(self.row_group_rows))
             .set_statistics_enabled(EnabledStatistics::Page)
+            .set_sorting_columns(sorting)
             .build())
     }
 
@@ -256,12 +265,33 @@ impl RowGroupBudget {
     }
 }
 
+/// How a [`DataWriter`] treats the table's sort order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    /// Check every row and stamp only the files that turned out sorted.
+    Verify,
+    /// The caller sorted the rows: also declare Parquet sorting columns, and
+    /// fail rather than write a row out of order.
+    Sorted,
+}
+
+struct WriterSort {
+    spec: SortSpec,
+    mode: SortMode,
+    verifier: SortVerifier,
+    /// Whether every row of the current file so far was in order.
+    file_sorted: bool,
+}
+
 /// One file is rotated only between batches, so positions are known as rows are written.
 /// An operation ID is immutable: retries must reuse prepared artifacts, never overwrite them.
 pub struct DataWriter {
     file_io: FileIO,
     schema: TableSchema,
+    /// The Iceberg schema files are written in, including lineage columns.
+    file_schema: Arc<Schema>,
     builder: ParquetWriterBuilder,
+    sort: Option<WriterSort>,
     config: WriterConfig,
     prefix: String,
     next_file: usize,
@@ -286,8 +316,8 @@ impl DataWriter {
         config: WriterConfig,
     ) -> Result<Self> {
         ensure!(spec_id >= 0, "invalid spec ID");
-        let builder =
-            ParquetWriterBuilder::new(config.properties()?, Arc::new(iceberg_schema(&schema)?));
+        let file_schema = Arc::new(iceberg_schema(&schema)?);
+        let builder = ParquetWriterBuilder::new(config.properties()?, file_schema.clone());
         ensure!(
             !operation.0.is_empty()
                 && operation
@@ -300,7 +330,9 @@ impl DataWriter {
             file_io,
             arrow_schema: writer_arrow_schema(&schema),
             schema,
+            file_schema,
             builder,
+            sort: None,
             config,
             prefix: format!("{}/data/{}", location.trim_end_matches('/'), operation.0),
             next_file: 0,
@@ -320,8 +352,46 @@ impl DataWriter {
         );
         let schema = crate::lineage::writer_schema(&self.schema)?;
         self.lineage_schema = Some(Arc::new(schema_to_arrow_schema(&schema)?));
-        self.builder = ParquetWriterBuilder::new(self.config.properties()?, Arc::new(schema));
+        self.file_schema = Arc::new(schema);
+        self.rebuild()?;
         Ok(self)
+    }
+
+    /// Write files in `spec`'s order. With [`SortMode::Verify`], a file is
+    /// stamped with the order only if all its rows were in order; with
+    /// [`SortMode::Sorted`], a row out of order is an error.
+    pub fn with_sort(mut self, spec: &SortSpec, mode: SortMode) -> Result<Self> {
+        ensure!(
+            self.current.is_none() && self.files.is_empty(),
+            "sort order must be configured before writing"
+        );
+        ensure!(
+            spec.keys
+                .iter()
+                .all(|key| key.column < self.schema.columns.len()),
+            "sort column is outside the table schema"
+        );
+        spec.iceberg_order_id()?;
+        self.sort = Some(WriterSort {
+            spec: spec.clone(),
+            mode,
+            verifier: SortVerifier::new(spec),
+            file_sorted: true,
+        });
+        self.rebuild()?;
+        Ok(self)
+    }
+
+    fn rebuild(&mut self) -> Result<()> {
+        let sorting = match &self.sort {
+            Some(sort) if sort.mode == SortMode::Sorted => Some(sort.spec.sorting_columns()?),
+            _ => None,
+        };
+        self.builder = ParquetWriterBuilder::new(
+            self.config.properties_sorted(sorting)?,
+            self.file_schema.clone(),
+        );
+        Ok(())
     }
 
     /// Accept owned or borrowed rows without copying their payloads.
@@ -486,6 +556,21 @@ impl DataWriter {
                     .build(self.file_io.new_output(path)?.if_absent())
                     .await?,
             );
+            if let Some(sort) = &mut self.sort {
+                sort.verifier.reset();
+                sort.file_sorted = true;
+            }
+        }
+        if let Some(sort) = &mut self.sort
+            && sort.file_sorted
+            && !sort.verifier.accept(&columns)?
+        {
+            ensure!(
+                sort.mode == SortMode::Verify,
+                "rows are out of the table's sort order {}",
+                sort.spec.order_id
+            );
+            sort.file_sorted = false;
         }
         let writer = self.current.as_mut().expect("writer opened above");
         self.row_group
@@ -528,10 +613,17 @@ impl DataWriter {
     }
     async fn finish_file(&mut self) -> Result<()> {
         if let Some(writer) = self.current.take() {
+            let order = match &self.sort {
+                Some(sort) if sort.file_sorted => Some(sort.spec.iceberg_order_id()?),
+                _ => None,
+            };
             for mut file in writer.close().await? {
                 file.content(DataContentType::Data)
                     .partition(Struct::empty())
                     .partition_spec_id(self.spec_id);
+                if let Some(order) = order {
+                    file.sort_order_id(order);
+                }
                 self.files.push(file.build()?);
             }
         }

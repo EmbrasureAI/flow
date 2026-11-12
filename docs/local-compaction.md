@@ -3,7 +3,8 @@
 The live concurrency, deadline and recovery gates pass. Sustained throughput,
 publication latency and reader-health qualification remain incomplete; see
 [Performance](performance.md). The implementation uses local workers without
-distributed coordination, HA or sort/Z-order requirements.
+distributed coordination or HA. How rewrites treat a table's sort order is in
+[Sorted layout](sorted-layout.md).
 
 The existing strict rewrite remains the fallback. Optional data builds can run
 while the table continues publishing CDC. Delete-only, manifest and retention

@@ -14,7 +14,7 @@ mod spool;
 #[cfg(all(test, feature = "sst-profile"))]
 #[path = "../tests/profiles/sst_staging.rs"]
 mod sst_staging_profile;
-pub use buffer::{Bound, BufferResult, CollapseBuffer, MemoryRows};
+pub use buffer::{Bound, BufferResult, CollapseBuffer, MemoryRows, RowOrder};
 pub use control::{CheckpointRecord, ControlMirror, ControlRestore, ControlStore, GenerationState};
 pub use reader::{IndexSnapshot, RowIndex};
 pub use remap::{
@@ -744,6 +744,29 @@ impl StateStore {
         id: &OperationId,
         deltas: impl IntoIterator<Item = Result<IndexDelta>>,
     ) -> Result<()> {
+        self.stage_deltas_checked(id, deltas, false)
+    }
+
+    /// [`Self::stage_deltas`] for deltas whose keys the caller guarantees are
+    /// unique across every call for this operation, such as the rows of one
+    /// epoch collapsed in memory. Their keys need not arrive in key order:
+    /// only the cross-call duplicate-key check, which needs that order to stay
+    /// cheap, is skipped. Duplicates within a call and duplicate output
+    /// locations are still rejected. An operation uses one form throughout.
+    pub fn stage_unique_deltas(
+        &self,
+        id: &OperationId,
+        deltas: impl IntoIterator<Item = IndexDelta>,
+    ) -> Result<()> {
+        self.stage_deltas_checked(id, deltas.into_iter().map(Ok), true)
+    }
+
+    fn stage_deltas_checked(
+        &self,
+        id: &OperationId,
+        deltas: impl IntoIterator<Item = Result<IndexDelta>>,
+        unique_keys: bool,
+    ) -> Result<()> {
         let _guard = self.lock()?;
         let mut record = self.require_operation(id)?;
         if record.phase != OperationPhase::Building {
@@ -776,6 +799,14 @@ impl StateStore {
         let mut dense_flag = operation_prefix(id);
         dense_flag.push(DENSE_MARKERS_MARKER);
         let mut dense = self.0.db.get_pinned_cf(&cf, &dense_flag)?.is_some();
+        let mut unique_flag = operation_prefix(id);
+        unique_flag.push(UNIQUE_KEYS_MARKER);
+        let attested = self.0.db.get_pinned_cf(&cf, &unique_flag)?.is_some();
+        if attested != unique_keys && (attested || record.delta_count > 0) {
+            return Err(Error::InvalidState(
+                "an operation's deltas must all be staged with the same key check".into(),
+            ));
+        }
         let mut ordinal = delta_key(id, 0);
         let ordinal_offset = ordinal.len() - size_of::<u64>();
         let mut encoded = Vec::new();
@@ -825,13 +856,17 @@ impl StateStore {
                 return Ok(());
             }
             self.put(&mut batch, OPERATIONS, id.0.as_bytes(), &record)?;
+            if unique_keys && start == 0 {
+                batch.put_cf(&cf, &unique_flag, []);
+            }
             let build = build_started.elapsed();
             let lookup_started = Instant::now();
-            let check_keys = !self.keys_follow_existing(
-                &cf,
-                &unique_prefix,
-                batch_keys.first().map(Vec::as_slice),
-            )?;
+            let check_keys = !unique_keys
+                && !self.keys_follow_existing(
+                    &cf,
+                    &unique_prefix,
+                    batch_keys.first().map(Vec::as_slice),
+                )?;
             let check_locations = !self.keys_follow_existing(
                 &cf,
                 &location_prefix,
@@ -844,12 +879,18 @@ impl StateStore {
             }
             // The sets retain marker bytes for both validation and the write;
             // WriteBatch copies them, so staging needs no per-marker clone.
+            // Attested keys need no markers: no later call compares against them.
+            let key_markers = if unique_keys { None } else { Some(&batch_keys) };
             if dense {
-                for marker in batch_keys.iter().chain(&batch_locations) {
+                for marker in key_markers.into_iter().flatten().chain(&batch_locations) {
                     batch.put_cf(&cf, marker, []);
                 }
             } else {
-                for marker in batch_keys.last().into_iter().chain(batch_locations.last()) {
+                for marker in key_markers
+                    .and_then(|keys| keys.last())
+                    .into_iter()
+                    .chain(batch_locations.last())
+                {
                     batch.put_cf(&cf, marker, []);
                 }
             }
@@ -1747,6 +1788,8 @@ pub(crate) const REMAP_MARKER: u8 = 4;
 pub(crate) const OUTPUT_COUNT_MARKER: u8 = 5;
 /// Data-file ordinals the operation's staged deltas name; see `files`.
 const FILE_PIN_MARKER: u8 = 6;
+/// Set when the operation's keys were attested unique; see `stage_unique_deltas`.
+const UNIQUE_KEYS_MARKER: u8 = 7;
 fn file_pin_key(id: &OperationId, ordinal: u64) -> Vec<u8> {
     let mut key = operation_prefix(id);
     key.push(FILE_PIN_MARKER);

@@ -131,9 +131,8 @@ async fn compact(
             .metadata()
             .default_partition_spec()
             .fields()
-            .is_empty()
-            && table.metadata().default_sort_order().fields.is_empty(),
-        "fixture requires unpartitioned, unsorted tables"
+            .is_empty(),
+        "fixture requires unpartitioned tables"
     );
     let view = SnapshotView::current(&table).await?;
     let mut data = BTreeSet::new();
@@ -197,6 +196,11 @@ async fn compact(
     )?;
     if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
         writer = writer.with_row_lineage()?;
+    }
+    // Like an external engine's bin-packing rewrite: rows keep scan order and
+    // the output carries the table's order only if it turned out sorted.
+    if let Some(spec) = flow_materializer::TableSort::of_table(&schema, table.metadata()).spec() {
+        writer = writer.with_sort(spec, flow_materializer::SortMode::Verify)?;
     }
     let mut rows = 0u64;
     flow_compactor::scan_live_files(

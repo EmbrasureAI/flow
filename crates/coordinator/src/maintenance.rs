@@ -39,7 +39,7 @@ pub use deletes::{DeleteRepairCursor, DeleteRewritePolicy};
 mod levels;
 mod manifests;
 mod recovery;
-use levels::file_level;
+pub(crate) use levels::file_level;
 pub(crate) use recovery::resolve_maintenance_catalog_operation;
 use recovery::{MaintenanceResolution, resolve_maintenance_operation};
 
@@ -85,6 +85,8 @@ pub struct Inventory {
     /// The table's format version, which selects the delete-debt policy. See
     /// [`flow_compactor::Policy::for_format_version`].
     pub format_version: iceberg::spec::FormatVersion,
+    /// How the live files follow the table's sort order.
+    pub sort: crate::layout::SortLayout,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -460,6 +462,7 @@ impl TableMaintenance {
             manifest_entries: view.manifest_entries(),
             delete_file_count,
             format_version: table.metadata().format_version(),
+            sort: crate::layout::sort_layout(table, &view),
         })
     }
 

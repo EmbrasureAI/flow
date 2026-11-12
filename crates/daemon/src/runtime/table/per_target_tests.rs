@@ -215,6 +215,8 @@ impl Harness {
             garbage_checked: Arc::default(),
             metadata_backoff: Arc::default(),
             compaction: true,
+            configured: Arc::default(),
+            sort_checked: Arc::default(),
         };
         // Garbage collection is not due during the run.
         work.garbage_checked

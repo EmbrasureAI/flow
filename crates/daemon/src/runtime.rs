@@ -335,6 +335,14 @@ async fn run_service(
             garbage_checked: Arc::default(),
             metadata_backoff: Arc::default(),
             compaction,
+            configured: Arc::new(
+                boot.schemas
+                    .iter()
+                    .enumerate()
+                    .map(|(index, schema)| (schema.table_id, index))
+                    .collect(),
+            ),
+            sort_checked: Arc::default(),
         },
         profiles: boot
             .schemas

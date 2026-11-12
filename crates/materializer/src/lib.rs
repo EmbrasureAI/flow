@@ -2,11 +2,13 @@
 mod arrow;
 mod deletion_vector;
 mod puffin;
+mod sort;
 mod writer;
 pub use arrow::{
     arrow_schema, iceberg_schema, rows_from_batch, rows_to_batch, writer_arrow_schema,
 };
-pub use writer::{DataWriter, DeletePosition, WriterConfig, WrittenBatch};
+pub use sort::{SortKey, SortSpec, TableSort, primary_key_sort, sort_order};
+pub use writer::{DataWriter, DeletePosition, SortMode, WriterConfig, WrittenBatch};
 
 pub use deletion_vector::DeleteWriter;
 pub use puffin::{VectorRead, VectorReadLimits, read_vectors};

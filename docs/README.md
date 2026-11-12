@@ -11,6 +11,7 @@
 - [Remote durability](remote-durability.md): replicating the journal and control state to object storage, ownership, recovery and cost.
 - [Changelog](../CHANGELOG.md) and [security policy](../SECURITY.md).
 - [Iceberg v3](iceberg-v3.md): deletion vectors, upgrades and compatibility checks.
+- [Sorted layout](sorted-layout.md): table sort orders, which files are sorted, and the `layout` command.
 - [Performance](performance.md): recorded throughput, publication latency and reader overhead.
 
 ## Development

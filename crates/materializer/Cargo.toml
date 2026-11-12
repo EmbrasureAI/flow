@@ -12,6 +12,7 @@ rust-version.workspace = true
 flow-model.workspace = true
 flow-iceberg-ext.workspace = true
 arrow-array.workspace = true
+arrow-ord.workspace = true
 arrow-schema.workspace = true
 iceberg.workspace = true
 parquet.workspace = true

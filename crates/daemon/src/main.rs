@@ -9,6 +9,7 @@ mod exit;
 mod generation;
 mod hardening;
 mod http;
+mod layout;
 mod lifecycle;
 mod metadata_import;
 mod observation;
@@ -75,6 +76,16 @@ enum Command {
     /// Read the latest local service status without opening its state database.
     /// Exits 0 when ready and 3 when not ready.
     Status,
+    /// Print each target's sort order and how its live data files follow it.
+    /// Reads catalog metadata only, so it can run beside the daemon.
+    Layout {
+        /// One target, as namespace.table; defaults to every configured target.
+        #[arg(long)]
+        table: Option<String>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Adopt catalog metadata JSON that Flow did not register into grace-delayed GC; run while the daemon is stopped.
     MetadataImport {
         /// NDJSON entries containing table_uuid and path; inventory is operator supplied.
@@ -239,6 +250,10 @@ async fn command(cli: Cli) -> Result<ExitCode> {
             let _http = http::start(&config).await?;
             let compaction = roles.iter().any(|r| r == "compactor");
             replicated(&config, runtime::run(config.clone(), compaction)).await
+        }
+        Command::Layout { table, json } => {
+            layout::run(&config, table.as_deref(), json).await?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::Status => Ok(if runtime::status(config)? {
             ExitCode::SUCCESS
