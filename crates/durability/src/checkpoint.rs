@@ -4,7 +4,7 @@ use crate::format::{
     self, Checkpoint, ControlImage, JournalImage, Part, SegmentImage, checkpoint_key, control_key,
 };
 use crate::store::{self, Created};
-use crate::writer::Shared;
+use crate::writer::{Shared, backoff};
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use flow_state_store::ControlStore;
@@ -24,6 +24,9 @@ use tokio::sync::{mpsc, oneshot};
 const MAX_PARTS: usize = 16;
 /// Journal parts uploaded at once; each is read into memory whole.
 const PART_UPLOADS: usize = 4;
+/// Checkpoint objects are sent in pieces of this size, so the request timeout
+/// bounds one piece rather than a whole segment or snapshot.
+const CHUNK: usize = 8 << 20;
 
 pub(crate) enum Request {
     Control(ControlStore),
@@ -159,14 +162,85 @@ fn read_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Write a checkpoint object while the lease outlasts the request, so a
-/// replaced owner does not keep adding objects.
-async fn put(shared: &Shared, operator: &Operator, object: &str, data: Vec<u8>) -> Result<()> {
-    shared.writable().await?;
-    operator
-        .write(object, data)
+/// Write a checkpoint object, retrying transient failures until replication
+/// stops, as log writes do. An attempt, and the request that completes it,
+/// starts only while the lease outlasts a request, so a replaced owner does
+/// not keep adding objects.
+async fn put(
+    shared: &Shared,
+    operator: &Operator,
+    object: &str,
+    data: Bytes,
+    kind: &'static str,
+) -> Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        shared.writable().await?;
+        let started = Instant::now();
+        match write_object(shared, operator, object, data.clone()).await {
+            Ok(()) => {
+                metrics::histogram!("flow_durability_put_seconds", "kind" => kind)
+                    .record(started.elapsed().as_secs_f64());
+                return Ok(());
+            }
+            Err(error) => {
+                attempt += 1;
+                retrying(shared, kind, object, attempt, &error)?;
+                tokio::time::sleep(backoff(attempt)).await;
+            }
+        }
+    }
+}
+
+/// Upload one object in `CHUNK` pieces; a small object is still one request.
+async fn write_object(
+    shared: &Shared,
+    operator: &Operator,
+    object: &str,
+    data: Bytes,
+) -> Result<()> {
+    let mut writer = operator
+        .writer_with(object)
+        .chunk(CHUNK)
         .await
         .with_context(|| format!("write {object}"))?;
+    let mut result = writer.write(data).await.map_err(anyhow::Error::from);
+    if result.is_ok() {
+        // The object appears only once the upload completes.
+        result = match shared.writable().await {
+            Ok(()) => writer.close().await.map(|_| ()).map_err(Into::into),
+            Err(error) => Err(error),
+        };
+    }
+    if result.is_err() {
+        let _ = writer.abort().await;
+    }
+    result.with_context(|| format!("write {object}"))
+}
+
+/// Count a failed checkpoint write that will be retried, unless replication
+/// stopped meanwhile.
+fn retrying(
+    shared: &Shared,
+    kind: &'static str,
+    object: &str,
+    attempt: u32,
+    error: &anyhow::Error,
+) -> Result<()> {
+    {
+        let mut state = shared.lock();
+        if state.failure.is_some() || state.closing {
+            bail!("remote durability stopped while writing {object}: {error:#}");
+        }
+        state.stats.retries += 1;
+    }
+    metrics::counter!("flow_durability_retries_total", "kind" => kind).increment(1);
+    tracing::warn!(
+        object,
+        attempt,
+        error = %format!("{error:#}"),
+        "remote durability checkpoint write failed; retrying"
+    );
     Ok(())
 }
 
@@ -186,10 +260,7 @@ async fn upload_part(
         "{}-{crc32:08x}.part",
         format::part_key(journal, segment, start, end).trim_end_matches(".part")
     );
-    let started = Instant::now();
-    put(shared, operator, &object, data).await?;
-    metrics::histogram!("flow_durability_put_seconds", "kind" => "part")
-        .record(started.elapsed().as_secs_f64());
+    put(shared, operator, &object, Bytes::from(data), "part").await?;
     Ok(Part {
         object,
         start,
@@ -238,10 +309,7 @@ async fn checkpoint(
                 tokio::task::spawn_blocking(move || format::encode_snapshot(&entries)).await??;
             let bytes = encoded.len() as u64;
             let object = control_key(control_ordinal, shared.epoch, crc32fast::hash(&encoded));
-            let started = Instant::now();
-            put(shared, operator, &object, encoded).await?;
-            metrics::histogram!("flow_durability_put_seconds", "kind" => "control")
-                .record(started.elapsed().as_secs_f64());
+            put(shared, operator, &object, Bytes::from(encoded), "control").await?;
             metrics::gauge!("flow_durability_control_snapshot_bytes").set(bytes as f64);
             ControlImage {
                 object,
@@ -331,16 +399,19 @@ async fn checkpoint(
             .as_millis() as u64,
     };
     let key = checkpoint_key(replay_from, ordinal, checkpoint.epoch, count);
-    shared.writable().await?;
-    match store::create(
-        operator,
-        &key,
-        Bytes::from(serde_json::to_vec(&checkpoint)?),
-    )
-    .await?
-    {
-        Created::New | Created::Same => {}
-        Created::Different(_) => bail!("checkpoint {key} was written by another owner"),
+    let body = Bytes::from(serde_json::to_vec(&checkpoint)?);
+    let mut attempt = 0u32;
+    loop {
+        shared.writable().await?;
+        match store::create(operator, &key, body.clone()).await {
+            Ok(Created::New | Created::Same) => break,
+            Ok(Created::Different(_)) => bail!("checkpoint {key} was written by another owner"),
+            Err(error) => {
+                attempt += 1;
+                retrying(shared, "checkpoint", &key, attempt, &error)?;
+                tokio::time::sleep(backoff(attempt)).await;
+            }
+        }
     }
     let mut state = shared.lock();
     for (name, image) in &checkpoint.journals {
