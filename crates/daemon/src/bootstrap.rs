@@ -16,8 +16,8 @@ use flow_model::{
     TableSchema, TableSchemaVersion,
 };
 use flow_pg_source::{
-    Acknowledgement, CopyRowDecoder, SnapshotSession, export_snapshot, export_temporary_snapshot,
-    fetch_relation,
+    Acknowledgement, CopyRowDecoder, PageRange, SnapshotSession, export_snapshot,
+    export_temporary_snapshot, fetch_relation,
     tokio_postgres::{binary_copy::BinaryCopyOutStream, types::Type},
 };
 use flow_state_store::{ControlStore, OperationKind, OperationPhase, StateStore};
@@ -711,6 +711,9 @@ pub(crate) async fn resume(
     // concurrent COPYs use separate runtime threads. Workers start lazily as
     // slots free up and are aborted if bootstrap is dropped.
     let shared_config = Arc::new(config.clone());
+    // Tables staged before a restart publish without copying again.
+    let copying = plans.iter().filter(|plan| plan.3.is_none()).count();
+    let streams = (COPY_STREAMS / copying.clamp(1, COPY_STREAMS)).max(1);
     let work = futures::stream::iter(plans.into_iter().map(|(index, schema, copy, staged)| {
         let config = shared_config.clone();
         let store = store.clone();
@@ -731,6 +734,7 @@ pub(crate) async fn resume(
                     copy,
                     staged,
                     exported,
+                    streams,
                 },
             )
             .await
@@ -742,7 +746,7 @@ pub(crate) async fn resume(
             })
         }))
     }))
-    .buffer_unordered(4);
+    .buffer_unordered(COPY_STREAMS);
     tokio::pin!(work);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
     let mut failure = None;
@@ -919,6 +923,157 @@ struct CopyWork {
     copy: TableCopy,
     staged: Option<(JournalReader, SourceTransaction)>,
     exported: Option<(String, PgLsn)>,
+    /// COPY streams this table may use; see [`COPY_STREAMS`].
+    streams: usize,
+}
+
+/// Concurrent COPY streams for the whole initial snapshot. Tables share them:
+/// one large table uses all of them, and four or more use one each, so the
+/// source never serves more COPYs at once than with one stream per table.
+const COPY_STREAMS: usize = 4;
+
+/// Pages per COPY range, 1 MiB at the default block size. Ranges are small so
+/// that streams working ahead of the journal writer buffer little.
+pub(crate) fn range_pages() -> u64 {
+    if cfg!(test) { 2 } else { 128 }
+}
+
+/// Staged chunks one range may buffer before the journal writer reaches it.
+const RANGE_CHUNKS: usize = 4;
+
+/// Serialized staging-journal chunk and the rows it holds.
+struct StagedChunk {
+    bytes: Vec<u8>,
+    rows: u64,
+}
+
+/// What a COPY stream sends for one range: its chunks, then completion. A
+/// range whose channel closes without `Done` was not read completely.
+enum RangeItem {
+    Chunk(StagedChunk),
+    Done,
+}
+
+/// The ranges still to read, in page order, each with its index.
+type RangeQueue = std::collections::VecDeque<(usize, PageRange)>;
+
+/// What every COPY stream of one table needs to decode and chunk its rows.
+#[derive(Clone)]
+struct CopyStream {
+    schema: TableSchema,
+    relation: flow_pg_source::Relation,
+    types: flow_pg_source::TypeRegistry,
+    projection: Vec<String>,
+    batch_rows: usize,
+    chunk_bytes: u64,
+    queue: Arc<std::sync::Mutex<RangeQueue>>,
+    /// Ranges taken but not yet appended; bounds how far streams run ahead.
+    window: Arc<tokio::sync::Semaphore>,
+    /// Each taken range's receiver, for the journal writer.
+    ranges: tokio::sync::mpsc::UnboundedSender<(usize, tokio::sync::mpsc::Receiver<RangeItem>)>,
+}
+
+impl CopyStream {
+    /// Copy page ranges from the shared queue, in order, until it is empty.
+    /// Each range's bounded chunks go to its own channel, which the journal
+    /// writer drains in range order.
+    async fn copy(&self, snapshot: &SnapshotSession<'_>) -> Result<()> {
+        let schema = &self.schema;
+        let decoder = CopyRowDecoder::new(schema, &self.relation, &self.types)?;
+        // COPY framing reads raw bytes. The catalog-validated resolver
+        // interprets user-defined OIDs, not rust-postgres's built-in Type list.
+        let types = self
+            .relation
+            .columns
+            .iter()
+            .map(|column| {
+                Type::from_oid(column.type_oid).unwrap_or_else(|| {
+                    Type::new(
+                        column.name.clone(),
+                        column.type_oid,
+                        flow_pg_source::tokio_postgres::types::Kind::Simple,
+                        "public".into(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        loop {
+            self.window
+                .acquire()
+                .await
+                .context("initial COPY journal writer stopped")?
+                .forget();
+            let Some((index, range)) = self.queue.lock().expect("COPY range queue").pop_front()
+            else {
+                return Ok(());
+            };
+            let (chunks, received) = tokio::sync::mpsc::channel(RANGE_CHUNKS);
+            self.ranges
+                .send((index, received))
+                .ok()
+                .context("initial COPY journal writer stopped")?;
+            let output = snapshot
+                .copy_pages(
+                    &self.relation.namespace,
+                    &self.relation.name,
+                    &self.projection,
+                    range,
+                )
+                .await?;
+            let stream = BinaryCopyOutStream::new(output, &types);
+            tokio::pin!(stream);
+            let mut rows = Vec::new();
+            let mut bytes = 8u64;
+            let send = |rows: &mut Vec<Mutation>| -> Result<StagedChunk> {
+                let chunk = StagedChunk {
+                    bytes: bincode::serialize(&*rows)?,
+                    rows: rows.len() as u64,
+                };
+                rows.clear();
+                Ok(chunk)
+            };
+            while let Some(row) = stream.as_mut().try_next().await? {
+                let mutation = Mutation {
+                    table_id: schema.table_id,
+                    schema_version: schema.version,
+                    kind: MutationKind::Insert {
+                        row: decoder.decode(&row)?,
+                    },
+                };
+                let size = bincode::serialized_size(&mutation)?;
+                ensure!(
+                    size + 8 <= self.chunk_bytes,
+                    "snapshot row exceeds configured chunk limit"
+                );
+                if !rows.is_empty()
+                    && (rows.len() >= self.batch_rows || bytes + size > self.chunk_bytes)
+                {
+                    let chunk = send(&mut rows)?;
+                    chunks
+                        .send(RangeItem::Chunk(chunk))
+                        .await
+                        .ok()
+                        .context("initial COPY journal writer stopped")?;
+                    bytes = 8;
+                }
+                rows.push(mutation);
+                bytes += size;
+            }
+            if !rows.is_empty() {
+                let chunk = send(&mut rows)?;
+                chunks
+                    .send(RangeItem::Chunk(chunk))
+                    .await
+                    .ok()
+                    .context("initial COPY journal writer stopped")?;
+            }
+            chunks
+                .send(RangeItem::Done)
+                .await
+                .ok()
+                .context("initial COPY journal writer stopped")?;
+        }
+    }
 }
 
 async fn copy_and_publish(
@@ -935,6 +1090,7 @@ async fn copy_and_publish(
         mut copy,
         staged,
         exported,
+        streams,
     } = work;
     let schema = &schema;
     let table = &table;
@@ -954,27 +1110,8 @@ async fn copy_and_publish(
             .iter()
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
-        let output = snapshot
-            .copy_table(&relation.namespace, &relation.name, &projection)
-            .await?;
-        // COPY framing reads raw bytes. The catalog-validated resolver above
-        // interprets user-defined OIDs, not rust-postgres's built-in Type list.
-        let types = relation
-            .columns
-            .iter()
-            .map(|column| {
-                Type::from_oid(column.type_oid).unwrap_or_else(|| {
-                    Type::new(
-                        column.name.clone(),
-                        column.type_oid,
-                        flow_pg_source::tokio_postgres::types::Kind::Simple,
-                        "public".into(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        let stream = BinaryCopyOutStream::new(output, &types);
-        tokio::pin!(stream);
+        // Validate the relation once before any COPY starts.
+        CopyRowDecoder::new(schema, &relation, &resolved_types)?;
         let (mut journal, recovered) =
             Journal::open(copy.path(config, schema.table_id)?, journal_config(config))
                 .with_context(|| {
@@ -987,40 +1124,109 @@ async fn copy_and_publish(
             recovered.transactions.is_empty(),
             "new COPY staging directory is not empty"
         );
-        let decoder = CopyRowDecoder::new(schema, &relation, &resolved_types)?;
-        let mut rows = Vec::new();
-        let mut bytes = 8u64;
-        while let Some(row) = stream.as_mut().try_next().await? {
-            let mutation = Mutation {
-                table_id: schema.table_id,
-                schema_version: schema.version,
-                kind: MutationKind::Insert {
-                    row: decoder.decode(&row)?,
-                },
-            };
-            let size = bincode::serialized_size(&mutation)?;
-            ensure!(
-                size + 8 <= u64::from(config.limits.chunk_bytes),
-                "snapshot row exceeds configured chunk limit"
-            );
-            if !rows.is_empty()
-                && (rows.len() >= config.limits.batch_rows
-                    || bytes + size > u64::from(config.limits.chunk_bytes))
+        // A large table is read as small `ctid` page ranges under the same
+        // exported snapshot by this session and up to `streams - 1` extra ones,
+        // which take ranges from a shared queue in page order; an extra session
+        // that cannot connect only lowers parallelism. Each stream decodes and
+        // serializes its own rows, and this task appends the ranges in page
+        // order, so the journal keeps the table's physical row order (often key
+        // order, which the initial collapse is much faster at spooling). At most
+        // `streams + 2` ranges, each holding at most RANGE_CHUNKS chunks, are
+        // ever taken but not yet appended.
+        let ranges = match streams {
+            0 | 1 => vec![PageRange::ALL],
+            _ => match snapshot
+                .heap_pages(&relation.namespace, &relation.name)
+                .await?
             {
-                journal.append_chunk(0, &bincode::serialize(&rows)?)?;
-                rows.clear();
-                bytes = 8;
+                Some(pages) => PageRange::split(pages, range_pages()),
+                None => vec![PageRange::ALL],
+            },
+        };
+        let range_count = ranges.len();
+        let workers = streams.clamp(1, range_count);
+        let window = Arc::new(tokio::sync::Semaphore::new(workers + 2));
+        let (registered, mut taken) = tokio::sync::mpsc::unbounded_channel();
+        let stream = CopyStream {
+            schema: schema.clone(),
+            relation: relation.clone(),
+            types: resolved_types.clone(),
+            projection,
+            batch_rows: config.limits.batch_rows,
+            chunk_bytes: u64::from(config.limits.chunk_bytes),
+            queue: Arc::new(std::sync::Mutex::new(
+                ranges.into_iter().enumerate().collect(),
+            )),
+            window: window.clone(),
+            ranges: registered,
+        };
+        let mut extra = tokio::task::JoinSet::new();
+        for _ in 1..workers {
+            let config = config.clone();
+            let stream = stream.clone();
+            let snapshot_name = snapshot_name.clone();
+            extra.spawn(async move {
+                let slot = config.source.slot.clone();
+                let mut sql = match connect(&config, false).await {
+                    Ok(sql) => sql,
+                    Err(error) => {
+                        tracing::warn!(table_id = stream.schema.table_id.0, error = %format!("{error:#}"), "initial COPY range session unavailable; continuing with fewer streams");
+                        return Ok(());
+                    }
+                };
+                let session = match SnapshotSession::import(&mut sql, &slot, cut, &snapshot_name).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        tracing::warn!(table_id = stream.schema.table_id.0, error = %error, "initial COPY range session could not import the snapshot; continuing with fewer streams");
+                        return Ok(());
+                    }
+                };
+                stream.copy(&session).await?;
+                session.finish().await?;
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        let first = async {
+            let stream = stream;
+            stream.copy(&snapshot).await
+        };
+        let append = async {
+            let mut pending = BTreeMap::new();
+            for index in 0..range_count {
+                let mut range = loop {
+                    if let Some(range) = pending.remove(&index) {
+                        break range;
+                    }
+                    let (taken_index, range) = taken
+                        .recv()
+                        .await
+                        .context("initial COPY stopped before reading every page range")?;
+                    pending.insert(taken_index, range);
+                };
+                loop {
+                    match range.recv().await {
+                        Some(RangeItem::Chunk(chunk)) => {
+                            journal.append_chunk(0, &chunk.bytes)?;
+                            copy.rows = copy
+                                .rows
+                                .checked_add(chunk.rows)
+                                .context("COPY row count overflow")?;
+                        }
+                        Some(RangeItem::Done) => break,
+                        None => anyhow::bail!("initial COPY page range ended incompletely"),
+                    }
+                }
+                window.add_permits(1);
             }
-            rows.push(mutation);
-            bytes += size;
-            copy.rows = copy
-                .rows
-                .checked_add(1)
-                .context("COPY row count overflow")?;
-        }
-        if !rows.is_empty() {
-            journal.append_chunk(0, &bincode::serialize(&rows)?)?;
-        }
+            Ok::<_, anyhow::Error>(())
+        };
+        let others = async {
+            while let Some(joined) = extra.join_next().await {
+                joined.context("initial COPY range task failed")??;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(first, append, others)?;
         let transaction = envelope(
             config,
             std::slice::from_ref(schema),
@@ -1032,7 +1238,7 @@ async fn copy_and_publish(
         copy.phase = CopyPhase::Staged;
         copy.save(store, schema.table_id)?;
         snapshot.finish().await?;
-        tracing::info!(event = "bootstrap_table_staged", table_id = schema.table_id.0, rows = copy.rows, lsn = %cut, "initial table COPY durable");
+        tracing::info!(event = "bootstrap_table_staged", table_id = schema.table_id.0, rows = copy.rows, lsn = %cut, copy_ranges = range_count, "initial table COPY durable");
         (journal.reader(), transaction)
     };
     let epoch = Epoch::new(

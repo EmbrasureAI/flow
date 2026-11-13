@@ -130,7 +130,7 @@ class BootstrapRun(Run):
         self.barrier = 0
         self.writer_thread = threading.Thread(target=self.writer)
         self.writer_thread.start()
-        self.until("orders COPY was not held unsent", lambda: self.copy_proxy.active == 1)
+        self.until("orders COPY was not held unsent", lambda: self.copy_proxy.active >= 1)
         events = self.wait_event(lambda events: any(event.get("event") == "bootstrap_table_published" and event.get("table_id") == self.account_oid for event in events)
                                 and any(event.get("event") == "transaction_journaled" for event in events), "small base or concurrent CDC was not published")
         self.stop(crash=True)

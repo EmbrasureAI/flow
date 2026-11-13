@@ -87,6 +87,8 @@ pub struct SnapshotSession<'a> {
     pub slot: String,
     pub consistent_lsn: PgLsn,
     pub snapshot_name: String,
+    /// Whether this transaction already disabled its statement timeout.
+    copying: std::sync::atomic::AtomicBool,
 }
 
 /// Creates a NEW permanent slot and imports its exported consistent snapshot on
@@ -200,6 +202,7 @@ impl<'a> SnapshotSession<'a> {
             slot: slot.to_owned(),
             consistent_lsn,
             snapshot_name: snapshot_name.to_owned(),
+            copying: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -238,6 +241,27 @@ impl<'a> SnapshotSession<'a> {
         fetch_relation(&self.transaction, namespace, table, mutable).await
     }
 
+    /// Heap pages of a plain table or materialized view, which COPY can split
+    /// into `ctid` page ranges, or `None` for any other relation. The size is
+    /// physical, not MVCC: pages added later are covered by open-ended ranges.
+    pub async fn heap_pages(&self, namespace: &str, table: &str) -> Result<Option<u64>> {
+        let row = self
+            .transaction
+            .query_opt(
+                "SELECT CASE WHEN c.relkind IN ('r', 'm') THEN \
+                 pg_catalog.pg_relation_size(c.oid, 'main') \
+                 / pg_catalog.current_setting('block_size')::bigint END \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&namespace, &table],
+            )
+            .await?;
+        Ok(row
+            .and_then(|row| row.get::<_, Option<i64>>(0))
+            .and_then(|pages| u64::try_from(pages).ok()))
+    }
+
     /// Binary COPY is streamed by the transport; the caller chooses a bounded
     /// decoder and must use the exact same publication column projection.
     /// Publication row filters are deliberately unsupported in this V1 helper.
@@ -246,6 +270,21 @@ impl<'a> SnapshotSession<'a> {
         namespace: &str,
         table: &str,
         columns: &[String],
+    ) -> Result<CopyOutStream> {
+        self.copy_pages(namespace, table, columns, PageRange::ALL)
+            .await
+    }
+
+    /// [`Self::copy_table`] restricted to the tuples stored in `pages`. Under
+    /// one snapshot every visible row version lives on exactly one page, so
+    /// ranges that partition the pages copy every row exactly once. PostgreSQL
+    /// 14 and later read such a range with a TID range scan.
+    pub async fn copy_pages(
+        &self,
+        namespace: &str,
+        table: &str,
+        columns: &[String],
+        pages: PageRange,
     ) -> Result<CopyOutStream> {
         if columns.is_empty() {
             return Err(Error::Config("snapshot projection cannot be empty"));
@@ -256,16 +295,22 @@ impl<'a> SnapshotSession<'a> {
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "COPY (SELECT {projection} FROM ONLY {}.{}) TO STDOUT (FORMAT BINARY)",
+            "COPY (SELECT {projection} FROM ONLY {}.{}{}) TO STDOUT (FORMAT BINARY)",
             quote_identifier(namespace),
-            quote_identifier(table)
+            quote_identifier(table),
+            pages.predicate()?
         );
         // A streamed snapshot can outlive an application's query deadline,
         // especially while the bounded reader applies backpressure. Keep this
-        // override local to the read-only snapshot transaction.
-        self.transaction
-            .batch_execute("SET LOCAL statement_timeout = 0")
-            .await?;
+        // override local to the read-only snapshot transaction; it lasts until
+        // the transaction ends, so later page ranges need no round trip.
+        if !self.copying.load(std::sync::atomic::Ordering::Relaxed) {
+            self.transaction
+                .batch_execute("SET LOCAL statement_timeout = 0")
+                .await?;
+            self.copying
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(self.transaction.copy_out(&query).await?)
     }
 
@@ -276,6 +321,54 @@ impl<'a> SnapshotSession<'a> {
     pub async fn cancel(self) -> Result<()> {
         self.transaction.rollback().await?;
         Ok(())
+    }
+}
+
+/// A half-open range of heap pages, `[start, end)`; a missing bound is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageRange {
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+}
+
+impl PageRange {
+    pub const ALL: Self = Self {
+        start: None,
+        end: None,
+    };
+
+    /// Consecutive ranges of `range_pages` pages covering `pages`, in page
+    /// order, or one unbounded range if there would be fewer than two. The
+    /// first range has no lower bound and the last no upper bound, so pages
+    /// added after `pages` was read are still covered.
+    pub fn split(pages: u64, range_pages: u64) -> Vec<Self> {
+        let range_pages = range_pages.max(1);
+        let count = pages / range_pages;
+        if count < 2 {
+            return vec![Self::ALL];
+        }
+        (0..count)
+            .map(|index| Self {
+                start: (index > 0).then(|| index * range_pages),
+                end: (index + 1 < count).then(|| (index + 1) * range_pages),
+            })
+            .collect()
+    }
+
+    fn predicate(self) -> Result<String> {
+        let tid = |page: u64| {
+            u32::try_from(page)
+                .map(|page| format!("'({page},0)'::pg_catalog.tid"))
+                .map_err(|_| Error::Config("COPY page range exceeds the heap block range"))
+        };
+        Ok(match (self.start, self.end) {
+            (None, None) => String::new(),
+            (Some(start), None) => format!(" WHERE ctid >= {}", tid(start)?),
+            (None, Some(end)) => format!(" WHERE ctid < {}", tid(end)?),
+            (Some(start), Some(end)) => {
+                format!(" WHERE ctid >= {} AND ctid < {}", tid(start)?, tid(end)?)
+            }
+        })
     }
 }
 
@@ -333,5 +426,65 @@ impl<'a> FromSql<'a> for RawColumn<'a> {
     }
     fn accepts(_: &Type) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod page_range_tests {
+    use super::PageRange;
+
+    #[test]
+    fn split_covers_every_page_once_with_open_outer_bounds() {
+        assert_eq!(PageRange::split(1_500, 1_024), vec![PageRange::ALL]);
+        assert_eq!(
+            PageRange::split(3_100, 1_000),
+            vec![
+                PageRange {
+                    start: None,
+                    end: Some(1_000)
+                },
+                PageRange {
+                    start: Some(1_000),
+                    end: Some(2_000)
+                },
+                PageRange {
+                    start: Some(2_000),
+                    end: None
+                },
+            ]
+        );
+        for pages in [0, 1, 7, 2_049, 1_000_003] {
+            for range_pages in [1, 2, 3, 128] {
+                let ranges = PageRange::split(pages, range_pages);
+                assert_eq!(ranges.first().unwrap().start, None);
+                assert_eq!(ranges.last().unwrap().end, None);
+                for pair in ranges.windows(2) {
+                    assert!(pair[0].end.is_some() && pair[0].end == pair[1].start);
+                    assert!(pair[0].start.unwrap_or(0) < pair[0].end.unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn predicates_bound_ctid_by_page() {
+        assert_eq!(PageRange::ALL.predicate().unwrap(), "");
+        assert_eq!(
+            PageRange {
+                start: Some(5),
+                end: Some(9)
+            }
+            .predicate()
+            .unwrap(),
+            " WHERE ctid >= '(5,0)'::pg_catalog.tid AND ctid < '(9,0)'::pg_catalog.tid"
+        );
+        assert!(
+            PageRange {
+                start: Some(1 << 33),
+                end: None
+            }
+            .predicate()
+            .is_err()
+        );
     }
 }

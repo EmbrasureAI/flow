@@ -262,6 +262,16 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- Initial COPY reads a large table as 1 MiB `ctid` page ranges on several
+  connections under the same snapshot, instead of one stream per table. The
+  existing four concurrent COPYs are shared: one table uses up to four
+  streams, and four or more tables keep one each, so the source never serves
+  more COPYs than before. Ranges are appended to the staging journal in page
+  order, preserving the row order a single stream would produce; interleaving
+  them doubled the initial collapse of a key-ordered table in testing. An extra
+  connection that cannot be opened only lowers parallelism. For one 2M-row
+  table, the COPY window fell 38% (1.91 s to 1.18 s) and the whole bootstrap
+  9% (12.6 s to 11.5 s), medians of 6 release runs per side.
 - Lazy index remaps are stored in chunks of up to 512 runs, varint-encoded with
   a restart point every 32 runs, at about three bytes per run instead of 28,
   with a small header per retired file. A forward read through a retired file
