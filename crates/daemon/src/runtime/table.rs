@@ -70,6 +70,17 @@ enum MetadataScope {
     Mandatory,
 }
 
+/// What resolving a table's unfinished operation did before publication.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingRecovery {
+    /// Nothing reached the catalog; the head loaded before recovery is current.
+    Unchanged,
+    /// A maintenance operation was resolved and may have moved the head.
+    Maintenance,
+    /// An ingest operation was resolved and must be reconciled first.
+    Ingest,
+}
+
 /// Per-table retry state for metadata maintenance. Process-local: a restart
 /// retries immediately, which is harmless.
 #[derive(Default)]
@@ -718,11 +729,11 @@ impl TableWork {
         Ok((table.metadata().uuid() == *uuid).then_some(table))
     }
 
-    /// Discard a building operation or resolve a prepared one. Returns true
-    /// when an ingest operation was recovered and must be reconciled first.
-    async fn recover_pending(&self, table: &Table, id: TableId) -> Result<bool> {
+    /// Discard a building operation or resolve a prepared one, reporting
+    /// whether the catalog head loaded before recovery may have moved.
+    async fn recover_pending(&self, table: &Table, id: TableId) -> Result<PendingRecovery> {
         let Some(operation) = self.store.table_state(&id)?.pending_operation else {
-            return Ok(false);
+            return Ok(PendingRecovery::Unchanged);
         };
         let record = self
             .store
@@ -732,13 +743,13 @@ impl TableWork {
             (OperationPhase::Building, _) => {
                 self.store.discard_uncommitted(&operation)?;
                 self.store.discard_transaction(&operation.0)?;
-                Ok(false)
+                Ok(PendingRecovery::Unchanged)
             }
             (_, OperationKind::Ingest) => {
                 let recovery = self.publisher.recover(table, &operation).await;
                 discard_unowned_spool(self.store.clone(), operation.clone()).await?;
                 recovery?;
-                Ok(true)
+                Ok(PendingRecovery::Ingest)
             }
             (
                 _,
@@ -747,7 +758,7 @@ impl TableWork {
                 self.maintenance.recover(table, &operation).await?;
                 let store = self.store.clone();
                 tokio::task::spawn_blocking(move || store.forget_applied(&operation)).await??;
-                Ok(false)
+                Ok(PendingRecovery::Maintenance)
             }
             _ => bail!("index reconstruction must finish before publication"),
         }
@@ -770,7 +781,8 @@ impl TableWork {
             );
             return self.probe_build(&table, schema).await;
         }
-        if self.recover_pending(&table, id).await? {
+        let recovery = self.recover_pending(&table, id).await?;
+        if recovery == PendingRecovery::Ingest {
             // Reconcile the recovered operation separately from newly
             // admitted CDC. Its original batch may differ after restart.
             return Ok(TableOutcome::Recovered);
@@ -805,7 +817,13 @@ impl TableWork {
                 "journal schema is newer than durable source registry"
             );
         }
-        let mut current = crate::schema::refresh_table(self.catalog.as_ref(), &table).await?;
+        // load_target just verified this head. Only a recovered maintenance
+        // operation can have moved it since; publication rechecks it anyway.
+        let mut current = if recovery == PendingRecovery::Maintenance {
+            crate::schema::refresh_table(self.catalog.as_ref(), &table).await?
+        } else {
+            table.clone()
+        };
         current = crate::schema::ensure_table_schema(
             &self.store,
             self.catalog.as_ref(),

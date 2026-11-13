@@ -741,6 +741,12 @@ impl PublishRuntime {
                         lane.record_release(id, Instant::now());
                     }
                     scheduler.stall(id, false);
+                    // Every outcome of a periodic visit releases the single
+                    // periodic slot, including recovery of an operation that
+                    // a crash left behind before the visit could run.
+                    if periodic_maintenance {
+                        periodic_active = false;
+                    }
                     match outcome {
                         TableOutcome::Blocked { error_code } => {
                             let indexed = store.table_state(&id)?;
@@ -757,15 +763,16 @@ impl PublishRuntime {
                             maintenance_due.remove(&id);
                             periodic_due.remove(&id);
                             idle_work.retain(|queued| *queued != id);
-                            if periodic_maintenance {
-                                periodic_active = false;
-                            }
                         }
                         TableOutcome::Recovered => {
                             if reserved_build {
                                 build_active.remove(&id);
                                 activation_pending.remove(&id);
                                 waiting_for_build.remove(&id);
+                            }
+                            if periodic_maintenance {
+                                // Recovery consumed the visit; maintenance still runs.
+                                periodic_due.insert(id, Instant::now() + OPTIONAL_MAINTENANCE_DELAY);
                             }
                             pending.defer(id, &mut scheduler);
                             blocked.clear(id)?;
@@ -779,7 +786,6 @@ impl PublishRuntime {
                             maintenance_due.remove(&id);
                         }
                         TableOutcome::PeriodicComplete { next_due } => {
-                            periodic_active = false;
                             ensure!(!reserved_build && transactions.is_empty(), "invalid periodic maintenance completion");
                             if let Some(due) = next_due {
                                 periodic_due.insert(id, due);
