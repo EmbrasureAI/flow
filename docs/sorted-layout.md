@@ -67,10 +67,12 @@ strings and other orders do not match.
 
 ## Compaction
 
-Set `[compaction] sort_merge = true` to enable merging (default `false`).
-Merging improves sorted coverage and Parquet pruning, but adds index-remap
-work under updates; better pruning does not guarantee lower reader latency.
-Measure both ingestion and your reader's queries before enabling it.
+Merging is enabled by default (`[compaction] sort_merge = true`). It preserves
+sorted coverage and Parquet pruning through overlapping rewrites. Reader cost
+also depends on delete processing and metadata; measure the reader version and
+query shape along with the physical layout.
+The [service and reader comparison](benchmarks/sorted-merge.md) records the
+measured gains, resource costs and remaining publication-latency limits.
 
 A rewrite can preserve the table's current order when all inputs are marked
 with that order and the merge policy and memory budget allow it. If the inputs' ranges on the leading sort column are disjoint, it
@@ -92,7 +94,7 @@ Merge admission reads the input footers before fetching data pages. It
 charges each input's largest fetched row group (or whole-file prefetch),
 uncompressed pages,
 dictionary-expanded batch payload, sort keys, gathering and row metadata
-against `[compaction] merge_memory_bytes` (default 256 MiB). Otherwise the
+against `[compaction] merge_memory_bytes` (default 1 GiB per worker). Otherwise the
 rewrite concatenates in commit order. This is a conservative logical payload
 budget, not a process RSS cap: allocator overhead, writer buffers and encoded
 remaps are additional. `sort_merge = false` keeps overlapping inputs in

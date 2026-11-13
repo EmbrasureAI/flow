@@ -417,10 +417,9 @@ async fn compaction_concatenates_disjoint_sorted_inputs_in_key_order() {
     assert_eq!(ids, [-3, -2, -1, 0, 1, 10, 11, 12, 13]);
 }
 
-/// Without opt-in merging, overlapping inputs keep commit order and the
-/// output is not stamped. `merge_compaction.rs` covers enabled merges.
+/// The default compactor merges overlapping sorted inputs and stamps output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compaction_of_overlapping_inputs_keeps_commit_order_unstamped() {
+async fn compaction_of_overlapping_inputs_merges_in_sort_order() {
     let mut fixture = Fixture::new().await;
     fixture.order_by(&[("id", false)]).await;
     fixture
@@ -430,8 +429,8 @@ async fn compaction_of_overlapping_inputs_keeps_commit_order_unstamped() {
         .publish(20, Fixture::insert([2, 4], "b"), 8 << 20)
         .await;
     let (order, ids) = compact_all(&fixture).await;
-    assert_eq!(order, None);
-    assert_eq!(ids, [1, 3, 5, 2, 4]);
+    assert_eq!(order, Some(1));
+    assert_eq!(ids, [1, 2, 3, 4, 5]);
 }
 
 /// An unsorted table's rewrite of in-order inputs is not stamped: there is

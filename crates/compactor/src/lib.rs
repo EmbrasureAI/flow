@@ -321,8 +321,8 @@ impl Default for Policy {
             remap_max_files: 512,
             remap_max_depth: 8,
             remap_max_bytes: 256 << 20,
-            sort_merge: false,
-            merge_memory_bytes: 256 << 20,
+            sort_merge: true,
+            merge_memory_bytes: 1 << 30,
             remap_cleanup_rows: 32_768,
         }
     }
@@ -372,8 +372,8 @@ pub struct MergePolicy {
 impl Default for MergePolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
-            memory_bytes: 256 << 20,
+            enabled: true,
+            memory_bytes: 1 << 30,
         }
     }
 }

@@ -1205,8 +1205,8 @@ async fn external_input_rewrite_cancels_completed_build_without_resurrecting_row
         sorted(expected.clone())
     );
 
-    // A different invalidation: all selected data stays physically identical,
-    // but another maintenance commit replaces its original position deletes.
+    // Delete-only consolidation is different: selected data stays identical,
+    // and the replacement preserves its effective deletes. Reuse the build.
     let delete_base = f.head.clone();
     let selected = SnapshotView::current(&delete_base).await.unwrap();
     let reclaim = TableMaintenance::new(
@@ -1256,14 +1256,11 @@ async fn external_input_rewrite_cancels_completed_build_without_resurrecting_row
         entry.content_type() == DataContentType::PositionDeletes
             && !after.live_files.contains_key(entry.file_path())
     }));
-    let rejected = reclaim
+    let committed = reclaim
         .finish_compaction(&consolidated, &f.schema, ready)
         .await
-        .unwrap_err();
-    assert!(
-        rejected.is::<flow_coordinator::ReplanRequired>(),
-        "{rejected:#}"
-    );
+        .unwrap();
+    assert!(committed.is_some());
     assert!(f.index.pending_operations().unwrap().is_empty());
     assert!(
         f.index
@@ -1276,10 +1273,11 @@ async fn external_input_rewrite_cancels_completed_build_without_resurrecting_row
         .load_table(consolidated.identifier())
         .await
         .unwrap();
-    assert_eq!(
+    assert_ne!(
         final_head.metadata().current_snapshot_id(),
         consolidated.metadata().current_snapshot_id()
     );
+    assert_index_exact(&f, &final_head, "consolidated-index").await;
     assert_eq!(
         sorted(scan(&final_head, &f.schema).await.unwrap()),
         sorted(expected.clone())
@@ -1288,6 +1286,115 @@ async fn external_input_rewrite_cancels_completed_build_without_resurrecting_row
         sorted(scan(&delete_base, &f.schema).await.unwrap()),
         sorted(expected)
     );
+}
+
+/// Matching counts cannot authorize a replacement which swaps one deleted
+/// physical row for another: a build has already omitted the resurrected row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_deletes_cannot_resurrect_a_build_input_row() {
+    for lazy in [false, true] {
+        let mut f = Fixture::new().await;
+        cdc(&mut f, 90, vec![(16, Change::Insert(row(16)))]).await;
+        let base = f.head.clone();
+        let policy = Policy {
+            lazy_index_remap: lazy,
+            ..compaction_policy()
+        };
+        let inventory = maintenance(&f)
+            .inventory(&base, f.schema.table_id)
+            .await
+            .unwrap();
+        let plan = policy
+            .plan(
+                base.metadata().current_snapshot_id().unwrap(),
+                base.metadata().current_schema_id(),
+                &inventory.files,
+                &inventory.deletes,
+            )
+            .unwrap()
+            .unwrap();
+        let selected = plan.input_files.iter().cloned().collect::<Vec<_>>();
+        let counts = selected
+            .iter()
+            .cloned()
+            .zip(
+                f.index
+                    .file_live_row_counts(
+                        &f.schema.table_id,
+                        base.metadata().current_snapshot_id(),
+                        &selected,
+                    )
+                    .unwrap(),
+            )
+            .collect();
+        let built = flow_compactor::build_data(
+            &base,
+            f.schema.clone(),
+            plan,
+            OperationId("resurrection-build".into()),
+            &f.index,
+            f.scratch("resurrection-build"),
+            WriterConfig::default(),
+            &flow_compactor::ReadLimits::default(),
+            &ManifestCache::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        let view = SnapshotView::current(&base).await.unwrap();
+        let removed = view
+            .live_files
+            .values()
+            .find(|entry| {
+                entry.content_type() == DataContentType::PositionDeletes
+                    && entry.file_path().contains("shared-a-")
+            })
+            .unwrap();
+        // Keep the unselected target's delete. On the selected L0 input,
+        // resurrect id 11 and delete id 10 instead; the live count is unchanged.
+        let replacement = fixture::delete(
+            &base,
+            "resurrecting-replacement",
+            vec![f.locations[1].clone(), f.locations[6].clone()],
+        )
+        .await;
+        let head = RewriteFilesAction::new(&base, "resurrecting-replacement")
+            .with_operation_id_key("external.operation-id")
+            .unwrap()
+            .remove_delete_files([removed.file_path().to_owned()])
+            .rewrite_position_deletes(replacement, removed.sequence_number.unwrap())
+            .commit(f.catalog.as_ref(), &base)
+            .await
+            .unwrap()
+            .table;
+        let error = flow_compactor::catch_up(
+            &head,
+            &f.schema,
+            &CommitBase::new(&base),
+            built,
+            &f.index,
+            &counts,
+            &policy,
+            WriterConfig::default(),
+            &flow_compactor::ReadLimits::default(),
+            &ManifestCache::default(),
+            |_| panic!("invalid replacement must fail before staging"),
+        )
+        .await
+        .err()
+        .expect("resurrection must reject the build");
+        assert!(error.is::<flow_compactor::CatchUpRejected>(), "{error:#}");
+        assert!(error.to_string().contains("resurrect"), "{error:#}");
+        assert_eq!(
+            f.catalog
+                .load_table(head.identifier())
+                .await
+                .unwrap()
+                .metadata()
+                .current_snapshot_id(),
+            head.metadata().current_snapshot_id(),
+        );
+    }
 }
 
 /// Every live Iceberg row is indexed at its exact physical location, and the

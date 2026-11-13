@@ -204,6 +204,11 @@ fields obey `mapping_elapsed = mapping_lookup + residual_spool + mapping_verify
 the actual intersection with the next caller batch's interval. Queue, dispatch,
 join and other mapping bookkeeping belong to `mapping_other_ms`. These fields
 measure elapsed intervals, not CPU time or counterfactual time saved.
+`replaced_position_deletes` identifies a pass that proved retention after
+delete-file replacement. `compact_replacement` identifies the bounded in-memory
+proof path; `base_delete_rows_skipped` counts original input holes omitted from
+late-delete staging on that path. `scanned_late_delete_rows` still includes all
+physical rows scanned from the replacement set.
 
 The mapping caller and staging thread each retain at most one row-capped batch;
 owned key/path/partition payload also uses the existing writer batch/row-group

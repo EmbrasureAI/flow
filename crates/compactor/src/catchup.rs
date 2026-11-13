@@ -1,5 +1,5 @@
 //! Correct a completed data build using an exact catalog and index head.
-//! Only additive position deletes and unrelated physical changes are accepted.
+//! Delete replacements must retain every base delete on the selected inputs.
 
 use crate::{
     BuiltData, DeleteReadLimits, Policy, ReadLimits, WorkerOutput,
@@ -61,7 +61,7 @@ pub async fn catch_up(
                 .is_some_and(|snapshot| snapshot.sequence_number() == base.sequence_number),
         "completed build differs from its captured base"
     );
-    let head =
+    let (head, replaced_position_deletes) =
         validate_history(table, base, &original, &output, cache, policy, read_limits).await?;
     let deletes = required_deletes(&head, &output.plan.input_files)?;
     ensure!(
@@ -89,10 +89,18 @@ pub async fn catch_up(
         bytes <= policy.max_delete_input_bytes && rows <= policy.max_delete_input_rows,
         CatchUpRejected("delete input size exceeds catch-up budget")
     );
-    let late_deletes = deletes
-        .difference(&output.plan.delete_files)
-        .cloned()
-        .collect();
+    // Consolidation can replace both original and newly added delete files.
+    // Read the complete head set in that case, then prove that the build did
+    // not omit a row which became live again. The additive path reads only
+    // new files and reuses the base spool.
+    let late_deletes = if replaced_position_deletes {
+        deletes.clone()
+    } else {
+        deletes
+            .difference(&output.plan.delete_files)
+            .cloned()
+            .collect()
+    };
     let data = head
         .live_files
         .values()
@@ -105,22 +113,60 @@ pub async fn catch_up(
     let late_scan = format!("{}-late", output.operation_id.0);
     let output_scan = format!("{}-output", output.operation_id.0);
     let validation_finished = Instant::now();
-    let scanned_late_delete_rows = stage_delete_files(
-        table,
-        schema,
-        &head,
-        &data,
-        &late_deletes,
-        &output.scratch,
-        &late_scan,
-        batch_rows,
-        DeleteReadLimits {
-            max_bytes: policy.max_delete_input_bytes,
-            max_rows: policy.max_delete_input_rows,
-        },
-        read_limits,
-    )
-    .await?;
+    // A small replacement set can prove retention before staging only the
+    // genuinely late positions. Charge 48 bytes per declared row for the
+    // compact (file rank, position) vector, capacity growth and sort scratch.
+    // Larger sets retain the disk-backed path. The physical reader enforces
+    // the declared row budget too, so malformed metadata cannot bypass it.
+    let compact_replacement = replaced_position_deletes
+        && rows
+            .checked_mul(48)
+            .is_some_and(|bytes| bytes <= read_limits.batch_bytes);
+    let (scanned_late_delete_rows, base_delete_rows_skipped) = if compact_replacement {
+        let (positions, scanned) = crate::read_delete_files(
+            table,
+            &head,
+            &data,
+            &late_deletes,
+            batch_rows,
+            DeleteReadLimits {
+                max_bytes: policy.max_delete_input_bytes,
+                max_rows: rows,
+            },
+            read_limits,
+        )
+        .await?;
+        let retained = stage_replacement_positions(
+            &output,
+            &head,
+            positions.iter(),
+            &late_scan,
+            batch_rows,
+            table.metadata().default_partition_spec_id(),
+        )?;
+        (scanned, retained)
+    } else {
+        let scanned = stage_delete_files(
+            table,
+            schema,
+            &head,
+            &data,
+            &late_deletes,
+            &output.scratch,
+            &late_scan,
+            batch_rows,
+            DeleteReadLimits {
+                max_bytes: policy.max_delete_input_bytes,
+                max_rows: policy.max_delete_input_rows,
+            },
+            read_limits,
+        )
+        .await?;
+        if replaced_position_deletes {
+            validate_retained_deletes(&output, &late_scan)?;
+        }
+        (scanned, 0)
+    };
     let late_scan_finished = Instant::now();
 
     let lazy = output.lazy_files.take();
@@ -316,7 +362,14 @@ pub async fn catch_up(
     (output.delete_files, output.residual_delete_rows) = crate::worker::write_residual_positions(
         table,
         &output,
-        residual_positions(&output, &late_scan, &output_scan, &data, v3),
+        residual_positions(
+            &output,
+            &late_scan,
+            &output_scan,
+            &data,
+            v3,
+            !replaced_position_deletes,
+        ),
         config,
     )
     .await?;
@@ -339,6 +392,9 @@ pub async fn catch_up(
         input_delete_bytes = bytes,
         late_delete_files = late_deletes.len(),
         scanned_late_delete_rows,
+        replaced_position_deletes,
+        compact_replacement,
+        base_delete_rows_skipped,
         mapped_rows,
         accepted_rows,
         masked_rows,
@@ -367,6 +423,108 @@ pub async fn catch_up(
         "compaction catch-up validated and staged"
     );
     Ok(output)
+}
+
+/// `positions` is the reader's sorted, unique effective head set. Prove that
+/// every original delete on selected inputs is retained, and omit those base
+/// holes from late-mask staging. Unselected targets keep all current deletes.
+/// Scratch writes are private; no index deltas or residuals are accepted until
+/// the entire proof succeeds.
+fn stage_replacement_positions<'a>(
+    output: &WorkerOutput,
+    head: &SnapshotView,
+    positions: impl Iterator<Item = (&'a FileId, u64)>,
+    scan: &str,
+    batch_rows: usize,
+    spec_id: i32,
+) -> Result<u64> {
+    output.scratch.discard_transaction(scan)?;
+    let mut originals = output
+        .scratch
+        .position_deletes(&output.operation_id.0, &output.table_id)
+        .filter(|position| {
+            position.as_ref().map_or(true, |position| {
+                output.plan.input_files.contains(&position.data_file_id)
+            })
+        });
+    let mut original = originals.next().transpose()?;
+    let mut retained = 0;
+    let mut pending = Vec::with_capacity(batch_rows);
+    for (file, position) in positions {
+        if let Some(base) = original.as_ref() {
+            ensure!(
+                physical(base) >= (file, position),
+                CatchUpRejected("replacement deletes resurrect an input row")
+            );
+            if physical(base) == (file, position) {
+                original = originals.next().transpose()?;
+                retained += 1;
+                continue;
+            }
+        }
+        pending.push(RowLocation {
+            data_file_id: file.clone(),
+            row_position: position,
+            data_sequence_number: head.live_files[&file.0]
+                .sequence_number
+                .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
+            spec_id,
+            partition: Vec::new(),
+            source_commit_lsn: flow_model::PgLsn(0),
+            row_version: 0,
+            row_fingerprint: [0; 16],
+        });
+        if pending.len() == batch_rows {
+            output
+                .scratch
+                .put_position_deletes(scan, &output.table_id, pending.drain(..))?;
+        }
+    }
+    ensure!(
+        original.is_none(),
+        CatchUpRejected("replacement deletes resurrect an input row")
+    );
+    output
+        .scratch
+        .put_position_deletes(scan, &output.table_id, pending)?;
+    Ok(retained)
+}
+
+/// Selected data files remain physically identical throughout the ancestry.
+/// Their live rows at H must be a subset of the rows read at the build base.
+/// Compare the already bounded, disk-backed effective sets; file identities
+/// alone cannot prove this after a position-delete consolidation.
+fn validate_retained_deletes(output: &WorkerOutput, head_scan: &str) -> Result<()> {
+    let mut head = output
+        .scratch
+        .position_deletes(head_scan, &output.table_id)
+        .peekable();
+    for original in output
+        .scratch
+        .position_deletes(&output.operation_id.0, &output.table_id)
+    {
+        let original = original?;
+        if !output.plan.input_files.contains(&original.data_file_id) {
+            continue;
+        }
+        loop {
+            match head.peek() {
+                Some(Err(_)) => {
+                    return Err(head.next().expect("peeked delete").unwrap_err().into());
+                }
+                Some(Ok(position)) if physical(position) < physical(&original) => {
+                    head.next();
+                }
+                Some(Ok(position)) if physical(position) == physical(&original) => break,
+                _ => {
+                    return Err(
+                        CatchUpRejected("replacement deletes resurrect an input row").into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Lazy remap catch-up: translate late deletes through the per-file remaps and
@@ -591,12 +749,15 @@ fn stage_mapping_batches(
 /// spool is already ordered, so overlapping input deletes need neither another
 /// encoding pass nor a second scratch write. With `outputs_only` (format v3,
 /// whose vectors are per target) only positions on this rewrite's output remain.
+/// When original files were replaced, `late_scan` is the complete head set and
+/// base residuals must be excluded: they may no longer apply to other targets.
 fn residual_positions<'a>(
     output: &'a WorkerOutput,
     late_scan: &str,
     mask_scan: &str,
     live_data: &'a BTreeSet<FileId>,
     outputs_only: bool,
+    retain_base: bool,
 ) -> ResidualMerge<'a> {
     let on_output = move |file: &FileId| {
         !outputs_only
@@ -615,11 +776,14 @@ fn residual_positions<'a>(
             .scratch
             .position_delete_cursor(scan, &output.table_id)
     };
-    ResidualMerge::new(vec![
-        ResidualInput::new(cursor(&output.operation_id.0), carried),
+    let mut inputs = vec![
         ResidualInput::new(cursor(late_scan), carried),
         ResidualInput::new(cursor(mask_scan), on_output),
-    ])
+    ];
+    if retain_base {
+        inputs.push(ResidualInput::new(cursor(&output.operation_id.0), carried));
+    }
+    ResidualMerge::new(inputs)
 }
 
 fn physical(position: &RowLocation) -> (&FileId, u64) {
@@ -646,7 +810,7 @@ async fn validate_history(
     cache: &ManifestCache,
     policy: &Policy,
     read_limits: &ReadLimits,
-) -> Result<SnapshotView> {
+) -> Result<(SnapshotView, bool)> {
     let mut history = Vec::new();
     let mut cursor = table.metadata().current_snapshot_id();
     while cursor != base.snapshot_id {
@@ -663,6 +827,7 @@ async fn validate_history(
             .parent_snapshot_id();
     }
     let mut prior = original.clone();
+    let mut replaced_position_deletes = false;
     let mut checked_bytes = 0u64;
     let mut checked_rows = 0u64;
     let limits = iceberg::puffin::DeletionVectorLimits {
@@ -697,6 +862,15 @@ async fn validate_history(
                         && before.file_sequence_number == after.file_sequence_number,
                     CatchUpRejected("selected input or delete identity changed")
                 );
+                continue;
+            }
+            if before.content_type() == DataContentType::PositionDeletes
+                && before.file_format() == iceberg::spec::DataFileFormat::Parquet
+            {
+                // Do not trust the snapshot's operation label or a replacement's
+                // metadata. Catch-up checks effective base positions against the
+                // complete head set before accepting any mappings or residuals.
+                replaced_position_deletes = true;
                 continue;
             }
             ensure!(
@@ -775,7 +949,7 @@ async fn validate_history(
         }
         prior = next;
     }
-    Ok(prior)
+    Ok((prior, replaced_position_deletes))
 }
 
 #[cfg(test)]
@@ -1016,7 +1190,7 @@ mod tests {
         crate::worker::write_residual_positions(
             table,
             output,
-            residual_positions(output, &late, &mask, live, false),
+            residual_positions(output, &late, &mask, live, false, true),
             WriterConfig {
                 batch_rows: 8192,
                 ..WriterConfig::default()
@@ -1024,6 +1198,146 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replaced_delete_residuals_use_only_the_head_set_and_output_masks() {
+        let fixture = residual_fixture(1, false).await;
+        let output = &fixture.outputs[0];
+        let head = format!("{}-late", output.operation_id.0);
+        let mask = format!("{}-output", output.operation_id.0);
+        let expected: BTreeSet<_> = [head.as_str(), mask.as_str()]
+            .into_iter()
+            .flat_map(|scan| output.scratch.position_deletes(scan, &output.table_id))
+            .map(|position| position.unwrap())
+            .filter(|position| !output.plan.input_files.contains(&position.data_file_id))
+            .map(|position| (position.data_file_id, position.row_position))
+            .collect();
+        let mut actual = BTreeSet::new();
+        let mut residuals = residual_positions(output, &head, &mask, &fixture.live, false, false);
+        let mut position = crate::residual::empty_location();
+        while residuals.next_into(&mut position).unwrap().is_some() {
+            actual.insert((position.data_file_id.clone(), position.row_position));
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2_000 + MASK_ROWS as usize);
+    }
+
+    #[tokio::test]
+    async fn compact_replacement_proof_skips_base_holes_and_matches_disk_proof() {
+        use iceberg::spec::{
+            DataFileBuilder, DataFileFormat, ManifestEntry, ManifestStatus, Struct,
+        };
+        let fixture = residual_fixture(1, false).await;
+        let output = &fixture.outputs[0];
+        let mut view = SnapshotView::default();
+        for file in &fixture.live {
+            let data = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(file.0.clone())
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::empty())
+                .partition_spec_id(0)
+                .file_size_in_bytes(1 << 20)
+                .record_count(20_000)
+                .build()
+                .unwrap();
+            view.live_files.insert(
+                file.0.clone(),
+                std::sync::Arc::new(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .sequence_number(3)
+                        .file_sequence_number(3)
+                        .data_file(data)
+                        .build(),
+                ),
+            );
+        }
+        let base: BTreeSet<_> = output
+            .scratch
+            .position_deletes(&output.operation_id.0, &output.table_id)
+            .map(|position| position.unwrap())
+            .filter(|position| output.plan.input_files.contains(&position.data_file_id))
+            .map(|position| (position.data_file_id, position.row_position))
+            .collect();
+        let mut head = base.clone();
+        head.extend(
+            output
+                .scratch
+                .position_deletes(&format!("{}-late", output.operation_id.0), &output.table_id)
+                .map(|position| position.unwrap())
+                .map(|position| (position.data_file_id, position.row_position)),
+        );
+        assert_eq!(
+            stage_replacement_positions(
+                output,
+                &view,
+                head.iter().map(|(file, row)| (file, *row)),
+                "compact-proof",
+                128,
+                0,
+            )
+            .unwrap(),
+            6_000,
+        );
+        let staged: BTreeSet<_> = output
+            .scratch
+            .position_deletes("compact-proof", &output.table_id)
+            .map(|position| position.unwrap())
+            .map(|position| (position.data_file_id, position.row_position))
+            .collect();
+        assert_eq!(staged, head.difference(&base).cloned().collect());
+        let stage_head = |positions: &BTreeSet<(FileId, u64)>| {
+            output.scratch.discard_transaction("disk-proof").unwrap();
+            let rows: Vec<_> = positions
+                .iter()
+                .map(|(file, row)| RowLocation {
+                    data_file_id: file.clone(),
+                    row_position: *row,
+                    data_sequence_number: 3,
+                    spec_id: 0,
+                    partition: Vec::new(),
+                    source_commit_lsn: PgLsn(0),
+                    row_version: 0,
+                    row_fingerprint: [0; 16],
+                })
+                .collect();
+            for batch in rows.chunks(128) {
+                output
+                    .scratch
+                    .put_position_deletes("disk-proof", &output.table_id, batch.iter().cloned())
+                    .unwrap();
+            }
+        };
+        stage_head(&head);
+        validate_retained_deletes(output, "disk-proof").unwrap();
+        for missing in [
+            base.first().unwrap(),
+            base.iter().nth(3_000).unwrap(),
+            base.last().unwrap(),
+        ] {
+            let mut invalid = head.clone();
+            invalid.remove(missing);
+            stage_head(&invalid);
+            assert!(
+                validate_retained_deletes(output, "disk-proof")
+                    .unwrap_err()
+                    .is::<CatchUpRejected>()
+            );
+            assert!(
+                stage_replacement_positions(
+                    output,
+                    &view,
+                    invalid.iter().map(|(file, row)| (file, *row)),
+                    "compact-proof",
+                    128,
+                    0,
+                )
+                .unwrap_err()
+                .is::<CatchUpRejected>()
+            );
+        }
     }
 
     async fn residual_digest(table: &Table, files: &[iceberg::spec::DataFile]) -> String {
@@ -1076,7 +1390,8 @@ mod tests {
                 let started = Instant::now();
                 let late = format!("{}-late", output.operation_id.0);
                 let mask = format!("{}-output", output.operation_id.0);
-                let mut merge = residual_positions(output, &late, &mask, &fixture.live, false);
+                let mut merge =
+                    residual_positions(output, &late, &mask, &fixture.live, false, true);
                 let mut slot = crate::residual::empty_location();
                 let mut merged = 0u64;
                 while merge.next_into(&mut slot).unwrap().is_some() {

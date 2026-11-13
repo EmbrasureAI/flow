@@ -3,7 +3,7 @@
 //! index exact, and every fallback to concatenation.
 
 use flow_compactor::Policy;
-use flow_coordinator::{ReplanRequired, TableMaintenance, TablePublisher};
+use flow_coordinator::{DeleteRewritePolicy, ReplanRequired, TableMaintenance, TablePublisher};
 use flow_iceberg_ext::{RowDeltaAction, SnapshotView};
 use flow_materializer::{DataWriter, SortKey, SortMode, SortSpec, WriterConfig, iceberg_schema};
 use flow_model::{FileId, OperationId, PgLsn, Row, SourceId, TableSchema, Value};
@@ -633,6 +633,21 @@ async fn background_merge_catches_up_late_changes_to_its_inputs() {
         BUFFERED,
     )
     .await;
+    let scratch = f.scratch();
+    maintenance
+        .compact_deletes(
+            &f.head,
+            &f.schema,
+            scratch,
+            &DeleteRewritePolicy {
+                min_input_files: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    f.refresh().await;
     let ready = running.wait().await.unwrap();
     let head = f.head.clone();
     assert!(
@@ -833,6 +848,7 @@ async fn merged_remaps_recover_after_lost_catalog_response_and_reopen() {
         let mut f = Fixture::new(version).await;
         f.insert((0..60).step_by(2), "a").await;
         f.insert((1..60).step_by(2), "b").await;
+        f.cdc(vec![(2, Change::Delete)], BUFFERED).await;
         let maintenance = f.maintenance(policy());
         let scratch = f.scratch();
         let running = maintenance
@@ -846,6 +862,23 @@ async fn merged_remaps_recover_after_lost_catalog_response_and_reopen() {
         )
         .await;
         let ready = running.wait().await.unwrap();
+        if version == FormatVersion::V2 {
+            let scratch = f.scratch();
+            maintenance
+                .compact_deletes(
+                    &f.head,
+                    &f.schema,
+                    scratch,
+                    &DeleteRewritePolicy {
+                        min_input_files: 2,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            f.refresh().await;
+        }
         f.catalog.lose_next_response_and_disconnect();
         assert!(
             maintenance

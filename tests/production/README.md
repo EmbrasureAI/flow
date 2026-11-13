@@ -4,6 +4,32 @@ Use the [fault suite](FAULTS.md) for recovery and outage checks, `benchmark.py` 
 
 This is a reproducible local qualification harness, not a claim that one machine reproduces a cloud region. Docker services, the daemon, the producer, and DuckDB share the host's CPU, disk, network stack, and memory. Run the suites serially, record the host and service resource limits, and repeat representative results before comparing changes.
 
+The workload and selective-query benchmarks pin DuckDB 2.0.0. Its Iceberg
+extension uses compressed bitmaps for positional deletes; the 1.5.5 extension
+used per-position hash sets, whose loading and cleanup can dominate selective
+queries even when Parquet pruning improves. Record the extension identities in
+the reports, and use the same reader for both sides of an ingestion comparison:
+the concurrent reader shares CPU with the writer. Compatibility suites retain
+their own version pins. External file caching stays disabled in these benchmarks.
+
+For selective queries on a retained benchmark table, stop ingestion and run:
+
+```sh
+uv run tests/production/query_benchmark.py \
+  --catalog-uri http://127.0.0.1:58181 \
+  --s3-endpoint http://127.0.0.1:59000 \
+  --table flow_test_RUN.events_0 --repeats 3 > target/query-results.json
+```
+
+This pins the table's metadata once, warms metadata/connections, and measures
+40 seeded positive point lookups, 20 ranges of 1,000 IDs, a full aggregate, and
+10 sets of 50 transaction-marker IDs. A full PyIceberg scan supplies independent
+expected values; every measured result is checked. Sampling follows key order,
+so file order cannot change the selected keys. The JSON includes raw timings,
+query keys, reader/extension versions and the metadata location. Compare at
+least three runs per layout in alternating order; different end snapshots can
+also have different delete sets, so this does not isolate sorting alone.
+
 ## Fast A/B comparisons
 
 Use `ab.py` to decide whether a change helps. It builds two revisions, runs them alternately against the fixture, verifies every row of every run and compares the medians:

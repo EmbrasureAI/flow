@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["duckdb==1.5.5", "psycopg[binary]==3.3.5", "boto3==1.43.88", "fastavro==1.12.2"]
+# dependencies = ["duckdb==2.0.0", "psycopg[binary]==3.3.5", "boto3==1.43.88", "fastavro==1.12.2"]
 # ///
 """Open-loop CDC load, commit-to-reader latency, and independent full-row verification."""
 
