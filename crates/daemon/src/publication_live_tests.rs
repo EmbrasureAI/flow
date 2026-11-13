@@ -83,6 +83,22 @@ async fn with_configured_daemon<F, Fut>(
     F: FnOnce(Config, String) -> Fut,
     Fut: Future<Output = ()>,
 {
+    with_seeded_daemon(url, sql, label, "", configure, checks).await;
+}
+
+/// [`with_configured_daemon`], running `seed` (with `{name}` replaced by the
+/// schema) after the tables are created and before the initial copy.
+async fn with_seeded_daemon<F, Fut>(
+    url: &str,
+    sql: &Client,
+    label: &str,
+    seed: &str,
+    configure: impl FnOnce(&mut Config),
+    checks: F,
+) where
+    F: FnOnce(Config, String) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let name = format!(
         "flow_public_block_{label}_{}",
         SystemTime::now()
@@ -102,6 +118,11 @@ async fn with_configured_daemon<F, Fut>(
     ))
     .await
     .unwrap();
+    if !seed.is_empty() {
+        sql.batch_execute(&seed.replace("{name}", &name))
+            .await
+            .unwrap();
+    }
     // Surface capture warnings (disconnects, deferred checks) in test output.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
@@ -340,6 +361,51 @@ fn blocked_tables(config: &Config) -> Vec<serde_json::Value> {
         .as_array()
         .cloned()
         .unwrap_or_default()
+}
+
+/// Every published `(id, status)` of a target table, sorted.
+async fn published_values(name: &str, table: &str) -> Vec<(i64, Option<String>)> {
+    use arrow_array::{Array, Int64Array, StringArray};
+    use futures::TryStreamExt;
+    let catalog = crate::services::TEST_CATALOGS
+        .lock()
+        .unwrap()
+        .get(&format!("memory://{name}"))
+        .cloned()
+        .unwrap();
+    let table = catalog
+        .load_table(&iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new(name.into()),
+            table.into(),
+        ))
+        .await
+        .unwrap();
+    let mut batches = table.scan().build().unwrap().to_arrow().await.unwrap();
+    let mut values = Vec::new();
+    while let Some(batch) = batches.try_next().await.unwrap() {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone();
+        let statuses = batch
+            .column_by_name("status")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        for row in 0..batch.num_rows() {
+            values.push((
+                ids.value(row),
+                (!statuses.is_null(row)).then(|| statuses.value(row).to_owned()),
+            ));
+        }
+    }
+    values.sort();
+    values
 }
 
 async fn published_rows(name: &str, table: &str) -> usize {
@@ -983,6 +1049,74 @@ async fn live_external_writes_block_one_table_until_rollback_or_grace() {
     let sql_task = tokio::spawn(connection);
     external_write(&url, &sql, true).await;
     external_write(&url, &sql, false).await;
+    drop(sql);
+    sql_task.await.unwrap().unwrap();
+}
+
+/// A table larger than one COPY stream's minimum is read as several `ctid`
+/// page ranges under one snapshot. Updated, deleted and moved row versions
+/// before the cut must each be copied exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FLOW_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn live_initial_copy_splits_large_tables_into_page_ranges() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let seed = "INSERT INTO {name}.orders
+                    SELECT id, repeat('order-', 30) || id FROM generate_series(2, 20000) id;
+                UPDATE {name}.orders SET status = status || '-updated' WHERE id % 3 = 0;
+                DELETE FROM {name}.orders WHERE id % 7 = 0;
+                INSERT INTO {name}.orders
+                    SELECT id, 'late-' || id FROM generate_series(20001, 20500) id;
+                UPDATE {name}.orders SET status = NULL WHERE id % 11 = 0;";
+    with_seeded_daemon(
+        &url,
+        &sql,
+        "copy_ranges",
+        seed,
+        |_| {},
+        |_config, name| {
+            let sql = &sql;
+            async move {
+                let pages: i64 = sql
+                    .query_one(
+                        &format!(
+                            "SELECT pg_catalog.pg_relation_size('{name}.orders') \
+                         / pg_catalog.current_setting('block_size')::bigint"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                let ranges = flow_pg_source::PageRange::split(
+                    u64::try_from(pages).unwrap(),
+                    crate::bootstrap::range_pages(),
+                );
+                assert!(
+                    ranges.len() > 1,
+                    "the table must span several ranges: {pages} pages"
+                );
+                let expected: Vec<(i64, Option<String>)> = sql
+                    .query(
+                        &format!("SELECT id, status FROM {name}.orders ORDER BY id"),
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| (row.get(0), row.get(1)))
+                    .collect();
+                assert_eq!(expected.len(), 20_500 - 20_000 / 7);
+                until("initial copy published", || async {
+                    published_rows(&name, "orders").await == expected.len()
+                })
+                .await;
+                assert_eq!(published_values(&name, "orders").await, expected);
+            }
+        },
+    )
+    .await;
     drop(sql);
     sql_task.await.unwrap().unwrap();
 }
