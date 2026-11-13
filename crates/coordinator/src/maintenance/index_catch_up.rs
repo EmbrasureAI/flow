@@ -80,18 +80,27 @@ impl TableMaintenance {
         let after = file_paths(&current, DataContentType::Data);
         let removed: BTreeSet<_> = before.difference(&after).cloned().collect();
         let added: BTreeSet<_> = after.difference(&before).cloned().collect();
-        // Shared files can only lose rows, through deletes the checkpoint lacked.
-        let new_deletes: BTreeSet<_> = file_paths(&current, DataContentType::PositionDeletes)
-            .difference(&file_paths(&previous, DataContentType::PositionDeletes))
-            .cloned()
-            .collect();
+        // Shared files may only lose rows, through deletes the checkpoint lacked.
+        // A file whose checkpoint deletes no longer all apply (a removed, replaced
+        // or superseded delete) must keep every checkpoint position deleted.
+        let previous_deletes = file_paths(&previous, DataContentType::PositionDeletes);
+        let current_deletes = file_paths(&current, DataContentType::PositionDeletes);
         let mut changed = BTreeSet::new();
-        if !new_deletes.is_empty() {
+        let mut narrowed = BTreeSet::new();
+        if previous_deletes != current_deletes {
+            let ids = |deletes: Vec<&iceberg::spec::ManifestEntry>| {
+                deletes
+                    .into_iter()
+                    .map(|entry| FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
+                    .collect::<BTreeSet<_>>()
+            };
             for file in before.intersection(&after) {
-                if current.applicable_deletes(&file.0)?.iter().any(|entry| {
-                    new_deletes
-                        .contains(&FileId(flow_iceberg_ext::content_file_id(&entry.data_file)))
-                }) {
+                let old = ids(previous.applicable_deletes(&file.0)?);
+                let new = ids(current.applicable_deletes(&file.0)?);
+                if !old.is_subset(&new) {
+                    narrowed.insert(file.clone());
+                }
+                if old != new {
                     changed.insert(file.clone());
                 }
             }
@@ -160,7 +169,9 @@ impl TableMaintenance {
                         payload: Vec::new(),
                     })?;
                     let deletes_scan = format!("{}-deletes", removal.0);
-                    worker_runtime()?.block_on(flow_compactor::stage_position_deletes(
+                    let previous_scan = format!("{}-previous", removal.0);
+                    let runtime = worker_runtime()?;
+                    runtime.block_on(flow_compactor::stage_position_deletes(
                         &worker_table,
                         &worker_schema,
                         &current,
@@ -170,6 +181,18 @@ impl TableMaintenance {
                         batch_rows,
                         &read_limits,
                     ))?;
+                    if !narrowed.is_empty() {
+                        runtime.block_on(flow_compactor::stage_position_deletes(
+                            &worker_table,
+                            &worker_schema,
+                            &previous,
+                            &narrowed,
+                            &scratch,
+                            &previous_scan,
+                            batch_rows,
+                            &read_limits,
+                        ))?;
+                    }
                     let mut pending: Vec<(u64, flow_model::PrimaryKey)> = Vec::new();
                     let mut stage = |pending: &mut Vec<(u64, flow_model::PrimaryKey)>,
                                      file: &FileId|
@@ -201,12 +224,21 @@ impl TableMaintenance {
                         let deleted = if removed.contains(file) {
                             None
                         } else {
-                            Some(
-                                scratch
-                                    .file_position_deletes(&deletes_scan, &table_id, file)
-                                    .map(|location| location.map(|location| location.row_position))
-                                    .collect::<flow_state_store::Result<BTreeSet<_>>>()?,
-                            )
+                            let deleted = scratch
+                                .file_position_deletes(&deletes_scan, &table_id, file)
+                                .map(|location| location.map(|location| location.row_position))
+                                .collect::<flow_state_store::Result<BTreeSet<_>>>()?;
+                            if narrowed.contains(file) {
+                                for location in
+                                    scratch.file_position_deletes(&previous_scan, &table_id, file)
+                                {
+                                    ensure!(
+                                        deleted.contains(&location?.row_position),
+                                        "a catalog change restored rows deleted at the checkpoint"
+                                    );
+                                }
+                            }
+                            Some(deleted)
                         };
                         for row in index.file_rows(&table_id, file) {
                             let (position, key) = row?;
