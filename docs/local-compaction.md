@@ -30,8 +30,15 @@ work retain their existing paths.
    to the background. The daemon pauses admission of the next same-table CDC
    epoch while that task loads catalog head H and captures one immutable index
    snapshot, including the full table state and exact live-file counts. Require
-   S ancestry, unchanged selected data identities and unchanged original delete
-   inputs; additive late position deletes and unrelated appends are permitted.
+   S ancestry and unchanged selected data identities. Additive late position
+   deletes and unrelated appends are permitted. If position-delete files were
+   replaced, read the bounded complete effective delete set at H and prove it
+   still contains every base delete on the selected data files. This permits
+   consolidation without accepting resurrection or trusting a snapshot label.
+   Replacement sets charged at 48 bytes per declared position within
+   `read.batch_bytes` use the compact sorted delete reader. They prove retention
+   and stage only late input deletes and current deletes on unselected targets,
+   skipping the original holes. Larger sets use disk-backed staging and proof.
 5. Without an effective late position delete, retain an output row's index delta
    only if its old location still equals the current mapping. With such a delete,
    require either no current key or a newer source-LSN mapping outside the
@@ -42,7 +49,8 @@ work retain their existing paths.
    detached phase creates no main-store operation or catalog commit. A failure
    discards the whole candidate; a new H requires fresh preparation.
 6. Rebuild residual deletes for unselected surviving data using original sequence
-   applicability, and add the translated output masks. New data uses S's data
+   applicability, and add the translated output masks. After delete replacement,
+   residuals use only H's effective set, not stale base deletes. New data uses S's data
    sequence; delete outputs use the maximum removed delete sequence. Reacquire
    the table actor and require the catalog identity, location, snapshot, schema
    and spec plus the complete index `TableState` to equal captured H. Atomically
@@ -241,7 +249,8 @@ depend on that rewrite retiring sparse vectors.
   clears it; no rows move and no row-index deltas are written. A soft build
   probe runs the same consolidation instead of yielding. If hard pressure from
   delete-file count alone meets a running build, the consolidation still runs;
-  a build whose delete inputs it replaced is invalidated at catch-up.
+  catch-up proves that replacement deletes retain the build's original deleted
+  positions, allowing an equivalent consolidation to preserve the data build.
 - Delete-file count no longer makes a data file a rewrite candidate. Data
   rewrites for deletes select files whose own deleted fraction reaches
   `deleted_rows_percent`, and an L1 or L2 seed admits only companions that also

@@ -1205,7 +1205,7 @@ impl PublishRuntime {
                                 event = "compaction_preparation_discarded",
                                 table = ?id,
                                 hard_pressure,
-                                %error,
+                                error = %format!("{error:#}"),
                                 "background compaction preparation invalidated; scheduling maintenance"
                             );
                             if hard_pressure {

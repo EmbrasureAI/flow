@@ -5,6 +5,17 @@ PostgreSQL-commit-to-Iceberg-publication latency below 1 second at p95 and
 2 seconds at p99, and read time at most 1.25 times a compacted equivalent.
 No 24-hour endurance qualification has completed.
 
+## Sorted merge compaction
+
+The [sorted merge comparison](benchmarks/sorted-merge.md) preserves large builds
+across delete consolidation and enables merging with a 1 GiB admission budget.
+On a 2M-row update workload, median CDC service time fell 4.2%; DuckDB 2.0 point
+and range queries on the resulting snapshots were about 56% faster. Publication
+p95 remained 8.5 seconds, above the target, and compaction stalls increased.
+The smaller mixed workload passed all gates with 1.8% higher CDC service time
+and 10.9% higher peak RSS. The report includes admitted load, missed arrivals,
+reader versions, actual HTTP bytes and the limits of the comparison.
+
 ## Expanded load and schema coverage
 
 The [expanded load matrix](benchmarks/load-matrix.md) passed exact data checks
