@@ -107,6 +107,15 @@ From earlier development builds of `main`:
   sets the order of new tables and replaces a differing order on existing
   ones; without it an existing table keeps the order set from SQL. See
   [Sorted layout](docs/sorted-layout.md).
+- Opt-in `[compaction] sort_merge = true` merges overlapping inputs verified
+  in the current sort order into
+  sorted Parquet output, preserving per-input row order for lazy index remaps,
+  late-delete catch-up and v3 row lineage. Disjoint inputs still concatenate
+  in key order. `[compaction] sort_merge` and `merge_memory_bytes` control
+  eligibility and logical input memory admission; inputs that exceed the budget
+  concatenate. Misstamped inputs trigger a retry without merging.
+  `flow_compaction_layout_total` and `flow_compaction_merge_demotions_total`
+  expose layout choices and invalid sort stamps.
 - Snapshot expiration is on by default (`limits.snapshot_expiration`). It keeps
   at least `limits.snapshot_retain_last` (128) snapshots of `main`, honors an
   explicit table `history.expire.max-snapshot-age-ms`, and caps Flow-managed

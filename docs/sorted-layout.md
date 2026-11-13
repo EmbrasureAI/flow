@@ -53,6 +53,7 @@ sorting for tables with a declared order.
 | A CDC epoch collapsed in memory (up to `limits.collapse_memory_bytes`) | Sorted before writing | Always; Parquet sorting columns are declared too |
 | A larger epoch collapsed on disk, and the PostgreSQL initial copy | In primary-key encoding order | Only if that order is the sort order |
 | A compaction of sorted inputs whose key ranges are disjoint | Inputs in key order | When the output checks out |
+| An eligible merge of a keyed table's sorted, overlapping inputs | Inputs merged | Always; Parquet sorting columns are declared too |
 | Any other compaction | Inputs in commit order | Only if the output happens to be sorted |
 
 Sorting an epoch costs no index work: its new rows get fresh index entries in
@@ -64,8 +65,52 @@ non-negative integer and UUID keys, so the initial copy and disk-collapsed
 epochs of such tables are marked sorted. Negative integers, variable-length
 strings and other orders do not match.
 
-Compaction keeps each input file contiguous. Inputs that overlap in key range,
-such as CDC epochs that update keys across the table, are rewritten unsorted.
+## Compaction
+
+Set `[compaction] sort_merge = true` to enable merging (default `false`).
+Merging improves sorted coverage and Parquet pruning, but adds index-remap
+work under updates; better pruning does not guarantee lower reader latency.
+Measure both ingestion and your reader's queries before enabling it.
+
+A rewrite can preserve the table's current order when all inputs are marked
+with that order and the merge policy and memory budget allow it. If the inputs' ranges on the leading sort column are disjoint, it
+concatenates them in key order, one input open at a time. Otherwise, it
+merges them: every input is open at once, and the rewrite repeatedly takes
+the longest run of rows from one input that sorts before every other input's
+next row. Merged output is sorted across files too, so each output file
+covers a narrower key range. Equal sort keys can span output boundaries,
+and files outside this rewrite can still overlap those ranges.
+
+CDC epochs that update keys across the table overlap, so their compactions
+merge. Rows with equal sort keys keep commit order. Each input's rows keep
+their relative order, so the rewrite's [lazy remap](local-compaction.md#lazy-index-remap)
+still describes where every row moved. A merge needs one, so it applies to
+keyed tables with `lazy_index_remap` on (the default). Interleaved inputs
+make the remap larger: about one run per moved row, three bytes each.
+
+Merge admission reads the input footers before fetching data pages. It
+charges each input's largest fetched row group (or whole-file prefetch),
+uncompressed pages,
+dictionary-expanded batch payload, sort keys, gathering and row metadata
+against `[compaction] merge_memory_bytes` (default 256 MiB). Otherwise the
+rewrite concatenates in commit order. This is a conservative logical payload
+budget, not a process RSS cap: allocator overhead, writer buffers and encoded
+remaps are additional. `sort_merge = false` keeps overlapping inputs in
+commit order.
+
+A merge checks every row against the order. An input marked sorted whose
+rows are not, such as a file from a faulty external writer, fails the
+rewrite, which is retried at once without merging. A bounded process-local
+cache remembers the file; after a cache reset or restart, a still-live file
+is checked again. The rewrite that retires it is marked sorted only if its
+output is. The `compaction_input_out_of_order` event and
+`flow_compaction_merge_demotions_total` report it.
+
+`flow_compaction_layout_total{layout}` counts published rewrites by
+`merge`, `key_order` and `commit_order`. The worker's
+`compaction_data_built` event also carries `layout`, `merge_held_bytes`,
+`merge_runs` (contiguous runs taken from one input) and `merge_declined`
+(`memory` when the inputs did not fit).
 
 ## Inspecting a table
 

@@ -271,6 +271,14 @@ pub struct Policy {
     pub remap_max_depth: u64,
     /// ... or while the table's remap records and chunks take more bytes.
     pub remap_max_bytes: u64,
+    /// Merge rewrite inputs that are all sorted in the table's order, so the
+    /// output is sorted even when their key ranges overlap. Needs lazy index
+    /// remaps on a keyed table; other rewrites concatenate.
+    pub sort_merge: bool,
+    /// Logical input payload budget for a merge: fetched groups, decoded pages,
+    /// expanded batches, sort keys and gathering. Excludes allocator overhead,
+    /// writer buffers and encoded remaps.
+    pub merge_memory_bytes: u64,
     /// Index entries one periodic visit may rewrite while materializing.
     pub remap_cleanup_rows: u64,
 }
@@ -313,6 +321,8 @@ impl Default for Policy {
             remap_max_files: 512,
             remap_max_depth: 8,
             remap_max_bytes: 256 << 20,
+            sort_merge: false,
+            merge_memory_bytes: 256 << 20,
             remap_cleanup_rows: 32_768,
         }
     }
@@ -352,6 +362,22 @@ pub struct Debt {
     pub pressure: PublicationPressure,
 }
 
+/// The merge settings a plan carries to its worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergePolicy {
+    pub enabled: bool,
+    pub memory_bytes: u64,
+}
+
+impl Default for MergePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            memory_bytes: 256 << 20,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionPlan {
     pub base_snapshot_id: i64,
@@ -367,6 +393,8 @@ pub struct CompactionPlan {
     pub delete_input_rows: u64,
     /// Build a lazy index remap instead of per-row mappings (keyed tables).
     pub lazy_index_remap: bool,
+    /// Whether and within what memory the worker may merge sorted inputs.
+    pub merge: MergePolicy,
     /// Write residual position deletes one file per target data file
     /// ([`DeleteLayout::PerTarget`]) instead of in shared ranges.
     pub per_target_deletes: bool,
@@ -436,6 +464,9 @@ impl Policy {
             return Err(Error::InvalidPolicy(
                 "remap_max_depth must be 1..=1024 and remap_cleanup_rows positive",
             ));
+        }
+        if self.merge_memory_bytes == 0 {
+            return Err(Error::InvalidPolicy("merge_memory_bytes must be positive"));
         }
         Ok(())
     }
@@ -1143,6 +1174,10 @@ impl Policy {
                         delete_input_bytes,
                         delete_input_rows,
                         lazy_index_remap: self.lazy_index_remap,
+                        merge: MergePolicy {
+                            enabled: self.sort_merge,
+                            memory_bytes: self.merge_memory_bytes,
+                        },
                         per_target_deletes: self.delete_layout == DeleteLayout::PerTarget,
                         target_ranges,
                         reason,
@@ -1180,13 +1215,17 @@ impl Policy {
 }
 
 mod columnar;
+mod live;
+mod merge;
 mod parquet_scan;
 pub use parquet_scan::{ReadLimits, read_positions};
 mod catchup;
 mod residual;
 pub use catchup::{CatchUpRejected, catch_up};
+pub use merge::InputOutOfOrder;
 mod worker;
 pub use worker::{
-    BuiltData, DeletePositions, DeleteReadLimits, LiveBatch, WorkerOutput, build_data, compact,
-    read_delete_files, scan_live_files, stage_delete_files, stage_position_deletes,
+    BuiltData, DeletePositions, DeleteReadLimits, LiveBatch, RewriteLayout, WorkerOutput,
+    build_data, compact, read_delete_files, scan_live_files, stage_delete_files,
+    stage_position_deletes,
 };

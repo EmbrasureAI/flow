@@ -21,7 +21,9 @@ use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector},
-        async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder},
+        async_reader::{
+            AsyncFileReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
+        },
     },
     basic::Type as PhysicalType,
     errors::{ParquetError, Result as ParquetResult},
@@ -229,7 +231,7 @@ fn admit_group(
     requested_rows: usize,
     file_size: u64,
     limits: &ReadLimits,
-) -> Result<usize> {
+) -> Result<(usize, u64)> {
     let parquet_schema = metadata.parquet_schema();
     let mut charge = BatchCharge {
         fixed_per_row: 0,
@@ -333,7 +335,10 @@ fn admit_group(
             high = middle - 1;
         }
     }
-    Ok(low)
+    Ok((
+        low,
+        charge.bytes(low).context("Parquet batch charge overflow")?,
+    ))
 }
 
 /// An input file fetched whole ahead of its scan, or one to read by range.
@@ -504,102 +509,264 @@ pub(crate) async fn read_input_batches(
     limits: &ReadLimits,
     mut visit: impl AsyncFnMut(RecordBatch) -> Result<()>,
 ) -> Result<()> {
-    limits.validate()?;
-    ensure!(batch_rows > 0, "Parquet batch row limit must be positive");
-    let input = file_io.new_input(path)?;
-    let file_size = source.size(&input).await?;
-    let reader = ArrowFileReader::new(
-        FileMetadata { size: file_size },
-        source.reader(&input).await?,
-    );
-    let mut reader = BoundedReader::new(reader, file_size, limits);
-    let metadata = ArrowReaderMetadata::load_async(
-        &mut reader,
-        ArrowReaderOptions::new()
-            .with_skip_arrow_metadata(true)
-            .with_page_index_policy(PageIndexPolicy::Skip),
-    )
-    .await?;
-    let parquet_schema = metadata.parquet_schema();
-    let mut selected = BTreeSet::new();
-    let mut columns = Vec::new();
-    for (index, column) in parquet_schema.columns().iter().enumerate() {
-        let info = column.self_type().get_basic_info();
-        if field_ids.is_none_or(|ids| info.has_id() && ids.contains(&info.id())) {
-            if field_ids.is_some() {
-                ensure!(
-                    selected.insert(info.id()),
-                    "duplicate selected Parquet field ID {}",
-                    info.id()
-                );
-            }
-            columns.push(index);
-        }
+    let mut input =
+        ParquetInput::open(file_io, path, source, field_ids, batch_rows, limits).await?;
+    while let Some(batch) = input.next_batch().await? {
+        visit(batch).await?;
     }
-    if let Some(ids) = field_ids {
-        ensure!(
-            ids.iter().copied().collect::<BTreeSet<_>>() == selected,
-            "Parquet projection field ID is missing"
-        );
-    }
-    ensure!(!columns.is_empty(), "Parquet projection has no columns");
-    let projection = ProjectionMask::leaves(parquet_schema, columns.iter().copied());
-    let expected_rows = u64::try_from(metadata.metadata().file_metadata().num_rows())?;
-    let declared_rows = metadata
-        .metadata()
-        .row_groups()
-        .iter()
-        .try_fold(0u64, |rows, group| {
-            rows.checked_add(u64::try_from(group.num_rows())?)
-                .context("Parquet declared row count overflow")
-        })?;
-    ensure!(
-        declared_rows == expected_rows,
-        "Parquet row-group counts differ from file metadata"
-    );
-    let mut total_rows = 0u64;
-    for (index, group) in metadata.metadata().row_groups().iter().enumerate() {
-        let expected_group_rows = u64::try_from(group.num_rows())?;
-        if expected_group_rows == 0 {
-            continue;
-        }
-        let rows = admit_group(&metadata, group, &columns, batch_rows, file_size, limits)
-            .with_context(|| format!("Parquet input {path}, row group {index}"))?;
+    Ok(())
+}
+
+type GroupStream = ParquetRecordBatchStream<BoundedReader<ArrowFileReader>>;
+
+/// One Parquet input read one batch at a time, under the same admission
+/// limits and row-count checks as a sequential scan. Only the current row
+/// group's selected column chunks are fetched, so k open inputs hold at most
+/// k row groups; see [`Self::max_group_fetch_bytes`].
+pub(crate) struct ParquetInput {
+    path: String,
+    input: iceberg::io::InputFile,
+    source: Input,
+    file_size: u64,
+    metadata: ArrowReaderMetadata,
+    columns: Vec<usize>,
+    projection: ProjectionMask,
+    batch_rows: usize,
+    limits: ReadLimits,
+    next_group: usize,
+    /// The open row group: its stream, declared rows and rows decoded so far.
+    group: Option<(GroupStream, u64, u64)>,
+    total_rows: u64,
+    expected_rows: u64,
+}
+
+impl ParquetInput {
+    /// Read and check the footer; no data page is fetched yet.
+    pub(crate) async fn open(
+        file_io: &FileIO,
+        path: &str,
+        source: Input,
+        field_ids: Option<&[i32]>,
+        batch_rows: usize,
+        limits: &ReadLimits,
+    ) -> Result<Self> {
+        limits.validate()?;
+        ensure!(batch_rows > 0, "Parquet batch row limit must be positive");
+        let input = file_io.new_input(path)?;
+        let file_size = source.size(&input).await?;
         let reader = ArrowFileReader::new(
             FileMetadata { size: file_size },
             source.reader(&input).await?,
         );
-        let reader = BoundedReader::new(reader, file_size, limits);
-        let mut batches =
-            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata.clone())
-                .with_projection(projection.clone())
-                .with_row_groups(vec![index])
-                .with_batch_size(rows)
-                .build()?;
-        let mut group_rows = 0u64;
-        while let Some(batch) = batches.try_next().await? {
-            group_rows = group_rows
-                .checked_add(batch.num_rows() as u64)
-                .context("Parquet row count overflow")?;
-            ensure!(
-                group_rows <= expected_group_rows,
-                "Parquet decoded row count exceeds row group metadata"
-            );
-            visit(batch).await?;
+        let mut reader = BoundedReader::new(reader, file_size, limits);
+        let metadata = ArrowReaderMetadata::load_async(
+            &mut reader,
+            ArrowReaderOptions::new()
+                .with_skip_arrow_metadata(true)
+                .with_page_index_policy(PageIndexPolicy::Skip),
+        )
+        .await?;
+        let parquet_schema = metadata.parquet_schema();
+        let mut selected = BTreeSet::new();
+        let mut columns = Vec::new();
+        for (index, column) in parquet_schema.columns().iter().enumerate() {
+            let info = column.self_type().get_basic_info();
+            if field_ids.is_none_or(|ids| info.has_id() && ids.contains(&info.id())) {
+                if field_ids.is_some() {
+                    ensure!(
+                        selected.insert(info.id()),
+                        "duplicate selected Parquet field ID {}",
+                        info.id()
+                    );
+                }
+                columns.push(index);
+            }
         }
+        if let Some(ids) = field_ids {
+            ensure!(
+                ids.iter().copied().collect::<BTreeSet<_>>() == selected,
+                "Parquet projection field ID is missing"
+            );
+        }
+        ensure!(!columns.is_empty(), "Parquet projection has no columns");
+        let projection = ProjectionMask::leaves(parquet_schema, columns.iter().copied());
+        let expected_rows = u64::try_from(metadata.metadata().file_metadata().num_rows())?;
+        let declared_rows =
+            metadata
+                .metadata()
+                .row_groups()
+                .iter()
+                .try_fold(0u64, |rows, group| {
+                    rows.checked_add(u64::try_from(group.num_rows())?)
+                        .context("Parquet declared row count overflow")
+                })?;
         ensure!(
-            group_rows == expected_group_rows,
-            "Parquet decoded row count differs from row group metadata"
+            declared_rows == expected_rows,
+            "Parquet row-group counts differ from file metadata"
         );
-        total_rows = total_rows
-            .checked_add(group_rows)
-            .context("Parquet file row count overflow")?;
+        Ok(Self {
+            path: path.to_owned(),
+            input,
+            source,
+            file_size,
+            metadata,
+            columns,
+            projection,
+            batch_rows,
+            limits: limits.clone(),
+            next_group: 0,
+            group: None,
+            total_rows: 0,
+            expected_rows,
+        })
     }
-    ensure!(
-        total_rows == expected_rows,
-        "Parquet decoded row count differs from file metadata"
-    );
-    Ok(())
+
+    /// The largest span of selected compressed column chunks in any row group:
+    /// what this input holds fetched while one of its groups is open.
+    pub(crate) fn max_group_fetch_bytes(&self) -> u64 {
+        self.metadata
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|group| {
+                let (mut start, mut end) = (u64::MAX, 0u64);
+                for &index in &self.columns {
+                    let column = group.column(index);
+                    let offset = column
+                        .dictionary_page_offset()
+                        .unwrap_or(column.data_page_offset())
+                        .max(0) as u64;
+                    start = start.min(offset);
+                    end = end.max(offset.saturating_add(column.compressed_size().max(0) as u64));
+                }
+                end.saturating_sub(start)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Conservative logical payload charge for simultaneous merge inputs.
+    /// Reuse scan admission's dictionary-expansion bound rather than dividing
+    /// encoded bytes by row count. Reserve space for decoded pages, the live
+    /// batch, encoded sort keys and a gathered output batch, plus row metadata.
+    /// This is not an allocator/RSS cap; writer buffers and remaps are separate.
+    pub(crate) fn held_bytes(&self) -> Result<u64> {
+        let mut payload = 0u64;
+        for group in self.metadata.metadata().row_groups() {
+            if group.num_rows() == 0 {
+                continue;
+            }
+            let (rows, batch) = admit_group(
+                &self.metadata,
+                group,
+                &self.columns,
+                self.batch_rows,
+                self.file_size,
+                &self.limits,
+            )?;
+            let pages = self.columns.iter().try_fold(0u64, |bytes, &index| {
+                let size = u64::try_from(group.column(index).uncompressed_size())?;
+                bytes
+                    .checked_add(size)
+                    .context("Parquet page charge overflow")
+            })?;
+            payload = payload.max(
+                pages
+                    .saturating_add(batch.saturating_mul(4))
+                    .saturating_add((rows as u64).saturating_mul(128)),
+            );
+        }
+        let fetched = match &self.source {
+            Input::Fetched(bytes) => bytes.len() as u64,
+            Input::Lazy | Input::Sized(_) if self.should_prefetch() => self.file_size,
+            Input::Lazy | Input::Sized(_) => self.max_group_fetch_bytes(),
+        };
+        Ok(fetched
+            .saturating_add(payload)
+            .saturating_add(self.metadata.metadata().memory_size() as u64))
+    }
+
+    fn should_prefetch(&self) -> bool {
+        self.limits.prefetch_files > 0 && self.file_size <= self.limits.prefetch_file_bytes
+    }
+
+    /// Called only after all merge inputs pass admission. The whole-file
+    /// allocation is already included in held_bytes, even before this fetch.
+    pub(crate) async fn prefetch(&mut self) -> Result<()> {
+        if self.should_prefetch() && !matches!(self.source, Input::Fetched(_)) {
+            let bytes = self.input.reader().await?.read(0..self.file_size).await?;
+            ensure!(
+                bytes.len() as u64 == self.file_size,
+                "input file size differs from manifest"
+            );
+            self.source = Input::Fetched(bytes);
+        }
+        Ok(())
+    }
+
+    /// The next decoded batch, or `None` once every row was read and checked.
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            if let Some((stream, expected, rows)) = &mut self.group {
+                if let Some(batch) = stream.try_next().await? {
+                    *rows = rows
+                        .checked_add(batch.num_rows() as u64)
+                        .context("Parquet row count overflow")?;
+                    ensure!(
+                        *rows <= *expected,
+                        "Parquet decoded row count exceeds row group metadata"
+                    );
+                    return Ok(Some(batch));
+                }
+                ensure!(
+                    *rows == *expected,
+                    "Parquet decoded row count differs from row group metadata"
+                );
+                self.total_rows = self
+                    .total_rows
+                    .checked_add(*rows)
+                    .context("Parquet file row count overflow")?;
+                self.group = None;
+            }
+            let groups = self.metadata.metadata().row_groups();
+            let Some(group) = groups.get(self.next_group) else {
+                ensure!(
+                    self.total_rows == self.expected_rows,
+                    "Parquet decoded row count differs from file metadata"
+                );
+                return Ok(None);
+            };
+            let index = self.next_group;
+            self.next_group += 1;
+            let expected = u64::try_from(group.num_rows())?;
+            if expected == 0 {
+                continue;
+            }
+            let (rows, _) = admit_group(
+                &self.metadata,
+                group,
+                &self.columns,
+                self.batch_rows,
+                self.file_size,
+                &self.limits,
+            )
+            .with_context(|| format!("Parquet input {}, row group {index}", self.path))?;
+            let reader = ArrowFileReader::new(
+                FileMetadata {
+                    size: self.file_size,
+                },
+                self.source.reader(&self.input).await?,
+            );
+            let reader = BoundedReader::new(reader, self.file_size, &self.limits);
+            let stream =
+                ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.metadata.clone())
+                    .with_projection(self.projection.clone())
+                    .with_row_groups(vec![index])
+                    .with_batch_size(rows)
+                    .build()?;
+            self.group = Some((stream, expected, 0));
+        }
+    }
 }
 
 /// Read exactly the rows at strictly ascending physical `positions`, with every
@@ -654,7 +821,7 @@ pub async fn read_positions(
             group_start = group_end;
             continue;
         }
-        let rows = admit_group(&metadata, group, &columns, batch_rows, file_size, limits)
+        let (rows, _) = admit_group(&metadata, group, &columns, batch_rows, file_size, limits)
             .with_context(|| format!("Parquet input {path}, row group {index}"))?;
         let mut selectors = Vec::new();
         let mut cursor = group_start;

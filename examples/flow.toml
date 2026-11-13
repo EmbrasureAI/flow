@@ -145,6 +145,13 @@ prefetch_file_bytes = 4194304
 # remap_max_depth = 8
 # remap_max_bytes = 268435456
 # remap_cleanup_rows = 32768
+# Opt-in: rewrites of keyed tables whose inputs are all stamped with the table's sort
+# order merge them into sorted output when their key ranges overlap, if the
+# inputs' fetched and decoded payloads, sort keys and gathering fit
+# merge_memory_bytes. Writer buffers, remaps and allocator overhead are extra.
+# See docs/sorted-layout.md.
+# sort_merge = false
+# merge_memory_bytes = 268435456
 
 # Optional: replicate the journal and control state to object storage, so a
 # worker and its whole state volume can be replaced without losing changes

@@ -151,6 +151,24 @@ async fn dictionary_expansion_and_decimal_slots_are_bounded_with_or_without_size
             batch_bytes: 18_000,
             ..ReadLimits::default()
         };
+        // Merge admission must cover dictionary-expanded batches too, even
+        // when the footer lacks decoded-size statistics.
+        let mut input = ParquetInput::open(
+            &FileIO::new_with_fs(),
+            path.to_str().unwrap(),
+            Input::Lazy,
+            None,
+            1024,
+            &limits,
+        )
+        .await?;
+        let held = input.held_bytes()?;
+        while let Some(batch) = input.next_batch().await? {
+            assert!(
+                held >= batch.get_array_memory_size() as u64,
+                "merge admission undercharged dictionary-expanded input"
+            );
+        }
         let mut recovered = Vec::new();
         let mut largest_batch = 0;
         read_batches(

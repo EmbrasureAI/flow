@@ -976,6 +976,7 @@ mod tests {
                     delete_input_bytes: 0,
                     delete_input_rows: 200_000,
                     lazy_index_remap: false,
+                    merge: crate::MergePolicy::default(),
                     per_target_deletes: per_target,
                     target_ranges: crate::TargetRanges {
                         pooled: BTreeSet::new(),
@@ -994,6 +995,7 @@ mod tests {
                 table_id: TableId(1),
                 lazy_files: None,
                 lazy: None,
+                layout: crate::RewriteLayout::CommitOrder,
             });
         }
         ResidualFixture {
