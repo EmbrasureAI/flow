@@ -38,7 +38,15 @@ work retain their existing paths.
    Replacement sets charged at 48 bytes per declared position within
    `read.batch_bytes` use the compact sorted delete reader. They prove retention
    and stage only late input deletes and current deletes on unselected targets,
-   skipping the original holes. Larger sets use disk-backed staging and proof.
+   skipping the original holes. For a lazy remap the compact set is not staged
+   at all. The remap records exactly the rows the build wrote, so the input
+   positions no run covers are exactly its original deletes; one pass proves
+   that the set contains every such hole and translates the other input
+   positions, the late deletes, into output masks, 16 bytes each within the
+   same charge. Residuals are then written from the set and the masks in
+   memory. Larger sets use disk-backed staging and proof, which reads the
+   build's original deletes through a borrowing cursor that skips unselected
+   targets with one seek.
 5. Without an effective late position delete, retain an output row's index delta
    only if its old location still equals the current mapping. With such a delete,
    require either no current key or a newer source-LSN mapping outside the

@@ -466,6 +466,39 @@ impl FileRemap {
         self.runs
     }
 
+    /// Call `visit` with each maximal `[start, end)` range of old positions
+    /// the remap covers, ascending, coalescing adjacent runs: exactly the
+    /// rows that survived in the source file. Decodes one chunk at a time.
+    pub fn for_each_covered<E: From<Error>>(
+        &self,
+        mut visit: impl FnMut(u64, u64) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let mut range = None::<(u64, u64)>;
+        let mut add = |run: &RemapRun, range: &mut Option<(u64, u64)>| {
+            match range {
+                Some((_, end)) if *end == run.old_start => *end = run.end(),
+                _ => {
+                    if let Some((start, end)) = range.replace((run.old_start, run.end())) {
+                        visit(start, end)?;
+                    }
+                }
+            }
+            Ok::<(), E>(())
+        };
+        for chunk in &self.chunks {
+            for run in chunk.decode()? {
+                add(&run, &mut range)?;
+            }
+        }
+        for run in &self.open {
+            add(run, &mut range)?;
+        }
+        if let Some((start, end)) = range {
+            visit(start, end)?;
+        }
+        Ok(())
+    }
+
     /// Encoded size, as staged and stored in the index.
     pub fn encoded_bytes(&self) -> u64 {
         let open = if self.open.is_empty() {
@@ -603,7 +636,15 @@ pub struct RemapTranslator<'a> {
 
 impl RemapTranslator<'_> {
     pub fn translate(&mut self, location: &RowLocation) -> Result<Option<RowLocation>> {
-        let position = location.row_position;
+        let remap = self.remap;
+        Ok(self
+            .translate_position(location.row_position)?
+            .map(|(target, position)| translated(&remap.targets[target], position, location)))
+    }
+
+    /// The index into [`FileRemap::targets`] and the new position of an old
+    /// position, or `None` if no run covers it. Does not allocate.
+    pub fn translate_position(&mut self, position: u64) -> Result<Option<(usize, u64)>> {
         let remap = self.remap;
         let found = if remap
             .open
@@ -621,9 +662,7 @@ impl RemapTranslator<'_> {
             };
             remap.chunks[index].translate(position)?
         };
-        Ok(found.map(|(target, position)| {
-            translated(&remap.targets[target as usize], position, location)
-        }))
+        Ok(found.map(|(target, position)| (target as usize, position)))
     }
 }
 

@@ -3,7 +3,7 @@
 
 use crate::{
     BuiltData, DeleteReadLimits, Policy, ReadLimits, WorkerOutput,
-    residual::{ResidualInput, ResidualMerge},
+    residual::{MemoryPositions, MemoryTarget, ResidualInput, ResidualMerge},
     stage_delete_files,
 };
 use anyhow::{Result, ensure};
@@ -122,7 +122,11 @@ pub async fn catch_up(
         && rows
             .checked_mul(48)
             .is_some_and(|bytes| bytes <= read_limits.batch_bytes);
-    let (scanned_late_delete_rows, base_delete_rows_skipped) = if compact_replacement {
+    // A lazy build proves retention while translating late input deletes from
+    // the same in-memory set, and writes residuals from it, without staging.
+    let compact_lazy = compact_replacement && output.lazy_files.is_some();
+    let mut compact_positions = None;
+    let (scanned_late_delete_rows, mut base_delete_rows_skipped) = if compact_replacement {
         let (positions, scanned) = crate::read_delete_files(
             table,
             &head,
@@ -136,15 +140,20 @@ pub async fn catch_up(
             read_limits,
         )
         .await?;
-        let retained = stage_replacement_positions(
-            &output,
-            &head,
-            positions.iter(),
-            &late_scan,
-            batch_rows,
-            table.metadata().default_partition_spec_id(),
-        )?;
-        (scanned, retained)
+        if compact_lazy {
+            compact_positions = Some(positions);
+            (scanned, 0)
+        } else {
+            let retained = stage_replacement_positions(
+                &output,
+                &head,
+                positions.iter(),
+                &late_scan,
+                batch_rows,
+                table.metadata().default_partition_spec_id(),
+            )?;
+            (scanned, retained)
+        }
     } else {
         let scanned = stage_delete_files(
             table,
@@ -170,19 +179,35 @@ pub async fn catch_up(
     let late_scan_finished = Instant::now();
 
     let lazy = output.lazy_files.take();
+    let mut memory_masks = None;
     let (mapping, mapping_lookup, mask_spool, mapped_rows, accepted_rows, masked_rows) =
         if let Some(files) = lazy {
             let spool_started = Instant::now();
-            let (lazy, mapped_rows, masked_rows) = lazy_catch_up(
-                &output,
-                files,
-                &late_scan,
-                &output_scan,
-                live_counts,
-                sequence,
-                base.sequence_number,
-                batch_rows,
-            )?;
+            let (lazy, mapped_rows, masked_rows) = if let Some(positions) = &compact_positions {
+                let caught = compact_lazy_catch_up(
+                    &output,
+                    &head,
+                    files,
+                    positions,
+                    live_counts,
+                    sequence,
+                    base.sequence_number,
+                )?;
+                base_delete_rows_skipped = caught.retained;
+                memory_masks = Some((caught.masks, caught.outputs));
+                (caught.lazy, caught.mapped_rows, caught.masked_rows)
+            } else {
+                lazy_catch_up(
+                    &output,
+                    files,
+                    &late_scan,
+                    &output_scan,
+                    live_counts,
+                    sequence,
+                    base.sequence_number,
+                    batch_rows,
+                )?
+            };
             let mask_spool = spool_started.elapsed();
             let accepted_rows = lazy.output_live_rows.iter().map(|(_, rows)| rows).sum();
             output.lazy = Some(lazy);
@@ -359,10 +384,18 @@ pub async fn catch_up(
         crate::worker::retain_shared_legacy_deletes(&mut output, &head)?;
     }
     let mapping_finished = Instant::now();
-    (output.delete_files, output.residual_delete_rows) = crate::worker::write_residual_positions(
-        table,
-        &output,
-        residual_positions(
+    let residuals = match (&compact_positions, &memory_masks) {
+        (Some(positions), Some((masks, outputs))) => memory_residual_positions(
+            &output,
+            &head,
+            positions,
+            masks,
+            outputs,
+            &data,
+            v3,
+            table.metadata().default_partition_spec_id(),
+        )?,
+        _ => residual_positions(
             &output,
             &late_scan,
             &output_scan,
@@ -370,9 +403,9 @@ pub async fn catch_up(
             v3,
             !replaced_position_deletes,
         ),
-        config,
-    )
-    .await?;
+    };
+    (output.delete_files, output.residual_delete_rows) =
+        crate::worker::write_residual_positions(table, &output, residuals, config).await?;
     let finished = Instant::now();
     // The staging thread can overlap the next caller batch. Report the whole
     // mapping interval once; its inner elapsed durations are nested observations.
@@ -425,6 +458,75 @@ pub async fn catch_up(
     Ok(output)
 }
 
+/// Staged deletes on the selected inputs only, in path and position order,
+/// borrowed from a spool instead of decoded as owned records. Other targets
+/// are skipped with one seek each, and each path is read once.
+struct InputDeletes<'a> {
+    cursor: flow_state_store::PositionDeleteCursor<'a>,
+    inputs: &'a BTreeSet<FileId>,
+    /// The current accepted target, its encoded key and the position.
+    path: FileId,
+    key: Vec<u8>,
+    position: Option<u64>,
+    probe: FileId,
+}
+
+impl<'a> InputDeletes<'a> {
+    fn new(
+        cursor: flow_state_store::PositionDeleteCursor<'a>,
+        inputs: &'a BTreeSet<FileId>,
+    ) -> Result<Self> {
+        let mut deletes = Self {
+            cursor,
+            inputs,
+            path: FileId(String::new()),
+            key: Vec::new(),
+            position: None,
+            probe: FileId(String::new()),
+        };
+        deletes.settle()?;
+        Ok(deletes)
+    }
+
+    fn current(&self) -> Option<(&str, u64)> {
+        self.position
+            .map(|position| (self.path.0.as_str(), position))
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.cursor.advance();
+        self.settle()
+    }
+
+    /// Stop on the cursor's record if it targets an input, else skip ahead.
+    fn settle(&mut self) -> Result<()> {
+        loop {
+            let Some((key, position)) = self.cursor.current()? else {
+                self.position = None;
+                return Ok(());
+            };
+            if !self.key.is_empty() && key == self.key.as_slice() {
+                self.position = Some(position);
+                return Ok(());
+            }
+            self.probe.0.clear();
+            self.probe.0.push_str(self.cursor.record()?.path()?);
+            if self.inputs.contains(&self.probe) {
+                self.key.clear();
+                self.key.extend_from_slice(key);
+                std::mem::swap(&mut self.path, &mut self.probe);
+                self.position = Some(position);
+                return Ok(());
+            }
+            self.cursor.skip_target();
+        }
+    }
+}
+
+fn resurrected() -> anyhow::Error {
+    CatchUpRejected("replacement deletes resurrect an input row").into()
+}
+
 /// `positions` is the reader's sorted, unique effective head set. Prove that
 /// every original delete on selected inputs is retained, and omit those base
 /// holes from late-mask staging. Unselected targets keep all current deletes.
@@ -439,35 +541,42 @@ fn stage_replacement_positions<'a>(
     spec_id: i32,
 ) -> Result<u64> {
     output.scratch.discard_transaction(scan)?;
-    let mut originals = output
-        .scratch
-        .position_deletes(&output.operation_id.0, &output.table_id)
-        .filter(|position| {
-            position.as_ref().map_or(true, |position| {
-                output.plan.input_files.contains(&position.data_file_id)
-            })
-        });
-    let mut original = originals.next().transpose()?;
+    let mut originals = InputDeletes::new(
+        output
+            .scratch
+            .position_delete_cursor(&output.operation_id.0, &output.table_id),
+        &output.plan.input_files,
+    )?;
     let mut retained = 0;
     let mut pending = Vec::with_capacity(batch_rows);
+    // Positions arrive grouped by file; resolve each file's sequence once.
+    let mut sequence = None::<(&FileId, i64)>;
     for (file, position) in positions {
-        if let Some(base) = original.as_ref() {
-            ensure!(
-                physical(base) >= (file, position),
-                CatchUpRejected("replacement deletes resurrect an input row")
-            );
-            if physical(base) == (file, position) {
-                original = originals.next().transpose()?;
+        if let Some(order) = originals
+            .current()
+            .map(|base| base.cmp(&(file.0.as_str(), position)))
+        {
+            ensure!(order.is_ge(), resurrected());
+            if order.is_eq() {
+                originals.advance()?;
                 retained += 1;
                 continue;
             }
         }
+        let data_sequence_number = match sequence {
+            Some((cached, value)) if std::ptr::eq(cached, file) || cached == file => value,
+            _ => {
+                let value = head.live_files[&file.0]
+                    .sequence_number
+                    .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?;
+                sequence = Some((file, value));
+                value
+            }
+        };
         pending.push(RowLocation {
             data_file_id: file.clone(),
             row_position: position,
-            data_sequence_number: head.live_files[&file.0]
-                .sequence_number
-                .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
+            data_sequence_number,
             spec_id,
             partition: Vec::new(),
             source_commit_lsn: flow_model::PgLsn(0),
@@ -480,10 +589,7 @@ fn stage_replacement_positions<'a>(
                 .put_position_deletes(scan, &output.table_id, pending.drain(..))?;
         }
     }
-    ensure!(
-        original.is_none(),
-        CatchUpRejected("replacement deletes resurrect an input row")
-    );
+    ensure!(originals.current().is_none(), resurrected());
     output
         .scratch
         .put_position_deletes(scan, &output.table_id, pending)?;
@@ -495,36 +601,119 @@ fn stage_replacement_positions<'a>(
 /// Compare the already bounded, disk-backed effective sets; file identities
 /// alone cannot prove this after a position-delete consolidation.
 fn validate_retained_deletes(output: &WorkerOutput, head_scan: &str) -> Result<()> {
-    let mut head = output
-        .scratch
-        .position_deletes(head_scan, &output.table_id)
-        .peekable();
-    for original in output
-        .scratch
-        .position_deletes(&output.operation_id.0, &output.table_id)
-    {
-        let original = original?;
-        if !output.plan.input_files.contains(&original.data_file_id) {
-            continue;
-        }
-        loop {
-            match head.peek() {
-                Some(Err(_)) => {
-                    return Err(head.next().expect("peeked delete").unwrap_err().into());
-                }
-                Some(Ok(position)) if physical(position) < physical(&original) => {
-                    head.next();
-                }
-                Some(Ok(position)) if physical(position) == physical(&original) => break,
-                _ => {
-                    return Err(
-                        CatchUpRejected("replacement deletes resurrect an input row").into(),
-                    );
-                }
+    let cursor = |scan: &str| {
+        output
+            .scratch
+            .position_delete_cursor(scan, &output.table_id)
+    };
+    let inputs = &output.plan.input_files;
+    let mut head = InputDeletes::new(cursor(head_scan), inputs)?;
+    let mut originals = InputDeletes::new(cursor(&output.operation_id.0), inputs)?;
+    loop {
+        let order = match (originals.current(), head.current()) {
+            (None, _) => return Ok(()),
+            (Some(_), None) => return Err(resurrected()),
+            (Some(original), Some(retained)) => retained.cmp(&original),
+        };
+        match order {
+            std::cmp::Ordering::Less => head.advance()?,
+            std::cmp::Ordering::Equal => {
+                head.advance()?;
+                originals.advance()?;
             }
+            std::cmp::Ordering::Greater => return Err(resurrected()),
         }
     }
-    Ok(())
+}
+
+/// Per-input late deletes and per-output masks a lazy catch-up translated.
+#[derive(Default)]
+struct LateMasks {
+    late_by_input: BTreeMap<FileId, u64>,
+    masked_by_output: BTreeMap<FileId, u64>,
+    masked_rows: u64,
+}
+
+impl LateMasks {
+    /// Record one input's translated late deletes; `per_target` counts them
+    /// by index into the remap's targets.
+    fn add(&mut self, remap: &flow_state_store::FileRemap, per_target: &[u64]) {
+        let late: u64 = per_target.iter().sum();
+        if late == 0 {
+            return;
+        }
+        *self.late_by_input.entry(remap.source.clone()).or_default() += late;
+        for (target, masked) in remap.targets.iter().zip(per_target) {
+            if *masked > 0 {
+                *self
+                    .masked_by_output
+                    .entry(target.data_file_id.clone())
+                    .or_default() += masked;
+            }
+        }
+        self.masked_rows += late;
+    }
+
+    /// Prove, per input file, that the index at H holds exactly the base
+    /// survivors that no late delete removed, and derive output live counts.
+    fn finish(
+        mut self,
+        output: &WorkerOutput,
+        files: Vec<flow_state_store::FileRemap>,
+        live_counts: &BTreeMap<FileId, u64>,
+    ) -> Result<(flow_state_store::LazyRemap, u64, u64)> {
+        let survivors: BTreeMap<&FileId, u64> = files
+            .iter()
+            .map(|remap| (&remap.source, remap.survivors()))
+            .collect();
+        let mut mapped_rows = 0u64;
+        for file in &output.plan.input_files {
+            let survivors = survivors.get(file).copied().unwrap_or(0);
+            mapped_rows += survivors;
+            let late = self.late_by_input.get(file).copied().unwrap_or(0);
+            ensure!(
+                live_counts.get(file).copied() == Some(survivors - late),
+                CatchUpRejected("current index coverage differs from replacement mappings")
+            );
+        }
+        let mut output_live_rows = Vec::with_capacity(output.data_files.len());
+        for file in &output.data_files {
+            let id = FileId(file.file_path().to_owned());
+            let masked = self.masked_by_output.remove(&id).unwrap_or(0);
+            let live = file
+                .record_count()
+                .checked_sub(masked)
+                .ok_or_else(|| anyhow::anyhow!("masked rows exceed an output file"))?;
+            output_live_rows.push((id, live));
+        }
+        ensure!(
+            self.masked_by_output.is_empty(),
+            "lazy remap targets an unknown output file"
+        );
+        let masked_rows = self.masked_rows;
+        Ok((
+            flow_state_store::LazyRemap {
+                files,
+                output_live_rows,
+            },
+            mapped_rows,
+            masked_rows,
+        ))
+    }
+}
+
+fn remaps_by_input<'a>(
+    output: &WorkerOutput,
+    files: &'a [flow_state_store::FileRemap],
+) -> Result<BTreeMap<&'a FileId, &'a flow_state_store::FileRemap>> {
+    let remaps: BTreeMap<_, _> = files.iter().map(|remap| (&remap.source, remap)).collect();
+    ensure!(
+        remaps
+            .keys()
+            .all(|file| output.plan.input_files.contains(*file)),
+        "lazy remap names a file outside the plan"
+    );
+    Ok(remaps)
 }
 
 /// Lazy remap catch-up: translate late deletes through the per-file remaps and
@@ -543,47 +732,56 @@ fn lazy_catch_up(
     build_sequence: i64,
     batch_rows: usize,
 ) -> Result<(flow_state_store::LazyRemap, u64, u64)> {
-    let remaps: BTreeMap<&FileId, &flow_state_store::FileRemap> =
-        files.iter().map(|remap| (&remap.source, remap)).collect();
-    ensure!(
-        remaps
-            .keys()
-            .all(|file| output.plan.input_files.contains(*file)),
-        "lazy remap names a file outside the plan"
-    );
-    // Late deletes arrive in (file, position) order, so one translator per
-    // input decodes each of its chunks once.
-    let mut translators: BTreeMap<&FileId, flow_state_store::RemapTranslator<'_>> = remaps
-        .iter()
-        .map(|(file, remap)| (*file, remap.translator()))
-        .collect();
-    let mut late_by_input = BTreeMap::<&FileId, u64>::new();
-    let mut masked_by_output = BTreeMap::<FileId, u64>::new();
-    let mut positions = Vec::with_capacity(batch_rows);
-    let mut masked_rows = 0u64;
-    for position in output.scratch.position_deletes(late_scan, &output.table_id) {
-        let position = position?;
-        let Some((&source, _)) = remaps.get_key_value(&position.data_file_id) else {
-            continue;
-        };
-        let translator = translators
-            .get_mut(source)
-            .expect("one translator per remap");
-        // Positions already deleted at the base were never written.
-        let Some(replacement) = translator.translate(&position)? else {
-            continue;
-        };
-        ensure!(
-            sequence.is_some_and(|sequence| sequence >= build_sequence),
-            CatchUpRejected("late delete cannot mask output at its build sequence")
-        );
-        *late_by_input.entry(source).or_default() += 1;
-        *masked_by_output
-            .entry(replacement.data_file_id.clone())
-            .or_default() += 1;
-        positions.push(replacement);
-        masked_rows += 1;
-        if positions.len() == batch_rows {
+    let mut late = LateMasks::default();
+    {
+        let remaps = remaps_by_input(output, &files)?;
+        let mut positions = Vec::with_capacity(batch_rows);
+        // Late deletes arrive grouped by target in position order: look each
+        // target up once, skip unselected ones with one seek, and translate
+        // with one translator per input, which decodes each chunk once.
+        let mut cursor = output
+            .scratch
+            .position_delete_cursor(late_scan, &output.table_id);
+        let mut path = FileId(String::new());
+        let mut key = Vec::new();
+        while let Some((target, _)) = cursor.current()? {
+            key.clear();
+            key.extend_from_slice(target);
+            path.0.clear();
+            path.0.push_str(cursor.record()?.path()?);
+            let Some(&remap) = remaps.get(&path) else {
+                cursor.skip_target();
+                continue;
+            };
+            let mut translator = remap.translator();
+            let mut per_target = vec![0u64; remap.targets.len()];
+            loop {
+                let position = match cursor.current()? {
+                    Some((target, position)) if target == key.as_slice() => position,
+                    _ => break,
+                };
+                cursor.advance();
+                // Positions already deleted at the base were never written.
+                let Some((target, row)) = translator.translate_position(position)? else {
+                    continue;
+                };
+                ensure!(
+                    sequence.is_some_and(|sequence| sequence >= build_sequence),
+                    CatchUpRejected("late delete cannot mask output at its build sequence")
+                );
+                per_target[target] += 1;
+                positions.push(mask_location(&remap.targets[target], row));
+                if positions.len() == batch_rows {
+                    output.scratch.put_position_deletes(
+                        output_scan,
+                        &output.table_id,
+                        positions.drain(..),
+                    )?;
+                }
+            }
+            late.add(remap, &per_target);
+        }
+        if !positions.is_empty() {
             output.scratch.put_position_deletes(
                 output_scan,
                 &output.table_id,
@@ -591,43 +789,232 @@ fn lazy_catch_up(
             )?;
         }
     }
-    if !positions.is_empty() {
-        output
-            .scratch
-            .put_position_deletes(output_scan, &output.table_id, positions.drain(..))?;
+    late.finish(output, files, live_counts)
+}
+
+/// A position-delete record masking an output row. Delete files record no
+/// row identity, so those fields are zero, as in every staged delete.
+fn mask_location(target: &flow_state_store::RemapTarget, row_position: u64) -> RowLocation {
+    RowLocation {
+        data_file_id: target.data_file_id.clone(),
+        row_position,
+        data_sequence_number: target.data_sequence_number,
+        spec_id: target.spec_id,
+        partition: target.partition.clone(),
+        source_commit_lsn: flow_model::PgLsn(0),
+        row_version: 0,
+        row_fingerprint: [0; 16],
     }
-    let mut mapped_rows = 0u64;
-    for file in &output.plan.input_files {
-        let survivors = remaps.get(file).map_or(0, |remap| remap.survivors());
-        mapped_rows += survivors;
-        let late = late_by_input.get(file).copied().unwrap_or(0);
-        ensure!(
-            live_counts.get(file).copied() == Some(survivors - late),
-            CatchUpRejected("current index coverage differs from replacement mappings")
-        );
+}
+
+/// What a compact lazy catch-up proved and translated.
+struct CompactCatchUp {
+    lazy: flow_state_store::LazyRemap,
+    mapped_rows: u64,
+    masked_rows: u64,
+    /// Base deletes on the inputs that the head set retains.
+    retained: u64,
+    /// Output masks as `(rank in outputs, row)`, sorted and unique.
+    masks: Vec<(u32, u64)>,
+    /// The remaps' output targets, in path order.
+    outputs: Vec<flow_state_store::RemapTarget>,
+}
+
+/// [`stage_replacement_positions`] and [`lazy_catch_up`] in one pass over the
+/// compact head set, without staging either. A lazy remap records exactly the
+/// rows the build wrote, so the positions of an input that no run covers are
+/// exactly the build's original deletes. The head set must contain every one
+/// of them, or a row the output omits would be live again; this proves the
+/// same retention as comparing with the staged originals, without reading
+/// them. Each other input position, a late delete, is translated into an
+/// output mask. Masks take 16 bytes each and at most one per input position,
+/// reserved exactly, so with the head set's vector they stay within the
+/// compact path's 48-byte charge per declared position.
+fn compact_lazy_catch_up(
+    output: &WorkerOutput,
+    head: &SnapshotView,
+    files: Vec<flow_state_store::FileRemap>,
+    positions: &crate::DeletePositions,
+    live_counts: &BTreeMap<FileId, u64>,
+    sequence: Option<i64>,
+    build_sequence: i64,
+) -> Result<CompactCatchUp> {
+    let inputs = &output.plan.input_files;
+    let mut late = LateMasks::default();
+    let mut retained = 0u64;
+    let mut masks = Vec::new();
+    let outputs;
+    {
+        let remaps = remaps_by_input(output, &files)?;
+        let mut by_path = BTreeMap::<&FileId, &flow_state_store::RemapTarget>::new();
+        for remap in &files {
+            for target in &remap.targets {
+                by_path.entry(&target.data_file_id).or_insert(target);
+            }
+        }
+        let ranks = by_path
+            .keys()
+            .enumerate()
+            .map(|(rank, file)| Ok((*file, u32::try_from(rank)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        outputs = by_path
+            .into_values()
+            .cloned()
+            .collect::<Vec<flow_state_store::RemapTarget>>();
+        let runs: HashMap<&FileId, &[(u32, u64)]> = positions
+            .runs()
+            .filter(|(file, _)| inputs.contains(*file))
+            .collect();
+        masks.reserve_exact(runs.values().map(|run| run.len()).sum());
+        for file in inputs {
+            let rows = head
+                .live_files
+                .get(&file.0)
+                .ok_or_else(|| anyhow::anyhow!("selected input is not live at the head"))?
+                .data_file
+                .record_count();
+            let run = runs.get(file).copied().unwrap_or(&[]);
+            let remap = remaps.get(file).copied();
+            let mut translator = remap.map(flow_state_store::FileRemap::translator);
+            let target_ranks: Vec<u32> = remap.map_or_else(Vec::new, |remap| {
+                remap
+                    .targets
+                    .iter()
+                    .map(|target| ranks[&target.data_file_id])
+                    .collect()
+            });
+            let mut per_target = vec![0u64; target_ranks.len()];
+            let mut at = 0usize;
+            // Head positions before `limit` inside covered ranges are late
+            // deletes; translate each into a mask on its output row.
+            let mut translate = |limit: u64, at: &mut usize| -> Result<()> {
+                while let Some(&(_, position)) = run.get(*at)
+                    && position < limit
+                {
+                    *at += 1;
+                    let Some((target, row)) = translator
+                        .as_mut()
+                        .map(|translator| translator.translate_position(position))
+                        .transpose()?
+                        .flatten()
+                    else {
+                        // Beyond the file's rows; the reader rejects those.
+                        continue;
+                    };
+                    per_target[target] += 1;
+                    masks.push((target_ranks[target], row));
+                }
+                Ok(())
+            };
+            // The holes between covered ranges: every one must be deleted.
+            let mut hole = |start: u64, end: u64, at: &mut usize| -> Result<()> {
+                if start == end {
+                    return Ok(());
+                }
+                ensure!(
+                    start < end && end <= rows,
+                    "lazy remap exceeds its input file"
+                );
+                let length = usize::try_from(end - start)?;
+                // Sorted, unique positions hold all of `start..end` exactly
+                // when the next `length` of them begin and end there.
+                ensure!(
+                    run.get(*at).is_some_and(|&(_, first)| first == start)
+                        && run
+                            .get(*at + length - 1)
+                            .is_some_and(|&(_, last)| last == end - 1),
+                    resurrected()
+                );
+                *at += length;
+                retained += end - start;
+                Ok(())
+            };
+            let mut covered_end = 0u64;
+            if let Some(remap) = remap {
+                remap.for_each_covered(|start, end| {
+                    hole(covered_end, start, &mut at)?;
+                    translate(end, &mut at)?;
+                    covered_end = end;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+            }
+            hole(covered_end, rows, &mut at)?;
+            translate(u64::MAX, &mut at)?;
+            if let Some(remap) = remap {
+                late.add(remap, &per_target);
+            }
+        }
     }
-    let mut output_live_rows = Vec::with_capacity(output.data_files.len());
-    for file in &output.data_files {
-        let id = FileId(file.file_path().to_owned());
-        let masked = masked_by_output.remove(&id).unwrap_or(0);
-        let live = file
-            .record_count()
-            .checked_sub(masked)
-            .ok_or_else(|| anyhow::anyhow!("masked rows exceed an output file"))?;
-        output_live_rows.push((id, live));
-    }
+    // Checked once the whole retention proof has passed, as when staging.
     ensure!(
-        masked_by_output.is_empty(),
-        "lazy remap targets an unknown output file"
+        masks.is_empty() || sequence.is_some_and(|sequence| sequence >= build_sequence),
+        CatchUpRejected("late delete cannot mask output at its build sequence")
     );
-    Ok((
-        flow_state_store::LazyRemap {
-            files,
-            output_live_rows,
-        },
+    masks.sort_unstable();
+    let (lazy, mapped_rows, masked_rows) = late.finish(output, files, live_counts)?;
+    Ok(CompactCatchUp {
+        lazy,
         mapped_rows,
         masked_rows,
-    ))
+        retained,
+        masks,
+        outputs,
+    })
+}
+
+/// [`residual_positions`] for a compact lazy catch-up: the head set's
+/// positions on unselected targets and the output masks, both in memory.
+#[allow(clippy::too_many_arguments)]
+fn memory_residual_positions<'a>(
+    output: &'a WorkerOutput,
+    head: &SnapshotView,
+    positions: &'a crate::DeletePositions,
+    masks: &'a [(u32, u64)],
+    outputs: &'a [flow_state_store::RemapTarget],
+    live_data: &'a BTreeSet<FileId>,
+    outputs_only: bool,
+    spec_id: i32,
+) -> Result<ResidualMerge<'a>> {
+    let on_output = move |file: &FileId| {
+        !outputs_only
+            || output
+                .data_files
+                .iter()
+                .any(|data| data.file_path() == file.0)
+    };
+    let carried = move |file: &FileId| {
+        !output.plan.input_files.contains(file) && live_data.contains(file) && on_output(file)
+    };
+    // Staged head positions carry the head sequence, the default spec and no
+    // partition; masks carry their output's.
+    let carried_positions = MemoryPositions::new(positions.pairs(), |rank| {
+        let path = positions.target(rank);
+        Ok(MemoryTarget {
+            path: path.clone(),
+            data_sequence_number: head
+                .live_files
+                .get(&path.0)
+                .and_then(|entry| entry.sequence_number)
+                .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
+            spec_id,
+            partition: Vec::new(),
+        })
+    })?;
+    let mask_positions = MemoryPositions::new(masks, |rank| {
+        let target = outputs
+            .get(rank as usize)
+            .ok_or_else(|| anyhow::anyhow!("mask targets an unknown output"))?;
+        Ok(MemoryTarget {
+            path: target.data_file_id.clone(),
+            data_sequence_number: target.data_sequence_number,
+            spec_id: target.spec_id,
+            partition: target.partition.clone(),
+        })
+    })?;
+    Ok(ResidualMerge::new(vec![
+        ResidualInput::memory(carried_positions, carried),
+        ResidualInput::memory(mask_positions, on_output),
+    ]))
 }
 
 // Charge the owned decoded payload, including fixed slots and both paths.
@@ -1338,6 +1725,380 @@ mod tests {
                 .is::<CatchUpRejected>()
             );
         }
+    }
+
+    /// Every `(path, row)` in written delete files, with `output` renamed.
+    async fn delete_contents(
+        table: &Table,
+        files: &[iceberg::spec::DataFile],
+        output: &str,
+    ) -> Vec<(String, i64)> {
+        use arrow_array::{Int64Array, StringArray};
+        let mut rows = Vec::new();
+        for file in files {
+            let bytes = table
+                .file_io()
+                .new_input(file.file_path())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let paths = batch
+                    .column_by_name("file_path")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let positions = batch
+                    .column_by_name("pos")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    let path = paths.value(row);
+                    let path = if path == output { "OUTPUT" } else { path };
+                    rows.push((path.to_owned(), positions.value(row)));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Lazy remaps over the fixture's three inputs, interleaved like a merge,
+    /// the head set (every original delete on live files plus late ones),
+    /// and the live counts at that head.
+    struct LazyHead {
+        remaps: Vec<flow_state_store::FileRemap>,
+        head: BTreeSet<(FileId, u64)>,
+        view: SnapshotView,
+        counts: BTreeMap<FileId, u64>,
+    }
+
+    const INPUT_ROWS: u64 = 6_000;
+    const BLOCK: std::ops::Range<u64> = 5_000..5_100;
+
+    fn lazy_head(fixture: &ResidualFixture, output: &WorkerOutput) -> LazyHead {
+        use iceberg::spec::{
+            DataFileBuilder, DataFileFormat, ManifestEntry, ManifestStatus, Struct,
+        };
+        // Each input also lost a contiguous block at the base, so the
+        // remap leaves multi-row holes as well as single ones.
+        for file in &output.plan.input_files {
+            output
+                .scratch
+                .put_position_deletes(
+                    &output.operation_id.0,
+                    &output.table_id,
+                    BLOCK.map(|row| RowLocation {
+                        data_file_id: file.clone(),
+                        row_position: row,
+                        data_sequence_number: 3,
+                        spec_id: 0,
+                        partition: Vec::new(),
+                        source_commit_lsn: PgLsn(0),
+                        row_version: 0,
+                        row_fingerprint: [0; 16],
+                    }),
+                )
+                .unwrap();
+        }
+        let spool = |scan: &str| -> BTreeSet<(FileId, u64)> {
+            output
+                .scratch
+                .position_deletes(scan, &output.table_id)
+                .map(|position| position.unwrap())
+                .filter(|position| fixture.live.contains(&position.data_file_id))
+                .map(|position| (position.data_file_id, position.row_position))
+                .collect()
+        };
+        let base = spool(&output.operation_id.0);
+        let mut head = base.clone();
+        head.extend(spool(&format!("{}-late", output.operation_id.0)));
+        let target = output.data_files[0].file_path().to_owned();
+        let inputs: Vec<_> = output.plan.input_files.iter().collect();
+        let mut remaps = Vec::new();
+        let mut counts = BTreeMap::new();
+        for (index, file) in inputs.iter().enumerate() {
+            let mut remap = flow_state_store::FileRemap::new((*file).clone());
+            let mut survivors = 0u64;
+            let mut live = 0u64;
+            for row in 0..INPUT_ROWS {
+                if base.contains(&((*file).clone(), row)) {
+                    continue;
+                }
+                // Interleave the inputs, one row each, like a full merge.
+                let replacement = RowLocation {
+                    data_file_id: FileId(target.clone()),
+                    row_position: survivors * inputs.len() as u64 + index as u64,
+                    data_sequence_number: 3,
+                    spec_id: 0,
+                    partition: Vec::new(),
+                    source_commit_lsn: PgLsn(0),
+                    row_version: 0,
+                    row_fingerprint: [0; 16],
+                };
+                remap.push(row, &replacement, 4).unwrap();
+                survivors += 1;
+                live += u64::from(!head.contains(&((*file).clone(), row)));
+            }
+            remaps.push(remap);
+            counts.insert((*file).clone(), live);
+        }
+        let mut view = SnapshotView::default();
+        for file in &fixture.live {
+            let data = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(file.0.clone())
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::empty())
+                .partition_spec_id(0)
+                .file_size_in_bytes(1 << 20)
+                .record_count(INPUT_ROWS)
+                .build()
+                .unwrap();
+            view.live_files.insert(
+                file.0.clone(),
+                std::sync::Arc::new(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .sequence_number(3)
+                        .file_sequence_number(3)
+                        .data_file(data)
+                        .build(),
+                ),
+            );
+        }
+        LazyHead {
+            remaps,
+            head,
+            view,
+            counts,
+        }
+    }
+
+    fn delete_positions(head: &BTreeSet<(FileId, u64)>) -> crate::DeletePositions {
+        let targets: Vec<FileId> = head
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let positions = head
+            .iter()
+            .map(|(file, row)| (targets.binary_search(file).unwrap() as u32, *row))
+            .collect();
+        crate::DeletePositions::from_sorted(targets, positions)
+    }
+
+    /// The in-memory compact path must prove, translate and write exactly
+    /// what staging the head set, translating the late spool and merging the
+    /// spools does, for remaps that interleave their inputs like a merge.
+    #[tokio::test]
+    async fn compact_lazy_catch_up_matches_the_staged_path() {
+        let fixture = residual_fixture(2, false).await;
+        let config = WriterConfig {
+            batch_rows: 8192,
+            ..WriterConfig::default()
+        };
+        // The staged path, as for a large replacement or a non-lazy build.
+        let staged = &fixture.outputs[0];
+        let lazy = lazy_head(&fixture, staged);
+        let retained = stage_replacement_positions(
+            staged,
+            &lazy.view,
+            lazy.head.iter().map(|(file, row)| (file, *row)),
+            "equal-late",
+            128,
+            0,
+        )
+        .unwrap();
+        let (staged_remap, staged_mapped, staged_masked) = lazy_catch_up(
+            staged,
+            lazy.remaps,
+            "equal-late",
+            "equal-output",
+            &lazy.counts,
+            Some(4),
+            3,
+            128,
+        )
+        .unwrap();
+        let (staged_files, staged_residual) = crate::worker::write_residual_positions(
+            &fixture.table,
+            staged,
+            residual_positions(
+                staged,
+                "equal-late",
+                "equal-output",
+                &fixture.live,
+                false,
+                false,
+            ),
+            config.clone(),
+        )
+        .await
+        .unwrap();
+
+        let compact = &fixture.outputs[1];
+        let lazy = lazy_head(&fixture, compact);
+        let positions = delete_positions(&lazy.head);
+        let caught = compact_lazy_catch_up(
+            compact,
+            &lazy.view,
+            lazy.remaps,
+            &positions,
+            &lazy.counts,
+            Some(4),
+            3,
+        )
+        .unwrap();
+        let (compact_files, compact_residual) = crate::worker::write_residual_positions(
+            &fixture.table,
+            compact,
+            memory_residual_positions(
+                compact,
+                &lazy.view,
+                &positions,
+                &caught.masks,
+                &caught.outputs,
+                &fixture.live,
+                false,
+                0,
+            )
+            .unwrap(),
+            config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(caught.retained, retained);
+        assert!(retained > 0);
+        assert_eq!(
+            (caught.mapped_rows, caught.masked_rows),
+            (staged_mapped, staged_masked)
+        );
+        assert!(staged_masked > 0);
+        let remaps = |remap: &flow_state_store::LazyRemap| {
+            remap
+                .files
+                .iter()
+                .map(|file| (file.source.clone(), file.survivors(), file.runs()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(remaps(&caught.lazy), remaps(&staged_remap));
+        let live_rows = |remap: &flow_state_store::LazyRemap| {
+            remap
+                .output_live_rows
+                .iter()
+                .map(|(_, rows)| *rows)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(live_rows(&caught.lazy), live_rows(&staged_remap));
+        assert_eq!(compact_residual, staged_residual);
+        let staged_rows = delete_contents(
+            &fixture.table,
+            &staged_files,
+            staged.data_files[0].file_path(),
+        )
+        .await;
+        let compact_rows = delete_contents(
+            &fixture.table,
+            &compact_files,
+            compact.data_files[0].file_path(),
+        )
+        .await;
+        assert_eq!(compact_rows, staged_rows);
+        assert_eq!(
+            compact_rows
+                .iter()
+                .filter(|(path, _)| path == "OUTPUT")
+                .count() as u64,
+            staged_masked
+        );
+        assert_eq!(
+            compact_files
+                .iter()
+                .map(|file| file.record_count())
+                .collect::<Vec<_>>(),
+            staged_files
+                .iter()
+                .map(|file| file.record_count())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_lazy_catch_up_rejects_resurrection_and_stale_masks() {
+        let fixture = residual_fixture(1, false).await;
+        let output = &fixture.outputs[0];
+        let lazy = lazy_head(&fixture, output);
+        let inputs = &output.plan.input_files;
+        let base: Vec<_> = lazy
+            .head
+            .iter()
+            .filter(|(file, row)| inputs.contains(file) && row % 2 == 0 && *row < 4_000)
+            .cloned()
+            .collect();
+        let block = |row: u64| (inputs.iter().nth(1).unwrap().clone(), row);
+        for missing in [
+            base.first(),
+            base.get(base.len() / 2),
+            base.last(),
+            Some(&block(BLOCK.start)),
+            Some(&block(BLOCK.start + 50)),
+            Some(&block(BLOCK.end - 1)),
+        ] {
+            let mut head = lazy.head.clone();
+            head.remove(missing.unwrap());
+            let error = compact_lazy_catch_up(
+                output,
+                &lazy.view,
+                lazy.remaps.clone(),
+                &delete_positions(&head),
+                &lazy.counts,
+                Some(4),
+                3,
+            )
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains("resurrect"), "{error:#}");
+        }
+        // Without its late deletes, an input loses nothing at the build's
+        // own sequence; with them, an older delete sequence cannot mask.
+        let error = compact_lazy_catch_up(
+            output,
+            &lazy.view,
+            lazy.remaps.clone(),
+            &delete_positions(&lazy.head),
+            &lazy.counts,
+            Some(2),
+            3,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("build sequence"), "{error:#}");
+        let mut counts = lazy.counts.clone();
+        *counts.values_mut().next().unwrap() += 1;
+        let error = compact_lazy_catch_up(
+            output,
+            &lazy.view,
+            lazy.remaps,
+            &delete_positions(&lazy.head),
+            &counts,
+            Some(4),
+            3,
+        )
+        .err()
+        .unwrap();
+        assert!(error.is::<CatchUpRejected>(), "{error:#}");
     }
 
     async fn residual_digest(table: &Table, files: &[iceberg::spec::DataFile]) -> String {

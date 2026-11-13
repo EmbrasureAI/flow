@@ -4,7 +4,9 @@ Measured on 2026-11-13. Preserving completed builds across delete consolidation
 and admitting the large sorted merge improve selective reads while keeping CDC
 service cost below the baseline in the 2M-row comparison. The 2M-row update workload
 still misses the absolute publication-latency target. These are single-host
-fixture results, not a cloud-latency or ingest-capacity qualification.
+fixture results, not a cloud-latency or ingest-capacity qualification. A
+[catch-up follow-up](#catch-up-follow-up) removes the compaction stall this
+change added on that workload.
 
 ## Change and cause
 
@@ -179,3 +181,90 @@ and disk-backed retention proofs, exclusion of stale residual deletes, late
 changes during merge, v2/v3 lineage, lost catalog responses and index reopen.
 The broader PostgreSQL service-version matrix remains a CI check; the fixture
 measurements here use PostgreSQL 18.6.
+
+## Catch-up follow-up
+
+Measured on 2026-11-13, after the change above merged. A profile of the
+2M-row update workload (`perf`, frame pointers, 85 seconds at 499 Hz)
+attributed about 0.6% of daemon CPU to the merge itself (loser tree,
+gathering and remap pushes), so merging rows was not the overhead. The added
+stall came from completing the large rewrites that delete consolidation used
+to discard:
+their catch-up ran while the table's CDC was paused, for up to 2.2 seconds,
+and the slowest exceeded the 750 ms stall budget and were deferred. That
+catch-up used most of its time staging the consolidated head set in the
+scratch store and reading it back twice, decoding an owned record per
+position, and reading back every original delete of the build to prove that
+none was resurrected.
+
+When the head set fits the compact path and the build has a lazy remap,
+catch-up now keeps it in memory. The remap records exactly the rows the build
+wrote, so the input positions it leaves uncovered are the build's original
+deletes; one pass checks that the head set contains every such position and
+translates the remaining input positions into output masks. Residual delete
+files are written from the head set and the masks without staging either. The
+disk-backed paths read staged deletes through borrowing cursors that skip
+unselected files with one seek. Proof strength is unchanged: a missing
+original delete, including one inside a contiguous hole, still rejects the
+build. A unit test compares the new path with the staged path on the same
+build and head, including the written residual positions.
+
+The base is the change above; the candidate adds this follow-up. Same host,
+fixture, release ThinLTO build with jemalloc and workload arguments as above. Runs alternate base and candidate.
+The fixture's PostgreSQL volume grows by several GiB per 2M-row run, so the
+update workload ran as three invocations of 2, 2 and 1 runs per side with a
+fixture reset before each; the mixed workload ran 5 runs per side in one
+invocation. All 20 runs passed full row verification, admitted 29,972 to
+30,003 mutations/s, missed no measured or warmup arrivals and passed the arrival
+gate. As before, every update90 run on both sides failed the publication
+latency gate; every mixed run passed it. Paired changes compare runs
+adjacent in time.
+
+### 2M-row update90, 5 runs per side
+
+| measure (median) | base | candidate | change | paired geomean |
+|---|---:|---:|---:|---:|
+| compaction stall s | 6.7 | 4.2 | -37.3% | -36.8% |
+| catch-up time per run s | 5.41 | 2.49 | -54.0% | |
+| largest catch-up ms | 1,897 | 569 | -70.0% | |
+| CDC service µs/mutation | 18.3 | 18.5 | +1.1% | +1.9% |
+| drain mutations/s | 28,632 | 29,773 | +4.0% | +1.3% |
+| commit→catalog p95 ms | 8,819 | 8,671 | -1.7% | -7.1% |
+| peak RSS MiB | 617 | 628 | +1.8% | -3.1% |
+
+Every pair's stall fell, by 32% to 43%. The 11 base catch-ups that took the
+compact replacement path, large rewrites caught up across a delete
+consolidation, took 0.94 to 2.22 s; the candidate's 13 took 0.18 to 0.31 s.
+Three base runs deferred a preparation past the stall budget; no candidate
+run did. Both sides read the
+same build input, 6.8M to 9.9M rows per run. CDC service ranges overlap
+(base 17.8–19.6, candidate 17.9–20.2 µs/mutation), and the change only removes
+work from catch-up, which runs while CDC is paused; the difference is within
+run-to-run variation. Publication p95 remains far above target on both sides.
+
+### Mixed, 5 runs per side
+
+| measure (median) | base | candidate | change | paired geomean |
+|---|---:|---:|---:|---:|
+| CDC service µs/mutation | 15.8 | 15.7 | -0.2% | +0.2% |
+| drain mutations/s | 29,802 | 29,797 | -0.0% | +0.1% |
+| commit→catalog p95 ms | 482 | 494 | +2.6% | +0.7% |
+| compaction stall s | 8.2 | 8.3 | +1.4% | +0.5% |
+| mean RSS MiB | 323 | 325 | +0.6% | |
+| p90 RSS MiB | 429 | 422 | -1.6% | |
+| peak RSS MiB | 445 | 493 | +10.8% | +6.8% |
+
+The mixed workload never takes the compact path: its catch-ups are
+additive, median about 80 ms, and total about 3 seconds per run on both
+sides. Mean and p90 RSS over each run are unchanged; peak RSS is the largest
+one-second sample and varies by single transient spikes (base 431 to 498 MiB,
+candidate 464 to 514 MiB). The allocator's median peak allocated bytes were
+185 MiB on the base and 177 MiB on the candidate.
+
+An earlier 3-run mixed comparison of a previous revision of this change, on
+this host, showed CDC service time falling
+steadily across consecutive runs (18.7 to 14.9 µs/mutation in run order)
+after the 2M-row runs; its medians were dominated by run order and are not
+reported. The 5-run mixed comparison above ran about 20 minutes after the
+last 2M-row run and shows no such trend.
+

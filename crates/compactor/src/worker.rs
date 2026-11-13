@@ -1419,6 +1419,29 @@ impl DeletePositions {
             .iter()
             .map(|&(rank, position)| (&self.targets[rank as usize], position))
     }
+
+    /// `targets` in path order and sorted, unique `(rank, row)` pairs.
+    #[cfg(test)]
+    pub(crate) fn from_sorted(targets: Vec<FileId>, positions: Vec<(u32, u64)>) -> Self {
+        assert!(targets.is_sorted() && positions.is_sorted());
+        Self { targets, positions }
+    }
+
+    /// The `(target rank, row)` pairs, sorted; ranks follow path order.
+    pub(crate) fn pairs(&self) -> &[(u32, u64)] {
+        &self.positions
+    }
+
+    pub(crate) fn target(&self, rank: u32) -> &FileId {
+        &self.targets[rank as usize]
+    }
+
+    /// Each target with positions and its pairs, in path order.
+    pub(crate) fn runs(&self) -> impl Iterator<Item = (&FileId, &[(u32, u64)])> + '_ {
+        self.positions
+            .chunk_by(|left, right| left.0 == right.0)
+            .map(|run| (&self.targets[run[0].0 as usize], run))
+    }
 }
 
 /// [`stage_delete_files`] without a scratch store: the same checks, limits and
