@@ -275,14 +275,18 @@ PostgreSQL necessarily receives it.
 updates.
 
 `ingest_prepared` partitions `precommit_prepare_ms` into
-`data_stage_pair_wall_ms`, `delete_write_ms` (delete-writer calls and close),
-and `other_prepare_ms`. Each pair starts before staging the previous batch on a
-blocking worker and ends after both that stage and the next data write, final
-close, or input receive finish. Only one stage is outstanding. The first write
-has no preceding stage. The outer remainder includes table loading, writer
+`data_stage_pair_wall_ms`, `close_delete_wall_ms` and `other_prepare_ms`. Each
+pair starts before staging the previous batch on a blocking worker and ends
+after both that stage and the next data write or input receive finish. Only one
+stage is outstanding. The first write has no preceding stage.
+`close_delete_wall_ms` starts once input is exhausted and the last stage has
+joined. It runs the final data-file close concurrently with v3 prior-delete
+merging and the delete writer; `delete_write_ms` (delete-writer calls and
+close) is nested inside it. The outer remainder includes table loading, writer
 setup, mutation-to-delta assembly, artifact-plan writing and durable sealing.
 
-Within those pairs, `data_write_ms` measures data-writer calls and close;
+Within those pairs, `data_write_ms` measures data-writer calls, plus the
+concurrent final close;
 `index_delete_stage_ms` measures index-delta and position-delete spool staging
 inside the worker, including lock waits. `data_stage_overlap_ms` is the summed
 intersection of their actual start/end intervals. `data_stage_other_ms` covers

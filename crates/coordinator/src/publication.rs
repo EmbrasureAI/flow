@@ -315,7 +315,6 @@ impl TablePublisher {
         let mut data_stage_pair_wall = Duration::ZERO;
         let mut data_stage_overlap = Duration::ZERO;
         let mut data_stage_other = Duration::ZERO;
-        let mut delete_write = Duration::ZERO;
         let table = self.catalog.load_table(table.identifier()).await?;
         if base.format_version != table.metadata().format_version()
             || schema != &captured_schema
@@ -402,20 +401,15 @@ impl TablePublisher {
         let mut referenced = BTreeSet::new();
         let mut first = Some(first);
         let mut stage = None;
-        let data_files = loop {
+        loop {
             let next = async {
                 let mutations = match first.take() {
                     Some(first) => Some(first),
                     None => batches.next().await?,
                 };
                 let Some(mutations) = mutations else {
-                    let started = Instant::now();
-                    let files = data_writer
-                        .take()
-                        .expect("writer closes once")
-                        .close()
-                        .await?;
-                    return Ok((DataOutput::Complete(files), started, Instant::now()));
+                    let now = Instant::now();
+                    return Ok((DataOutput::Exhausted, now, now));
                 };
                 let rows = mutations
                     .iter()
@@ -443,7 +437,7 @@ impl TablePublisher {
             data_stage_other += timing.other;
             let (mutations, written) = match output {
                 DataOutput::Batch(mutations, written) => (mutations, written),
-                DataOutput::Complete(files) => break files,
+                DataOutput::Exhausted => break,
             };
             let mut locations = written.locations.into_iter();
             let mut deltas = Vec::with_capacity(mutations.len());
@@ -481,27 +475,49 @@ impl TablePublisher {
                 store.put_position_deletes(&epoch.id.0, &epoch.table, deletes)?;
                 Ok(())
             }));
-        };
-        let removed_deletes = self
-            .merge_previous_deletes(&table, schema, epoch, &referenced)
-            .await?;
-        let mut delete_writer = DeleteWriter::new_for_version(
-            table.file_io().clone(),
-            table.metadata().location(),
-            &attempt,
-            spec_id,
-            writer_config.clone(),
-            table.metadata().format_version(),
-        )?;
-        let mut deletes = self.delete_batches(epoch);
-        while let Some(batch) = deletes.recv().await.transpose()? {
-            let write_started = Instant::now();
-            delete_writer.write(&batch).await?;
-            delete_write += write_started.elapsed();
         }
-        let write_started = Instant::now();
-        let delete_files = delete_writer.close().await?;
-        delete_write += write_started.elapsed();
+        // The last stage was joined above, so every position delete is spooled.
+        // Closing data uploads its final object; the delete side reads prior
+        // vectors and uploads deletes. Neither needs the other's output.
+        let finish_started = Instant::now();
+        let data_writer = data_writer.take().expect("writer closes once");
+        let close_data = async {
+            let started = Instant::now();
+            let files = data_writer.close().await;
+            (files, started.elapsed())
+        };
+        let write_deletes = async {
+            let removed = self
+                .merge_previous_deletes(&table, schema, epoch, &referenced)
+                .await?;
+            let mut delete_writer = DeleteWriter::new_for_version(
+                table.file_io().clone(),
+                table.metadata().location(),
+                &attempt,
+                spec_id,
+                writer_config.clone(),
+                table.metadata().format_version(),
+            )?;
+            let mut elapsed = Duration::ZERO;
+            let mut deletes = self.delete_batches(epoch);
+            while let Some(batch) = deletes.recv().await.transpose()? {
+                let write_started = Instant::now();
+                delete_writer.write(&batch).await?;
+                elapsed += write_started.elapsed();
+            }
+            let write_started = Instant::now();
+            let files = delete_writer.close().await?;
+            elapsed += write_started.elapsed();
+            Ok::<_, anyhow::Error>((removed, files, elapsed))
+        };
+        // Await both before propagating either error, as in join_data_stage:
+        // the delete side runs blocking state-store work that a dropped future
+        // would not stop before the caller discards Building.
+        let ((data_files, close_elapsed), deletes) = tokio::join!(close_data, write_deletes);
+        let close_delete_wall = finish_started.elapsed();
+        data_write += close_elapsed;
+        let data_files = data_files?;
+        let (removed_deletes, delete_files, delete_write) = deletes?;
         for (kind, files) in [("data", &data_files), ("delete", &delete_files)] {
             let (objects, bytes) = flow_iceberg_ext::physical_file_stats(files);
             metrics::counter!("flow_artifact_files_written_total", "table_id" => epoch.table.0.to_string(), "kind" => kind).increment(objects as u64);
@@ -573,7 +589,7 @@ impl TablePublisher {
         .await?;
         let preparation = prepare_started.elapsed();
         let precommit_prepare_ms = preparation.as_secs_f64() * 1000.0;
-        let other_prepare = preparation.saturating_sub(data_stage_pair_wall + delete_write);
+        let other_prepare = preparation.saturating_sub(data_stage_pair_wall + close_delete_wall);
         metrics::histogram!("flow_ingest_prepare_seconds", "table_id" => epoch.table.0.to_string())
             .record(precommit_prepare_ms / 1000.0);
         tracing::debug!(
@@ -587,6 +603,7 @@ impl TablePublisher {
             data_stage_pair_wall_ms = data_stage_pair_wall.as_secs_f64() * 1000.0,
             data_stage_overlap_ms = data_stage_overlap.as_secs_f64() * 1000.0,
             data_stage_other_ms = data_stage_other.as_secs_f64() * 1000.0,
+            close_delete_wall_ms = close_delete_wall.as_secs_f64() * 1000.0,
             delete_write_ms = delete_write.as_secs_f64() * 1000.0,
             other_prepare_ms = other_prepare.as_secs_f64() * 1000.0,
             "ingest artifacts and index deltas prepared"
@@ -864,7 +881,7 @@ impl CollapsedBatches {
 
 enum DataOutput {
     Batch(Vec<CollapsedMutation>, WrittenBatch),
-    Complete(Vec<DataFile>),
+    Exhausted,
 }
 
 struct DataStage {
