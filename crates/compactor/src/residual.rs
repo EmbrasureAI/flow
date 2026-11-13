@@ -1,17 +1,152 @@
-//! Sorted union of staged position-delete spools, read without decoding an
-//! owned record per position.
+//! Sorted union of staged position-delete spools and in-memory position sets,
+//! read without decoding an owned record per position.
 
 use anyhow::{Result, ensure};
 use flow_model::{FileId, PgLsn, RowLocation};
 use flow_state_store::PositionDeleteCursor;
+use std::ops::Range;
 
-/// One staged spool and the target files it contributes.
+/// The fields a position-delete file records for one position, borrowed.
+struct Record<'r> {
+    path: &'r str,
+    row_position: u64,
+    data_sequence_number: i64,
+    spec_id: i32,
+    partition: &'r [u8],
+}
+
+/// One in-memory target: its path, encoded key and the metadata every
+/// position on it is written with.
+pub(crate) struct MemoryTarget {
+    pub(crate) path: FileId,
+    pub(crate) data_sequence_number: i64,
+    pub(crate) spec_id: i32,
+    pub(crate) partition: Vec<u8>,
+}
+
+/// Positions held in memory as `(target rank, row)` pairs, sorted and unique,
+/// where rank order is path order. Each target's metadata is resolved once.
+pub(crate) struct MemoryPositions<'a> {
+    /// Each target with its encoded key and its slice of `positions`.
+    targets: Vec<(MemoryTarget, Vec<u8>, Range<usize>)>,
+    positions: &'a [(u32, u64)],
+    target: usize,
+    at: usize,
+}
+
+impl<'a> MemoryPositions<'a> {
+    /// `target` resolves a rank's path and metadata; it runs once per rank
+    /// present in `positions`.
+    pub(crate) fn new(
+        positions: &'a [(u32, u64)],
+        mut target: impl FnMut(u32) -> Result<MemoryTarget>,
+    ) -> Result<Self> {
+        let mut targets: Vec<(MemoryTarget, Vec<u8>, Range<usize>)> = Vec::new();
+        let mut start = 0;
+        while start < positions.len() {
+            let rank = positions[start].0;
+            let end = start + positions[start..].partition_point(|&(next, _)| next == rank);
+            ensure!(
+                positions[start..end]
+                    .windows(2)
+                    .all(|pair| pair[0].1 < pair[1].1),
+                "in-memory delete positions are not sorted and unique"
+            );
+            let resolved = target(rank)?;
+            let mut key = Vec::with_capacity(resolved.path.0.len() + 2);
+            flow_state_store::encode_delete_target(&resolved.path.0, &mut key);
+            ensure!(
+                targets.last().is_none_or(|(_, last, _)| *last < key),
+                "in-memory delete targets are not in path order"
+            );
+            targets.push((resolved, key, start..end));
+            start = end;
+        }
+        Ok(Self {
+            targets,
+            positions,
+            target: 0,
+            at: 0,
+        })
+    }
+}
+
+/// Where a residual input's positions come from.
+enum Source<'a> {
+    Spool(PositionDeleteCursor<'a>),
+    Memory(MemoryPositions<'a>),
+}
+
+impl Source<'_> {
+    /// The current target's encoded key and the row position.
+    fn current(&self) -> Result<Option<(&[u8], u64)>> {
+        match self {
+            Self::Spool(cursor) => Ok(cursor.current()?),
+            Self::Memory(memory) => Ok(memory
+                .targets
+                .get(memory.target)
+                .map(|(_, key, _)| (key.as_slice(), memory.positions[memory.at].1))),
+        }
+    }
+
+    fn record(&self) -> Result<Record<'_>> {
+        match self {
+            Self::Spool(cursor) => {
+                let record = cursor.record()?;
+                Ok(Record {
+                    path: record.path()?,
+                    row_position: record.row_position,
+                    data_sequence_number: record.data_sequence_number,
+                    spec_id: record.spec_id,
+                    partition: record.partition,
+                })
+            }
+            Self::Memory(memory) => {
+                let (target, _, _) = memory
+                    .targets
+                    .get(memory.target)
+                    .ok_or_else(|| anyhow::anyhow!("in-memory delete positions are exhausted"))?;
+                Ok(Record {
+                    path: &target.path.0,
+                    row_position: memory.positions[memory.at].1,
+                    data_sequence_number: target.data_sequence_number,
+                    spec_id: target.spec_id,
+                    partition: &target.partition,
+                })
+            }
+        }
+    }
+
+    fn advance(&mut self) {
+        match self {
+            Self::Spool(cursor) => cursor.advance(),
+            Self::Memory(memory) => {
+                memory.at += 1;
+                if memory.at == memory.targets[memory.target].2.end {
+                    memory.target += 1;
+                }
+            }
+        }
+    }
+
+    fn skip_target(&mut self) {
+        match self {
+            Self::Spool(cursor) => cursor.skip_target(),
+            Self::Memory(memory) => {
+                memory.at = memory.targets[memory.target].2.end;
+                memory.target += 1;
+            }
+        }
+    }
+}
+
+/// One staged spool or in-memory set and the target files it contributes.
 pub(crate) struct ResidualInput<'a> {
-    cursor: PositionDeleteCursor<'a>,
+    source: Source<'a>,
     keep: Box<dyn Fn(&FileId) -> bool + Send + 'a>,
-    /// Whether `keep` accepted the cursor's current target.
+    /// Whether `keep` accepted the source's current target.
     accepted: bool,
-    /// The cursor's position while it is on the current target.
+    /// The source's position while it is on the current target.
     at: Option<u64>,
 }
 
@@ -20,8 +155,19 @@ impl<'a> ResidualInput<'a> {
         cursor: PositionDeleteCursor<'a>,
         keep: impl Fn(&FileId) -> bool + Send + 'a,
     ) -> Self {
+        Self::with_source(Source::Spool(cursor), keep)
+    }
+
+    pub(crate) fn memory(
+        positions: MemoryPositions<'a>,
+        keep: impl Fn(&FileId) -> bool + Send + 'a,
+    ) -> Self {
+        Self::with_source(Source::Memory(positions), keep)
+    }
+
+    fn with_source(source: Source<'a>, keep: impl Fn(&FileId) -> bool + Send + 'a) -> Self {
         Self {
-            cursor,
+            source,
             keep: Box::new(keep),
             accepted: false,
             at: None,
@@ -29,7 +175,7 @@ impl<'a> ResidualInput<'a> {
     }
 }
 
-/// Merges spools that are each ordered and unique by physical position, using
+/// Merges inputs that are each ordered and unique by physical position, using
 /// bytewise path order followed by the ordinal. Positions arrive grouped by
 /// target file, so each filter runs once per target and a rejected target is
 /// skipped with one seek. Paths are compared once per target, ordinals per
@@ -73,7 +219,7 @@ impl<'a> ResidualMerge<'a> {
             }
             starts = true;
         };
-        let record = self.inputs[index].cursor.record()?;
+        let record = self.inputs[index].source.record()?;
         ensure!(
             record.row_position == position,
             "staged position-delete key and record disagree"
@@ -90,8 +236,8 @@ impl<'a> ResidualMerge<'a> {
         slot.row_fingerprint = [0; 16];
         for input in &mut self.inputs {
             if input.at == Some(position) {
-                input.cursor.advance();
-                input.at = match input.cursor.current()? {
+                input.source.advance();
+                input.at = match input.source.current()? {
                     Some((key, next)) if key == self.key.as_slice() => Some(next),
                     _ => {
                         input.accepted = false;
@@ -108,21 +254,21 @@ impl<'a> ResidualMerge<'a> {
     fn start_target(&mut self) -> Result<bool> {
         for input in &mut self.inputs {
             while !input.accepted {
-                if input.cursor.current()?.is_none() {
+                if input.source.current()?.is_none() {
                     break;
                 }
                 self.scratch.0.clear();
-                self.scratch.0.push_str(input.cursor.record()?.path()?);
+                self.scratch.0.push_str(input.source.record()?.path);
                 if (input.keep)(&self.scratch) {
                     input.accepted = true;
                 } else {
-                    input.cursor.skip_target();
+                    input.source.skip_target();
                 }
             }
         }
         let mut first = None::<(usize, &[u8])>;
         for (index, input) in self.inputs.iter().enumerate() {
-            if let Some((key, _)) = input.cursor.current()?
+            if let Some((key, _)) = input.source.current()?
                 && first.is_none_or(|(_, smallest)| key < smallest)
             {
                 first = Some((index, key));
@@ -136,9 +282,9 @@ impl<'a> ResidualMerge<'a> {
         self.target.0.clear();
         self.target
             .0
-            .push_str(self.inputs[first].cursor.record()?.path()?);
+            .push_str(self.inputs[first].source.record()?.path);
         for input in &mut self.inputs {
-            input.at = match input.cursor.current()? {
+            input.at = match input.source.current()? {
                 Some((key, position)) if key == self.key.as_slice() => Some(position),
                 _ => None,
             };

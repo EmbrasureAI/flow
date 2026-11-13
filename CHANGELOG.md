@@ -276,6 +276,18 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- Compaction catch-up keeps a consolidated head set that fits the compact
+  path in memory when the build has a lazy remap: one pass proves that the
+  set contains every position the remap leaves uncovered (the build's original
+  deletes) and translates late input deletes into output masks, and residual
+  delete files are written from memory. Neither set is staged in the scratch
+  store, and the build's original deletes are not read back. Disk-backed
+  proofs and late-delete translation read staged positions through borrowing
+  cursors that skip unselected files. On a 2M-row update workload, compaction
+  stall fell 37%, catch-up time per run 54% and the largest catch-up from
+  1.9 s to 0.57 s (medians of 5 release runs per side); CDC service time and
+  the mixed workload were unchanged within run-to-run variation. See the
+  [catch-up follow-up](docs/benchmarks/sorted-merge.md#catch-up-follow-up).
 - Lazy index remaps are stored in chunks of up to 512 runs, varint-encoded with
   a restart point every 32 runs, at about three bytes per run instead of 28,
   with a small header per retired file. A forward read through a retired file

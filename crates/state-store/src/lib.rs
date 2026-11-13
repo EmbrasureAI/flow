@@ -21,7 +21,9 @@ pub use remap::{
     FileRemap, LazyRemap, RemapCleanup, RemapLimits, RemapRun, RemapStats, RemapTarget,
     RemapTranslator,
 };
-pub use spool::{Change, CollapsedMutation, PositionDeleteCursor, StagedPosition};
+pub use spool::{
+    Change, CollapsedMutation, PositionDeleteCursor, StagedPosition, encode_delete_target,
+};
 
 use files::{StoredDelta, StoredLocation};
 

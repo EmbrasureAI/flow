@@ -14,7 +14,12 @@ and range queries on the resulting snapshots were about 56% faster. Publication
 p95 remained 8.5 seconds, above the target, and compaction stalls increased.
 The smaller mixed workload passed all gates with 1.8% higher CDC service time
 and 10.9% higher peak RSS. The report includes admitted load, missed arrivals,
-reader versions, actual HTTP bytes and the limits of the comparison.
+reader versions, actual HTTP bytes and the limits of the comparison. Its
+[catch-up follow-up](benchmarks/sorted-merge.md#catch-up-follow-up) keeps
+compact replacement catch-ups in memory: on the 2M-row update workload,
+compaction stall fell 37% and the largest catch-up 70%, with CDC service time
+within run-to-run variation; the mixed workload, whose mean and p90 RSS were
+unchanged, was neutral.
 
 ## Expanded load and schema coverage
 

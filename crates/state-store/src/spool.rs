@@ -364,13 +364,7 @@ impl StateStore {
                 ));
             }
             let mut key = delete_prefix(transaction, table);
-            for byte in location.data_file_id.0.bytes() {
-                key.push(byte);
-                if byte == 0 {
-                    key.push(255);
-                }
-            }
-            key.extend_from_slice(&[0, 0]);
+            encode_delete_target(&location.data_file_id.0, &mut key);
             key.extend_from_slice(&location.row_position.to_be_bytes());
             self.put(&mut batch, SPOOL, key, &location)?;
         }
@@ -422,13 +416,7 @@ impl StateStore {
         // Only the store is borrowed: the prefix is owned, so callers may
         // keep the cursor after the file identity they passed is dropped.
         let mut prefix = delete_prefix(transaction, table);
-        for byte in file.0.bytes() {
-            prefix.push(byte);
-            if byte == 0 {
-                prefix.push(255);
-            }
-        }
-        prefix.extend_from_slice(&[0, 0]);
+        encode_delete_target(&file.0, &mut prefix);
         self.scan(SPOOL, prefix).map(|entry| {
             let (_, bytes) = entry?;
             decode(&bytes)
@@ -551,6 +539,21 @@ impl PositionDeleteCursor<'_> {
     }
 }
 
+/// Append the encoded target part of a staged position-delete key, as
+/// [`PositionDeleteCursor::current`] returns it. Encoded targets compare as
+/// their paths do and are equal only for the same path, so in-memory position
+/// sets can be merged with staged ones by comparing these bytes.
+pub fn encode_delete_target(path: &str, key: &mut Vec<u8>) {
+    for byte in path.bytes() {
+        key.push(byte);
+        if byte == 0 {
+            key.push(255);
+        }
+    }
+    // The terminator sorts before any continuation of the path.
+    key.extend_from_slice(&[0, 0]);
+}
+
 /// The leading fields of a staged [`RowLocation`], borrowed from its
 /// encoding: what a position-delete file records and its writer checks. The
 /// identity fields that follow are not decoded.
@@ -563,9 +566,9 @@ pub struct StagedPosition<'a> {
     pub partition: &'a [u8],
 }
 
-impl StagedPosition<'_> {
+impl<'a> StagedPosition<'a> {
     /// The target data file's path.
-    pub fn path(&self) -> Result<&str> {
+    pub fn path(&self) -> Result<&'a str> {
         std::str::from_utf8(self.data_file_id)
             .map_err(|_| Error::InvalidState("staged delete path is not UTF-8".into()))
     }
