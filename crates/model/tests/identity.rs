@@ -64,3 +64,38 @@ fn key_encoding_has_a_stable_versioned_storage_format() {
         .unwrap();
     assert_eq!(key.0, [1, 3, 255, 255, 255, 255, 255, 255, 255, 249]);
 }
+
+#[test]
+fn key_values_encode_exactly_like_a_row_and_validate_key_columns() {
+    // Composite key in a non-leading, non-column order.
+    let mut schema = schema();
+    schema.columns.push(Column {
+        field_id: 3,
+        name: "tenant".into(),
+        data_type: ColumnType::String,
+        nullable: false,
+    });
+    schema.primary_key = vec![2, 0];
+    let row = vec![
+        Value::Int64(-7),
+        Value::String("ignored".into()),
+        Value::String("acme".into()),
+    ];
+    assert_eq!(
+        schema
+            .encode_key_values(&[Value::String("acme".into()), Value::Int64(-7)])
+            .unwrap(),
+        schema.encode_key(&row).unwrap()
+    );
+    // Wrong type, NULL key and wrong arity are rejected.
+    for values in [
+        vec![Value::Int64(1), Value::Int64(-7)],
+        vec![Value::Null, Value::Int64(-7)],
+        vec![Value::String("acme".into())],
+    ] {
+        assert!(schema.encode_key_values(&values).is_err(), "{values:?}");
+    }
+    schema.primary_key.clear();
+    schema.append_only = true;
+    assert!(schema.encode_key_values(&[]).is_err());
+}

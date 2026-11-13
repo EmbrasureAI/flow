@@ -6,7 +6,7 @@ use flow_model::{
     TableMutationCount, TableSchema, TableSchemaVersion, Value,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     time::Instant,
 };
 
@@ -102,6 +102,10 @@ pub struct CaptureAssembler {
     spool: TransactionSpool,
     schemas: HashMap<TableId, TableSchema>,
     relations: HashMap<u32, Relation>,
+    /// Relations validated against their table's current schema and `types`.
+    /// Rows skip repeating that per-column check; a schema or type change
+    /// clears it, so the next row revalidates.
+    validated: HashSet<u32>,
     transactions: HashMap<u32, PendingTransaction>,
     /// The transaction of the active StreamStart..StreamStop segment.
     streaming: Option<u32>,
@@ -145,6 +149,7 @@ impl CaptureAssembler {
             spool,
             schemas: configured,
             relations: HashMap::new(),
+            validated: HashSet::new(),
             transactions: HashMap::new(),
             streaming: None,
             buffer: None,
@@ -158,6 +163,7 @@ impl CaptureAssembler {
 
     pub fn set_types(&mut self, types: crate::TypeRegistry) {
         self.types = types;
+        self.validated.clear();
     }
 
     /// Bound terminal descriptors waiting for one journal durability barrier.
@@ -433,6 +439,7 @@ impl CaptureAssembler {
             ));
         }
         self.flush()?;
+        self.validated.remove(&schema.table_id.0);
         self.schemas.insert(schema.table_id, schema);
         Ok(())
     }
@@ -612,6 +619,7 @@ impl CaptureAssembler {
                     .get(&TableId(relation.id))
                     .ok_or(Error::Config("relation outside the capture set"))?;
                 self.types.validate_relation(schema, &relation)?;
+                self.validated.insert(relation.id);
                 self.relations.insert(relation.id, relation);
             }
             SourceEvent::Insert {
@@ -621,13 +629,17 @@ impl CaptureAssembler {
                 row,
             } => {
                 let (schema, metadata) = self.table(relation)?;
+                let validated = self.validated.contains(&relation);
                 let mutation = Mutation {
                     table_id: schema.table_id,
                     schema_version: schema.version,
                     kind: MutationKind::Insert {
-                        row: decode_row_with_types(schema, metadata, &row, &self.types)?,
+                        row: decode_cdc_row(schema, metadata, &row, &self.types, validated)?,
                     },
                 };
+                if !validated {
+                    self.validated.insert(relation);
+                }
                 self.append(xid, subxid, mutation)?;
             }
             SourceEvent::Update {
@@ -663,17 +675,22 @@ impl CaptureAssembler {
                         }
                     }
                 }
-                let row = decode_row_with_types(schema, metadata, &row, &self.types)?;
+                let validated = self.validated.contains(&relation);
+                let row = decode_cdc_row(schema, metadata, &row, &self.types, validated)?;
                 let old_key = if let Some(old) = old {
                     decode_key(schema, metadata, &old, &self.types)?
                 } else {
-                    schema.encode_key(&row)?
+                    // The decoded row is already validated against `schema`.
+                    schema.encode_key_values(schema.primary_key.iter().map(|&i| &row[i]))?
                 };
                 let mutation = Mutation {
                     table_id: schema.table_id,
                     schema_version: schema.version,
                     kind: MutationKind::Update { old_key, row },
                 };
+                if !validated {
+                    self.validated.insert(relation);
+                }
                 self.append(xid, subxid, mutation)?;
             }
             SourceEvent::Delete {
@@ -1056,13 +1073,6 @@ fn decode_key(
             "key tuple column count differs from relation",
         ));
     }
-    let mut key_schema = schema.clone();
-    key_schema.columns = schema
-        .primary_key
-        .iter()
-        .map(|&i| schema.columns[i].clone())
-        .collect();
-    key_schema.primary_key = (0..key_schema.columns.len()).collect();
     let mut values = Vec::with_capacity(schema.primary_key.len());
     for &index in &schema.primary_key {
         let column = &schema.columns[index];
@@ -1074,7 +1084,7 @@ fn decode_key(
             Cell::Binary(bytes) => types.decode(&column.data_type, pg.type_oid, bytes, true)?,
         });
     }
-    Ok(key_schema.encode_key(&values)?)
+    Ok(schema.encode_key_values(&values)?)
 }
 
 pub fn decode_row(schema: &TableSchema, relation: &Relation, tuple: &Tuple) -> Result<Row> {
@@ -1087,6 +1097,33 @@ pub fn decode_row_with_types(
     types: &crate::TypeRegistry,
 ) -> Result<Row> {
     types.validate_relation(schema, relation)?;
+    decode_validated_row(schema, relation, tuple, types)
+}
+
+/// Decode a CDC row, validating its relation only when the assembler has not
+/// already validated it against the current schema and types.
+fn decode_cdc_row(
+    schema: &TableSchema,
+    relation: &Relation,
+    tuple: &Tuple,
+    types: &crate::TypeRegistry,
+    validated: bool,
+) -> Result<Row> {
+    if validated {
+        decode_validated_row(schema, relation, tuple, types)
+    } else {
+        decode_row_with_types(schema, relation, tuple, types)
+    }
+}
+
+/// [`decode_row_with_types`] for a relation `types` already validated
+/// against `schema`.
+fn decode_validated_row(
+    schema: &TableSchema,
+    relation: &Relation,
+    tuple: &Tuple,
+    types: &crate::TypeRegistry,
+) -> Result<Row> {
     relation.validate_row(tuple)?;
     let mut row = Vec::with_capacity(tuple.len());
     for ((cell, column), pg) in tuple.iter().zip(&schema.columns).zip(&relation.columns) {

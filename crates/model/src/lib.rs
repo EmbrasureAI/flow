@@ -162,33 +162,7 @@ impl TableSchema {
             return Err(ModelError::InvalidRow("column count differs".into()));
         }
         for (col, value) in self.columns.iter().zip(row) {
-            let valid = match (&col.data_type, value) {
-                (_, Value::Null) => col.nullable,
-                (ColumnType::Bool, Value::Bool(_))
-                | (ColumnType::Int32, Value::Int32(_))
-                | (ColumnType::Int64, Value::Int64(_))
-                | (ColumnType::Float64, Value::Float64(_))
-                | (ColumnType::String, Value::String(_))
-                | (ColumnType::Binary, Value::Binary(_))
-                | (ColumnType::Date, Value::Date(_))
-                | (ColumnType::TimestampMicros, Value::TimestampMicros(_))
-                | (ColumnType::TimestampTzMicros, Value::TimestampTzMicros(_))
-                | (ColumnType::Uuid, Value::Uuid(_)) => true,
-                (
-                    ColumnType::Decimal { precision, scale },
-                    Value::Decimal {
-                        unscaled,
-                        scale: actual,
-                    },
-                ) => scale == actual && unscaled.unsigned_abs() < 10u128.pow(u32::from(*precision)),
-                _ => false,
-            };
-            if !valid {
-                return Err(ModelError::InvalidRow(format!(
-                    "type or nullability mismatch for {}",
-                    col.name
-                )));
-            }
+            validate_value(col, value)?;
         }
         Ok(())
     }
@@ -200,6 +174,33 @@ impl TableSchema {
         let mut bytes = vec![1]; // canonical format version
         for idx in &self.primary_key {
             encode_value(&row[*idx], |chunk| bytes.extend_from_slice(chunk));
+        }
+        Ok(PrimaryKey(bytes))
+    }
+    /// Encode a key from its values alone, in primary-key order. Each value is
+    /// validated against its key column only; the key equals `encode_key` of
+    /// any valid row holding these values.
+    pub fn encode_key_values<'a>(
+        &self,
+        values: impl IntoIterator<Item = &'a Value>,
+    ) -> Result<PrimaryKey, ModelError> {
+        if self.primary_key.is_empty() {
+            return Err(ModelError::MissingKey);
+        }
+        let arity = || ModelError::InvalidRow("key column count differs".into());
+        let mut values = values.into_iter();
+        let mut bytes = vec![1]; // canonical format version
+        for idx in &self.primary_key {
+            let value = values.next().ok_or_else(arity)?;
+            let col = self
+                .columns
+                .get(*idx)
+                .ok_or_else(|| ModelError::InvalidSchema("key column out of bounds".into()))?;
+            validate_value(col, value)?;
+            encode_value(value, |chunk| bytes.extend_from_slice(chunk));
+        }
+        if values.next().is_some() {
+            return Err(arity());
         }
         Ok(PrimaryKey(bytes))
     }
@@ -244,6 +245,36 @@ impl TableSchema {
 }
 
 /// Canonical, typed, length-delimited encoding. Never concatenate unframed keys.
+fn validate_value(col: &Column, value: &Value) -> Result<(), ModelError> {
+    let valid = match (&col.data_type, value) {
+        (_, Value::Null) => col.nullable,
+        (ColumnType::Bool, Value::Bool(_))
+        | (ColumnType::Int32, Value::Int32(_))
+        | (ColumnType::Int64, Value::Int64(_))
+        | (ColumnType::Float64, Value::Float64(_))
+        | (ColumnType::String, Value::String(_))
+        | (ColumnType::Binary, Value::Binary(_))
+        | (ColumnType::Date, Value::Date(_))
+        | (ColumnType::TimestampMicros, Value::TimestampMicros(_))
+        | (ColumnType::TimestampTzMicros, Value::TimestampTzMicros(_))
+        | (ColumnType::Uuid, Value::Uuid(_)) => true,
+        (
+            ColumnType::Decimal { precision, scale },
+            Value::Decimal {
+                unscaled,
+                scale: actual,
+            },
+        ) => scale == actual && unscaled.unsigned_abs() < 10u128.pow(u32::from(*precision)),
+        _ => false,
+    };
+    if !valid {
+        return Err(ModelError::InvalidRow(format!(
+            "type or nullability mismatch for {}",
+            col.name
+        )));
+    }
+    Ok(())
+}
 fn encode_value(value: &Value, mut emit: impl FnMut(&[u8])) {
     match value {
         Value::Null => emit(&[0]),
