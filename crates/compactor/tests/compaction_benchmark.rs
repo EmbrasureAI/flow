@@ -137,12 +137,45 @@ struct Fixture {
     input_bytes: u64,
 }
 
+/// How input files' keys relate. Every file is sorted by id on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+    /// Each file holds its own contiguous id range.
+    Disjoint,
+    /// Files take turns in runs of this many consecutive ids.
+    Clustered(usize),
+    /// Consecutive ids belong to different files.
+    Interleaved,
+}
+
+impl Shape {
+    fn id(self, files: usize, rows_per_file: usize, file: usize, offset: usize) -> i64 {
+        (match self {
+            Self::Disjoint => file * rows_per_file + offset,
+            Self::Clustered(run) => ((offset / run) * files + file) * run + offset % run,
+            Self::Interleaved => offset * files + file,
+        }) as i64
+    }
+}
+
 /// Commit `files` data files and delete every `delete_every`th row, if any.
 async fn fixture(
     version: FormatVersion,
     files: usize,
     rows_per_file: usize,
     delete_every: usize,
+) -> Fixture {
+    sorted_fixture(version, files, rows_per_file, delete_every, None).await
+}
+
+/// [`fixture`] for a table sorted by id when `shape` is set: inputs are
+/// written sorted and stamped, and their key ranges relate as `shape` says.
+async fn sorted_fixture(
+    version: FormatVersion,
+    files: usize,
+    rows_per_file: usize,
+    delete_every: usize,
+    shape: Option<Shape>,
 ) -> Fixture {
     let dir = TempDir::new().unwrap();
     let schema = schema();
@@ -173,13 +206,33 @@ async fn fixture(
         )
         .await
         .unwrap();
+    let table = if shape.is_some() {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        let transaction = Transaction::new(&table);
+        let action = transaction
+            .replace_sort_order()
+            .asc("id", iceberg::spec::NullOrder::First);
+        action
+            .apply(transaction)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap()
+    } else {
+        table
+    };
+    let sort = flow_materializer::TableSort::of_table(&schema, table.metadata());
     let index = StateStore::open(dir.path().join("index"), StateStoreOptions::default()).unwrap();
     let mut data_files = Vec::new();
     let mut deltas = Vec::new();
     let mut deleted = Vec::new();
     for file in 0..files {
         let rows: Vec<Row> = (0..rows_per_file)
-            .map(|offset| row((file * rows_per_file + offset) as i64))
+            .map(|offset| {
+                row(shape
+                    .unwrap_or(Shape::Disjoint)
+                    .id(files, rows_per_file, file, offset))
+            })
             .collect();
         // One writer per file gives the many-small-files shape compaction repairs.
         let mut writer = DataWriter::new(
@@ -191,6 +244,11 @@ async fn fixture(
             WriterConfig::default(),
         )
         .unwrap();
+        if let Some(spec) = sort.spec() {
+            writer = writer
+                .with_sort(spec, flow_materializer::SortMode::Verify)
+                .unwrap();
+        }
         let locations = writer.write(&rows, PgLsn(1)).await.unwrap().locations;
         data_files.extend(writer.close().await.unwrap());
         for (row, location) in rows.iter().zip(locations) {
@@ -288,6 +346,7 @@ async fn fixture(
         delete_input_bytes: delete_files.iter().map(delete_content_size).sum(),
         delete_input_rows: delete_rows,
         lazy_index_remap: false,
+        merge: flow_compactor::MergePolicy::default(),
         per_target_deletes: false,
         target_ranges: Default::default(),
         reason: flow_compactor::PlanReason::L0Debt,
@@ -326,6 +385,11 @@ struct Sample {
     wall: Duration,
     cpu: f64,
     peak_growth_kib: u64,
+    layout: &'static str,
+    remap_runs: u64,
+    remap_bytes: u64,
+    stamped_outputs: usize,
+    output_bytes: u64,
 }
 
 async fn run(fixture: &Fixture, iteration: usize) -> Sample {
@@ -360,10 +424,26 @@ async fn run(fixture: &Fixture, iteration: usize) -> Sample {
             .sum::<u64>(),
         fixture.live_rows
     );
-    assert_eq!(
-        output.index_deltas().unwrap().count() as u64,
-        fixture.live_rows
-    );
+    let (remap_runs, remap_bytes) = output.lazy_remap().map_or((0, 0), |remap| {
+        (
+            remap.files.iter().map(|file| file.runs()).sum(),
+            remap.files.iter().map(|file| file.encoded_bytes()).sum(),
+        )
+    });
+    let stamped_outputs = output
+        .data_files
+        .iter()
+        .filter(|file| file.sort_order_id().is_some())
+        .count();
+    if let Some(remap) = output.lazy_remap() {
+        let mapped: u64 = remap.output_live_rows.iter().map(|(_, rows)| rows).sum();
+        assert_eq!(mapped, fixture.live_rows);
+    } else {
+        assert_eq!(
+            output.index_deltas().unwrap().count() as u64,
+            fixture.live_rows
+        );
+    }
     for file in &output.data_files {
         fixture
             .table
@@ -376,6 +456,15 @@ async fn run(fixture: &Fixture, iteration: usize) -> Sample {
         wall,
         cpu,
         peak_growth_kib,
+        layout: output.layout().as_str(),
+        remap_runs,
+        remap_bytes,
+        stamped_outputs,
+        output_bytes: output
+            .data_files
+            .iter()
+            .map(|file| file.file_size_in_bytes())
+            .sum(),
     }
 }
 
@@ -443,6 +532,114 @@ fn compaction_worker_benchmark() {
                 percentile(&cpu, 50.0),
                 peak as f64 / 1024.0,
             );
+        });
+    }
+}
+
+/// Concatenation against merge of the same sorted inputs, whose key ranges
+/// are disjoint, clustered in runs or fully interleaved. Each iteration runs
+/// both on one fixture, alternating which goes first, so the reported ratio
+/// is paired and host noise largely cancels. Every case uses a lazy remap,
+/// which a merge requires.
+#[test]
+#[ignore = "focused timing workload; run explicitly with --release --ignored --nocapture"]
+fn merge_layout_benchmark() {
+    let files = env("FLOW_BENCH_FILES", 16);
+    let rows_per_file = env("FLOW_BENCH_ROWS_PER_FILE", 32_768);
+    let warmups = env("FLOW_BENCH_WARMUPS", 1);
+    let iterations = env("FLOW_BENCH_ITERATIONS", 7);
+    let run_rows = env("FLOW_BENCH_RUN_ROWS", 512);
+    let only = std::env::var("FLOW_BENCH_CASE").ok();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    println!(
+        "host_cpus={} files={files} rows_per_file={rows_per_file} run_rows={run_rows} warmups={warmups} iterations={iterations}",
+        std::thread::available_parallelism().unwrap()
+    );
+    println!(
+        "| inputs | layout | stamped outputs | p50 ms | rows/s (p50) | CPU s (p50) | merge/concat wall (paired p50) | peak RSS growth MiB (max) | output MiB | remap runs | remap KiB |"
+    );
+    println!("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let cases: Vec<(String, Shape, usize)> = vec![
+        ("disjoint".into(), Shape::Disjoint, 0),
+        (
+            format!("clustered {run_rows}"),
+            Shape::Clustered(run_rows),
+            0,
+        ),
+        ("interleaved".into(), Shape::Interleaved, 0),
+        ("interleaved, 10% deletes".into(), Shape::Interleaved, 10),
+    ];
+    for (name, shape, delete_every) in cases {
+        if only
+            .as_ref()
+            .is_some_and(|only| !name.contains(only.as_str()))
+        {
+            continue;
+        }
+        runtime.block_on(async {
+            let mut fixture =
+                sorted_fixture(FormatVersion::V2, files, rows_per_file, delete_every, Some(shape))
+                    .await;
+            fixture.plan.lazy_index_remap = true;
+            let mut variants = [false, true].map(|merge| {
+                let mut plan = fixture.plan.clone();
+                plan.merge.enabled = merge;
+                (plan, Vec::<Sample>::new())
+            });
+            for iteration in 0..warmups + iterations {
+                for turn in 0..2 {
+                    let variant = (iteration + turn) % 2;
+                    fixture.plan = variants[variant].0.clone();
+                    let sample = run(&fixture, iteration * 2 + turn).await;
+                    if iteration >= warmups {
+                        variants[variant].1.push(sample);
+                    }
+                }
+            }
+            let mut ratios: Vec<f64> = variants[0]
+                .1
+                .iter()
+                .zip(&variants[1].1)
+                .map(|(concat, merge)| merge.wall.as_secs_f64() / concat.wall.as_secs_f64())
+                .collect();
+            ratios.sort_by(f64::total_cmp);
+            for (plan, samples) in &variants {
+                let mut wall: Vec<_> = samples
+                    .iter()
+                    .map(|sample| sample.wall.as_secs_f64() * 1000.0)
+                    .collect();
+                wall.sort_by(f64::total_cmp);
+                let mut cpu: Vec<_> = samples.iter().map(|sample| sample.cpu).collect();
+                cpu.sort_by(f64::total_cmp);
+                let peak = samples
+                    .iter()
+                    .map(|sample| sample.peak_growth_kib)
+                    .max()
+                    .unwrap();
+                let last = samples.last().unwrap();
+                let p50 = percentile(&wall, 50.0);
+                println!(
+                    "| {name} | {}{} | {} | {p50:.0} | {:.0} | {:.2} | {} | {:.0} | {:.1} | {} | {:.1} |",
+                    last.layout,
+                    if plan.merge.enabled { "" } else { " (merge off)" },
+                    last.stamped_outputs,
+                    fixture.live_rows as f64 / (p50 / 1000.0),
+                    percentile(&cpu, 50.0),
+                    if plan.merge.enabled {
+                        format!("{:.3}", percentile(&ratios, 50.0))
+                    } else {
+                        "1".into()
+                    },
+                    peak as f64 / 1024.0,
+                    last.output_bytes as f64 / (1 << 20) as f64,
+                    last.remap_runs,
+                    last.remap_bytes as f64 / 1024.0,
+                );
+            }
         });
     }
 }

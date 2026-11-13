@@ -86,6 +86,7 @@ pub async fn scan(table: &Table, schema: &TableSchema) -> anyhow::Result<Vec<Row
 
 /// Build publication input through real journal frames, including schema/key
 /// validation. Maintenance fixtures use this instead of pre-sealing index rows.
+/// The epoch is collapsed on disk, so it streams in key-encoding order.
 pub fn collapse_fixture(
     store: &flow_state_store::StateStore,
     table: &Table,
@@ -93,6 +94,20 @@ pub fn collapse_fixture(
     source: flow_model::SourceId,
     lsn: flow_model::PgLsn,
     changes: impl IntoIterator<Item = (flow_model::PrimaryKey, flow_state_store::Change)>,
+) -> (flow_coordinator::Epoch, flow_coordinator::CollapsedEpoch) {
+    collapse_fixture_with(store, table, schema, source, lsn, changes, 0)
+}
+
+/// [`collapse_fixture`] with an in-memory collapse budget: an epoch that fits
+/// is buffered, and so written in the table's sort order.
+pub fn collapse_fixture_with(
+    store: &flow_state_store::StateStore,
+    table: &Table,
+    schema: &TableSchema,
+    source: flow_model::SourceId,
+    lsn: flow_model::PgLsn,
+    changes: impl IntoIterator<Item = (flow_model::PrimaryKey, flow_state_store::Change)>,
+    memory_bytes: usize,
 ) -> (flow_coordinator::Epoch, flow_coordinator::CollapsedEpoch) {
     use flow_ingress_journal::{Journal, JournalConfig};
     use flow_model::{
@@ -150,7 +165,7 @@ pub fn collapse_fixture(
         flow_coordinator::CollapseLimits {
             batch_rows: store.batch_rows(),
             batch_bytes: 1 << 20,
-            memory_bytes: 0,
+            memory_bytes,
         },
     )
     .unwrap();

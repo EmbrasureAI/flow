@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 use crate::{artifacts, blocking, publication::ReplanRequired};
 
 mod deletes;
+mod demotions;
 pub use deletes::{DeleteRepairCursor, DeleteRewritePolicy};
+pub(crate) use demotions::MergeDemotions;
 mod levels;
 mod manifests;
 mod recovery;
@@ -286,6 +288,7 @@ pub struct TableMaintenance {
     read_limits: flow_compactor::ReadLimits,
     cache: ManifestCache,
     garbage: garbage::RetainedIndexes,
+    demotions: MergeDemotions,
 }
 
 impl TableMaintenance {
@@ -304,6 +307,7 @@ impl TableMaintenance {
             read_limits: flow_compactor::ReadLimits::default(),
             cache: ManifestCache::default(),
             garbage: garbage::RetainedIndexes::new(garbage::RETAINED_INDEX_BYTES),
+            demotions: MergeDemotions::default(),
         })
     }
 
@@ -494,7 +498,7 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, table_id).await?;
-        let Some(plan) = self
+        let Some(mut plan) = self
             .policy
             .for_format_version(table.metadata().format_version())
             .plan(
@@ -506,6 +510,7 @@ impl TableMaintenance {
         else {
             return Ok(None);
         };
+        self.demotions.apply(table_id, &mut plan);
         let base = CommitBase::new(&table);
         let level = match plan.output_level {
             Level::L0 => "l0",
@@ -559,7 +564,8 @@ impl TableMaintenance {
                 &cache,
             ))
         })
-        .await??;
+        .await?
+        .map_err(|error| self.demotions.observe(table_id, error))?;
         let worker_ms = worker_started.elapsed().as_secs_f64() * 1000.0;
         let prepare_started = std::time::Instant::now();
         let head = self.catalog.load_table(table.identifier()).await?;
@@ -673,6 +679,7 @@ impl TableMaintenance {
         };
         let id = operation.id.clone();
         let selection_reason = output.plan.reason;
+        let layout = output.layout().as_str();
         let residual_delete_rows = output.residual_delete_rows;
         // Physical output includes rows masked during catch-up. It is not the
         // number of surviving mappings or the catalog's logical row count.
@@ -749,12 +756,15 @@ impl TableMaintenance {
             * 1000.0;
         let coordinator_prepare_publish_other_ms =
             (coordinator_prepare_publish_ms - prepare_ms - publish_and_apply_ms).max(0.0);
+        metrics::counter!("flow_compaction_layout_total", "table_id" => table_id.0.to_string(), "layout" => layout)
+            .increment(1);
         tracing::info!(
             event = "compaction_completed",
             table_id = table_id.0,
             operation_id = %id.0,
             candidate_kind = "data_rewrite",
             selection_reason = selection_reason.as_str(),
+            layout,
             snapshot_id = snapshot,
             output_level = level,
             output_data_files,

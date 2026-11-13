@@ -1,21 +1,22 @@
 use crate::{
     CompactionPlan, ReadLimits,
-    columnar::{RowEncoder, conform},
+    columnar::RowEncoder,
+    live::{LiveColumns, LiveInput},
+    merge::{Merge, MergeBatch, SortKeys},
     parquet_scan::{Input, Prefetch, read_input_batches},
     residual::{ResidualInput, ResidualMerge},
 };
 use anyhow::{Result, bail, ensure};
-use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
-use arrow_select::filter::filter_record_batch;
+use arrow_array::{Array, Int64Array, StringArray};
 use flow_iceberg_ext::{ManifestCache, SnapshotView};
 use flow_materializer::{
     DataWriter, DeleteWriter, SortMode, SortSpec, TableSort, WriterConfig, rows_from_batch,
-    writer_arrow_schema,
 };
 use flow_model::{FileId, OperationId, PgLsn, Row, RowLocation, TableId, TableSchema, Value};
 use flow_state_store::{
     FileRemap, IndexDelta, LazyRemap, OperationKind, PreparedOperation, RowIndex, StateStore,
 };
+use futures::{StreamExt, TryStreamExt};
 use iceberg::{io::FileIO, spec::DataFile, table::Table};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -39,8 +40,37 @@ pub struct WorkerOutput {
     pub(crate) lazy_files: Option<Vec<FileRemap>>,
     /// The complete lazy remap, after catch-up derived exact output counts.
     pub(crate) lazy: Option<LazyRemap>,
+    pub(crate) layout: RewriteLayout,
 }
+
+/// How a rewrite ordered its output rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteLayout {
+    /// Inputs concatenated in commit order: the default for unsorted tables
+    /// and for inputs that cannot be merged.
+    CommitOrder,
+    /// Sorted inputs with disjoint key ranges, concatenated in key order.
+    KeyOrder,
+    /// Sorted inputs merged row by row into one sorted stream.
+    Merge,
+}
+
+impl RewriteLayout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommitOrder => "commit_order",
+            Self::KeyOrder => "key_order",
+            Self::Merge => "merge",
+        }
+    }
+}
+
 impl WorkerOutput {
+    /// How this rewrite ordered its output rows.
+    pub fn layout(&self) -> RewriteLayout {
+        self.layout
+    }
+
     pub fn table_id(&self) -> TableId {
         self.table_id
     }
@@ -266,13 +296,29 @@ pub async fn build_data(
         required_deletes == plan.delete_files,
         "plan must consume exactly every applicable delete file"
     );
-    // Rewrites keep each input contiguous, so the output is sorted when the
-    // inputs are sorted and their key ranges can be laid end to end.
+    // Sorted inputs with disjoint key ranges are concatenated in key order:
+    // one input open at a time. Other sorted inputs are merged when the plan
+    // allows it, the remap is lazy and the inputs fit the merge's memory.
     let sort = TableSort::of_table(&schema, table.metadata());
-    let (scan_order, layout) = match key_order(&view, &plan.input_files, &schema, sort.spec())? {
-        Some(order) => (order, "key_order"),
-        None => (commit_order(&view, &plan.input_files)?, "commit_order"),
+    let lazy_remap = plan.lazy_index_remap && !schema.primary_key.is_empty();
+    let (scan_order, mut layout) = match key_order(&view, &plan.input_files, &schema, sort.spec())?
+    {
+        Some(order) => (order, RewriteLayout::KeyOrder),
+        None => (
+            commit_order(&view, &plan.input_files)?,
+            RewriteLayout::CommitOrder,
+        ),
     };
+    let merge_spec = sort.spec().filter(|spec| {
+        layout == RewriteLayout::CommitOrder
+            && plan.merge.enabled
+            && lazy_remap
+            && plan.input_files.len() > 1
+            && stamped(&view, &plan.input_files, spec)
+    });
+    if merge_spec.is_some() {
+        layout = RewriteLayout::Merge;
+    }
     let input_data_rows = plan.input_files.iter().try_fold(0u64, |rows, id| {
         let entry = view
             .live_files
@@ -294,7 +340,7 @@ pub async fn build_data(
         input_delete_files = plan.delete_files.len(),
         input_delete_rows = plan.delete_input_rows,
         input_delete_bytes = plan.delete_input_bytes,
-        layout,
+        layout = layout.as_str(),
         sort_order_id = sort.order_id(),
         "compaction metadata admitted before file reads"
     );
@@ -345,6 +391,32 @@ pub async fn build_data(
             ))
         })?;
     config.target_file_bytes = usize::try_from(plan.target_file_bytes)?;
+    // A merge opens every input before reading data, so its memory is known
+    // from their footers and prefetched files; over budget, it concatenates.
+    let mut merge_inputs = None;
+    let mut merge_held_bytes = 0u64;
+    let mut merge_declined = None::<&str>;
+    if layout == RewriteLayout::Merge {
+        let (inputs, held) = open_inputs(
+            table,
+            &schema,
+            &view,
+            &scan_order,
+            &scratch,
+            &operation_id.0,
+            batch_rows,
+            read_limits,
+            plan.merge.memory_bytes,
+            cancelled,
+        )
+        .await?;
+        merge_held_bytes = held;
+        if inputs.is_none() {
+            layout = RewriteLayout::CommitOrder;
+            merge_declined = Some("memory");
+        }
+        merge_inputs = inputs;
+    }
     let mut writer = DataWriter::new(
         table.file_io().clone(),
         table.metadata().location(),
@@ -357,7 +429,14 @@ pub async fn build_data(
         writer = writer.with_row_lineage()?;
     }
     if let Some(spec) = sort.spec() {
-        writer = writer.with_sort(spec, SortMode::Verify)?;
+        // A merge's output is sorted by construction: declare it, and fail
+        // rather than write a row out of order.
+        let mode = if merge_inputs.is_some() {
+            SortMode::Sorted
+        } else {
+            SortMode::Verify
+        };
+        writer = writer.with_sort(spec, mode)?;
     }
     let mut reverse_file = None;
     type ReverseRows<'a> = Box<
@@ -374,118 +453,153 @@ pub async fn build_data(
         .expect("validated base snapshot")
         .sequence_number();
     let mut stager = Stager::spawn(scratch.clone(), operation_id.clone())?;
-    scan_staged_live_columns(
-        table,
-        &schema,
-        &view,
-        &scan_order,
-        &scratch,
-        &operation_id.0,
-        batch_rows,
-        read_limits,
-        Some(cancelled),
-        async |live| {
-            let rows = live.batch.num_rows();
-            let mut encoder = RowEncoder::new(&schema, &live.batch)?;
-            let keys = if schema.primary_key.is_empty() {
-                ensure!(schema.append_only, "mutable compaction requires a key");
-                if reverse_file.as_ref() != Some(&live.file_id) {
-                    if let Some(rows) = &mut reverse_rows {
-                        ensure!(
-                            rows.next().transpose()?.is_none(),
-                            "unconsumed reverse rows in compaction input"
-                        );
+    let mut merge_stats = None;
+    if let Some(mut inputs) = merge_inputs.take() {
+        let spec = merge_spec.expect("merge layout has a sort order");
+        let files: Vec<FileId> = inputs.iter().map(|input| input.file_id().clone()).collect();
+        let mut merge = Merge::new(SortKeys::new(&schema, spec)?, files.clone());
+        let mut remaps: Vec<Option<FileRemap>> = files.iter().map(|_| None).collect();
+        loop {
+            while let Some(input) = merge.pending() {
+                check_cancelled(Some(cancelled))?;
+                match inputs[input].next().await? {
+                    Some(live) => {
+                        let VerifiedInput { fingerprints, .. } =
+                            verify_inputs(&schema, live_index, &live, None)?;
+                        merge.push(input, MergeBatch { live, fingerprints })?;
                     }
-                    reverse_file = Some(live.file_id.clone());
-                    reverse_rows = Some(Box::new(
-                        live_index.file_rows(&schema.table_id, &live.file_id),
-                    ));
+                    None => merge.finish(input),
                 }
-                let mut keys = Vec::with_capacity(rows);
-                let rows = reverse_rows.as_mut().expect("reverse iterator initialized");
-                for position in &live.positions {
-                    let Some((indexed_position, key)) = rows.next().transpose()? else {
-                        bail!("keyless compaction reverse index is incomplete");
-                    };
-                    ensure!(
-                        *position == indexed_position,
-                        "keyless compaction reverse index positions differ"
-                    );
-                    keys.push(key);
-                }
-                keys
-            } else {
-                (0..rows).map(|row| encoder.key(row)).collect()
-            };
-            // A rewritten row keeps its values, so the original's fingerprint
-            // is also its replacement's.
-            let fingerprints: Vec<_> = (0..rows).map(|row| encoder.fingerprint(row)).collect();
-            let old_locations = live_index.lookup_many(&schema.table_id, &keys)?;
-            let mut originals = Vec::with_capacity(rows);
-            for ((key, old), (position, fingerprint)) in keys
-                .iter()
-                .zip(old_locations)
-                .zip(live.positions.iter().zip(&fingerprints))
-            {
-                let Some(old) = old else {
-                    bail!("compaction key {key:?} no longer exists; replan");
-                };
-                ensure!(
-                    old.data_file_id == live.file_id
-                        && old.row_position == *position
-                        && old.row_fingerprint == *fingerprint,
-                    "compaction input row changed or index is stale; replan"
-                );
-                originals.push(old);
             }
+            let Some(merged) = merge.next(batch_rows)? else {
+                break;
+            };
             check_cancelled(Some(cancelled))?;
             let written = writer
                 .write_arrow(
-                    &live.batch,
-                    live.lineage.as_deref(),
-                    &fingerprints,
+                    &merged.batch,
+                    merged.lineage.as_deref(),
+                    &merged.fingerprints,
                     PgLsn(0),
                 )
                 .await?;
-            check_cancelled(Some(cancelled))?;
-            if let Some(remaps) = &mut lazy {
-                // Survivors are written in input order, so each input file's
-                // rows form a few contiguous runs of the outputs.
-                ensure!(
-                    written.locations.len() == live.positions.len(),
-                    "writer returned a location per row"
-                );
-                let remap = remaps
-                    .entry(live.file_id.clone())
-                    .or_insert_with(|| FileRemap::new(live.file_id.clone()));
-                for (position, location) in live.positions.iter().zip(&written.locations) {
-                    remap.push(*position, location, output_sequence)?;
-                }
-                mapped_rows += rows as u64;
-                return Ok(());
-            }
-            let deltas = keys.into_iter().zip(originals).zip(written.locations).map(
-                |((key, original), mut replacement)| {
-                    replacement.data_sequence_number = table
-                        .metadata()
-                        .current_snapshot()
-                        .expect("validated base snapshot")
-                        .sequence_number();
-                    replacement.source_commit_lsn = original.source_commit_lsn;
-                    replacement.row_version = original.row_version;
-                    IndexDelta {
-                        key,
-                        expected: Some(original),
-                        replacement: Some(replacement),
-                    }
-                },
+            ensure!(
+                written.locations.len() == merged.sources.len(),
+                "writer returned a location per row"
             );
-            stager.stage(deltas.collect())?;
-            mapped_rows += rows as u64;
-            Ok(())
-        },
-    )
-    .await?;
+            // Each input's rows keep their relative order, so every remap
+            // receives ascending old positions; output positions interleave.
+            for ((input, position), location) in merged.sources.iter().zip(&written.locations) {
+                remaps[*input]
+                    .get_or_insert_with(|| FileRemap::new(files[*input].clone()))
+                    .push(*position, location, output_sequence)?;
+            }
+            mapped_rows += merged.sources.len() as u64;
+        }
+        let remap_files = lazy.as_mut().expect("a merge needs a lazy remap");
+        for remap in remaps.into_iter().flatten() {
+            remap_files.insert(remap.source.clone(), remap);
+        }
+        merge_stats = Some(merge.stats());
+    } else {
+        scan_staged_live_columns(
+            table,
+            &schema,
+            &view,
+            &scan_order,
+            &scratch,
+            &operation_id.0,
+            batch_rows,
+            read_limits,
+            Some(cancelled),
+            async |live| {
+                let rows = live.batch.num_rows();
+                let keys = if schema.primary_key.is_empty() {
+                    ensure!(schema.append_only, "mutable compaction requires a key");
+                    if reverse_file.as_ref() != Some(&live.file_id) {
+                        if let Some(rows) = &mut reverse_rows {
+                            ensure!(
+                                rows.next().transpose()?.is_none(),
+                                "unconsumed reverse rows in compaction input"
+                            );
+                        }
+                        reverse_file = Some(live.file_id.clone());
+                        reverse_rows = Some(Box::new(
+                            live_index.file_rows(&schema.table_id, &live.file_id),
+                        ));
+                    }
+                    let mut keys = Vec::with_capacity(rows);
+                    let rows = reverse_rows.as_mut().expect("reverse iterator initialized");
+                    for position in &live.positions {
+                        let Some((indexed_position, key)) = rows.next().transpose()? else {
+                            bail!("keyless compaction reverse index is incomplete");
+                        };
+                        ensure!(
+                            *position == indexed_position,
+                            "keyless compaction reverse index positions differ"
+                        );
+                        keys.push(key);
+                    }
+                    Some(keys)
+                } else {
+                    None
+                };
+                let VerifiedInput {
+                    keys,
+                    fingerprints,
+                    originals,
+                } = verify_inputs(&schema, live_index, &live, keys)?;
+                check_cancelled(Some(cancelled))?;
+                let written = writer
+                    .write_arrow(
+                        &live.batch,
+                        live.lineage.as_deref(),
+                        &fingerprints,
+                        PgLsn(0),
+                    )
+                    .await?;
+                check_cancelled(Some(cancelled))?;
+                if let Some(remaps) = &mut lazy {
+                    // Survivors are written in input order, so each input file's
+                    // rows form a few contiguous runs of the outputs.
+                    ensure!(
+                        written.locations.len() == live.positions.len(),
+                        "writer returned a location per row"
+                    );
+                    let remap = remaps
+                        .entry(live.file_id.clone())
+                        .or_insert_with(|| FileRemap::new(live.file_id.clone()));
+                    for (position, location) in live.positions.iter().zip(&written.locations) {
+                        remap.push(*position, location, output_sequence)?;
+                    }
+                    mapped_rows += rows as u64;
+                    return Ok(());
+                }
+                let deltas = keys.into_iter().zip(originals).zip(written.locations).map(
+                    |((key, original), mut replacement)| {
+                        replacement.data_sequence_number = table
+                            .metadata()
+                            .current_snapshot()
+                            .expect("validated base snapshot")
+                            .sequence_number();
+                        replacement.source_commit_lsn = original.source_commit_lsn;
+                        replacement.row_version = original.row_version;
+                        IndexDelta {
+                            key,
+                            expected: Some(original),
+                            replacement: Some(replacement),
+                        }
+                    },
+                );
+                stager.stage(deltas.collect())?;
+                mapped_rows += rows as u64;
+                Ok(())
+            },
+        )
+        .await?;
+    }
+    // Inputs borrow the scratch store, which the output takes.
+    drop(merge_inputs);
     if let Some(rows) = &mut reverse_rows {
         ensure!(
             rows.next().transpose()?.is_none(),
@@ -513,6 +627,12 @@ pub async fn build_data(
         output_data_files = data_files.len(),
         output_data_rows = data_files.iter().map(|file| file.record_count()).sum::<u64>(),
         output_data_bytes = data_files.iter().map(|file| file.file_size_in_bytes()).sum::<u64>(),
+        layout = layout.as_str(),
+        merge_declined,
+        merge_held_bytes,
+        merge_runs = merge_stats.map_or(0, |stats| stats.runs),
+        merge_gathered_batches = merge_stats.map_or(0, |stats| stats.gathered_batches),
+        merge_sliced_batches = merge_stats.map_or(0, |stats| stats.sliced_batches),
         remap_runs = lazy
             .as_ref()
             .map_or(0, |files| files.values().map(FileRemap::runs).sum::<u64>()),
@@ -539,6 +659,7 @@ pub async fn build_data(
             table_id: schema.table_id,
             lazy_files: lazy.map(|files| files.into_values().collect()),
             lazy: None,
+            layout,
         },
     })
 }
@@ -898,15 +1019,6 @@ async fn scan_staged_live_files(
     Ok(())
 }
 
-/// One decoded batch's live rows, in the table's Arrow schema.
-struct LiveColumns {
-    file_id: FileId,
-    batch: RecordBatch,
-    /// Physical ordinals in the input file, before filtering position deletes.
-    positions: Vec<u64>,
-    lineage: Option<Vec<flow_materializer::RowLineage>>,
-}
-
 /// Data rewrite inputs in commit order: data sequence number, then path. Files
 /// written by one operation share a sequence and their paths number them in
 /// write order. Paths alone start with a random operation ID, so path order
@@ -988,6 +1100,116 @@ fn key_order<'a>(
     Ok(disjoint.then(|| ranges.into_iter().map(|(_, _, file)| file).collect()))
 }
 
+/// Whether every input is stamped with `spec`'s order, which its writer set
+/// only after checking every row. A merge still checks each row's order.
+fn stamped(view: &SnapshotView, files: &BTreeSet<FileId>, spec: &SortSpec) -> bool {
+    let Ok(order_id) = spec.iceberg_order_id() else {
+        return false;
+    };
+    files.iter().all(|file| {
+        view.live_files
+            .get(&file.0)
+            .is_some_and(|entry| entry.data_file.sort_order_id() == Some(order_id))
+    })
+}
+
+/// Opens every input of a merge in `files` order, or returns `None` as soon
+/// as their held bytes exceed `budget`, before reading any more of them.
+#[allow(clippy::too_many_arguments)]
+async fn open_inputs<'a>(
+    table: &Table,
+    schema: &'a TableSchema,
+    view: &SnapshotView,
+    files: &[&FileId],
+    scratch: &'a StateStore,
+    scan_id: &str,
+    batch_rows: usize,
+    read_limits: &ReadLimits,
+    budget: u64,
+    cancelled: &AtomicBool,
+) -> Result<(Option<Vec<LiveInput<'a>>>, u64)> {
+    let mut inputs = Vec::with_capacity(files.len());
+    let mut held = 0u64;
+    for &file in files {
+        check_cancelled(Some(cancelled))?;
+        let source = Input::Sized(view.live_files[&file.0].data_file.file_size_in_bytes());
+        let input = LiveInput::open(
+            table,
+            schema,
+            view,
+            scratch,
+            scan_id,
+            file,
+            source,
+            batch_rows,
+            read_limits,
+        )
+        .await?;
+        held = held.saturating_add(input.held_bytes()?);
+        if held > budget {
+            return Ok((None, held));
+        }
+        inputs.push(input);
+    }
+    futures::stream::iter(inputs.iter_mut().map(|input| async move {
+        check_cancelled(Some(cancelled))?;
+        input.prefetch().await
+    }))
+    .buffer_unordered(read_limits.prefetch_files.max(1))
+    .try_collect::<Vec<_>>()
+    .await?;
+    Ok((Some(inputs), held))
+}
+
+struct VerifiedInput {
+    keys: Vec<flow_model::PrimaryKey>,
+    fingerprints: Vec<[u8; 16]>,
+    originals: Vec<RowLocation>,
+}
+
+/// Encodes a batch's keys, unless given, and fingerprints, and checks every
+/// row against the index: a row that moved or changed since planning means
+/// the input is stale and the build must be replanned.
+fn verify_inputs(
+    schema: &TableSchema,
+    live_index: &(impl RowIndex + ?Sized),
+    live: &LiveColumns,
+    keys: Option<Vec<flow_model::PrimaryKey>>,
+) -> Result<VerifiedInput> {
+    let rows = live.batch.num_rows();
+    let mut encoder = RowEncoder::new(schema, &live.batch)?;
+    let keys = match keys {
+        Some(keys) => keys,
+        None => (0..rows).map(|row| encoder.key(row)).collect(),
+    };
+    // A rewritten row keeps its values, so the original's fingerprint is
+    // also its replacement's.
+    let fingerprints: Vec<_> = (0..rows).map(|row| encoder.fingerprint(row)).collect();
+    let old_locations = live_index.lookup_many(&schema.table_id, &keys)?;
+    let mut originals = Vec::with_capacity(rows);
+    for ((key, old), (position, fingerprint)) in keys
+        .iter()
+        .zip(old_locations)
+        .zip(live.positions.iter().zip(&fingerprints))
+    {
+        let Some(old) = old else {
+            bail!("compaction key {key:?} no longer exists; replan");
+        };
+        ensure!(
+            old.data_file_id == live.file_id
+                && old.row_position == *position
+                && old.row_fingerprint == *fingerprint,
+            "compaction input row changed or index is stale; replan"
+        );
+        originals.push(old);
+    }
+    Ok(VerifiedInput {
+        keys,
+        fingerprints,
+        originals,
+    })
+}
+
 /// Data scan after delete staging. The caller owns the scratch namespace and
 /// must stage every applicable delete before entering this loop. Batches stay
 /// columnar: deleted rows are filtered out and the rest are not copied.
@@ -1004,8 +1226,6 @@ async fn scan_staged_live_columns(
     cancelled: Option<&AtomicBool>,
     mut visit: impl AsyncFnMut(LiveColumns) -> Result<()>,
 ) -> Result<()> {
-    let target = writer_arrow_schema(schema);
-    let v3 = table.metadata().format_version() == iceberg::spec::FormatVersion::V3;
     let mut prefetch = Prefetch::new(
         table.file_io(),
         files.iter().map(|file| {
@@ -1019,85 +1239,22 @@ async fn scan_staged_live_columns(
     for &file in files {
         check_cancelled(cancelled)?;
         let source = prefetch.next(&file.0).await?;
-        let mut deletes = scratch.file_position_deletes(scan_id, &schema.table_id, file);
-        let mut next_delete = deletes
-            .next()
-            .transpose()?
-            .map(|location| location.row_position);
-        let mut position = 0u64;
-        let entry = &view.live_files[&file.0];
-        read_input_batches(
-            table.file_io(),
-            &file.0,
+        let mut input = LiveInput::open(
+            table,
+            schema,
+            view,
+            scratch,
+            scan_id,
+            file,
             source,
-            None,
             batch_rows,
             read_limits,
-            async |batch| {
-                check_cancelled(cancelled)?;
-                let mut lineage = if v3 {
-                    Some(flow_materializer::read_row_lineage(
-                        &batch,
-                        position,
-                        entry.data_file.first_row_id(),
-                        entry
-                            .sequence_number
-                            .ok_or_else(|| anyhow::anyhow!("missing data sequence"))?,
-                    )?)
-                } else {
-                    None
-                };
-                let batch = conform(schema, &target, &batch)?;
-                let mut live = Vec::with_capacity(batch.num_rows());
-                let mut positions = Vec::with_capacity(batch.num_rows());
-                for _ in 0..batch.num_rows() {
-                    ensure!(
-                        next_delete.is_none_or(|deleted| deleted >= position),
-                        "position delete fell behind scan"
-                    );
-                    if next_delete == Some(position) {
-                        next_delete = deletes
-                            .next()
-                            .transpose()?
-                            .map(|location| location.row_position);
-                        live.push(false);
-                    } else {
-                        positions.push(position);
-                        live.push(true);
-                    }
-                    position += 1;
-                }
-                if positions.is_empty() {
-                    return Ok(());
-                }
-                let batch = if positions.len() == batch.num_rows() {
-                    batch
-                } else {
-                    if let Some(lineage) = &mut lineage {
-                        let mut live = live.iter();
-                        lineage.retain(|_| *live.next().expect("one flag per row"));
-                    }
-                    filter_record_batch(&batch, &BooleanArray::from(live))?
-                };
-                check_cancelled(cancelled)?;
-                visit(LiveColumns {
-                    file_id: file.clone(),
-                    batch,
-                    positions,
-                    lineage,
-                })
-                .await
-            },
         )
         .await?;
-        ensure!(
-            next_delete.is_none(),
-            "position delete is outside input file"
-        );
-        ensure!(
-            position == entry.data_file.record_count(),
-            "data file row count differs from metadata"
-        );
+        while let Some(live) = input.next().await? {
+            check_cancelled(cancelled)?;
+            visit(live).await?;
+        }
     }
     Ok(())
 }

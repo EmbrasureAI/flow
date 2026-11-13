@@ -121,11 +121,11 @@ and cleaned up.
 - A strict rewrite fences the table from its build base through publication,
   so it needs no catch-up: its remap is the worker's runs and every output row
   is live.
-- The worker reads inputs in commit order (data sequence number, then path)
-  and writes each input file's survivors in input order, so it records
-  only runs `(old start, output file, new start, length)`. Runs break at
-  positions deleted at the build base and at output-file rotation: the remap is
-  O(files + deleted positions), not O(rows).
+- The worker preserves each input file's survivor order and records runs
+  `(old start, output file, new start, length)`. Concatenating rewrites break
+  runs at deleted positions and output-file rotation. Sorted merges also
+  break runs when switching inputs, so heavily interleaved inputs can need
+  one run per row. See [sorted layout](sorted-layout.md) for merge admission.
 - Catch-up no longer looks up or verifies each moved row. It translates late
   position deletes through the remap into output masks and requires, per input
   file, that the live count at H equals the base survivors minus the effective

@@ -1,7 +1,7 @@
 //! Local speculative data compaction. The actor captures the base and later
 //! finalizes completed work; it never waits for a running worker under its fence.
 
-use super::{BuildRegistration, RewriteCommit, TableMaintenance};
+use super::{BuildRegistration, MergeDemotions, RewriteCommit, TableMaintenance};
 use crate::{blocking, publication::ReplanRequired};
 use anyhow::{Result, ensure};
 use flow_compactor::{BuiltData, CatchUpRejected, Level};
@@ -31,6 +31,8 @@ pub struct RunningCompaction {
     base: CommitBase,
     indexed: TableState,
     started: Instant,
+    demotions: MergeDemotions,
+    table_id: flow_model::TableId,
 }
 
 impl RunningCompaction {
@@ -69,7 +71,7 @@ impl RunningCompaction {
                     operation_id = %self.ownership.operation_id().0,
                     elapsed_ms = self.started.elapsed().as_millis(),
                     "joined compaction worker and released durable build ownership");
-                Err(replan_error(error))
+                Err(replan_error(self.demotions.observe(self.table_id, error)))
             }
         }
     }
@@ -270,7 +272,7 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, schema.table_id).await?;
-        let Some(plan) = self
+        let Some(mut plan) = self
             .policy
             .for_format_version(table.metadata().format_version())
             .plan(
@@ -282,6 +284,7 @@ impl TableMaintenance {
         else {
             return Ok(None);
         };
+        self.demotions.apply(schema.table_id, &mut plan);
         let level = match plan.output_level {
             Level::L0 => "l0",
             Level::L1 => "l1",
@@ -289,6 +292,7 @@ impl TableMaintenance {
         };
         let operation = OperationId(format!("flow-{level}-rewrite-{}", uuid::Uuid::new_v4()));
         let selection_reason = plan.reason.as_str();
+        let ownership_table = schema.table_id;
         let base = CommitBase::new(&table);
         let ownership = BuildRegistration::begin(
             self.store.clone(),
@@ -341,6 +345,8 @@ impl TableMaintenance {
                     base,
                     indexed,
                     started,
+                    demotions: self.demotions.clone(),
+                    table_id: ownership_table,
                 }))
             }
             Err(_) => {

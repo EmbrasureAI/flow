@@ -347,6 +347,7 @@ async fn compact_all(fixture: &Fixture) -> (Option<i32>, Vec<i64>) {
         delete_input_bytes: 0,
         delete_input_rows: 0,
         lazy_index_remap: true,
+        merge: flow_compactor::MergePolicy::default(),
         per_target_deletes: false,
         target_ranges: Default::default(),
         reason: flow_compactor::PlanReason::L0Debt,
@@ -416,7 +417,8 @@ async fn compaction_concatenates_disjoint_sorted_inputs_in_key_order() {
     assert_eq!(ids, [-3, -2, -1, 0, 1, 10, 11, 12, 13]);
 }
 
-/// Overlapping inputs keep commit order; the output is not stamped.
+/// Without opt-in merging, overlapping inputs keep commit order and the
+/// output is not stamped. `merge_compaction.rs` covers enabled merges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compaction_of_overlapping_inputs_keeps_commit_order_unstamped() {
     let mut fixture = Fixture::new().await;

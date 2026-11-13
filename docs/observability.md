@@ -139,6 +139,8 @@ No separate export task is created.
 | `flow_table_sort_order_id`, `flow_table_sorted_rows_ratio`, `flow_table_unsorted_bytes`, `flow_table_sort_overlap_files` | The default sort order (`0` unsorted), the share of rows in files marked with it, bytes outside L0 not marked with it, and the row-weighted mean number of files whose key range overlaps a file's; see [Sorted layout](sorted-layout.md) |
 | `flow_table_retries_total` | Interrupted table attempts that enter recovery and retry |
 | `flow_compaction_seconds`, `flow_compactions_total` | Successful built-in compaction passes, labelled `kind="data"` or `kind="delete"` |
+| `flow_compaction_layout_total` | Published data rewrites by how they ordered rows: `layout="merge"` (sorted inputs merged), `key_order` (sorted inputs with disjoint ranges concatenated in key order) or `commit_order` |
+| `flow_compaction_merge_demotions_total` | Rewrite inputs stamped with the table's sort order that a merge found out of order; rewrites that include them concatenate for the life of the process |
 | `flow_epoch_sort_total` | Epochs of sorted tables by `result`: `already_sorted`, `sorted` (reordered in memory), `unsortable` (a sort value was carried forward) and `disk` (collapsed on disk, written in key-encoding order) |
 | `flow_index_remap_files`, `flow_index_remap_max_depth`, `flow_index_remap_bytes` | Retired data files whose lazy index remap is still kept, the longest translation chain in hops, and the bytes of their records and chunks; periodic maintenance keeps them within `remap_max_files`, `remap_max_depth` and `remap_max_bytes` |
 | `flow_index_remaps_dropped_total`, `flow_index_remap_rows_materialized_total` | Remaps dropped by cleanup, and index entries it rewrote to their translated location |
