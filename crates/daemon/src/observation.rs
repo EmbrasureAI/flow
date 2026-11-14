@@ -436,6 +436,8 @@ fn sample_memory_budgets(
         .set(manifests.weighted_bytes() as f64);
     metrics::gauge!("flow_memory_manifest_cache_entries", "cache" => "shared")
         .set(manifests.entry_count() as f64);
+    metrics::counter!("flow_parquet_parallel_batches_total")
+        .absolute(iceberg::writer::file_writer::parquet_parallel_batches() as u64);
     failures
 }
 

@@ -34,6 +34,9 @@ parquet_row_group_bytes = 33554432
 # Rows per row group in compacted files and the initial copy; publication
 # files keep 8192.
 parquet_row_group_rows = 122880
+# Threads encoding Parquet columns at once across the process; unset uses
+# half the cores, at most four. Narrow or small batches stay sequential.
+# parquet_encode_threads = 4
 # The largest single row change; a larger one blocks its table.
 chunk_bytes = 4194304
 # Queued lookahead descriptors shared by all tables. It only makes tables

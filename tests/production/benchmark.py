@@ -130,6 +130,40 @@ class Benchmark(Run):
                            "FROM generate_series(1,%s) AS blocks(n)),%s)")
         return sql.SQL("left(repeat(md5(" + key + "),%s),%s)")
 
+    # Extra columns model a wider OLTP table: deterministic functions of the
+    # key and version, so every update rewrites them, with types whose text
+    # form is the same in PostgreSQL and DuckDB for full-row verification.
+    EXTRA_KINDS = (
+        ("bigint", "Int64", "(({key})*31 + ({version})*7 + {index}) % 1000003"),
+        ("integer", "Int32", "((({key}) + {index}) % 500)::integer"),
+        ("boolean", "Bool", "((({key}) + ({version}) + {index}) % 2 = 0)"),
+        # Marker rows have negative keys; keep the array index in range.
+        ("text", "String", "(ARRAY['new','paid','shipped','returned','cancelled'])[1 + (((({key}) + {index}) % 5 + 5) % 5)::int]"),
+        ("text", "String", "md5((({key})*1009 + {index})::text || ':' || ({version})::text)"),
+        ("bigint", "Int64", "1700000000000000 + (({key})*977 + ({version}) + {index}) % 86400000000"),
+    )
+
+    def extra_columns(self):
+        return [(f"c{index}",) + self.EXTRA_KINDS[index % len(self.EXTRA_KINDS)] for index in range(self.args.extra_columns)]
+
+    def extra_values(self, key, version):
+        """SQL fragments for every extra column, in order, prefixed by a comma."""
+        if not self.args.extra_columns:
+            return sql.SQL("")
+        # Used in statements with bind parameters, so a literal % is doubled.
+        return sql.SQL("," + ",".join(template.format(key=key, version=version, index=index).replace("%", "%%")
+                                      for index, (_, _, _, template) in enumerate(self.extra_columns())))
+
+    def extra_assignments(self, version):
+        return sql.SQL("".join("," + name + "=" + template.format(key="id", version=version, index=index).replace("%", "%%")
+                               for index, (name, _, _, template) in enumerate(self.extra_columns())))
+
+    def extra_digest(self, cast):
+        """A trailing md5 over every extra column's text, or nothing."""
+        if not self.args.extra_columns:
+            return ""
+        return ",md5(concat_ws('|'," + ",".join(cast(name) for name, *_ in self.extra_columns()) + "))"
+
     def configure(self):
         self.names = [f"events_{i}" for i in range(self.args.tables)]
         self.errors = []
@@ -221,6 +255,8 @@ snapshot_retention_secs = 3600
         if self.args.collapse_memory_bytes is not None:
             text += f'''collapse_memory_bytes = {self.args.collapse_memory_bytes}
 '''
+        extra = "".join(f'  {{ field_id = {4 + index}, name = "{column}", data_type = "{kind}", nullable = false }},\n'
+                        for index, (column, _, kind, _) in enumerate(self.extra_columns()))
         for name in self.names:
             text += f'''\n[[tables]]
 source_namespace = "{self.name}"
@@ -234,7 +270,7 @@ columns = [
   {{ field_id = 1, name = "id", data_type = "Int64", nullable = false }},
   {{ field_id = 2, name = "version", data_type = "Int64", nullable = false }},
   {{ field_id = 3, name = "payload", data_type = "String", nullable = false }},
-]
+{extra}]
 '''
         text = override_config(text, "compaction", self.args.compaction)
         text = override_config(text, "limits", self.args.limit)
@@ -299,10 +335,12 @@ columns = [
         self.pg.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(self.name)))
         for name in self.names:
             table = sql.Identifier(name)
-            self.pg.execute(sql.SQL("CREATE TABLE {} (id bigint PRIMARY KEY, version bigint NOT NULL, payload text NOT NULL)").format(table))
+            extra = "".join(f", {column} {pg_type} NOT NULL" for column, pg_type, _, _ in self.extra_columns())
+            self.pg.execute(sql.SQL("CREATE TABLE {} (id bigint PRIMARY KEY, version bigint NOT NULL, payload text NOT NULL" + extra + ")").format(table))
             self.pg.execute(sql.SQL("ALTER TABLE {} REPLICA IDENTITY FULL").format(table))
             # Each row has a distinct deterministic payload. Its entropy is recorded below.
-            self.pg.execute(sql.SQL("INSERT INTO {} SELECT i,0,{} FROM generate_series(1,%s) i").format(table, self.payload_expression("i::text")),
+            self.pg.execute(sql.SQL("INSERT INTO {} SELECT i,0,{}{} FROM generate_series(1,%s) i").format(
+                                table, self.payload_expression("i::text"), self.extra_values("i", "0")),
                             (math.ceil(self.args.row_bytes / 32), self.args.row_bytes, self.args.initial_rows))
         self.pg.execute(sql.SQL("CREATE PUBLICATION {} FOR TABLE {}").format(
             sql.Identifier(self.name), sql.SQL(",").join(map(sql.Identifier, self.names))))
@@ -323,7 +361,8 @@ columns = [
     def verify(self, pinned_tables=None):
         result = {}
         for name in self.names:
-            query = sql.SQL("SELECT id,version,md5(payload) FROM {} ORDER BY id").format(sql.Identifier(name))
+            query = sql.SQL("SELECT id,version,md5(payload)" + self.extra_digest(lambda column: column + "::text")
+                            + " FROM {} ORDER BY id").format(sql.Identifier(name))
             metadata = self.table(name) if pinned_tables is None else pinned_tables[name]
             actual_version = metadata["metadata"]["format-version"]
             assert actual_version == self.args.format_version, (
@@ -335,7 +374,8 @@ columns = [
             evidence.with_suffix(".metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
             path = evidence.with_suffix(".csv")
             destination = "'" + str(path).replace("'", "''") + "'"
-            self.duck.execute("COPY (SELECT id,version,md5(payload) FROM iceberg_scan(?) ORDER BY id) TO " +
+            self.duck.execute("COPY (SELECT id,version,md5(payload)" + self.extra_digest(lambda column: f"CAST({column} AS VARCHAR)")
+                              + " FROM iceberg_scan(?) ORDER BY id) TO " +
                               destination + " (FORMAT CSV, HEADER false)", [metadata["metadata-location"]])
             count = 0
             digest = hashlib.sha256()
@@ -349,8 +389,8 @@ columns = [
                         target = csv.reader(rows)
                         while True:
                             expected = source.fetchmany(4096)
-                            actual = [(int(key), int(version), payload_hash)
-                                      for key, version, payload_hash in islice(target, 4096)]
+                            actual = [(int(key), int(version), *hashes)
+                                      for key, version, *hashes in islice(target, 4096)]
                             if expected != actual:
                                 mismatch = next(((a, b) for a, b in zip(expected, actual) if a != b), None)
                                 raise AssertionError(f"{name}: source/target rows differ at offset {count}, first={mismatch}")
@@ -489,13 +529,17 @@ columns = [
                         with pg.transaction():
                             record["xid"] = pg.execute("SELECT pg_current_xact_id()::text").fetchone()[0]
                             if updates:
-                                affected = pg.execute(sql.SQL("UPDATE {} SET version=%s,payload={} WHERE id=ANY(%s)").format(sql.Identifier(name), self.payload_expression("id::text || ':' || %s::text")),
+                                affected = pg.execute(sql.SQL("UPDATE {} SET version=%s,payload={}{} WHERE id=ANY(%s)").format(
+                                                          sql.Identifier(name), self.payload_expression("id::text || ':' || %s::text"),
+                                                          self.extra_assignments(str(sequence + 1))),
                                                       (sequence + 1, sequence + 1, math.ceil(args.row_bytes / 32), args.row_bytes, update_keys)).rowcount
                                 assert affected == updates, "workload update missed its owned keys"
                             if deletes:
                                 affected = pg.execute(sql.SQL("DELETE FROM {} WHERE id=ANY(%s)").format(sql.Identifier(name)), (delete_keys,)).rowcount
                                 assert affected == deletes, "workload delete missed its owned keys"
-                            affected = pg.execute(sql.SQL("INSERT INTO {} SELECT i,%s,{} FROM unnest(%s::bigint[]) i").format(sql.Identifier(name), self.payload_expression("i::text || ':' || %s::text")),
+                            affected = pg.execute(sql.SQL("INSERT INTO {} SELECT i,%s,{}{} FROM unnest(%s::bigint[]) i").format(
+                                                      sql.Identifier(name), self.payload_expression("i::text || ':' || %s::text"),
+                                                      self.extra_values("i", str(sequence + 1))),
                                                   (sequence + 1, sequence + 1, math.ceil(args.row_bytes / 32), args.row_bytes, new_keys + [marker])).rowcount
                             assert affected == inserts, "workload inserted an unexpected number of rows"
                     finally:
@@ -1086,7 +1130,8 @@ columns = [
             },
         }
         self.report.update(format_version=args.format_version, profile=args.profile, seed=args.seed, initial_rows_per_table=args.initial_rows,
-                           tables=args.tables, payload_bytes=args.row_bytes, warmup_seconds=args.warmup,
+                           tables=args.tables, payload_bytes=args.row_bytes, extra_columns=args.extra_columns,
+                           warmup_seconds=args.warmup,
                            measured_seconds=args.duration, transaction_rows=args.transaction_rows, writers=args.writers,
                            key_distribution=args.key_distribution, reader_poll_seconds=args.reader_poll_seconds,
                            batch_rows=args.batch_rows, pending_transactions=args.pending_transactions,
@@ -1220,6 +1265,8 @@ def main():
     parser.add_argument("--initial-rows", type=int, default=100000)
     parser.add_argument("--row-bytes", type=int, choices=(256, 1024, 16384), default=256)
     parser.add_argument("--payload-entropy", choices=("repeated", "high"), default="repeated")
+    parser.add_argument("--extra-columns", type=int, default=0,
+                        help="add deterministic bigint, integer, boolean and text columns to model a wider table")
     parser.add_argument("--tables", type=int, default=1)
     parser.add_argument("--writers", type=int, default=4)
     parser.add_argument("--table-workers", type=int, default=4,

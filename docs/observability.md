@@ -617,6 +617,11 @@ publication:
 | `flow_memory_manifest_cache_entries{cache}` | Parsed manifests in that cache |
 | `flow_memory_retained_index_bytes` | Estimated bytes last accounted by the garbage-collection reachability indexes |
 
+The same sampler sets the counter `flow_parquet_parallel_batches_total`: Parquet
+batches whose columns were encoded on more than one thread (see
+`limits.parquet_encode_threads`). It stays at zero for narrow tables, small
+batches and a host whose encode threads are busy.
+
 These gauges overlap one another and the allocator gauges; they are not a
 decomposition of RSS. Pinned bytes are part of the block cache bytes. Cache
 bytes are the estimates each cache evicts against, not allocator measurements.
