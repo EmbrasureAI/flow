@@ -24,7 +24,14 @@ use super::CurrentFileStatus;
 use crate::Result;
 use crate::spec::DataFileBuilder;
 
+mod parallel_writer;
 mod parquet_writer;
+pub use parallel_writer::{
+    default_encode_threads, parquet_parallel_batches, set_parquet_encode_threads,
+};
+/// Exposed for equivalence tests against `AsyncArrowWriter`.
+#[doc(hidden)]
+pub use parallel_writer::{Adaptive, ParallelArrowWriter};
 pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
 
 use crate::io::OutputFile;

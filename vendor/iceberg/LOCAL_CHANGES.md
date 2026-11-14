@@ -40,6 +40,21 @@ cannot mask longer values in truncated groups. Existing files must be rewritten
 to correct previously published bounds. Changed file:
 `src/writer/file_writer/parquet_writer.rs`.
 
+The parallel-encode patch replaces the `AsyncArrowWriter` inside `ParquetWriter`
+with an equivalent writer that can encode a batch's top-level fields on several
+threads. It writes exactly the bytes of the sequential writer: the same column
+writers, written in field order per column, with the same row-count and byte
+row-group boundaries. A batch fans out only when it holds at least 256 KiB of
+Arrow data, its largest field is at most two thirds of the work (an achievable
+speedup of 1.5) and helper threads are free in a process-wide budget set by
+`set_parquet_encode_threads` (default half the cores, at most four); otherwise
+it encodes on the writer's thread. Writer properties with content-defined
+chunking keep `AsyncArrowWriter`. `parquet_parallel_batches()` counts batches
+that used helpers. Changed files: `src/writer/file_writer/mod.rs`,
+`src/writer/file_writer/parquet_writer.rs`; added
+`src/writer/file_writer/parallel_writer.rs`. See
+`docs/patches/iceberg-parallel-encode.patch`.
+
 The separate UUID schema patch preserves Arrow UUID extension metadata and
 recognizes it when converting Arrow schemas back to Iceberg, including list
 elements, map keys/values and struct children. Changed file:
@@ -67,6 +82,7 @@ patch -p1 < docs/patches/iceberg-source-nullability.patch
 patch -p1 < docs/patches/iceberg-debug-redaction.patch
 patch -p1 < docs/patches/iceberg-dv-observed-size.patch
 patch -p1 < docs/patches/iceberg-scan-shared-entry.patch
+patch -p1 < docs/patches/iceberg-parallel-encode.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is

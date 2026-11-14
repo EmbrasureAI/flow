@@ -262,6 +262,18 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- Parquet writers encode the top-level fields of a large batch on several
+  threads when its work is spread across fields and encode threads are free,
+  writing byte-identical files. A batch fans out only with at least 256 KiB
+  of Arrow data and an achievable speedup of 1.5, so narrow tables dominated
+  by one column, small batches and a host whose encode threads are busy stay
+  sequential. `limits.parquet_encode_threads` sets the process-wide budget
+  (default half the cores, at most four; 0 or 1 disables) and
+  `flow_parquet_parallel_batches_total` counts batches that fanned out. On a
+  64-column table, CDC Parquet writes took 12% less time and compaction
+  builds 10–20% less per row; a 3-column table never fanned out. See
+  [parallel encoding](docs/benchmarks/parallel-encode.md). The benchmark
+  harness gains `--extra-columns` for wider tables.
 - Lazy index remaps are stored in chunks of up to 512 runs, varint-encoded with
   a restart point every 32 runs, at about three bytes per run instead of 28,
   with a small header per retired file. A forward read through a retired file

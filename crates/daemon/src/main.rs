@@ -192,9 +192,15 @@ async fn command(cli: Cli) -> Result<ExitCode> {
         allocator::initialize();
     }
     if matches!(&cli.command, Command::Init | Command::Run { .. }) {
+        let encode_threads = config
+            .limits
+            .parquet_encode_threads
+            .unwrap_or_else(iceberg::writer::file_writer::default_encode_threads);
+        iceberg::writer::file_writer::set_parquet_encode_threads(encode_threads);
         tracing::info!(
             config = %cli.config.display(),
             state_dir = %config.state_dir.display(),
+            encode_threads,
             "starting"
         );
     }

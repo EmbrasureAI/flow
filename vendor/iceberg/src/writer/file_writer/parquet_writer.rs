@@ -26,6 +26,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 use parquet::arrow::AsyncArrowWriter;
+use super::parallel_writer::{Adaptive, ParallelArrowWriter};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
 use parquet::file::metadata::ParquetMetaData;
@@ -248,10 +249,55 @@ impl SchemaVisitor for IndexByParquetPathName {
 pub struct ParquetWriter {
     schema: SchemaRef,
     output_file: OutputFile,
-    inner_writer: Option<AsyncArrowWriter<AsyncFileWriter>>,
+    inner_writer: Option<InnerWriter>,
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+}
+
+/// The Arrow-to-Parquet writer: columns encoded on several threads when that
+/// pays off, or the sequential writer for content-defined chunking, which the
+/// parallel writer does not implement. Both produce the same bytes.
+enum InnerWriter {
+    Sequential(AsyncArrowWriter<AsyncFileWriter>),
+    Parallel(ParallelArrowWriter<AsyncFileWriter>),
+}
+
+impl InnerWriter {
+    async fn write(&mut self, batch: &arrow_array::RecordBatch) -> parquet::errors::Result<()> {
+        match self {
+            Self::Sequential(writer) => writer.write(batch).await,
+            Self::Parallel(writer) => writer.write(batch).await,
+        }
+    }
+
+    async fn flush(&mut self) -> parquet::errors::Result<()> {
+        match self {
+            Self::Sequential(writer) => writer.flush().await,
+            Self::Parallel(writer) => writer.flush().await,
+        }
+    }
+
+    async fn finish(&mut self) -> parquet::errors::Result<ParquetMetaData> {
+        match self {
+            Self::Sequential(writer) => writer.finish().await,
+            Self::Parallel(writer) => writer.finish().await,
+        }
+    }
+
+    fn bytes_written(&self) -> usize {
+        match self {
+            Self::Sequential(writer) => writer.bytes_written(),
+            Self::Parallel(writer) => writer.bytes_written(),
+        }
+    }
+
+    fn in_progress_size(&self) -> usize {
+        match self {
+            Self::Sequential(writer) => writer.in_progress_size(),
+            Self::Parallel(writer) => writer.in_progress_size(),
+        }
+    }
 }
 
 /// Used to aggregate min and max value of each column.
@@ -566,11 +612,22 @@ impl FileWriter for ParquetWriter {
             let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
-            let writer = AsyncArrowWriter::try_new(
-                async_writer,
-                arrow_schema.clone(),
-                Some(self.writer_properties.clone()),
-            )
+            let writer = if self.writer_properties.content_defined_chunking().is_some() {
+                AsyncArrowWriter::try_new(
+                    async_writer,
+                    arrow_schema.clone(),
+                    Some(self.writer_properties.clone()),
+                )
+                .map(InnerWriter::Sequential)
+            } else {
+                ParallelArrowWriter::try_new(
+                    async_writer,
+                    arrow_schema.clone(),
+                    self.writer_properties.clone(),
+                    Adaptive::default(),
+                )
+                .map(InnerWriter::Parallel)
+            }
             .map_err(|err| {
                 Error::new(ErrorKind::Unexpected, "Failed to build parquet writer.")
                     .with_source(err)

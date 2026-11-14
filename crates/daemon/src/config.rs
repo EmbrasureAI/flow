@@ -260,6 +260,12 @@ pub struct Limits {
     /// epoch commits and applies, within the same collapse budget.
     pub collapse_prefold: bool,
     pub parquet_row_group_bytes: usize,
+    /// Threads that may encode the columns of Parquet batches at once across
+    /// the process, each writer's own thread included. A large batch whose
+    /// encoding is spread across several fields uses idle ones; others stay
+    /// on the writer's thread. Unset: half the cores, at most four. `0` or `1`
+    /// keeps every batch on its writer's thread.
+    pub parquet_encode_threads: Option<usize>,
     /// Rows per Parquet row group in compacted files and the initial copy,
     /// which readers scan most. Publication files keep 8192 rows, so CDC
     /// epochs do not buffer larger groups.
@@ -318,6 +324,7 @@ impl Default for Limits {
             collapse_memory_bytes: 128 << 20,
             collapse_prefold: true,
             parquet_row_group_bytes: 32 << 20,
+            parquet_encode_threads: None,
             parquet_row_group_rows: 122_880,
             pending_transactions: 256,
             epoch_max_transactions: None,

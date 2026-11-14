@@ -3147,6 +3147,9 @@ pub fn iceberg::writer::base_writer::equality_delete_writer::EqualityDeleteWrite
 impl core::fmt::Debug for iceberg::writer::base_writer::equality_delete_writer::EqualityDeleteWriterConfig
 pub fn iceberg::writer::base_writer::equality_delete_writer::EqualityDeleteWriterConfig::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub mod iceberg::writer::file_writer
+pub fn iceberg::writer::file_writer::default_encode_threads() -> usize
+pub fn iceberg::writer::file_writer::parquet_parallel_batches() -> usize
+pub fn iceberg::writer::file_writer::set_parquet_encode_threads(threads: usize)
 pub mod iceberg::writer::file_writer::location_generator
 pub struct iceberg::writer::file_writer::location_generator::DefaultFileNameGenerator
 impl iceberg::writer::file_writer::location_generator::DefaultFileNameGenerator
